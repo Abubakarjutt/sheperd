@@ -46,6 +46,15 @@ importers:
         specifier: ^1.7.5
         version: 1.7.5
 
+  packages/sandbox:
+    dependencies:
+      '@rewire/core':
+        specifier: workspace:*
+        version: link:../core
+      '@rewire/policy':
+        specifier: workspace:*
+        version: link:../policy
+
 packages:
 
   '@biomejs/biome@2.6.8':
