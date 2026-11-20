@@ -76,6 +76,13 @@ pub enum Decision {
 pub struct Resolved {
     pub canonical: PathBuf,
     pub lexical: PathBuf,
+    /// Every spelling deny rules are checked against: canonical, lexical,
+    /// and each hybrid `canonicalize(prefix) + lexical rest` for every
+    /// prefix of the lexical path. A hybrid relates a lexical spelling to
+    /// root even when root is spelled through a symlinked ancestor
+    /// (`/tmp/..` vs `/private/tmp/..`), so relative deny globs always see
+    /// the in-root symlink names the caller walked through.
+    pub spellings: Vec<PathBuf>,
 }
 
 /// Fold a name for deny-side comparison: NFD, full Unicode case folding,
@@ -87,11 +94,26 @@ pub fn fold(s: &str) -> String {
     use unicode_normalization::char::is_combining_mark;
     use unicode_normalization::UnicodeNormalization;
     s.chars()
+        .filter(|c| !is_default_ignorable(*c))
         .nfd()
         .default_case_fold()
         .nfd()
-        .filter(|c| !is_combining_mark(*c))
+        .filter(|c| !is_combining_mark(*c) && !is_default_ignorable(*c))
         .collect()
+}
+
+/// Code points HFS+ ignores in names (Git's `is_hfs_dotgit` list), plus a
+/// few more invisible ones for safety. Stripped so `.git<U+200C>` ≡ `.git`.
+fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{206A}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,9 +322,22 @@ impl Profile {
     /// Both spellings of `path` (relative paths are taken relative to root).
     pub fn resolve(&self, path: &Path) -> std::io::Result<Resolved> {
         let joined = self.root.join(path);
+        let canonical = canonicalize_maybe_missing(&joined)?;
+        let lexical = normalize_lexically(&joined);
+        let mut spellings = vec![canonical.clone(), lexical.clone()];
+        let comps: Vec<_> = lexical.components().collect();
+        for i in 1..comps.len() {
+            let prefix: PathBuf = comps[..i].iter().collect();
+            let rest: PathBuf = comps[i..].iter().collect();
+            let hybrid = canonicalize_maybe_missing(&prefix)?.join(rest);
+            if !spellings.contains(&hybrid) {
+                spellings.push(hybrid);
+            }
+        }
         Ok(Resolved {
-            canonical: canonicalize_maybe_missing(&joined)?,
-            lexical: normalize_lexically(&joined),
+            canonical,
+            lexical,
+            spellings,
         })
     }
 
@@ -317,7 +352,7 @@ impl Profile {
             canonical: r.canonical.clone(),
             rule: rule.to_owned(),
         };
-        let spellings = [r.canonical.as_path(), r.lexical.as_path()];
+        let spellings: Vec<&Path> = r.spellings.iter().map(PathBuf::as_path).collect();
         match op {
             Op::Read => match self.deny_match(&self.read_deny, &spellings) {
                 Ok(Some(rule)) => deny(rule),
@@ -539,6 +574,23 @@ mod tests {
             let d = p.decide(Op::Write, Path::new(v)).unwrap();
             assert_eq!(rule_of(d), Some(RULE_GITDIR.into()), "{v}");
         }
+    }
+
+    #[test]
+    fn fold_strips_default_ignorables() {
+        assert_eq!(fold(".git\u{200c}"), ".git");
+        assert_eq!(fold(".g\u{feff}i\u{202e}t"), ".git");
+        assert_eq!(fold("te\u{ad}s\u{2060}ts"), "tests");
+    }
+
+    #[test]
+    fn hybrid_spellings_relate_aliased_root() {
+        let t = setup();
+        std::os::unix::fs::symlink(&t.base, t.base.join("alias")).unwrap();
+        let p = Profile::from_spec(spec(&t.root)).unwrap();
+        let r = p.resolve(&t.base.join("alias/root/src/a.ts")).unwrap();
+        assert!(r.spellings.contains(&t.root.join("src/a.ts")));
+        assert!(r.spellings.contains(&t.base.join("alias/root/src/a.ts")));
     }
 
     #[test]

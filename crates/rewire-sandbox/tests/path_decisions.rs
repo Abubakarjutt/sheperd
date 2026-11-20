@@ -495,3 +495,59 @@ fn nested_dot_git_in_extra_write_is_denied() {
     let a = f.check("write", extra.join("repo/.git/HEAD")).code(DENY);
     assert_eq!(denial(&a)["rule"], "<gitdir>");
 }
+
+// ---- fix round 2 regressions ----
+
+/// `base/alias -> base`, so `base/alias/root` spells root through a
+/// symlinked ancestor (like /tmp -> /private/tmp), on any OS.
+fn root_alias(f: &Fixture) -> PathBuf {
+    std::os::unix::fs::symlink(&f.base, f.base.join("alias")).unwrap();
+    f.base.join("alias/root")
+}
+
+#[test]
+fn root_spelled_via_symlinked_ancestor_still_hits_relative_deny() {
+    let f = Fixture::with(|p| {
+        p["write"] = json!(["**"]);
+        p["writeDeny"] = json!(["tests/*/data/**"]);
+    });
+    fs::create_dir_all(f.root.join("tests/a")).unwrap();
+    fs::create_dir_all(f.root.join("z")).unwrap();
+    std::os::unix::fs::symlink("../../z", f.root.join("tests/a/data")).unwrap();
+    let aliased = root_alias(&f);
+    f.check("write", "tests/a/data/x").code(DENY);
+    f.check("write", f.root.join("tests/a/data/x")).code(DENY);
+    let a = f.check("write", aliased.join("tests/a/data/x")).code(DENY);
+    assert_eq!(denial(&a)["rule"], "tests/*/data/**");
+    f.cmd("fs-write")
+        .arg(aliased.join("tests/a/data/x"))
+        .write_stdin("x")
+        .assert()
+        .code(DENY);
+    assert!(!f.root.join("z/x").exists());
+}
+
+#[test]
+fn dot_git_symlink_reached_via_root_alias_is_denied() {
+    let f = write_all_fixture();
+    fs::create_dir_all(f.root.join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink("../elsewhere", f.root.join("src/.git")).unwrap();
+    let aliased = root_alias(&f);
+    f.check("write", "src/.git/hooks/pre-commit").code(DENY);
+    let a = f
+        .check("write", aliased.join("src/.git/hooks/pre-commit"))
+        .code(DENY);
+    assert_eq!(denial(&a)["rule"], "<gitdir>");
+}
+
+#[test]
+fn default_ignorable_code_points_are_folded_away() {
+    let f = write_all_fixture();
+    let a = f.check("write", ".git\u{200c}/config").code(DENY);
+    assert_eq!(denial(&a)["rule"], "<gitdir>");
+    let a = f.check("write", "src/.g\u{feff}it/HEAD").code(DENY);
+    assert_eq!(denial(&a)["rule"], "<gitdir>");
+    let a = f.check("write", "tests\u{feff}/x.test.ts").code(DENY);
+    assert_eq!(denial(&a)["rule"], "tests/**");
+    f.check("write", "te\u{ad}sts/x").code(DENY);
+}
