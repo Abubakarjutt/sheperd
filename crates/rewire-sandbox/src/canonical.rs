@@ -23,34 +23,71 @@ const MAX_SYMLINK_HOPS: u32 = 40;
 /// Errors (fail closed): relative input, too many symlinks, or any I/O error
 /// other than "not found" (e.g. a component under a regular file).
 pub fn canonicalize_maybe_missing(path: &Path) -> io::Result<PathBuf> {
-    let mut hops = 0;
-    resolve(path, &mut hops)
+    Ok(canonicalize_traced(path)?.0)
 }
 
-fn resolve(path: &Path, hops: &mut u32) -> io::Result<PathBuf> {
+/// Like [`canonicalize_maybe_missing`], and also returns the *walk trace*:
+/// for every name the walk looks up (`cur/name`, with `cur` the real
+/// directory reached so far, including lookups inside symlink targets), the
+/// spelling `cur/name/<everything still to be walked>` with only that
+/// remainder normalized textually. Every intermediate real-walk directory
+/// name therefore appears as a prefix of some traced spelling, so a deny
+/// glob such as `tests/*/data/**` sees `R/tests/a/data/..` even when the
+/// caller reached it as `R/s/../a/data` or via a link whose target text
+/// contains `..`. Used for deny checks only.
+pub fn canonicalize_traced(path: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
+    let mut hops = 0;
+    let mut trace = Vec::new();
+    let canonical = resolve(path, Path::new(""), &mut hops, &mut trace)?;
+    trace.sort();
+    trace.dedup();
+    Ok((canonical, trace))
+}
+
+/// Resolve `path`; `suffix` is what the outer walk still has to traverse
+/// after `path` (used only for the trace).
+fn resolve(
+    path: &Path,
+    suffix: &Path,
+    hops: &mut u32,
+    trace: &mut Vec<PathBuf>,
+) -> io::Result<PathBuf> {
     if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("path must be absolute: {}", path.display()),
         ));
     }
+    let comps: Vec<Component> = path.components().collect();
     let mut cur = PathBuf::new();
-    for comp in path.components() {
+    for (i, comp) in comps.iter().enumerate() {
+        let rest = || -> PathBuf { comps[i + 1..].iter().collect::<PathBuf>().join(suffix) };
         match comp {
             Component::Prefix(_) | Component::RootDir => cur.push(comp.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
                 cur.pop();
+                trace.push(normalize_lexically(&cur.join(rest())));
             }
-            Component::Normal(name) => cur = step(&cur, name, hops)?,
+            Component::Normal(name) => {
+                let rest = rest();
+                trace.push(normalize_lexically(&cur.join(name).join(&rest)));
+                cur = step(&cur, name, &rest, hops, trace)?;
+            }
         }
     }
     Ok(cur)
 }
 
 /// Resolve `cur/name` where `cur` is already canonical (or a lexical tail
-/// below a missing component).
-fn step(cur: &Path, name: &OsStr, hops: &mut u32) -> io::Result<PathBuf> {
+/// below a missing component). `rest` is the remaining walk (for the trace).
+fn step(
+    cur: &Path,
+    name: &OsStr,
+    rest: &Path,
+    hops: &mut u32,
+    trace: &mut Vec<PathBuf>,
+) -> io::Result<PathBuf> {
     let next = cur.join(name);
     let meta = match fs::symlink_metadata(&next) {
         Ok(m) => m,
@@ -71,7 +108,7 @@ fn step(cur: &Path, name: &OsStr, hops: &mut u32) -> io::Result<PathBuf> {
     }
     let target = fs::read_link(&next)?;
     // Relative targets are relative to the directory containing the link.
-    resolve(&cur.join(target), hops)
+    resolve(&cur.join(target), rest, hops, trace)
 }
 
 /// Resolve `.` and `..` textually, without touching the filesystem. This is
@@ -223,6 +260,23 @@ mod tests {
         let (_t, b) = base();
         fs::write(b.join("file"), "x").unwrap();
         assert!(canonicalize_maybe_missing(&b.join("file/x")).is_err());
+    }
+
+    #[test]
+    fn trace_shows_names_hidden_by_dotdot() {
+        let (_t, b) = base();
+        fs::create_dir_all(b.join("tests/a")).unwrap();
+        fs::create_dir_all(b.join("tests/b")).unwrap();
+        fs::create_dir_all(b.join("z")).unwrap();
+        symlink("../../z", b.join("tests/a/data")).unwrap();
+        symlink("tests/b", b.join("s")).unwrap();
+        symlink("s/../a/data", b.join("t2")).unwrap();
+        let (c, trace) = canonicalize_traced(&b.join("s/../a/data/x")).unwrap();
+        assert_eq!(c, b.join("z/x"));
+        assert!(trace.contains(&b.join("tests/a/data/x")), "{trace:?}");
+        let (c, trace) = canonicalize_traced(&b.join("t2/x")).unwrap();
+        assert_eq!(c, b.join("z/x"));
+        assert!(trace.contains(&b.join("tests/a/data/x")), "{trace:?}");
     }
 
     #[test]

@@ -27,7 +27,9 @@
 //!   also denies `real/...`);
 //! - when relative and starting with `**/`, also apply outside `root`.
 
-use crate::canonical::{canonicalize_maybe_missing, git_protected_paths, normalize_lexically};
+use crate::canonical::{
+    canonicalize_maybe_missing, canonicalize_traced, git_protected_paths, normalize_lexically,
+};
 use anyhow::{bail, Context, Result};
 use globset::{GlobBuilder, GlobMatcher};
 use serde::Deserialize;
@@ -76,12 +78,15 @@ pub enum Decision {
 pub struct Resolved {
     pub canonical: PathBuf,
     pub lexical: PathBuf,
-    /// Every spelling deny rules are checked against: canonical, lexical,
-    /// and each hybrid `canonicalize(prefix) + lexical rest` for every
-    /// prefix of the lexical path. A hybrid relates a lexical spelling to
-    /// root even when root is spelled through a symlinked ancestor
-    /// (`/tmp/..` vs `/private/tmp/..`), so relative deny globs always see
-    /// the in-root symlink names the caller walked through.
+    /// Every spelling deny rules are checked against: the canonical path,
+    /// the lexical path (caller's spelling, `.`/`..` collapsed textually),
+    /// and the walk trace from [`canonicalize_traced`]: for every name the
+    /// real walk looks up, the real directory reached so far + that name +
+    /// the remaining components. Textual `..` collapsing alone would HIDE
+    /// symlink names the kernel walks through (`R/s/../a/data` with
+    /// `s -> tests/b` really traverses `R/tests/a/data`); the trace puts
+    /// every intermediate real-walk name into some spelling, including root
+    /// reached through a symlinked ancestor and `..` inside link targets.
     pub spellings: Vec<PathBuf>,
 }
 
@@ -322,16 +327,12 @@ impl Profile {
     /// Both spellings of `path` (relative paths are taken relative to root).
     pub fn resolve(&self, path: &Path) -> std::io::Result<Resolved> {
         let joined = self.root.join(path);
-        let canonical = canonicalize_maybe_missing(&joined)?;
+        let (canonical, trace) = canonicalize_traced(&joined)?;
         let lexical = normalize_lexically(&joined);
         let mut spellings = vec![canonical.clone(), lexical.clone()];
-        let comps: Vec<_> = lexical.components().collect();
-        for i in 1..comps.len() {
-            let prefix: PathBuf = comps[..i].iter().collect();
-            let rest: PathBuf = comps[i..].iter().collect();
-            let hybrid = canonicalize_maybe_missing(&prefix)?.join(rest);
-            if !spellings.contains(&hybrid) {
-                spellings.push(hybrid);
+        for t in trace {
+            if !spellings.contains(&t) {
+                spellings.push(t);
             }
         }
         Ok(Resolved {

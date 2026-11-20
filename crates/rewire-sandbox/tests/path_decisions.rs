@@ -551,3 +551,75 @@ fn default_ignorable_code_points_are_folded_away() {
     assert_eq!(denial(&a)["rule"], "tests/**");
     f.check("write", "te\u{ad}sts/x").code(DENY);
 }
+
+// ---- fix round 3 regressions ----
+
+/// R/tests/a/data -> ../../z, R/s -> tests/b, R/t2 -> s/../a/data,
+/// writeDeny/readDeny ["tests/*/data/**"], write ["**"].
+fn dotdot_fixture() -> Fixture {
+    let f = Fixture::with(|p| {
+        p["write"] = json!(["**"]);
+        p["writeDeny"] = json!(["tests/*/data/**"]);
+        p["readDeny"] = json!(["tests/*/data/**"]);
+    });
+    fs::create_dir_all(f.root.join("tests/a")).unwrap();
+    fs::create_dir_all(f.root.join("tests/b")).unwrap();
+    fs::create_dir_all(f.root.join("z")).unwrap();
+    fs::write(f.root.join("z/secret"), "s3cret").unwrap();
+    std::os::unix::fs::symlink("../../z", f.root.join("tests/a/data")).unwrap();
+    std::os::unix::fs::symlink("tests/b", f.root.join("s")).unwrap();
+    std::os::unix::fs::symlink("s/../a/data", f.root.join("t2")).unwrap();
+    f
+}
+
+#[test]
+fn dotdot_across_in_root_symlink_is_denied_for_write() {
+    let f = dotdot_fixture();
+    let a = f.check("write", "s/../a/data/x").code(DENY);
+    assert_eq!(denial(&a)["rule"], "tests/*/data/**");
+    f.check("write", f.root.join("s/../a/data/x")).code(DENY);
+    f.check("write", root_alias(&f).join("s/../a/data/x"))
+        .code(DENY);
+}
+
+#[test]
+fn dotdot_across_in_root_symlink_fs_write_writes_nothing() {
+    let f = dotdot_fixture();
+    f.cmd("fs-write")
+        .arg(f.root.join("s/../a/data/pwn"))
+        .write_stdin("pwned")
+        .assert()
+        .code(DENY);
+    assert!(!f.root.join("z/pwn").exists());
+}
+
+#[test]
+fn dotdot_across_in_root_symlink_is_denied_for_read() {
+    let f = dotdot_fixture();
+    let a = f
+        .cmd("fs-read")
+        .arg(f.root.join("s/../a/data/secret"))
+        .assert()
+        .code(DENY);
+    assert!(a.get_output().stdout.is_empty());
+    f.check("read", "s/../a/data/secret").code(DENY);
+}
+
+#[test]
+fn dotdot_across_outside_symlink_is_denied() {
+    let f = dotdot_fixture();
+    std::os::unix::fs::symlink(f.root.join("tests/b"), f.base.join("ob")).unwrap();
+    f.check("write", f.base.join("ob/../a/data/x")).code(DENY);
+    f.check("write", root_alias(&f).join("../ob/../a/data/x"))
+        .code(DENY);
+    f.check("read", f.base.join("ob/../a/data/secret"))
+        .code(DENY);
+}
+
+#[test]
+fn dotdot_inside_symlink_target_is_denied() {
+    let f = dotdot_fixture();
+    let a = f.check("write", "t2/x").code(DENY);
+    assert_eq!(denial(&a)["rule"], "tests/*/data/**");
+    f.check("read", "t2/secret").code(DENY);
+}
