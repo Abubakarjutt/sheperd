@@ -1,4 +1,4 @@
-import { Contract } from "@rewire/core";
+import { Contract, RewireError } from "@rewire/core";
 import { describe, expect, test } from "vitest";
 import { extractFirstJsonObject, FauxProvider, structured, text } from "../src/index.js";
 
@@ -74,5 +74,23 @@ describe("extractFirstJsonObject", () => {
   test("no object", () => {
     expect(extractFirstJsonObject("no json here")).toBeUndefined();
     expect(extractFirstJsonObject('{"unterminated":1')).toBeUndefined();
+  });
+});
+
+describe("structured abort", () => {
+  test("provider_aborted propagates immediately without retry", async () => {
+    let n = 0;
+    const faux = new FauxProvider([
+      () => {
+        n++;
+        throw new RewireError("provider_aborted", "aborted");
+      },
+      text("{}"),
+    ]);
+    await expect(structured(faux, fauxRef, Contract, req)).rejects.toMatchObject({
+      code: "provider_aborted",
+    });
+    expect(n).toBe(1);
+    expect(faux.callCount).toBe(1);
   });
 });

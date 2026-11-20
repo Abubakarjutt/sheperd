@@ -87,9 +87,12 @@ export function fromAnthropicResponse(resp: AResponse): ChatResponse {
       if (typeof input !== "object" || input === null || Array.isArray(input)) {
         throw new RewireError("provider_bad_response", "anthropic tool_use input is not an object");
       }
+      if (typeof b.id !== "string" || b.id === "" || typeof b.name !== "string" || b.name === "") {
+        throw new RewireError("provider_bad_response", "anthropic tool_use block lacks id or name");
+      }
       toolCalls.push({
-        id: String(b.id),
-        name: String(b.name),
+        id: b.id,
+        name: b.name,
         arguments: input as Record<string, unknown>,
       });
     }
@@ -106,8 +109,10 @@ export function fromAnthropicResponse(resp: AResponse): ChatResponse {
 
 export class AnthropicProvider implements Provider {
   private readonly client: Anthropic;
-  constructor(apiKey: string) {
-    this.client = new Anthropic({ apiKey });
+  private readonly apiKey: string;
+  constructor(apiKey: string, client?: Anthropic) {
+    this.apiKey = apiKey;
+    this.client = client ?? new Anthropic({ apiKey });
   }
   async chat(req: ChatRequest): Promise<ChatResponse> {
     let resp: unknown;
@@ -117,7 +122,7 @@ export class AnthropicProvider implements Provider {
         req.signal ? { signal: req.signal } : undefined,
       );
     } catch (err) {
-      throw providerError("anthropic", err);
+      throw providerError("anthropic", err, { apiKey: this.apiKey, signal: req.signal });
     }
     return fromAnthropicResponse(resp as AResponse);
   }

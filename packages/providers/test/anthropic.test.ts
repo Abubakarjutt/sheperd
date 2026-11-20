@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
+  AnthropicProvider,
   fromAnthropicResponse,
   mapAnthropicStopReason,
   toAnthropicParams,
@@ -77,5 +78,56 @@ describe("anthropic mapping", () => {
       inputTokens: 0,
       outputTokens: 0,
     });
+  });
+});
+
+describe("anthropic hardening", () => {
+  test("tool_use without id or name is provider_bad_response", () => {
+    for (const block of [
+      { type: "tool_use", name: "t", input: {} },
+      { type: "tool_use", id: "a", input: {} },
+      { type: "tool_use", id: "", name: "t", input: {} },
+    ]) {
+      expect(() =>
+        fromAnthropicResponse({ content: [block], stop_reason: "tool_use" }),
+      ).toThrowError(expect.objectContaining({ code: "provider_bad_response" }));
+    }
+  });
+  const KEY = "custom-proxy-key-12345";
+  const mk = (err: unknown) =>
+    new AnthropicProvider(KEY, {
+      messages: {
+        create: async () => {
+          throw err;
+        },
+      },
+    } as never);
+  const req = { model: "m", system: "s", messages: [], maxTokens: 1 };
+  test("real key is redacted, including nested error.error.message", async () => {
+    const e1 = await mk(new Error(`bad auth ${KEY} here`))
+      .chat(req)
+      .catch((e) => e);
+    expect(e1.code).toBe("provider_error");
+    expect(e1.message).not.toContain(KEY);
+    const nested = Object.assign(new Error("400"), { error: { error: { message: `x ${KEY}` } } });
+    const e2 = await mk(nested)
+      .chat(req)
+      .catch((e) => e);
+    expect(e2.message).not.toContain(KEY);
+  });
+  test("abort maps to provider_aborted", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const e1 = await mk(new Error("boom"))
+      .chat({ ...req, signal: ac.signal })
+      .catch((e) => e);
+    expect(e1.code).toBe("provider_aborted");
+    const abortErr = Object.assign(new Error("Request was aborted."), {
+      name: "APIUserAbortError",
+    });
+    const e2 = await mk(abortErr)
+      .chat(req)
+      .catch((e) => e);
+    expect(e2.code).toBe("provider_aborted");
   });
 });

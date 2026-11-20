@@ -129,8 +129,10 @@ export function fromOpenAIResponse(resp: OResponse): ChatResponse {
 
 export class OpenAIProvider implements Provider {
   private readonly client: OpenAI;
-  constructor(apiKey: string) {
-    this.client = new OpenAI({ apiKey });
+  private readonly apiKey: string;
+  constructor(apiKey: string, client?: OpenAI) {
+    this.apiKey = apiKey;
+    this.client = client ?? new OpenAI({ apiKey });
   }
   async chat(req: ChatRequest): Promise<ChatResponse> {
     let resp: unknown;
@@ -142,7 +144,7 @@ export class OpenAIProvider implements Provider {
         req.signal ? { signal: req.signal } : undefined,
       );
     } catch (err) {
-      throw providerError("openai", err);
+      throw providerError("openai", err, { apiKey: this.apiKey, signal: req.signal });
     }
     return fromOpenAIResponse(resp as OResponse);
   }

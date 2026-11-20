@@ -1,5 +1,10 @@
 import { describe, expect, test } from "vitest";
-import { fromOpenAIResponse, mapOpenAIFinishReason, toOpenAIParams } from "../src/openai.js";
+import {
+  fromOpenAIResponse,
+  mapOpenAIFinishReason,
+  OpenAIProvider,
+  toOpenAIParams,
+} from "../src/openai.js";
 
 describe("openai mapping", () => {
   test("request: system message, tool_calls, tool role", () => {
@@ -97,5 +102,44 @@ describe("openai mapping", () => {
         ],
       }),
     ).toThrowError(expect.objectContaining({ code: "provider_bad_response" }));
+  });
+});
+
+describe("openai hardening", () => {
+  const KEY = "custom-proxy-key-12345";
+  const mk = (err: unknown) =>
+    new OpenAIProvider(KEY, {
+      chat: {
+        completions: {
+          create: async () => {
+            throw err;
+          },
+        },
+      },
+    } as never);
+  const req = { model: "m", system: "s", messages: [], maxTokens: 1 };
+  test("real key is redacted, including nested error.error.message", async () => {
+    const e1 = await mk(new Error(`bad auth ${KEY} here`))
+      .chat(req)
+      .catch((e) => e);
+    expect(e1.code).toBe("provider_error");
+    expect(e1.message).not.toContain(KEY);
+    const nested = Object.assign(new Error("400"), { error: { message: `x ${KEY}` } });
+    const e2 = await mk(nested)
+      .chat(req)
+      .catch((e) => e);
+    expect(e2.message).not.toContain(KEY);
+  });
+  test("abort maps to provider_aborted", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const e1 = await mk(new Error("boom"))
+      .chat({ ...req, signal: ac.signal })
+      .catch((e) => e);
+    expect(e1.code).toBe("provider_aborted");
+    const e2 = await mk(Object.assign(new Error("x"), { name: "AbortError" }))
+      .chat(req)
+      .catch((e) => e);
+    expect(e2.code).toBe("provider_aborted");
   });
 });
