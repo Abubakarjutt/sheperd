@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { createProvider, FauxProvider, registerProvider } from "../src/index.js";
+import { createProvider, FauxProvider, OllamaProvider, registerProvider } from "../src/index.js";
 
 describe("createProvider", () => {
   test("provider_auth_missing for absent and empty keys, without leaking values", () => {
@@ -21,15 +21,18 @@ describe("createProvider", () => {
       createProvider({ provider: "openai", model: "m" }, { OPENAI_API_KEY: "k" }),
     ).toBeTruthy();
   });
-  test("ollama unknown until Task 7", () => {
-    expect(() => createProvider({ provider: "ollama", model: "m" }, {})).toThrowError(
-      expect.objectContaining({ code: "provider_unknown" }),
-    );
+  test("ollama is registered by default and needs no key", () => {
+    expect(createProvider({ provider: "ollama", model: "m" }, {})).toBeInstanceOf(OllamaProvider);
   });
   test("faux registered by default with empty script; registerProvider overrides", () => {
     expect(createProvider({ provider: "faux", model: "m" }, {})).toBeInstanceOf(FauxProvider);
     const custom = new FauxProvider([]);
-    registerProvider("ollama", () => custom);
-    expect(createProvider({ provider: "ollama", model: "m" }, {})).toBe(custom);
+    const restore = registerProvider("ollama", () => custom);
+    try {
+      expect(createProvider({ provider: "ollama", model: "m" }, {})).toBe(custom);
+    } finally {
+      restore();
+    }
+    expect(createProvider({ provider: "ollama", model: "m" }, {})).toBeInstanceOf(OllamaProvider);
   });
 });

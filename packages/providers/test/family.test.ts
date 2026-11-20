@@ -11,6 +11,22 @@ describe("modelFamily", () => {
     expect(modelFamily({ provider: "openai", model: "gpt-5" })).toBe("gpt");
     expect(modelFamily({ provider: "faux", model: "a" })).toBe("faux-a");
   });
+  test("ollama registry/namespace prefixes are stripped", () => {
+    expect(
+      modelFamily({ provider: "ollama", model: "hf.co/Qwen/Qwen2.5-Coder-7B-GGUF:Q4_K_M" }),
+    ).toBe("qwen");
+    expect(modelFamily({ provider: "ollama", model: "library/llama3.1" })).toBe("llama");
+    expect(modelFamily({ provider: "ollama", model: "registry.example.com/me/gpt-oss:20b" })).toBe(
+      "gpt",
+    );
+  });
+  test("unknown provider throws", () => {
+    expect(() =>
+      modelFamily({ provider: "mystery", model: "x" } as unknown as Parameters<
+        typeof modelFamily
+      >[0]),
+    ).toThrow(RewireError);
+  });
   test("empty model throws", () => {
     expect(() => modelFamily({ provider: "openai", model: "" })).toThrow(RewireError);
   });

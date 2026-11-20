@@ -45,6 +45,8 @@ export type ChatRequest = {
   tools?: ToolSpec[];
   maxTokens: number;
   signal?: AbortSignal;
+  /** Optional wall-clock cap for the call; honored by providers that support it (ollama). */
+  timeoutMs?: number;
 };
 export type ChatResponse = { message: AssistantMessage; stopReason: StopReason; usage: Usage };
 

@@ -31,3 +31,22 @@ describe.skipIf(!live)("live providers", () => {
     expect(r.usage.inputTokens).toBeGreaterThan(0);
   });
 });
+
+const ollamaModel = process.env.REWIRE_LIVE_OLLAMA_MODEL;
+
+describe.skipIf(!live || !ollamaModel)("live ollama", () => {
+  test("probe, model info and role-fitness smoke test", async () => {
+    const { mkdtemp } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { assertRoleFit, getModelInfo, normalizeOllamaHost, probeOllama } = await import(
+      "../src/index.js"
+    );
+    const model = ollamaModel as string;
+    const base = normalizeOllamaHost(process.env.OLLAMA_HOST);
+    expect((await probeOllama(base)).version).toMatch(/^\d+\./);
+    expect((await getModelInfo(base, model)).digest.length).toBeGreaterThan(0);
+    const dir = await mkdtemp(join(tmpdir(), "rewire-live-"));
+    await assertRoleFit({ provider: "ollama", model }, "reviewer", dir, { baseUrl: base });
+  }, 300_000);
+});

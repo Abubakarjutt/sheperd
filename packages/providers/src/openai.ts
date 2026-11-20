@@ -16,7 +16,16 @@ type OMessage =
     }
   | { role: "tool"; tool_call_id: string; content: string };
 
-export function toOpenAIParams(req: ChatRequest) {
+export type OpenAIParamOptions = {
+  /**
+   * Which request field carries the output cap. OpenAI uses `max_completion_tokens`; Ollama's
+   * OpenAI-compatible endpoint only lists `max_tokens` as supported
+   * (https://github.com/ollama/ollama/blob/main/docs/api/openai-compatibility.mdx).
+   */
+  maxTokensField?: "max_completion_tokens" | "max_tokens";
+};
+
+export function toOpenAIParams(req: ChatRequest, opts: OpenAIParamOptions = {}) {
   const messages: OMessage[] = [{ role: "system", content: req.system }];
   for (const m of req.messages) {
     if (m.role === "tool") {
@@ -40,13 +49,16 @@ export function toOpenAIParams(req: ChatRequest) {
   }
   const params: {
     model: string;
-    max_completion_tokens: number;
+    max_completion_tokens?: number;
+    max_tokens?: number;
     messages: OMessage[];
     tools?: {
       type: "function";
       function: { name: string; description: string; parameters: Record<string, unknown> };
     }[];
-  } = { model: req.model, max_completion_tokens: req.maxTokens, messages };
+  } = { model: req.model, messages };
+  if (opts.maxTokensField === "max_tokens") params.max_tokens = req.maxTokens;
+  else params.max_completion_tokens = req.maxTokens;
   if (req.tools && req.tools.length > 0) {
     params.tools = req.tools.map((t) => ({
       type: "function" as const,
@@ -84,37 +96,38 @@ type OResponse = {
   usage?: { prompt_tokens?: number | null; completion_tokens?: number | null } | null;
 };
 
-function parseArgs(raw: unknown, name: string): Record<string, unknown> {
+function parseArgs(raw: unknown, name: string, provider: string): Record<string, unknown> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(typeof raw === "string" ? raw : "");
   } catch {
     throw new RewireError(
       "provider_bad_response",
-      `openai tool call "${name}" has invalid JSON arguments`,
+      `${provider} tool call "${name}" has invalid JSON arguments`,
     );
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new RewireError(
       "provider_bad_response",
-      `openai tool call "${name}" arguments are not an object`,
+      `${provider} tool call "${name}" arguments are not an object`,
     );
   }
   return parsed as Record<string, unknown>;
 }
 
-export function fromOpenAIResponse(resp: OResponse): ChatResponse {
+export function fromOpenAIResponse(resp: OResponse, provider = "openai"): ChatResponse {
   const choice = resp.choices[0];
-  if (!choice) throw new RewireError("provider_bad_response", "openai response has no choices");
+  if (!choice)
+    throw new RewireError("provider_bad_response", `${provider} response has no choices`);
   const toolCalls: ToolCall[] = [];
   for (const c of choice.message.tool_calls ?? []) {
     if (!c.function) {
-      throw new RewireError("provider_bad_response", "openai tool call has no function");
+      throw new RewireError("provider_bad_response", `${provider} tool call has no function`);
     }
     toolCalls.push({
       id: c.id,
       name: c.function.name,
-      arguments: parseArgs(c.function.arguments, c.function.name),
+      arguments: parseArgs(c.function.arguments, c.function.name, provider),
     });
   }
   return {

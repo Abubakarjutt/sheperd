@@ -1,6 +1,7 @@
 import { RewireError } from "@rewire/core";
 import { AnthropicProvider } from "./anthropic.js";
 import { FauxProvider } from "./faux.js";
+import { normalizeOllamaHost, OllamaProvider } from "./ollama.js";
 import { OpenAIProvider } from "./openai.js";
 import type { ModelRef, Provider } from "./types.js";
 
@@ -8,8 +9,14 @@ export type ProviderFactory = (ref: ModelRef, env: NodeJS.ProcessEnv) => Provide
 
 const factories = new Map<string, ProviderFactory>();
 
-export function registerProvider(name: string, factory: ProviderFactory): void {
+/** Registers (or overrides) a factory. Returns a function that restores the previous state. */
+export function registerProvider(name: string, factory: ProviderFactory): () => void {
+  const prev = factories.get(name);
   factories.set(name, factory);
+  return () => {
+    if (prev) factories.set(name, prev);
+    else factories.delete(name);
+  };
 }
 
 export function requireKey(env: NodeJS.ProcessEnv, name: string): string {
@@ -23,11 +30,7 @@ export function requireKey(env: NodeJS.ProcessEnv, name: string): string {
 export function createProvider(ref: ModelRef, env: NodeJS.ProcessEnv = process.env): Provider {
   const factory = factories.get(ref.provider);
   if (!factory) {
-    throw new RewireError(
-      "provider_unknown",
-      `no provider registered for "${ref.provider}"`,
-      ref.provider === "ollama" ? "ollama provider arrives in a later task" : undefined,
-    );
+    throw new RewireError("provider_unknown", `no provider registered for "${ref.provider}"`);
   }
   return factory(ref, env);
 }
@@ -38,3 +41,4 @@ registerProvider(
 );
 registerProvider("openai", (_ref, env) => new OpenAIProvider(requireKey(env, "OPENAI_API_KEY")));
 registerProvider("faux", () => new FauxProvider([]));
+registerProvider("ollama", (_ref, env) => new OllamaProvider(normalizeOllamaHost(env.OLLAMA_HOST)));
