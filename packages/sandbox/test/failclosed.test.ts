@@ -119,3 +119,12 @@ test("REWIRE_SANDBOX_BIN override is used", () => {
 test("expandHome handles bare ~", () => {
   expect(expandHome("~")).toBe(homedir());
 });
+
+test("exec cwd inside an extraWrite dir outside root -> path_protected <outside-root>", async () => {
+  const scratch = tmp("rewire-scratch-");
+  const c = new SandboxClient(profileFor("verify", tmp(), DEFAULT_POLICY, scratch), fake("exit 0"));
+  await expect(c.exec(["x"], { timeoutMs: 1000, cwd: scratch })).rejects.toMatchObject({
+    code: "path_protected",
+    message: expect.stringContaining(`${scratch} is protected (rule <outside-root>)`),
+  });
+});

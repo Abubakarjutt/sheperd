@@ -174,14 +174,6 @@ function parseDeny(r: Raw): { canonical: string; rule: string } {
   throw unavailable("deny output", r);
 }
 
-function safeReal(p: string): string[] {
-  try {
-    return [realpathSync(p)];
-  } catch {
-    return [];
-  }
-}
-
 const DEFAULT_WATCHDOG_MS = 30_000;
 const EXEC_GRACE_MS = 5_000;
 const DEFAULT_MAX_OUTPUT = 16 * 1024 * 1024;
@@ -233,8 +225,7 @@ export class SandboxClient {
     } catch (e) {
       throw new RewireError("sandbox_unavailable", `cannot resolve exec cwd ${cwd}: ${String(e)}`);
     }
-    const allowed = [root, ...this.profile.extraWrite.flatMap((p) => safeReal(p))];
-    if (!allowed.some((a) => inside(real, a))) {
+    if (!inside(real, root)) {
       throw new RewireError("path_protected", `${real} is protected (rule <outside-root>)`);
     }
     return real;
@@ -292,7 +283,8 @@ export class SandboxClient {
   }
 
   async exec(argv: string[], opts: { timeoutMs: number; cwd?: string }): Promise<ExecResult> {
-    // cwd containment is enforced here: exec's exit 3 is the child's own code (the
+    // cwd must be inside profile.root only (extraWrite is a write target, not a cwd), matching
+    // the binary's resolve_cwd. Containment is enforced here: exec's exit 3 is the child's own code (the
     // binary's cwd denial would be indistinguishable from it), so it is never a deny.
     const cwd = opts.cwd === undefined ? undefined : this.checkCwd(opts.cwd);
     const args = ["exec", "--profile", this.profilePath, "--timeout-ms", String(opts.timeoutMs)];
