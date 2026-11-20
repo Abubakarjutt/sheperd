@@ -1,5 +1,5 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { RewireError } from "@rewire/core";
 import { z } from "zod";
 import { getModelInfo, normalizeOllamaHost, OllamaProvider, probeOllama } from "./ollama.js";
@@ -56,12 +56,15 @@ async function smokeTest(
   provider: Provider,
   ref: ModelRef,
   role: Role,
+  timeoutMs?: number,
 ): Promise<string | undefined> {
+  const t = timeoutMs === undefined ? {} : { timeoutMs };
   try {
     await structured(provider, ref, SmokeSchema, {
       system: "You are a precise assistant that follows output instructions exactly.",
       messages: [{ role: "user", content: "Return ok=true and n=3" }],
       maxTokens: 1024,
+      ...t,
     });
   } catch (err) {
     if (err instanceof RewireError && err.code === "structured_output_invalid") {
@@ -76,6 +79,7 @@ async function smokeTest(
     messages: [{ role: "user", content: 'Call the echo tool with value "ping".' }],
     tools: [ECHO_TOOL],
     maxTokens: 1024,
+    ...t,
   });
   if (resp.stopReason !== "tool_use") {
     return `tool call check failed: expected a tool call, got stop reason "${resp.stopReason}"`;
@@ -98,7 +102,7 @@ export async function assertRoleFit(
   ref: ModelRef,
   role: Role,
   cacheDir: string,
-  opts: { baseUrl?: string; provider?: Provider } = {},
+  opts: { baseUrl?: string; provider?: Provider; chatTimeoutMs?: number } = {},
 ): Promise<void> {
   if (ref.provider !== "ollama") return;
   const baseUrl = opts.baseUrl ?? normalizeOllamaHost(process.env.OLLAMA_HOST);
@@ -118,21 +122,26 @@ export async function assertRoleFit(
     if (hit.ok) return;
     throw new RewireError(
       "model_unfit",
-      hit.reason ?? `${ref.model} previously failed the smoke test for role ${role}`,
+      `${hit.reason ?? `${ref.model} previously failed the smoke test for role ${role}`} (cached ${hit.at})`,
+      `delete ${resolve(file)} to re-test`,
     );
   }
   let reason: string | undefined;
   try {
-    reason = await smokeTest(opts.provider ?? new OllamaProvider(baseUrl), ref, role);
+    reason = await smokeTest(
+      opts.provider ?? new OllamaProvider(baseUrl),
+      ref,
+      role,
+      opts.chatTimeoutMs,
+    );
   } catch (err) {
-    // Transient conditions are not a verdict on the model.
-    if (
-      err instanceof RewireError &&
-      ["ollama_unreachable", "provider_aborted"].includes(err.code)
-    ) {
+    // Only deterministic model-behaviour failures are verdicts on the model. Everything else
+    // (5xx, timeouts, unreachable, aborts, ...) is transient: rethrow with its own code, uncached.
+    if (err instanceof RewireError && err.code === "provider_bad_response") {
+      reason = `malformed tool call: ${err.message}`;
+    } else {
       throw err;
     }
-    reason = `request failed: ${err instanceof Error ? err.message : String(err)}`;
   }
   cache[key] = {
     ok: reason === undefined,

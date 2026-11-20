@@ -94,6 +94,10 @@ beforeEach(async () => {
         chatBodies.push(body);
         const out = mock.chat(body);
         if (out === "destroy") return void req.socket.destroy();
+        if (out === "hang") return;
+        if (typeof out === "object" && out !== null && "__status" in out) {
+          return json((out as { __status: number }).__status, { error: "server error" });
+        }
         return json(200, out);
       }
       json(404, {});
@@ -180,13 +184,21 @@ describe("getModelInfo", () => {
 });
 
 describe("normalizeOllamaHost", () => {
-  test("defaults, scheme and trailing slash", () => {
+  test("defaults, scheme, trailing slash and default port", () => {
     expect(normalizeOllamaHost(undefined)).toBe("http://localhost:11434");
     expect(normalizeOllamaHost("")).toBe("http://localhost:11434");
+    expect(normalizeOllamaHost("0.0.0.0")).toBe("http://0.0.0.0:11434");
+    expect(normalizeOllamaHost("myhost")).toBe("http://myhost:11434");
     expect(normalizeOllamaHost("myhost:1234")).toBe("http://myhost:1234");
-    expect(normalizeOllamaHost("0.0.0.0")).toBe("http://0.0.0.0");
+    expect(normalizeOllamaHost("http://myhost")).toBe("http://myhost");
     expect(normalizeOllamaHost("https://x.example/")).toBe("https://x.example");
     expect(normalizeOllamaHost("http://a:1///")).toBe("http://a:1");
+  });
+  test("IPv6 forms", () => {
+    expect(normalizeOllamaHost("[::1]")).toBe("http://[::1]:11434");
+    expect(normalizeOllamaHost("[::1]:1234")).toBe("http://[::1]:1234");
+    expect(normalizeOllamaHost("::1")).toBe("http://[::1]:11434");
+    expect(normalizeOllamaHost("http://[::1]")).toBe("http://[::1]");
   });
 });
 
@@ -348,6 +360,56 @@ describe("assertRoleFit", () => {
     mock.chat = () => "destroy";
     await expect(fit("reviewer")).rejects.toMatchObject({ code: "ollama_unreachable" });
     await expect(readFile(join(cache, "fitness.json"), "utf8")).rejects.toThrow();
+  });
+  test("5xx on the structured step is not cached and the next call re-runs it", async () => {
+    mock.chat = () => ({ __status: 500 });
+    await expect(fit("reviewer")).rejects.toMatchObject({ code: "provider_error" });
+    await expect(readFile(join(cache, "fitness.json"), "utf8")).rejects.toThrow();
+    mock.chat = goodChat;
+    await fit("reviewer");
+    expect(chats()).toBe(2);
+    expect((await readCache())["sha256:abc:reviewer"].ok).toBe(true);
+  });
+  test("chat timeout is not cached and has a distinct message", async () => {
+    mock.chat = () => "hang";
+    const err = await assertRoleFit(ref, "reviewer", cache, {
+      baseUrl: base,
+      chatTimeoutMs: 100,
+    }).catch((e) => e);
+    expect(err).toMatchObject({ code: "ollama_timeout" });
+    expect(err.message).toMatch(/timed out after/);
+    expect(err.message).not.toMatch(/not reachable/);
+    await expect(readFile(join(cache, "fitness.json"), "utf8")).rejects.toThrow();
+  });
+  test("malformed tool args from the model are a cached model failure", async () => {
+    mock.chat = (b) =>
+      b.tools
+        ? {
+            choices: [
+              {
+                finish_reason: "tool_calls",
+                message: {
+                  tool_calls: [
+                    { id: "c", type: "function", function: { name: "echo", arguments: "{" } },
+                  ],
+                },
+              },
+            ],
+          }
+        : structuredOk();
+    await expect(fit("implementer")).rejects.toMatchObject({ code: "model_unfit" });
+    expect((await readCache())["sha256:abc:implementer"].ok).toBe(false);
+  });
+  test("cached failure rethrow says when it was cached and how to clear it", async () => {
+    mock.chat = () => ({
+      choices: [{ finish_reason: "stop", message: { content: '{"ok":true,"n":4}' } }],
+    });
+    await fit("reviewer").catch(() => {});
+    const err = await fit("reviewer").catch((e) => e);
+    expect(err).toMatchObject({ code: "model_unfit" });
+    expect(err.message).toMatch(/\(cached \d{4}-\d{2}-\d{2}T/);
+    expect(err.hint).toContain(join(cache, "fitness.json"));
+    expect(err.hint).toContain("to re-test");
   });
   test("non-ollama ref returns immediately without touching cache or network", async () => {
     await assertRoleFit({ provider: "openai", model: "gpt-5" }, "implementer", cache, {

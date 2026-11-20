@@ -27,8 +27,12 @@ const DEFAULT_CHAT_TIMEOUT_MS = 300_000;
 export function normalizeOllamaHost(raw: string | undefined): string {
   const v = (raw ?? "").trim();
   if (v === "") return DEFAULT_OLLAMA_HOST;
-  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(v) ? v : `http://${v}`;
-  return withScheme.replace(/\/+$/, "");
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) return v.replace(/\/+$/, "");
+  // Scheme-less: Ollama treats a bare host as port 11434.
+  let host = v.replace(/\/+$/, "");
+  if ((host.match(/:/g) ?? []).length > 1 && !host.startsWith("[")) host = `[${host}]`; // bare IPv6
+  if (!/:\d+$/.test(host)) host = `${host}:11434`;
+  return `http://${host}`;
 }
 
 function unreachable(baseUrl: string, detail?: string): RewireError {
@@ -156,7 +160,8 @@ export class OllamaProvider implements Provider {
     this.client = new OpenAI({ baseURL: `${baseUrl}/v1`, apiKey: "ollama", maxRetries: 0 });
   }
   async chat(req: ChatRequest): Promise<ChatResponse> {
-    const timeout = AbortSignal.timeout(req.timeoutMs ?? DEFAULT_CHAT_TIMEOUT_MS);
+    const timeoutMs = req.timeoutMs ?? DEFAULT_CHAT_TIMEOUT_MS;
+    const timeout = AbortSignal.timeout(timeoutMs);
     const signal = req.signal ? AbortSignal.any([req.signal, timeout]) : timeout;
     let resp: unknown;
     try {
@@ -170,7 +175,13 @@ export class OllamaProvider implements Provider {
       );
     } catch (err) {
       if (req.signal?.aborted) throw providerError("ollama", err, { signal: req.signal });
-      if (timeout.aborted) throw unreachable(this.baseUrl, "request timed out");
+      if (timeout.aborted) {
+        throw new RewireError(
+          "ollama_timeout",
+          `Ollama chat request to ${this.baseUrl} timed out after ${Math.round(timeoutMs / 1000)}s`,
+          "The model may still be loading; retry, or raise the timeout",
+        );
+      }
       if (isConnectionError(err)) throw unreachable(this.baseUrl);
       throw providerError("ollama", err);
     }
