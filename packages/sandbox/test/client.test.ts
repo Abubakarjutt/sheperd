@@ -93,3 +93,37 @@ test("unrunnable binary fails closed with sandbox_unavailable", async () => {
   const c = new SandboxClient(profileFor("spec", tmp(), DEFAULT_POLICY, tmp()), "/nonexistent/bin");
   await expect(c.read("x")).rejects.toMatchObject({ code: "sandbox_unavailable" });
 });
+
+test.skipIf(!mac)(
+  "output cap kills the supervisor gracefully so detached descendants are swept",
+  { timeout: 20000 },
+  async () => {
+    const root = tmp();
+    const scratch = tmp("rewire-scratch-");
+    const c = new SandboxClient(profileFor("verify", root, DEFAULT_POLICY, scratch), undefined, {
+      maxOutputBytes: 64 * 1024,
+    });
+    const pyfile = join(scratch, "d.py");
+    const pidfile = join(scratch, "pid");
+    writeFileSync(
+      pyfile,
+      `import os,time\nif os.fork()==0:\n    os.setsid()\n    open(${JSON.stringify(pidfile)},"w").write(str(os.getpid()))\n    time.sleep(30)\n    os._exit(0)\n`,
+    );
+    await expect(
+      c.exec(["sh", "-c", `python3 ${pyfile} & sleep 1; yes | head -c 5000000`], {
+        timeoutMs: 20000,
+        cwd: root,
+      }),
+    ).rejects.toMatchObject({ code: "sandbox_unavailable" });
+    const pid = Number(readFileSync(pidfile, "utf8"));
+    await new Promise((r) => setTimeout(r, 300));
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+    }
+    if (alive) process.kill(pid, "SIGKILL");
+    expect(alive).toBe(false);
+  },
+);

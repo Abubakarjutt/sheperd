@@ -1,4 +1,4 @@
-import { chmodSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_POLICY } from "@rewire/policy";
@@ -15,7 +15,12 @@ function fake(script: string): string {
 
 function client(
   script: string,
-  opts?: { watchdogMs?: number; execGraceMs?: number; maxOutputBytes?: number },
+  opts?: {
+    watchdogMs?: number;
+    execGraceMs?: number;
+    maxOutputBytes?: number;
+    killGraceMs?: number;
+  },
 ) {
   const profile = profileFor("implementer", tmp(), DEFAULT_POLICY, tmp());
   return new SandboxClient(profile, fake(script), opts);
@@ -127,4 +132,19 @@ test("exec cwd inside an extraWrite dir outside root -> path_protected <outside-
     code: "path_protected",
     message: expect.stringContaining(`${scratch} is protected (rule <outside-root>)`),
   });
+});
+
+test("fake binary ignoring SIGTERM is SIGKILLed after the grace", { timeout: 8000 }, async () => {
+  const mark = join(tmp("rewire-mark-"), "term");
+  const c = client(`trap 'echo t > ${mark}' TERM; while :; do sleep 0.1; done`, {
+    // generous: a freshly written executable can take a while to start on macOS
+    watchdogMs: 1500,
+    killGraceMs: 400,
+  });
+  const t0 = Date.now();
+  const err = await c.read("a").catch((e: Error) => e);
+  expect((err as Error).message).toContain("watchdog");
+  expect((err as Error).message).toContain("SIGKILLed");
+  expect(Date.now() - t0).toBeGreaterThanOrEqual(1850);
+  expect(existsSync(mark)).toBe(true);
 });

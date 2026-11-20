@@ -82,7 +82,7 @@ type Raw = { code: number | null; signal: string | null; stdout: string; stderr:
 
 function run(
   bin: string,
-  limits: { watchdogMs: number; maxOutputBytes: number },
+  limits: { watchdogMs: number; maxOutputBytes: number; killGraceMs: number },
   args: string[],
   stdin?: string,
 ): Promise<Raw> {
@@ -90,36 +90,52 @@ function run(
     const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] });
     const out: Buffer[] = [];
     const err: Buffer[] = [];
-    let size = { out: 0, err: 0 };
+    const size = { out: 0, err: 0 };
+    let stderrTail = "";
     let failure: RewireError | undefined;
-    const fail = (e: RewireError): void => {
-      if (failure) return;
-      failure = e;
-      clearTimeout(timer);
-      child.kill("SIGKILL");
-      // Do not wait for `close`: a grandchild may hold the pipes open.
-      child.stdout.destroy();
-      child.stderr.destroy();
-      rej(e);
+    let closed = false;
+    let killTimer: NodeJS.Timeout | undefined;
+    let settled = false;
+    const settle = (f: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(watchdog);
+      clearTimeout(killTimer);
+      f();
     };
-    const timer = setTimeout(
-      () =>
-        fail(
-          new RewireError(
-            "sandbox_unavailable",
-            `rewire-sandbox watchdog fired after ${limits.watchdogMs}ms; child killed`,
+    // Watchdog / output cap: SIGTERM first so the binary can sweep the command's
+    // descendants, SIGKILL only if it has not exited within the grace.
+    const fail = (reason: string): void => {
+      if (failure || settled) return;
+      failure = new RewireError("sandbox_unavailable", reason);
+      clearTimeout(watchdog);
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => {
+        if (closed) return;
+        child.kill("SIGKILL");
+        child.stdout.destroy();
+        child.stderr.destroy();
+        settle(() =>
+          rej(
+            new RewireError(
+              "sandbox_unavailable",
+              `${reason}; no exit within ${limits.killGraceMs}ms of SIGTERM, SIGKILLed`,
+            ),
           ),
-        ),
+        );
+      }, limits.killGraceMs);
+    };
+    const watchdog = setTimeout(
+      () => fail(`rewire-sandbox watchdog fired after ${limits.watchdogMs}ms; child terminated`),
       limits.watchdogMs,
     );
     const collect = (which: "out" | "err", bucket: Buffer[]) => (d: Buffer) => {
-      size = { ...size, [which]: size[which] + d.length };
+      if (which === "err") stderrTail = (stderrTail + d.toString("utf8")).slice(-2000);
+      if (failure) return; // keep draining, discard
+      size[which] += d.length;
       if (size[which] > limits.maxOutputBytes) {
         fail(
-          new RewireError(
-            "sandbox_unavailable",
-            `rewire-sandbox ${which === "out" ? "stdout" : "stderr"} output exceeded ${limits.maxOutputBytes} bytes; child killed`,
-          ),
+          `rewire-sandbox ${which === "out" ? "stdout" : "stderr"} output exceeded ${limits.maxOutputBytes} bytes; child terminated`,
         );
         return;
       }
@@ -127,21 +143,30 @@ function run(
     };
     child.stdout.on("data", collect("out", out));
     child.stderr.on("data", collect("err", err));
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      rej(new RewireError("sandbox_unavailable", `cannot run rewire-sandbox: ${e.message}`));
-    });
+    child.on("error", (e) =>
+      settle(() =>
+        rej(new RewireError("sandbox_unavailable", `cannot run rewire-sandbox: ${e.message}`)),
+      ),
+    );
     child.on("close", (code, signal) => {
-      clearTimeout(timer);
-      if (failure) {
-        rej(failure);
-        return;
-      }
-      res({
-        code,
-        signal,
-        stdout: Buffer.concat(out).toString("utf8"),
-        stderr: Buffer.concat(err).toString("utf8"),
+      closed = true;
+      settle(() => {
+        if (failure) {
+          const tail = stderrTail.trim();
+          rej(
+            new RewireError(
+              "sandbox_unavailable",
+              tail ? `${failure.message}; binary stderr: ${tail}` : failure.message,
+            ),
+          );
+          return;
+        }
+        res({
+          code,
+          signal,
+          stdout: Buffer.concat(out).toString("utf8"),
+          stderr: Buffer.concat(err).toString("utf8"),
+        });
       });
     });
     child.stdin.on("error", () => {
@@ -176,6 +201,7 @@ function parseDeny(r: Raw): { canonical: string; rule: string } {
 
 const DEFAULT_WATCHDOG_MS = 30_000;
 const EXEC_GRACE_MS = 5_000;
+const KILL_GRACE_MS = 5_000;
 const DEFAULT_MAX_OUTPUT = 16 * 1024 * 1024;
 
 export type ClientOptions = {
@@ -183,6 +209,8 @@ export type ClientOptions = {
   watchdogMs?: number;
   /** Added to exec's timeoutMs before the TS-side kill (default 5s). */
   execGraceMs?: number;
+  /** After SIGTERM on watchdog/cap, wait this long before SIGKILL (default 5s). */
+  killGraceMs?: number;
   /** Per-stream output cap (default 16 MiB). */
   maxOutputBytes?: number;
 };
@@ -197,6 +225,7 @@ export class SandboxClient {
   private readonly watchdogMs: number;
   private readonly execGraceMs: number;
   private readonly maxOutputBytes: number;
+  private readonly killGraceMs: number;
   private readonly dir: string;
   readonly profilePath: string;
 
@@ -204,6 +233,7 @@ export class SandboxClient {
     this.profile = profile;
     this.watchdogMs = opts.watchdogMs ?? DEFAULT_WATCHDOG_MS;
     this.execGraceMs = opts.execGraceMs ?? EXEC_GRACE_MS;
+    this.killGraceMs = opts.killGraceMs ?? KILL_GRACE_MS;
     this.maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT;
     this.bin = binPath ?? findSandboxBinary();
     this.dir = mkdtempSync(join(tmpdir(), "rewire-profile-"));
@@ -213,7 +243,11 @@ export class SandboxClient {
   }
 
   private limits(watchdogMs = this.watchdogMs) {
-    return { watchdogMs, maxOutputBytes: this.maxOutputBytes };
+    return {
+      watchdogMs,
+      maxOutputBytes: this.maxOutputBytes,
+      killGraceMs: this.killGraceMs,
+    };
   }
 
   private checkCwd(cwd: string): string {
