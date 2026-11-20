@@ -120,3 +120,76 @@ test.each(["echo $'hello\\n'", "ls # comment with 'quote", 'echo "#notacomment" 
     expect(verdict(c)).toEqual({ forbidden: false });
   },
 );
+
+// Round 4: bash blanks are space/tab/newline only; `#` word-start tracking (S17); $'..' decoding (S18).
+test.each([
+  "echo a #x ; npm i",
+  "echo a #x ; npm i",
+  "echo a﻿#x ; npm i",
+  "echo a #x ; npm i",
+  "echo a\r#x ; npm i",
+  "echo a\v#x ; npm i",
+  "echo a\f#x ; npm i",
+  "function for x { npm i; }",
+  "echo a\\ b ; npm i",
+  "echo café#x ; npm i",
+])("forbidden or refused (round 4, blanks): %j", (c) => {
+  expect(verdict(c)).toMatchObject({ forbidden: true });
+});
+
+test.each([
+  "echo \\;#x ; npm i",
+  "echo a\\ #x ; npm i",
+  "echo $(date)#x ; npm i",
+  "echo <(true)#x ; npm i",
+  "echo $((1))#x ; npm i",
+  "echo $(echo $(date)#x ; npm i)",
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a template
+  "echo ${x#y} ; npm i",
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a template
+  "echo ${x:-#} ; npm i",
+  "npm \\\ni",
+  "echo a \\\n#'\nnpm i\n#'",
+  "npm $'i'",
+  "npm $'\\x69'",
+  "npm $'\\151'",
+  "$'npm' i",
+  "npm $'ins''tall'",
+  "npm $'ins'\"tall\"",
+])("forbidden (round 4): %j", (c) => {
+  const v = verdict(c);
+  expect(v).toMatchObject({ forbidden: true });
+  expect((v as { message: string }).message).toContain("use pnpm");
+});
+
+test.each([
+  "echo $'\\0' ; ls",
+  "echo $'\\xff' ; ls",
+  "echo $'\\u00e9' ; ls",
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a template
+  "echo ${x:-$(npm i)}",
+  "echo a>#x",
+  "echo a>&#x",
+])("refused (round 4): %j", (c) => {
+  expect((verdict(c) as { message: string }).message).toContain("cannot evaluate");
+});
+
+test.each([
+  "ls # comment",
+  "echo a#b",
+  "ls\t# comment",
+  "ls;# comment",
+  "echo a&#x",
+  "(ls)#x",
+  "echo $'hello\\n'",
+  "echo $'\\e[31mred'",
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a template
+  "echo ${HOME}/x",
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a template
+  'echo "${x#y}"',
+  "echo $#",
+  'echo "café a b"',
+  "ls \\\n  -la",
+])("round 4 allowed: %j", (c) => {
+  expect(verdict(c)).toEqual({ forbidden: false });
+});

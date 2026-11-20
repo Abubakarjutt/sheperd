@@ -35,8 +35,12 @@ const LOOP_HEADERS = new Set(["for", "select", "case"]);
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const GLOB = "\u0000";
 const SUB = "$__SUB__";
-const ANSI = "$__ANSI__";
 const MAX_DEPTH = 5;
+/** Whitespace to JS `\s` that bash does NOT treat as a blank (bash blanks: space, tab, newline). */
+const NON_BASH_BLANK = /[^\S \t\n]/;
+/** Scanner state: start of input, or "inside a word" after an escape, quote or expansion. */
+const START = "";
+const IN_WORD = "\u0000w";
 
 const cannot = (what: string): string =>
   `cannot evaluate command against command rules (${what}); rewrite it in plain form`;
@@ -44,6 +48,16 @@ const cannot = (what: string): string =>
 type Tok = ReturnType<typeof parse>[number];
 
 class Unevaluable extends Error {}
+
+/** Tracks the last two characters the scanner consumed, for `#` word-start decisions. */
+class Prev {
+  c = START;
+  c2 = START;
+  step(c: string): void {
+    this.c2 = this.c;
+    this.c = c;
+  }
+}
 
 /** Index of the `'` closing the ANSI-C quote `$'...'` whose opening quote is at `quote`. */
 function closeAnsiC(s: string, quote: number): number {
@@ -54,15 +68,111 @@ function closeAnsiC(s: string, quote: number): number {
   throw new Unevaluable("unterminated $'...' quote");
 }
 
+const ANSI_SIMPLE: Record<string, string> = {
+  a: "\x07",
+  b: "\b",
+  e: "\x1b",
+  E: "\x1b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+  v: "\v",
+  "\\": "\\",
+  "'": "'",
+  '"': '"',
+  "?": "?",
+};
+/** Max hex digits for `\xHH`, `\uHHHH`, `\UHHHHHHHH`. */
+const ANSI_HEX: Record<string, number> = { x: 2, u: 4, U: 8 };
+
 /**
- * Classify a `#` outside quotes: "comment" when it starts a word after blank/newline/`;|()`,
- * "word" when it is mid-word (`a#b`), and refuse as ambiguous after a redirection or `&`.
+ * Decode the body of `$'...'` like bash. Numeric escapes that yield NUL (bash truncates there) or
+ * a non-ASCII byte/code point (locale dependent) are refused. Unknown escapes keep the backslash.
  */
-function hashKind(s: string, i: number): "comment" | "word" {
-  if (i === 0) return "comment";
-  const prev = s[i - 1] as string;
-  if (/[\s;|()]/.test(prev)) return "comment";
-  if (prev === "<" || prev === ">" || prev === "&") throw new Unevaluable("ambiguous # comment");
+function decodeAnsiC(body: string): string {
+  let out = "";
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i] as string;
+    if (c !== "\\") {
+      out += c;
+      continue;
+    }
+    const n = body[i + 1];
+    if (n === undefined) return `${out}\\`;
+    i++;
+    const simple = ANSI_SIMPLE[n];
+    if (simple !== undefined) {
+      out += simple;
+      continue;
+    }
+    const octal = /^[0-7]{1,3}/.exec(body.slice(i));
+    const hexLen = ANSI_HEX[n];
+    const hex = hexLen ? new RegExp(`^[0-9A-Fa-f]{1,${hexLen}}`).exec(body.slice(i + 1)) : null;
+    let code: number;
+    if (octal) {
+      code = Number.parseInt(octal[0], 8);
+      i += octal[0].length - 1;
+    } else if (hex) {
+      code = Number.parseInt(hex[0], 16);
+      i += hex[0].length;
+    } else if (n === "c") {
+      const x = body[i + 1];
+      if (x === undefined || x === "\\") throw new Unevaluable("ambiguous $'\\c' escape");
+      code = x === "?" ? 0x7f : x.charCodeAt(0) & 0x1f;
+      i++;
+    } else {
+      out += `\\${n}`;
+      continue;
+    }
+    if (code === 0 || code > 0x7f) {
+      throw new Unevaluable("$'...' escape yields NUL or a non-ASCII byte");
+    }
+    out += String.fromCharCode(code);
+  }
+  return out;
+}
+
+/** `$'...'` at `dollar` decoded and re-quoted as a single-quoted literal; returns [text, end]. */
+function ansiC(s: string, dollar: number): [string, number] {
+  const end = closeAnsiC(s, dollar + 1);
+  const decoded = decodeAnsiC(s.slice(dollar + 2, end));
+  return [`'${decoded.replace(/'/g, "'\\''")}'`, end];
+}
+
+/**
+ * Index of the `}` closing the `${` whose `{` is at `open`. Only plain expansions are evaluated
+ * (`#` inside is never a comment); nested quotes, escapes, braces, backticks, `$(` or newlines
+ * are refused.
+ */
+function closeBrace(s: string, open: number): number {
+  for (let i = open + 1; i < s.length; i++) {
+    const c = s[i] as string;
+    if (c === "}") return i;
+    if ("'\"`\\{\n".includes(c) || (c === "$" && s[i + 1] === "(") || NON_BASH_BLANK.test(c)) {
+      throw new Unevaluable("complex $" + "{...} expansion");
+    }
+  }
+  throw new Unevaluable("unterminated $" + "{...} expansion");
+}
+
+/**
+ * Classify an unquoted `#` from the characters before it, using bash's rules: a comment starts
+ * only at a word start (start of input, after a bash blank or an unescaped `;|&()`). Inside a word
+ * (after an escape, quote or expansion, or a plain character) it is literal. After a redirection
+ * operator, a non-ASCII character or a control character it is refused as ambiguous.
+ */
+function hashKind(p: Prev): "comment" | "word" {
+  const { c, c2 } = p;
+  if (c === IN_WORD) return "word";
+  if (c === "<" || c === ">" || ((c === "&" || c === "|") && (c2 === "<" || c2 === ">"))) {
+    throw new Unevaluable("ambiguous # after a redirection");
+  }
+  if (c === START || " \t\n;|&()".includes(c)) return "comment";
+  const code = c.charCodeAt(0);
+  if (code < 0x20 || code >= 0x7f) {
+    throw new Unevaluable("ambiguous # after a non-ASCII or control character");
+  }
   return "word";
 }
 
@@ -82,30 +192,55 @@ function closeDouble(s: string, open: number): number {
     if (c === "\\") i++;
     else if (c === '"') return i;
     else if (c === "$" && s[i + 1] === "(") i = closeParen(s, i + 1);
+    else if (c === "$" && s[i + 1] === "{") i = closeBrace(s, i + 1);
     else if (c === "`") i = closeBacktick(s, i + 1);
   }
   throw new Unevaluable("unterminated double quote");
 }
 
-/** Index of the `)` closing the `(` at `open`; quote-aware. Throws when it cannot be matched. */
+/**
+ * Index of the `)` closing the `(` at `open`; quote-aware, with the same `#` word-start tracking
+ * as the top level. A `)` closing a nested `$(`/`<(`/`>(` leaves the scanner inside a word.
+ */
 function closeParen(s: string, open: number): number {
-  let depth = 0;
+  const p = new Prev();
+  const subst: boolean[] = [];
   for (let i = open; i < s.length; i++) {
-    const c = s[i];
-    if (c === "\\") i++;
-    else if (c === "$" && s[i + 1] === "'") i = closeAnsiC(s, i + 1);
-    else if (c === "#" && hashKind(s, i) === "comment") {
-      const nl = s.indexOf("\n", i);
-      if (nl < 0) throw new Unevaluable("comment runs to end of substitution");
-      i = nl;
+    const c = s[i] as string;
+    if (c === "\\") {
+      if (s[i + 1] !== "\n") p.step(IN_WORD); // `\<newline>` is removed by bash
+      i++;
+    } else if (c === "$" && s[i + 1] === "'") {
+      i = closeAnsiC(s, i + 1);
+      p.step(IN_WORD);
+    } else if (c === "$" && s[i + 1] === "{") {
+      i = closeBrace(s, i + 1);
+      p.step(IN_WORD);
+    } else if (c === "#") {
+      if (hashKind(p) === "comment") {
+        const nl = s.indexOf("\n", i);
+        if (nl < 0) throw new Unevaluable("comment runs to end of substitution");
+        i = nl - 1; // the newline is consumed next
+      } else p.step(c);
     } else if (c === "'") {
       const end = s.indexOf("'", i + 1);
       if (end < 0) throw new Unevaluable("unterminated single quote");
       i = end;
-    } else if (c === '"') i = closeDouble(s, i);
-    else if (c === "`") i = closeBacktick(s, i + 1);
-    else if (c === "(") depth++;
-    else if (c === ")" && --depth === 0) return i;
+      p.step(IN_WORD);
+    } else if (c === '"') {
+      i = closeDouble(s, i);
+      p.step(IN_WORD);
+    } else if (c === "`") {
+      i = closeBacktick(s, i + 1);
+      p.step(IN_WORD);
+    } else if (c === "(") {
+      subst.push(p.c === "$" || p.c === "<" || p.c === ">");
+      p.step(c);
+    } else if (c === ")") {
+      const wasSubst = subst.pop();
+      if (subst.length === 0) return i;
+      p.step(wasSubst ? IN_WORD : c);
+    } else p.step(c);
   }
   throw new Unevaluable("unbalanced substitution");
 }
@@ -113,7 +248,10 @@ function closeParen(s: string, open: number): number {
 /**
  * Evaluate and replace `$(..)`, `<(..)`, `>(..)` and backtick bodies with a placeholder word.
  * Quote-aware like the shell: single-quoted text is inert, `<(`/`>(` are literal inside double
- * quotes, and a substitution that cannot be matched unambiguously throws (refused).
+ * quotes, `$'...'` is decoded into a single-quoted literal, comments are dropped only where bash
+ * starts one, and anything that cannot be matched unambiguously throws (refused). Unquoted
+ * whitespace that bash does not treat as a blank (NBSP, `\r`, `\v`, ...) is refused, because
+ * shell-quote would split words on it.
  */
 function extractSubstitutions(
   s: string,
@@ -121,44 +259,70 @@ function extractSubstitutions(
 ): { text: string; refusal?: string } {
   let out = "";
   let dq = false;
+  const p = new Prev();
   for (let i = 0; i < s.length; i++) {
     const c = s[i] as string;
     const two = s.slice(i, i + 2);
     if (c === "\\") {
+      const n = s[i + 1];
+      if (n === "\n") {
+        i++; // line continuation: bash removes it, the word (or blank) state carries on
+        continue;
+      }
+      if (!dq && n !== undefined && NON_BASH_BLANK.test(n)) {
+        throw new Unevaluable("escaped non-blank whitespace");
+      }
       out += s.slice(i, i + 2);
       i++;
-    } else if (!dq && c === "$" && s[i + 1] === "'") {
-      i = closeAnsiC(s, i + 1);
-      out += ANSI;
+      p.step(IN_WORD);
+    } else if (!dq && two === "$'") {
+      const [lit, end] = ansiC(s, i);
+      out += lit;
+      i = end;
+      p.step(IN_WORD);
+    } else if (two === "${") {
+      const end = closeBrace(s, i + 1);
+      out += s.slice(i, end + 1);
+      i = end;
+      p.step(IN_WORD);
     } else if (!dq && c === "#") {
-      if (hashKind(s, i) === "comment") {
+      if (hashKind(p) === "comment") {
         const nl = s.indexOf("\n", i);
         i = nl < 0 ? s.length : nl - 1; // keep the newline
       } else {
         out += "\\#";
+        p.step(c);
       }
     } else if (!dq && c === "'") {
       const end = s.indexOf("'", i + 1);
       if (end < 0) throw new Unevaluable("unterminated single quote");
       out += s.slice(i, end + 1);
       i = end;
+      p.step(IN_WORD);
     } else if (c === '"') {
       dq = !dq;
       out += c;
+      p.step(IN_WORD);
     } else if (two === "$(" || (!dq && (two === "<(" || two === ">("))) {
       const end = closeParen(s, i + 1);
       const refusal = visit(s.slice(i + 2, end));
       if (refusal) return { text: "", refusal };
       out += SUB;
       i = end;
+      p.step(IN_WORD);
     } else if (c === "`") {
       const end = closeBacktick(s, i + 1);
       const refusal = visit(s.slice(i + 1, end));
       if (refusal) return { text: "", refusal };
       out += SUB;
       i = end;
+      p.step(IN_WORD);
     } else {
+      if (!dq && NON_BASH_BLANK.test(c)) {
+        throw new Unevaluable(`unquoted non-blank whitespace U+${c.codePointAt(0)?.toString(16)}`);
+      }
       out += c;
+      p.step(c);
     }
   }
   if (dq) throw new Unevaluable("unterminated double quote");
@@ -168,7 +332,7 @@ function extractSubstitutions(
 /** Split into simple commands. Glob words are marked so argv0 can be recognised as dynamic. */
 function segments(command: string): string[][] {
   // Newlines separate commands; shell-quote would otherwise treat them as whitespace.
-  const toks: Tok[] = parse(command.replace(/\r?\n/g, " ; "), (k) => `$${k}`);
+  const toks: Tok[] = parse(command.replace(/\n/g, " ; "), (k) => `$${k}`);
   const out: string[][] = [];
   let cur: string[] = [];
   const flush = () => {
@@ -344,6 +508,7 @@ function check(rules: CommandRule[], command: string, depth: number): string | u
     if (isDynamic(argv0)) {
       return cannot(`dynamic command name ${JSON.stringify(argv0.replace(GLOB, ""))}`);
     }
+    // Any JS whitespace (a superset of bash blanks) in a quoted argv0 is refused, never skipped.
     if (/\s/.test(argv0) || argv0.startsWith("-")) {
       return cannot(`unexpected command name ${JSON.stringify(argv0)}`);
     }
