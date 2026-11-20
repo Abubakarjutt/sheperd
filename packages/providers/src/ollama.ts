@@ -30,6 +30,13 @@ export function normalizeOllamaHost(raw: string | undefined): string {
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) return v.replace(/\/+$/, "");
   // Scheme-less: Ollama treats a bare host as port 11434.
   let host = v.replace(/\/+$/, "");
+  if (host.includes("/")) {
+    throw new RewireError(
+      "ollama_host_invalid",
+      `OLLAMA_HOST "${raw}" has a path but no scheme`,
+      "use host:port, or a full URL like http://host:11434",
+    );
+  }
   if ((host.match(/:/g) ?? []).length > 1 && !host.startsWith("[")) host = `[${host}]`; // bare IPv6
   if (!/:\d+$/.test(host)) host = `${host}:11434`;
   return `http://${host}`;

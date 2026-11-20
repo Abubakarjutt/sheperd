@@ -102,13 +102,13 @@ function parseArgs(raw: unknown, name: string, provider: string): Record<string,
     parsed = JSON.parse(typeof raw === "string" ? raw : "");
   } catch {
     throw new RewireError(
-      "provider_bad_response",
+      "provider_bad_tool_args",
       `${provider} tool call "${name}" has invalid JSON arguments`,
     );
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new RewireError(
-      "provider_bad_response",
+      "provider_bad_tool_args",
       `${provider} tool call "${name}" arguments are not an object`,
     );
   }

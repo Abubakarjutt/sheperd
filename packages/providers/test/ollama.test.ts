@@ -194,6 +194,14 @@ describe("normalizeOllamaHost", () => {
     expect(normalizeOllamaHost("https://x.example/")).toBe("https://x.example");
     expect(normalizeOllamaHost("http://a:1///")).toBe("http://a:1");
   });
+  test("scheme-less host with a path is rejected", () => {
+    expect(() => normalizeOllamaHost("myhost/api")).toThrowError(
+      expect.objectContaining({ code: "ollama_host_invalid" }),
+    );
+    expect(() => normalizeOllamaHost("myhost:1234/api")).toThrowError(
+      expect.objectContaining({ code: "ollama_host_invalid" }),
+    );
+  });
   test("IPv6 forms", () => {
     expect(normalizeOllamaHost("[::1]")).toBe("http://[::1]:11434");
     expect(normalizeOllamaHost("[::1]:1234")).toBe("http://[::1]:1234");
@@ -221,7 +229,7 @@ describe("OllamaProvider", () => {
     await p.chat({ model: "tiny:1b", system: "s", messages: [], maxTokens: 5 });
     expect(chats()).toBe(1);
   });
-  test("invalid tool-call arguments fail closed with provider_bad_response", async () => {
+  test("invalid tool-call arguments fail closed with provider_bad_tool_args", async () => {
     mock.chat = () => ({
       choices: [
         {
@@ -236,7 +244,7 @@ describe("OllamaProvider", () => {
     await expect(
       p.chat({ model: "tiny:1b", system: "s", messages: [], maxTokens: 5 }),
     ).rejects.toMatchObject({
-      code: "provider_bad_response",
+      code: "provider_bad_tool_args",
       message: expect.stringContaining("ollama"),
     });
   });
@@ -399,6 +407,19 @@ describe("assertRoleFit", () => {
         : structuredOk();
     await expect(fit("implementer")).rejects.toMatchObject({ code: "model_unfit" });
     expect((await readCache())["sha256:abc:implementer"].ok).toBe(false);
+  });
+  test("a chat response with no choices is provider_bad_response, not cached, re-run next call", async () => {
+    mock.chat = () => ({ choices: [] });
+    await expect(fit("reviewer")).rejects.toMatchObject({ code: "provider_bad_response" });
+    await expect(readFile(join(cache, "fitness.json"), "utf8")).rejects.toThrow();
+    mock.chat = goodChat;
+    await fit("reviewer");
+    expect(chats()).toBe(2);
+  });
+  test("an unparseable chat body is not cached", async () => {
+    mock.chat = () => "<html>";
+    await expect(fit("reviewer")).rejects.toBeTruthy();
+    await expect(readFile(join(cache, "fitness.json"), "utf8")).rejects.toThrow();
   });
   test("cached failure rethrow says when it was cached and how to clear it", async () => {
     mock.chat = () => ({

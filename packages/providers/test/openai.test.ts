@@ -69,7 +69,7 @@ describe("openai mapping", () => {
     });
   });
   test.each(["{not json", "[1]", "null", '"s"'])(
-    "bad tool args %s -> provider_bad_response",
+    "bad tool args %s -> provider_bad_tool_args",
     (args) => {
       expect(() =>
         fromOpenAIResponse({
@@ -85,7 +85,7 @@ describe("openai mapping", () => {
             },
           ],
         }),
-      ).toThrowError(expect.objectContaining({ code: "provider_bad_response" }));
+      ).toThrowError(expect.objectContaining({ code: "provider_bad_tool_args" }));
     },
   );
   test("empty arguments string is bad too (fail closed)", () => {
@@ -101,7 +101,7 @@ describe("openai mapping", () => {
           },
         ],
       }),
-    ).toThrowError(expect.objectContaining({ code: "provider_bad_response" }));
+    ).toThrowError(expect.objectContaining({ code: "provider_bad_tool_args" }));
   });
 });
 

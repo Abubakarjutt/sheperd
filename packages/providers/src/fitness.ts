@@ -137,7 +137,7 @@ export async function assertRoleFit(
   } catch (err) {
     // Only deterministic model-behaviour failures are verdicts on the model. Everything else
     // (5xx, timeouts, unreachable, aborts, ...) is transient: rethrow with its own code, uncached.
-    if (err instanceof RewireError && err.code === "provider_bad_response") {
+    if (err instanceof RewireError && err.code === "provider_bad_tool_args") {
       reason = `malformed tool call: ${err.message}`;
     } else {
       throw err;
