@@ -677,3 +677,70 @@ fn exec_command_inherits_no_extra_fds() {
     let fds = parse(&a.get_output().stdout);
     assert_eq!(fds, expected, "extra fds reached the command");
 }
+
+/// N1 (cross-run): a concurrent run A whose extraWrite is the per-user temp
+/// dir T must not be able to swap run B's tag dir (in T) for a symlink to a
+/// decoy. Either A's swap is denied, or B notices and fails closed; B must
+/// exit 120 and its fast double-forked survivor must be dead.
+#[cfg(target_os = "macos")]
+#[test]
+fn exec_concurrent_run_cannot_swap_another_runs_tag() {
+    let out = std::process::Command::new("getconf")
+        .arg("DARWIN_USER_TEMP_DIR")
+        .output()
+        .unwrap();
+    let t = fs::canonicalize(String::from_utf8(out.stdout).unwrap().trim()).unwrap();
+    let b = Fixture::new();
+    let a = Fixture::with(|p| p["extraWrite"] = json!([t]));
+    let bin = assert_cmd::cargo::cargo_bin("rewire-sandbox");
+    let run_b = std::process::Command::new(&bin)
+        .current_dir(&b.root)
+        .arg("exec")
+        .arg("--profile")
+        .arg(&b.profile)
+        .args(["--", "sh", "-c"])
+        .arg("sleep 1.5; perl -e 'exit if fork; exit if fork; sleep 1; open(F, \">src/late\"); print F 1'")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let bpid = run_b.id();
+    let decoy = t.join(format!("rewire-test-decoy-{bpid}"));
+    fs::create_dir_all(&decoy).unwrap();
+    fs::write(decoy.join("a"), "").unwrap();
+    fs::write(decoy.join("b"), "").unwrap();
+    let script = format!(
+        r#"for i in $(seq 40); do
+  for d in "{t}"/rewire-sandbox-tag-{bpid}-*; do
+    [ -d "$d" ] && [ ! -L "$d" ] || continue
+    mv "$d" "$d.moved" && ln -s "{decoy}" "$d" && echo SWAPPED
+  done
+  sleep 0.05
+done"#,
+        t = t.display(),
+        decoy = decoy.display()
+    );
+    let ra = a.exec(&[], &["sh", "-c", &script]).assert();
+    let swapped = String::from_utf8_lossy(&ra.get_output().stdout).contains("SWAPPED");
+    let out_b = run_b.wait_with_output().unwrap();
+    let err_b = String::from_utf8_lossy(&out_b.stderr).into_owned();
+    std::thread::sleep(Duration::from_millis(2000));
+    // Clean up whatever the swap left behind.
+    let _ = fs::remove_dir_all(&decoy);
+    for e in fs::read_dir(&t).unwrap().flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.starts_with(&format!("rewire-sandbox-tag-{bpid}-")) {
+            let _ = fs::remove_file(e.path());
+            let _ = fs::remove_dir_all(e.path());
+        }
+    }
+    assert_eq!(
+        out_b.status.code(),
+        Some(INTERNAL),
+        "swapped={swapped} {err_b}"
+    );
+    assert!(
+        !b.root.join("src/late").exists(),
+        "survivor ran (swapped={swapped})"
+    );
+}

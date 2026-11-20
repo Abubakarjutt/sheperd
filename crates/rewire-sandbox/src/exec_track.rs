@@ -19,6 +19,12 @@
 //! inside `extraWrite`), and the SBPL also denies writes to it and its
 //! parent entry, so the command cannot move it or swap in a decoy.
 //!
+//! Cross-run (N1): every run's SBPL denies writes to ALL tag names in all
+//! candidate bases, so a concurrent run with one of them in `extraWrite`
+//! cannot touch this run's tag either; and every sweep first checks the
+//! tag dir/files are the same inodes captured at creation ([`TagCheck`]),
+//! failing closed otherwise.
+//!
 //! Fail closed (N2): `sandbox_check` is reached through [`CheckFn`]; every
 //! answer other than 0/1 is "unknown", and before the command runs a
 //! self-test proves the checker sees a probe inside this run's sandbox and
@@ -103,11 +109,52 @@ fn tag_bases() -> Vec<PathBuf> {
     v
 }
 
+/// Every candidate base, canonicalized (the SBPL protects tag names in all
+/// of them, whichever one a given run picked).
+pub fn canonical_tag_bases() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = tag_bases()
+        .iter()
+        .filter_map(|b| fs::canonicalize(b).ok())
+        .collect();
+    v.dedup();
+    v
+}
+
 /// The per-run tag files (removed on drop).
 pub struct RunTag {
     pub dir: PathBuf,
     pub denied: PathBuf,
     allowed: PathBuf,
+    /// Open handle on the tag dir: pins the inode we compare against.
+    _handle: fs::File,
+    check: TagCheck,
+}
+
+/// Expected (dev, ino) of the tag dir and both tag files, captured by
+/// fstat on handles opened right after creation.
+#[derive(Clone, Debug)]
+pub struct TagCheck {
+    entries: Vec<(PathBuf, (u64, u64), bool)>,
+}
+
+impl TagCheck {
+    /// The tag dir and files must still be the very same, non-symlink
+    /// inodes at the same paths; otherwise the sandbox-tag answers could be
+    /// about a decoy, and descendant detection would fail open.
+    pub fn verify(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        for (path, id, is_dir) in &self.entries {
+            let m = fs::symlink_metadata(path)
+                .with_context(|| format!("run tag {} is gone", path.display()))?;
+            if m.file_type().is_symlink() || m.is_dir() != *is_dir || (m.dev(), m.ino()) != *id {
+                bail!(
+                    "run tag {} was replaced: cannot track descendants",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl RunTag {
@@ -128,18 +175,40 @@ impl RunTag {
             .mode(0o700)
             .create(&dir)
             .with_context(|| format!("creating {}", dir.display()))?;
-        let tag = RunTag {
-            denied: dir.join("a"),
-            allowed: dir.join("b"),
-            dir,
-        };
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         // Must still be exactly where we put it (no symlink in the way).
-        let real = fs::canonicalize(&tag.dir).context("canonicalizing tag dir")?;
-        if real != tag.dir || p.in_write_space(&real) {
-            bail!("run tag dir {} is not where expected", tag.dir.display());
+        let real = fs::canonicalize(&dir).context("canonicalizing tag dir")?;
+        if real != dir || p.in_write_space(&real) {
+            bail!("run tag dir {} is not where expected", dir.display());
         }
-        fs::write(&tag.denied, "").context("creating sandbox tag")?;
-        fs::write(&tag.allowed, "").context("creating sandbox tag")?;
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&dir)
+            .context("opening tag dir")?;
+        let id = |f: &fs::File| -> Result<(u64, u64)> {
+            let m = f.metadata()?;
+            Ok((m.dev(), m.ino()))
+        };
+        let (denied, allowed) = (dir.join("a"), dir.join("b"));
+        let mut entries = vec![(dir.clone(), id(&handle)?, true)];
+        for f in [&denied, &allowed] {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(f)
+                .context("creating sandbox tag")?;
+            entries.push((f.clone(), id(&file)?, false));
+        }
+        let tag = RunTag {
+            dir,
+            denied,
+            allowed,
+            _handle: handle,
+            check: TagCheck { entries },
+        };
+        tag.check.verify()?;
         Ok(tag)
     }
 }
@@ -214,6 +283,7 @@ pub struct Tracker {
     /// Start time of the command, so a recycled root pid is never walked.
     root_start: Option<u64>,
     probe: Probe,
+    tag: TagCheck,
     /// pid → start time (µs since epoch).
     seen: HashMap<i32, u64>,
     /// Sweep cache: pid → start time of processes found NOT to be ours.
@@ -293,6 +363,7 @@ impl Tracker {
             root,
             root_start: info(root).map(|i| i.start),
             probe: Probe::new(tag),
+            tag: tag.check.clone(),
             seen: HashMap::new(),
             cleared: HashMap::new(),
         }
@@ -338,6 +409,8 @@ impl Tracker {
     /// is skipped without validating its start time. Errors when the
     /// checker gives an unknown answer for a process that is still alive.
     pub fn survivors(&mut self, use_cache: bool) -> Result<Vec<i32>> {
+        // Answers about a swapped tag would be about a decoy: fail closed.
+        self.tag.verify()?;
         let mut out: Vec<i32> = self
             .seen
             .iter()
@@ -504,6 +577,78 @@ mod tests {
         // The real candidates ignore TMPDIR and land outside the space.
         let tag = RunTag::create(&token(), &p).unwrap();
         assert!(!p.in_write_space(&tag.dir));
+    }
+
+    #[test]
+    fn swapped_tag_dir_fails_closed() {
+        let (_t, t0) = tag();
+        t0.check.verify().unwrap();
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        let mut tr = Tracker::new(me, &t0);
+        tr.survivors(true).unwrap();
+        // Same swap as an attacker: move the dir, symlink a decoy in.
+        let moved = t0.dir.with_extension("moved");
+        let decoy = t0.dir.with_extension("decoy");
+        fs::rename(&t0.dir, &moved).unwrap();
+        fs::create_dir(&decoy).unwrap();
+        fs::write(decoy.join("a"), "").unwrap();
+        fs::write(decoy.join("b"), "").unwrap();
+        std::os::unix::fs::symlink(&decoy, &t0.dir).unwrap();
+        let e = tr.survivors(true).unwrap_err();
+        assert!(format!("{e:#}").contains("replaced"), "{e:#}");
+        assert!(tr.kill_until_quiet().is_err());
+        // A same-named real dir (new inode) is refused too.
+        fs::remove_file(&t0.dir).unwrap();
+        fs::create_dir(&t0.dir).unwrap();
+        fs::write(t0.denied.clone(), "").unwrap();
+        fs::write(t0.allowed.clone(), "").unwrap();
+        assert!(t0.check.verify().is_err());
+        fs::remove_dir_all(&moved).unwrap();
+        fs::remove_dir_all(&decoy).unwrap();
+    }
+
+    #[test]
+    fn sandbox_denies_writes_to_every_runs_tag() {
+        let (_t, mine) = tag();
+        let (_t2, other) = tag();
+        let bases = canonical_tag_bases();
+        assert!(bases.iter().any(|b| other.dir.starts_with(b)));
+        // A policy that otherwise allows all writes in the tag base.
+        let base = other.dir.parent().unwrap();
+        let pol = format!(
+            "(version 1)(allow default)(allow file-write* (subpath \"{}\"))\n{}",
+            base.display(),
+            crate::exec_macos::tag_rule(&mine.denied, &mine.dir, &bases).unwrap()
+        );
+        let try_sh = |script: String| {
+            std::process::Command::new(crate::exec_macos::SANDBOX_EXEC)
+                .args(["-p", &pol, "--", "/bin/sh", "-c", &script])
+                .status()
+                .unwrap()
+                .success()
+        };
+        let o = other.dir.display();
+        assert!(!try_sh(format!("mv '{o}' '{o}.moved'")));
+        assert!(!try_sh(format!("touch '{o}/new'")));
+        assert!(!try_sh(format!("rm '{o}/a'")));
+        let upper = other
+            .dir
+            .to_string_lossy()
+            .replace("rewire-sandbox-tag-", "REWIRE-SANDBOX-TAG-");
+        assert!(!try_sh(format!("mv '{upper}' '{o}.moved'")));
+        assert!(!try_sh(format!(
+            "mkdir '{}/rewire-sandbox-tag-planted'",
+            base.display()
+        )));
+        // Other names in the base stay writable.
+        let ok = base.join(format!("rewire-test-ok-{}", token()));
+        assert!(try_sh(format!(
+            "mkdir '{}' && rmdir '{}'",
+            ok.display(),
+            ok.display()
+        )));
+        other.check.verify().unwrap();
     }
 
     const INSIDE: i32 = 4242;

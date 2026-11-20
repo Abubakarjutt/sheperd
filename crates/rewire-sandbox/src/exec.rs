@@ -302,7 +302,8 @@ fn sandboxed(
     tag: &RunTag,
 ) -> Result<(Command, Keep)> {
     use crate::exec_macos::{build_sbpl, tag_rule, SANDBOX_EXEC};
-    let sbpl = build_sbpl(p)? + &tag_rule(&tag.denied, &tag.dir)?;
+    let bases = crate::exec_track::canonical_tag_bases();
+    let sbpl = build_sbpl(p)? + &tag_rule(&tag.denied, &tag.dir, &bases)?;
     // Preflight: sandbox-exec's own failures (bad policy, sandbox_init
     // refused) exit non-zero without running anything, indistinguishable
     // from the child's exit code. Prove the policy applies first.

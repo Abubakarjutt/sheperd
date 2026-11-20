@@ -149,7 +149,11 @@ pub fn build_sbpl(p: &Profile) -> Result<String> {
 /// The per-run tag rule `exec` appends: deny reading one tag file, so
 /// `sandbox_check` can tell this run's sandbox apart (see `exec_track`).
 /// Denying a read of our own empty scratch file grants nothing.
-pub fn tag_rule(denied: &Path, dir: &Path) -> Result<String> {
+/// `bases` are every (canonical) dir any run may put its tag in: writes to
+/// ANY `rewire-sandbox-tag-*` entry there (and below) and to the bases
+/// themselves are denied, so no run can move or replace another
+/// concurrent run's tag either.
+pub fn tag_rule(denied: &Path, dir: &Path, bases: &[PathBuf]) -> Result<String> {
     let mut out = format!(
         "; Per-run tag for descendant tracking (grants nothing).\n(deny file-read* (literal {}))\n",
         sbpl_string(denied)?
@@ -160,9 +164,20 @@ pub fn tag_rule(denied: &Path, dir: &Path) -> Result<String> {
     if let Some(parent) = dir.parent() {
         filters.push(format!("(literal {})", sbpl_string(parent)?));
     }
+    for base in bases {
+        filters.push(format!("(literal {})", sbpl_string(base)?));
+        filters.push(regex_filter(&format!(
+            "^{}/{}[^/]*(/.*)?$",
+            escape_re(utf8(base)?, true),
+            escape_re(TAG_PREFIX, true)
+        ))?);
+    }
     emit(&mut out, "deny file-write*", &filters);
     Ok(out)
 }
+
+/// Name prefix of every run's tag dir.
+pub const TAG_PREFIX: &str = "rewire-sandbox-tag-";
 
 /// Emit `(<head> f1 f2 …)` — never with zero filters, which would mean
 /// "everything" (an unfiltered `(allow file-write*)` allows all writes).
