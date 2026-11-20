@@ -65,3 +65,38 @@ test.each([
 ])("normal commands are allowed: %s", (c) => {
   expect(verdict(c)).toEqual({ forbidden: false });
 });
+
+test.each([
+  "time -p npm i",
+  "time -p -- npm i",
+  "env -iS 'npm i'",
+  "env -S'npm i'",
+  "env --split-string='npm i'",
+  "eval 'npm i'",
+  "eval npm i",
+  "2>&1 npm i",
+  ">out npm i",
+  "2>/dev/null npm i",
+  "builtin exec npm i",
+  "coproc npm i",
+  `echo "$(echo ')' ; npm i)"`,
+  "echo '$(' ; npm i; echo ')'",
+])("forbidden (round 2): %s", (c) => {
+  const v = verdict(c);
+  expect(v).toMatchObject({ forbidden: true });
+  expect((v as { message: string }).message).toContain("use pnpm");
+});
+
+test.each(["echo $(echo 'unterminated)", "$(echo 'x)", "-x i"])(
+  "unmatched or odd forms are refused: %s",
+  (c) => {
+    expect((verdict(c) as { message: string }).message).toContain("cannot evaluate");
+  },
+);
+
+test.each(["echo 'a)'", 'echo "a)" $(date)', "time -p ls", "ls 2>&1", "echo '$(npm i)'"])(
+  "round 2 allowed: %s",
+  (c) => {
+    expect(verdict(c)).toEqual({ forbidden: false });
+  },
+);
