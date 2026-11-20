@@ -291,4 +291,37 @@ describe("runAgent", () => {
     const asst = res.messages.filter((m) => m.role === "assistant");
     expect(asst.every((m) => m.content !== "" || (m.toolCalls?.length ?? 0) > 0)).toBe(true);
   });
+
+  describe("finishTurn fails closed", () => {
+    const run = (decision: () => Promise<unknown>) =>
+      runAgent(
+        base(new FauxProvider([text("a"), text("b")]), [], {
+          hooks: { finishTurn: decision as NonNullable<LoopHooks["finishTurn"]> },
+        }),
+      );
+    test("unknown action gives error loop_hook_error", async () => {
+      const res = await run(async () => ({ action: "fail" }));
+      expect(res.endedBy).toBe("error");
+      expect(res.error?.code).toBe("loop_hook_error");
+    });
+    test("undefined decision gives error without rejecting", async () => {
+      const res = await run(async () => undefined);
+      expect(res.endedBy).toBe("error");
+      expect(res.error?.code).toBe("loop_hook_error");
+    });
+    test("continue with missing or empty inject gives error", async () => {
+      for (const d of [{ action: "continue" }, { action: "continue", inject: "" }]) {
+        const res = await run(async () => d);
+        expect(res.endedBy).toBe("error");
+        expect(res.error?.code).toBe("loop_hook_error");
+      }
+    });
+    test("throwing finishTurn gives loop_hook_error", async () => {
+      const res = await run(async () => {
+        throw new Error("hook broke");
+      });
+      expect(res.endedBy).toBe("error");
+      expect(res.error?.code).toBe("loop_hook_error");
+    });
+  });
 });

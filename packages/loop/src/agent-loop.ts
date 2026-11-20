@@ -163,9 +163,21 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       } catch (e) {
         return fail(e, "loop_hook_error");
       }
-      if (decision.action === "continue") {
-        messages.push({ role: "user", content: decision.inject });
+      const d: unknown = decision;
+      const action = (d as { action?: unknown } | null | undefined)?.action;
+      const inject = (d as { inject?: unknown } | null | undefined)?.inject;
+      if (action === "continue" && typeof inject === "string" && inject !== "") {
+        messages.push({ role: "user", content: inject });
         continue;
+      }
+      if (action !== "end") {
+        return finish(
+          "error",
+          new RewireError(
+            "loop_hook_error",
+            `finishTurn returned an invalid decision: ${JSON.stringify(d) ?? String(d)}`,
+          ),
+        );
       }
     }
     return finish("model");
