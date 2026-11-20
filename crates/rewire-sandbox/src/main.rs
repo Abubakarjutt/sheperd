@@ -9,7 +9,7 @@ mod profile;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use profile::{Decision, Op, Profile};
+use profile::{Decision, Op, Profile, Resolved};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,9 @@ use std::process::ExitCode;
 
 const EXIT_DENY: u8 = 3;
 const EXIT_INTERNAL: u8 = 120;
+/// Built-in rule: the target resolved differently just before the rename.
+const RULE_PATH_CHANGED: &str = "<path-changed>";
+const SUBCOMMANDS: [&str; 3] = ["check-path", "fs-read", "fs-write"];
 
 #[derive(Parser)]
 #[command(
@@ -32,23 +35,29 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Decide whether an operation on a path is allowed (exit 0) or denied (exit 3).
+    #[command(disable_help_flag = true)]
     CheckPath {
         #[arg(long)]
         profile: PathBuf,
         #[arg(long, value_enum)]
         op: OpArg,
+        #[arg(allow_hyphen_values = true)]
         path: PathBuf,
     },
     /// Print a file's content to stdout if reading it is allowed.
+    #[command(disable_help_flag = true)]
     FsRead {
         #[arg(long)]
         profile: PathBuf,
+        #[arg(allow_hyphen_values = true)]
         path: PathBuf,
     },
     /// Atomically write stdin to a file if writing it is allowed.
+    #[command(disable_help_flag = true)]
     FsWrite {
         #[arg(long)]
         profile: PathBuf,
+        #[arg(allow_hyphen_values = true)]
         path: PathBuf,
     },
 }
@@ -84,7 +93,20 @@ fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
-            let code = if e.use_stderr() { EXIT_INTERNAL } else { 0 };
+            // Only bare top-level `--help`/`--version` may exit 0: anything
+            // naming a subcommand must reach a decision or exit 120.
+            let informational = matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            );
+            let names_subcommand = std::env::args()
+                .skip(1)
+                .any(|a| SUBCOMMANDS.contains(&a.as_str()));
+            let code = if informational && !names_subcommand {
+                0
+            } else {
+                EXIT_INTERNAL
+            };
             let _ = e.print();
             return ExitCode::from(code);
         }
@@ -115,29 +137,29 @@ fn run(cmd: Command) -> Result<Outcome> {
         }
         Command::FsRead { profile, path } => {
             let profile = Profile::load(&profile)?;
-            let (decision, canonical) = decide(&profile, Op::Read, &path)?;
+            let (decision, resolved) = decide(&profile, Op::Read, &path)?;
             if let Decision::Deny { .. } = decision {
                 return Ok(to_outcome(decision));
             }
-            fs_read(&canonical)?;
+            fs_read(&resolved.canonical)?;
             Ok(Outcome::Done)
         }
         Command::FsWrite { profile, path } => {
             let profile = Profile::load(&profile)?;
-            let (decision, canonical) = decide(&profile, Op::Write, &path)?;
+            let (decision, resolved) = decide(&profile, Op::Write, &path)?;
             if let Decision::Deny { .. } = decision {
                 return Ok(to_outcome(decision));
             }
-            fs_write(&profile, &canonical)
+            fs_write(&profile, &path, &resolved)
         }
     }
 }
 
-fn decide(profile: &Profile, op: Op, path: &Path) -> Result<(Decision, PathBuf)> {
-    let canonical = profile
-        .canonical(path)
+fn decide(profile: &Profile, op: Op, path: &Path) -> Result<(Decision, Resolved)> {
+    let resolved = profile
+        .resolve(path)
         .with_context(|| format!("canonicalizing {}", path.display()))?;
-    Ok((profile.decide_canonical(op, canonical.clone()), canonical))
+    Ok((profile.decide_resolved(op, &resolved), resolved))
 }
 
 fn to_outcome(d: Decision) -> Outcome {
@@ -163,7 +185,8 @@ fn fs_read(canonical: &Path) -> Result<()> {
 /// TOCTOU: a concurrent process could swap a directory for a symlink between
 /// the decision and the write. Accepted for v0.1; the OS sandbox around
 /// `exec` (Task 4) is the backstop.
-fn fs_write(profile: &Profile, canonical: &Path) -> Result<Outcome> {
+fn fs_write(profile: &Profile, path: &Path, resolved: &Resolved) -> Result<Outcome> {
+    let canonical = resolved.canonical.as_path();
     let parent = canonical
         .parent()
         .with_context(|| format!("no parent directory for {}", canonical.display()))?;
@@ -180,7 +203,7 @@ fn fs_write(profile: &Profile, canonical: &Path) -> Result<Outcome> {
         .collect();
     missing.reverse();
     for dir in &missing {
-        let rule = profile.write_denial(dir).or_else(|| {
+        let rule = profile.write_denial(&[dir]).or_else(|| {
             (!profile.in_write_space(dir)).then(|| profile::RULE_OUTSIDE_ROOT.to_owned())
         });
         if let Some(rule) = rule {
@@ -223,20 +246,38 @@ fn fs_write(profile: &Profile, canonical: &Path) -> Result<Outcome> {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    let result = write_tmp_and_rename(&tmp, canonical, &content, existing.as_ref());
-    if result.is_err() {
+    let result = write_tmp(&tmp, &content, existing.as_ref())
+        .and_then(|()| recheck(profile, path, resolved))
+        .and_then(|outcome| match outcome {
+            Outcome::Done => fs::rename(&tmp, canonical)
+                .with_context(|| format!("renaming into {}", canonical.display()))
+                .map(|()| Outcome::Done),
+            denied => Ok(denied),
+        });
+    if !matches!(result, Ok(Outcome::Done)) {
         let _ = fs::remove_file(&tmp);
     }
-    result?;
+    result
+}
+
+/// Belt and braces, right before the rename: re-resolve the caller's path
+/// now that parents exist. If the canonical target moved (e.g. a created
+/// directory aliased an existing one) or the decision flipped, deny.
+fn recheck(profile: &Profile, path: &Path, before: &Resolved) -> Result<Outcome> {
+    let (decision, now) = decide(profile, Op::Write, path)?;
+    if let Decision::Deny { .. } = decision {
+        return Ok(to_outcome(decision));
+    }
+    if now.canonical != before.canonical {
+        return Ok(Outcome::Denied {
+            canonical: now.canonical,
+            rule: RULE_PATH_CHANGED.to_owned(),
+        });
+    }
     Ok(Outcome::Done)
 }
 
-fn write_tmp_and_rename(
-    tmp: &Path,
-    target: &Path,
-    content: &[u8],
-    existing: Option<&fs::Metadata>,
-) -> Result<()> {
+fn write_tmp(tmp: &Path, content: &[u8], existing: Option<&fs::Metadata>) -> Result<()> {
     // create_new = O_EXCL: never follows or reuses a pre-planted file/symlink.
     let mut f = fs::OpenOptions::new()
         .write(true)
@@ -249,9 +290,8 @@ fn write_tmp_and_rename(
             .context("copying permissions")?;
     }
     f.sync_all().context("syncing temp file")?;
-    drop(f);
-    // rename(2) replaces the directory entry; it never follows a symlink at
-    // the target, and a hard link at the target is replaced, not written through.
-    fs::rename(tmp, target).with_context(|| format!("renaming into {}", target.display()))?;
+    // The caller renames it over the target: rename(2) replaces the
+    // directory entry, never follows a symlink at the target, and replaces
+    // (rather than writes through) a hard link.
     Ok(())
 }

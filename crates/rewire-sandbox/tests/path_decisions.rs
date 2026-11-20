@@ -364,3 +364,134 @@ fn usage_error_exits_120() {
         .assert()
         .code(INTERNAL);
 }
+
+// ---- fix round 1 regressions ----
+
+fn write_all_fixture() -> Fixture {
+    Fixture::with(|p| p["write"] = json!(["**"]))
+}
+
+#[test]
+fn unicode_long_s_alias_of_tests_is_denied() {
+    let f = write_all_fixture();
+    fs::remove_dir(f.root.join("tests")).unwrap();
+    let a = f.check("write", "te\u{17f}ts/x.test.ts").code(DENY);
+    assert_eq!(denial(&a)["rule"], "tests/**");
+    f.cmd("fs-write")
+        .arg("te\u{17f}ts/x.test.ts")
+        .write_stdin("pwned")
+        .assert()
+        .code(DENY);
+    assert!(!f.root.join("tests").exists());
+}
+
+#[test]
+fn existing_unicode_alias_dir_still_denies_plain_spelling() {
+    let f = write_all_fixture();
+    fs::remove_dir(f.root.join("tests")).unwrap();
+    fs::create_dir(f.root.join("te\u{17f}ts")).unwrap();
+    let a = f.check("write", "tests/x.test.ts").code(DENY);
+    assert_eq!(denial(&a)["rule"], "tests/**");
+}
+
+#[test]
+fn kelvin_sign_alias_is_denied() {
+    let f = Fixture::with(|p| {
+        p["write"] = json!(["**"]);
+        p["writeDeny"] = json!(["keys/**"]);
+    });
+    let a = f.check("write", "\u{212a}eys/a").code(DENY);
+    assert_eq!(denial(&a)["rule"], "keys/**");
+}
+
+#[test]
+fn sharp_s_and_nfd_aliases_are_denied() {
+    let f = Fixture::with(|p| {
+        p["write"] = json!(["**"]);
+        p["writeDeny"] = json!(["strasse/**", "caf\u{e9}/**"]);
+    });
+    f.check("write", "stra\u{df}e/a").code(DENY);
+    f.check("write", "cafe\u{301}/a").code(DENY);
+}
+
+#[test]
+fn dotted_capital_i_git_variant_is_denied() {
+    let f = write_all_fixture();
+    let a = f.check("write", ".G\u{130}T/hooks/pre-commit").code(DENY);
+    assert_eq!(denial(&a)["rule"], "<gitdir>");
+}
+
+#[test]
+fn help_flag_on_subcommand_is_a_path_not_success() {
+    let f = Fixture::new();
+    for flag in ["--help", "-h", "-V", "--version"] {
+        let a = f
+            .cmd("check-path")
+            .arg("--op")
+            .arg("write")
+            .arg(flag)
+            .assert()
+            .code(DENY);
+        assert_eq!(denial(&a)["rule"], "<no-write-rule>", "{flag}");
+    }
+    f.cmd("fs-write")
+        .arg("--help")
+        .write_stdin("x")
+        .assert()
+        .code(DENY);
+    assert!(!f.root.join("--help").exists());
+}
+
+#[test]
+fn help_without_required_args_exits_120() {
+    let mut c = Command::cargo_bin("rewire-sandbox").unwrap();
+    c.args(["check-path", "--help"]).assert().code(INTERNAL);
+    let mut c = Command::cargo_bin("rewire-sandbox").unwrap();
+    c.args(["fs-write", "-h"]).assert().code(INTERNAL);
+}
+
+#[test]
+fn symlinked_deny_prefix_denies_lexical_and_canonical_spellings() {
+    let f = write_all_fixture();
+    fs::remove_dir(f.root.join("tests")).unwrap();
+    fs::create_dir(f.root.join("real")).unwrap();
+    std::os::unix::fs::symlink("real", f.root.join("tests")).unwrap();
+    let a = f.check("write", "tests/a.test.ts").code(DENY);
+    assert_eq!(denial(&a)["rule"], "tests/**");
+    let a = f.check("write", "real/a.test.ts").code(DENY);
+    assert_eq!(denial(&a)["rule"], "tests/**");
+    f.cmd("fs-write")
+        .arg("tests/a.test.ts")
+        .write_stdin("x")
+        .assert()
+        .code(DENY);
+    assert!(!f.root.join("real/a.test.ts").exists());
+}
+
+#[test]
+fn nested_dot_git_anywhere_is_denied() {
+    let f = write_all_fixture();
+    for p in ["src/.git/hooks/pre-commit", "src/a/.GIT/config", "src/.git"] {
+        let a = f.check("write", p).code(DENY);
+        assert_eq!(denial(&a)["rule"], "<gitdir>", "{p}");
+    }
+    f.cmd("fs-write")
+        .arg("src/.git/hooks/pre-commit")
+        .write_stdin("x")
+        .assert()
+        .code(DENY);
+    assert!(!f.root.join("src/.git").exists());
+    // Reading is fine; `.gitignore` is not `.git`.
+    f.check("read", "src/.git/config").code(0);
+    f.check("write", "src/.gitignore").code(0);
+}
+
+#[test]
+fn nested_dot_git_in_extra_write_is_denied() {
+    let probe = Fixture::new();
+    let extra = probe.base.join("scratch");
+    fs::create_dir_all(&extra).unwrap();
+    let f = Fixture::with(|p| p["extraWrite"] = json!([extra]));
+    let a = f.check("write", extra.join("repo/.git/HEAD")).code(DENY);
+    assert_eq!(denial(&a)["rule"], "<gitdir>");
+}

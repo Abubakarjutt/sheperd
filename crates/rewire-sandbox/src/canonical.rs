@@ -74,6 +74,24 @@ fn step(cur: &Path, name: &OsStr, hops: &mut u32) -> io::Result<PathBuf> {
     resolve(&cur.join(target), hops)
 }
 
+/// Resolve `.` and `..` textually, without touching the filesystem. This is
+/// the path as the caller *spelled* it; deny rules are checked against it as
+/// well as against the canonical path, so a symlinked deny prefix cannot be
+/// dodged by either spelling.
+pub fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Directories that must never be writable because they hold git metadata
 /// for `root` (hooks, config, refs: writing there is code execution).
 ///
@@ -205,6 +223,15 @@ mod tests {
         let (_t, b) = base();
         fs::write(b.join("file"), "x").unwrap();
         assert!(canonicalize_maybe_missing(&b.join("file/x")).is_err());
+    }
+
+    #[test]
+    fn lexical_normalization() {
+        assert_eq!(
+            normalize_lexically(Path::new("/r/./a/../b/../../x")),
+            PathBuf::from("/x")
+        );
+        assert_eq!(normalize_lexically(Path::new("/../..")), PathBuf::from("/"));
     }
 
     #[test]

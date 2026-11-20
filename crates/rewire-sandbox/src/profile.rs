@@ -3,21 +3,31 @@
 //! Gitdir protection (see `canonical::git_protected_paths`) adapted from
 //! openai/codex default_read_only_subpaths_for_writable_root — Apache-2.0.
 //!
+//! Every decision considers two spellings of the target: the *canonical*
+//! path (symlinks resolved) and the *lexical* path (the caller's spelling
+//! with `.`/`..` resolved textually). Deny rules fire if EITHER matches;
+//! allow rules only ever look at the canonical path.
+//!
 //! Decision order (deny beats allow):
 //! - read:  `readDeny` match → deny; otherwise allow (reads are not confined
 //!   to `root`).
-//! - write: git metadata → deny `<gitdir>`; `writeDeny` match → deny;
-//!   inside an `extraWrite` dir → allow; outside `root` → deny
-//!   `<outside-root>`; `write` match → allow; otherwise deny `<no-write-rule>`.
+//! - write: git metadata (root's gitdir, or any `.git` component under root
+//!   or an extraWrite dir) → deny `<gitdir>`; `writeDeny` match → deny;
+//!   canonical inside an `extraWrite` dir → allow; canonical outside `root`
+//!   → deny `<outside-root>`; `write` match → allow; else `<no-write-rule>`.
+//! - A path that is not valid UTF-8 is denied (`<non-utf8>`) for both ops.
 //!
-//! Glob semantics: relative globs match the path relative to the canonical
-//! root; absolute globs match the canonical absolute path (their literal
-//! prefix is canonicalized too). `*` never crosses `/`. A glob ending in
-//! `/**` also matches the directory itself. Deny globs are case-insensitive
-//! (fail closed on case-insensitive filesystems) and relative deny globs that
-//! start with `**/` also apply to paths outside `root`.
+//! Glob semantics: relative globs match the path relative to root; absolute
+//! globs match the absolute path. `*` never crosses `/`. `X/**` also matches
+//! `X`. Deny globs additionally:
+//! - are compared after [`fold`] (NFD + full Unicode case folding + stripping
+//!   combining marks) on both sides, a superset of APFS's name equivalence
+//!   (`teſts` ≡ `tests`, `Keys` ≡ `keys`, `straße` ≡ `strasse`);
+//! - have their literal prefix canonicalized (`tests/**` with `tests -> real`
+//!   also denies `real/...`);
+//! - when relative and starting with `**/`, also apply outside `root`.
 
-use crate::canonical::{canonicalize_maybe_missing, git_protected_paths};
+use crate::canonical::{canonicalize_maybe_missing, git_protected_paths, normalize_lexically};
 use anyhow::{bail, Context, Result};
 use globset::{GlobBuilder, GlobMatcher};
 use serde::Deserialize;
@@ -26,6 +36,7 @@ use std::path::{Path, PathBuf};
 pub const RULE_GITDIR: &str = "<gitdir>";
 pub const RULE_OUTSIDE_ROOT: &str = "<outside-root>";
 pub const RULE_NO_WRITE_RULE: &str = "<no-write-rule>";
+pub const RULE_NON_UTF8: &str = "<non-utf8>";
 
 /// On-disk profile JSON, shared verbatim with the TS packages.
 /// Every field is required and unknown fields are rejected, so a typo can
@@ -60,74 +71,127 @@ pub enum Decision {
     Deny { canonical: PathBuf, rule: String },
 }
 
+/// Both spellings of a target path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub canonical: PathBuf,
+    pub lexical: PathBuf,
+}
+
+/// Fold a name for deny-side comparison: NFD, full Unicode case folding,
+/// NFD again, then drop combining marks. Two names APFS considers equal
+/// always fold equal; some distinct names also fold equal (`.GİT` ≡ `.git`,
+/// `café` ≡ `cafe`) — over-denial is the fail-closed direction.
+pub fn fold(s: &str) -> String {
+    use caseless::Caseless;
+    use unicode_normalization::char::is_combining_mark;
+    use unicode_normalization::UnicodeNormalization;
+    s.chars()
+        .nfd()
+        .default_case_fold()
+        .nfd()
+        .filter(|c| !is_combining_mark(*c))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Anchor {
+    /// Matched against the path relative to root.
+    Rel,
+    /// Matched against the absolute path.
+    Abs,
+}
+
 /// One glob rule as written in the profile, compiled to one or more matchers.
 #[derive(Debug)]
 struct Rule {
     /// The glob exactly as written in the profile (reported on denial).
     name: String,
-    absolute: bool,
-    /// Relative rule that also applies to absolute paths outside root.
-    anywhere: bool,
-    matchers: Vec<GlobMatcher>,
+    matchers: Vec<(Anchor, GlobMatcher)>,
+}
+
+/// One spelling of a candidate path, prepared for matching.
+struct Candidate {
+    abs: String,
+    rel: Option<String>,
 }
 
 impl Rule {
-    fn compile(pattern: &str, case_insensitive: bool) -> Result<Rule> {
+    /// Compile an allow rule: exact, case-sensitive, canonical paths only.
+    fn allow(pattern: &str) -> Result<Rule> {
+        Self::build(
+            pattern,
+            false,
+            vec![(anchor_of(pattern), pattern.to_owned())],
+        )
+    }
+
+    /// Compile a deny rule: folded, canonicalized literal prefix, `**/`
+    /// relative rules also applied to absolute paths.
+    fn deny(pattern: &str, root: &Path) -> Result<Rule> {
+        let anchor = anchor_of(pattern);
+        let mut sources = vec![(anchor, pattern.to_owned())];
+        if anchor == Anchor::Rel && pattern.starts_with("**/") {
+            sources.push((Anchor::Abs, pattern.to_owned()));
+        }
+        if let Some(src) = canonicalize_glob_prefix(pattern, root)? {
+            if !sources.contains(&src) {
+                sources.push(src);
+            }
+        }
+        Self::build(pattern, true, sources)
+    }
+
+    fn build(pattern: &str, folded: bool, mut sources: Vec<(Anchor, String)>) -> Result<Rule> {
         if pattern.is_empty() {
             bail!("empty glob in profile");
         }
-        let absolute = pattern.starts_with('/');
-        let mut sources = vec![pattern.to_owned()];
-        if absolute {
-            let canon = canonicalize_glob_prefix(pattern)?;
-            if canon != pattern {
-                sources.push(canon);
-            }
-        }
         // `dir/**` must also cover `dir` itself.
-        for s in sources.clone() {
+        for (a, s) in sources.clone() {
             if let Some(dir) = s.strip_suffix("/**") {
                 if !dir.is_empty() {
-                    sources.push(dir.to_owned());
+                    sources.push((a, dir.to_owned()));
                 }
             }
         }
         let matchers = sources
             .iter()
-            .map(|s| {
-                GlobBuilder::new(s)
+            .map(|(a, s)| {
+                let s = if folded { fold(s) } else { s.clone() };
+                GlobBuilder::new(&s)
                     .literal_separator(true)
-                    .case_insensitive(case_insensitive)
                     .build()
-                    .map(|g| g.compile_matcher())
+                    .map(|g| (*a, g.compile_matcher()))
                     .with_context(|| format!("invalid glob {pattern:?}"))
             })
             .collect::<Result<_>>()?;
         Ok(Rule {
             name: pattern.to_owned(),
-            absolute,
-            anywhere: !absolute && pattern.starts_with("**/"),
             matchers,
         })
     }
 
-    /// `rel` is the path relative to root, if the path is inside root.
-    fn matches(&self, canonical: &Path, rel: Option<&Path>) -> bool {
-        let candidate = if self.absolute || (self.anywhere && rel.is_none()) {
-            canonical
-        } else {
-            match rel {
-                Some(r) => r,
-                None => return false,
-            }
-        };
-        self.matchers.iter().any(|m| m.is_match(candidate))
+    fn matches(&self, c: &Candidate) -> bool {
+        self.matchers.iter().any(|(a, m)| match a {
+            Anchor::Abs => m.is_match(&c.abs),
+            Anchor::Rel => c.rel.as_ref().is_some_and(|r| m.is_match(r)),
+        })
     }
 }
 
-/// Canonicalize the literal (glob-free) directory prefix of an absolute glob,
-/// so `/var/x/**` also matches the canonical `/private/var/x/...`.
-fn canonicalize_glob_prefix(pattern: &str) -> Result<String> {
+fn anchor_of(pattern: &str) -> Anchor {
+    if pattern.starts_with('/') {
+        Anchor::Abs
+    } else {
+        Anchor::Rel
+    }
+}
+
+/// Canonicalize the literal (glob-free) directory prefix of a glob, so
+/// `/var/x/**` also matches `/private/var/x/...` and, with `root/tests` a
+/// symlink to `root/real`, `tests/**` also matches `real/...`. Returns the
+/// extra source to compile, or `None` if canonicalizing changes nothing.
+fn canonicalize_glob_prefix(pattern: &str, root: &Path) -> Result<Option<(Anchor, String)>> {
     let segments: Vec<&str> = pattern.split('/').collect();
     let first_glob = segments
         .iter()
@@ -135,24 +199,32 @@ fn canonicalize_glob_prefix(pattern: &str) -> Result<String> {
         .unwrap_or(segments.len());
     let prefix = segments[..first_glob].join("/");
     let rest = &segments[first_glob..];
-    let prefix = if prefix.is_empty() {
-        "/".to_owned()
-    } else {
-        prefix
+    let literal = match anchor_of(pattern) {
+        Anchor::Abs if prefix.is_empty() => PathBuf::from("/"),
+        Anchor::Abs => PathBuf::from(&prefix),
+        Anchor::Rel if prefix.is_empty() => return Ok(None),
+        Anchor::Rel => root.join(&prefix),
     };
-    let canon = canonicalize_maybe_missing(Path::new(&prefix))
+    let canon = canonicalize_maybe_missing(&literal)
         .with_context(|| format!("canonicalizing glob prefix {prefix:?}"))?;
-    let canon = canon
+    if canon == normalize_lexically(&literal) {
+        return Ok(None);
+    }
+    let (anchor, base) = match canon.strip_prefix(root) {
+        Ok(rel) => (Anchor::Rel, rel.to_path_buf()),
+        Err(_) => (Anchor::Abs, canon.clone()),
+    };
+    let base = base
         .to_str()
         .with_context(|| format!("non-UTF-8 canonical glob prefix for {pattern:?}"))?;
-    let mut out = globset::escape(canon);
+    let mut out = globset::escape(base);
     for seg in rest {
-        if !out.ends_with('/') {
+        if !out.is_empty() && !out.ends_with('/') {
             out.push('/');
         }
         out.push_str(seg);
     }
-    Ok(out)
+    Ok(Some((anchor, out)))
 }
 
 /// A validated, compiled profile. All paths held here are canonical.
@@ -163,7 +235,8 @@ pub struct Profile {
     write_deny: Vec<Rule>,
     read_deny: Vec<Rule>,
     extra_write: Vec<PathBuf>,
-    git_protected: Vec<PathBuf>,
+    /// Folded absolute spellings of root's git metadata paths.
+    git_protected: Vec<String>,
     #[allow(dead_code)] // consumed by `exec` (Task 4)
     network: Network,
 }
@@ -186,8 +259,8 @@ impl Profile {
         if !root.is_dir() {
             bail!("profile root is not a directory: {}", root.display());
         }
-        let compile = |globs: &[String], ci: bool| -> Result<Vec<Rule>> {
-            globs.iter().map(|g| Rule::compile(g, ci)).collect()
+        let deny = |globs: &[String]| -> Result<Vec<Rule>> {
+            globs.iter().map(|g| Rule::deny(g, &root)).collect()
         };
         let extra_write = spec
             .extra_write
@@ -200,11 +273,23 @@ impl Profile {
                     .with_context(|| format!("canonicalizing extraWrite {}", p.display()))
             })
             .collect::<Result<_>>()?;
-        let git_protected = git_protected_paths(&root).context("resolving git metadata")?;
+        let git_protected = git_protected_paths(&root)
+            .context("resolving git metadata")?
+            .iter()
+            .map(|p| {
+                p.to_str()
+                    .map(fold)
+                    .with_context(|| format!("non-UTF-8 git path {}", p.display()))
+            })
+            .collect::<Result<_>>()?;
         Ok(Profile {
-            write: compile(&spec.write, false)?,
-            write_deny: compile(&spec.write_deny, true)?,
-            read_deny: compile(&spec.read_deny, true)?,
+            write: spec
+                .write
+                .iter()
+                .map(|g| Rule::allow(g))
+                .collect::<Result<_>>()?,
+            write_deny: deny(&spec.write_deny)?,
+            read_deny: deny(&spec.read_deny)?,
             extra_write,
             git_protected,
             network: spec.network,
@@ -212,41 +297,49 @@ impl Profile {
         })
     }
 
-    /// Canonicalize `path` (relative paths are taken relative to `root`).
-    pub fn canonical(&self, path: &Path) -> std::io::Result<PathBuf> {
-        canonicalize_maybe_missing(&self.root.join(path))
+    /// Both spellings of `path` (relative paths are taken relative to root).
+    pub fn resolve(&self, path: &Path) -> std::io::Result<Resolved> {
+        let joined = self.root.join(path);
+        Ok(Resolved {
+            canonical: canonicalize_maybe_missing(&joined)?,
+            lexical: normalize_lexically(&joined),
+        })
     }
 
     /// Decide whether `op` on `path` is permitted. I/O errors while
     /// canonicalizing are returned as errors (callers fail closed).
     pub fn decide(&self, op: Op, path: &Path) -> std::io::Result<Decision> {
-        let canonical = self.canonical(path)?;
-        Ok(self.decide_canonical(op, canonical))
+        Ok(self.decide_resolved(op, &self.resolve(path)?))
     }
 
-    /// Decide for an already-canonical absolute path.
-    pub fn decide_canonical(&self, op: Op, canonical: PathBuf) -> Decision {
+    pub fn decide_resolved(&self, op: Op, r: &Resolved) -> Decision {
         let deny = |rule: &str| Decision::Deny {
-            canonical: canonical.clone(),
+            canonical: r.canonical.clone(),
             rule: rule.to_owned(),
         };
-        let rel = canonical.strip_prefix(&self.root).ok();
+        let spellings = [r.canonical.as_path(), r.lexical.as_path()];
         match op {
-            Op::Read => match first_match(&self.read_deny, &canonical, rel) {
-                Some(rule) => deny(rule),
-                None => Decision::Allow,
+            Op::Read => match self.deny_match(&self.read_deny, &spellings) {
+                Ok(Some(rule)) => deny(rule),
+                Ok(None) => Decision::Allow,
+                Err(rule) => deny(rule),
             },
             Op::Write => {
-                if let Some(rule) = self.write_denial(&canonical) {
+                if let Some(rule) = self.write_denial(&spellings) {
                     return deny(&rule);
                 }
-                if self.extra_write.iter().any(|d| canonical.starts_with(d)) {
+                if self.extra_write.iter().any(|d| r.canonical.starts_with(d)) {
                     return Decision::Allow;
                 }
-                let Some(rel) = rel else {
+                let Ok(rel) = r.canonical.strip_prefix(&self.root) else {
                     return deny(RULE_OUTSIDE_ROOT);
                 };
-                if first_match(&self.write, &canonical, Some(rel)).is_some() {
+                // Checked UTF-8 in write_denial.
+                let raw = Candidate {
+                    abs: r.canonical.to_string_lossy().into_owned(),
+                    rel: Some(rel.to_string_lossy().into_owned()),
+                };
+                if self.write.iter().any(|rule| rule.matches(&raw)) {
                     Decision::Allow
                 } else {
                     deny(RULE_NO_WRITE_RULE)
@@ -261,41 +354,70 @@ impl Profile {
             || self.extra_write.iter().any(|d| canonical.starts_with(d))
     }
 
-    /// The deny-only half of the write decision: git metadata and
-    /// `writeDeny`. Used for the final path and for every parent directory
-    /// `fs-write` creates.
-    pub fn write_denial(&self, canonical: &Path) -> Option<String> {
-        if self
-            .git_protected
-            .iter()
-            .any(|g| starts_with_ignore_ascii_case(canonical, g))
+    /// The deny-only half of the write decision: non-UTF-8, git metadata,
+    /// and `writeDeny`, over every given spelling. Also used for every
+    /// parent directory `fs-write` creates.
+    pub fn write_denial(&self, spellings: &[&Path]) -> Option<String> {
+        let cands = match self.candidates(spellings) {
+            Ok(c) => c,
+            Err(rule) => return Some(rule.to_owned()),
+        };
+        if spellings.iter().any(|p| self.has_git_component(p))
+            || cands.iter().any(|c| {
+                self.git_protected
+                    .iter()
+                    .any(|g| Path::new(&c.abs).starts_with(g))
+            })
         {
             return Some(RULE_GITDIR.to_owned());
         }
-        let rel = canonical.strip_prefix(&self.root).ok();
-        first_match(&self.write_deny, canonical, rel).map(str::to_owned)
+        first_match(&self.write_deny, &cands).map(str::to_owned)
+    }
+
+    /// A `.git` component (folded) anywhere below root or an extraWrite dir.
+    fn has_git_component(&self, path: &Path) -> bool {
+        std::iter::once(&self.root)
+            .chain(&self.extra_write)
+            .filter_map(|base| path.strip_prefix(base).ok())
+            .any(|rel| {
+                rel.components()
+                    .any(|c| c.as_os_str().to_str().is_none_or(|s| fold(s) == ".git"))
+            })
+    }
+
+    fn deny_match<'a>(
+        &self,
+        rules: &'a [Rule],
+        spellings: &[&Path],
+    ) -> std::result::Result<Option<&'a str>, &'static str> {
+        Ok(first_match(rules, &self.candidates(spellings)?))
+    }
+
+    /// Fold spellings for deny matching; any non-UTF-8 spelling is a denial.
+    fn candidates(&self, spellings: &[&Path]) -> std::result::Result<Vec<Candidate>, &'static str> {
+        spellings
+            .iter()
+            .map(|p| {
+                let f = |p: &Path| -> std::result::Result<String, &'static str> {
+                    let s = p.to_str().ok_or(RULE_NON_UTF8)?;
+                    Ok(fold(s))
+                };
+                Ok(Candidate {
+                    abs: f(p)?,
+                    rel: match p.strip_prefix(&self.root) {
+                        Ok(rel) => Some(f(rel)?),
+                        Err(_) => None,
+                    },
+                })
+            })
+            .collect()
     }
 }
 
-/// Component-wise `starts_with`, ignoring ASCII case. Used on the deny side
-/// so `.GIT/...` cannot dodge `.git` protection on a case-insensitive FS
-/// when the directory does not exist yet (realpath only fixes existing names).
-fn starts_with_ignore_ascii_case(path: &Path, prefix: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let mut p = path.components();
-    prefix.components().all(|pc| {
-        p.next().is_some_and(|c| {
-            c.as_os_str()
-                .as_bytes()
-                .eq_ignore_ascii_case(pc.as_os_str().as_bytes())
-        })
-    })
-}
-
-fn first_match<'a>(rules: &'a [Rule], canonical: &Path, rel: Option<&Path>) -> Option<&'a str> {
+fn first_match<'a>(rules: &'a [Rule], cands: &[Candidate]) -> Option<&'a str> {
     rules
         .iter()
-        .find(|r| r.matches(canonical, rel))
+        .find(|r| cands.iter().any(|c| r.matches(c)))
         .map(|r| r.name.as_str())
 }
 
@@ -413,16 +535,61 @@ mod tests {
         let mut s = spec(&t.root);
         s.write = vec!["**".into()];
         let p = Profile::from_spec(s).unwrap();
-        let d = p.decide(Op::Write, Path::new(".GIT/config")).unwrap();
-        assert_eq!(rule_of(d), Some(RULE_GITDIR.into()));
-        assert!(starts_with_ignore_ascii_case(
-            Path::new("/a/B/c"),
-            Path::new("/A/b")
-        ));
-        assert!(!starts_with_ignore_ascii_case(
-            Path::new("/a/bc"),
-            Path::new("/a/b")
-        ));
+        for v in [".GIT/config", ".G\u{130}T/config", "src/.Git/HEAD"] {
+            let d = p.decide(Op::Write, Path::new(v)).unwrap();
+            assert_eq!(rule_of(d), Some(RULE_GITDIR.into()), "{v}");
+        }
+    }
+
+    #[test]
+    fn fold_matches_apfs_equivalences() {
+        assert_eq!(fold("te\u{17f}ts"), "tests");
+        assert_eq!(fold("\u{212a}EYS"), "keys");
+        assert_eq!(fold("Stra\u{df}e"), "strasse");
+        assert_eq!(fold("caf\u{e9}"), fold("cafe\u{301}"));
+        assert_eq!(fold(".G\u{130}T"), ".git");
+        assert_eq!(fold("src/**/*.ts"), "src/**/*.ts");
+    }
+
+    #[test]
+    fn unicode_alias_of_deny_glob_is_denied() {
+        let t = setup();
+        let mut s = spec(&t.root);
+        s.write = vec!["**".into()];
+        let p = Profile::from_spec(s).unwrap();
+        let d = p.decide(Op::Write, Path::new("te\u{17f}ts/x.ts")).unwrap();
+        assert_eq!(rule_of(d), Some("tests/**".into()));
+    }
+
+    #[test]
+    fn lexical_spelling_is_checked_against_deny() {
+        let t = setup();
+        fs::remove_dir(t.root.join("tests")).unwrap();
+        fs::create_dir(t.root.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", t.root.join("tests")).unwrap();
+        let mut s = spec(&t.root);
+        s.write = vec!["**".into()];
+        let p = Profile::from_spec(s).unwrap();
+        for v in ["tests/a.ts", "real/a.ts", "src/../tests/a.ts"] {
+            let d = p.decide(Op::Write, Path::new(v)).unwrap();
+            assert_eq!(rule_of(d), Some("tests/**".into()), "{v}");
+        }
+    }
+
+    #[test]
+    fn non_utf8_path_is_denied() {
+        use std::os::unix::ffi::OsStrExt;
+        let t = setup();
+        let p = Profile::from_spec(spec(&t.root)).unwrap();
+        let bad = Path::new(std::ffi::OsStr::from_bytes(b"src/\xff.ts"));
+        assert_eq!(
+            rule_of(p.decide(Op::Write, bad).unwrap()),
+            Some(RULE_NON_UTF8.into())
+        );
+        assert_eq!(
+            rule_of(p.decide(Op::Read, bad).unwrap()),
+            Some(RULE_NON_UTF8.into())
+        );
     }
 
     #[test]
