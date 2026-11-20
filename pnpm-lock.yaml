@@ -79,6 +79,31 @@ importers:
         specifier: workspace:*
         version: link:../policy
 
+  packages/tools:
+    dependencies:
+      '@rewire/core':
+        specifier: workspace:*
+        version: link:../core
+      '@rewire/loop':
+        specifier: workspace:*
+        version: link:../loop
+      '@rewire/policy':
+        specifier: workspace:*
+        version: link:../policy
+      '@rewire/providers':
+        specifier: workspace:*
+        version: link:../providers
+      '@rewire/sandbox':
+        specifier: workspace:*
+        version: link:../sandbox
+      shell-quote:
+        specifier: ^1.8.3
+        version: 1.12.0
+    devDependencies:
+      '@types/shell-quote':
+        specifier: ^1.7.5
+        version: 1.7.5
+
 packages:
 
   '@anthropic-ai/sdk@1.11.0':
