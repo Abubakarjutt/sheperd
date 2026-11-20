@@ -13,10 +13,10 @@ export type GateContext = {
   manifest?: FrozenTestManifest;
   contract?: Contract;
   scratch: string;
-  /** Run id stamped on emitted gate_result events. Defaults to "unknown". */
-  runId?: string;
-  /** Stage name stamped on emitted gate_result events. Defaults to "verify". */
-  stage?: string;
+  /** Run id stamped on emitted gate_result events. */
+  runId: string;
+  /** Stage name stamped on emitted gate_result events. */
+  stage: string;
   /**
    * Aborted when the gate times out. Gate implementations MUST honor it
    * (stop work, kill children): a gate that ignores it keeps running in the

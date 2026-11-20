@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { RewireError } from "@rewire/core";
 import { describe, expect, test } from "vitest";
 import { detectTsPack } from "../src/index.js";
@@ -146,5 +146,25 @@ describe("detectTsPack", () => {
     expect(e.code).toBe("pack_undetected");
     expect(e.message).toContain(join(root, "package.json"));
     expect(e.message).toMatch(/not valid JSON: .+/);
+  });
+
+  test("null or non-object dependencies → pack_undetected naming the field", async () => {
+    for (const field of ["dependencies", "devDependencies"]) {
+      for (const bad of [null, "x", 5, []]) {
+        const root = fixture({ "package.json": pkg({ [field]: bad }), "tsconfig.json": "{}" });
+        const e = await code(detectTsPack(root));
+        expect(e.code).toBe("pack_undetected");
+        expect(e.message).toContain(field);
+      }
+    }
+  });
+
+  test("relative root still yields an absolute tsconfig", async () => {
+    const root = fixture({
+      "package.json": pkg({ devDependencies: { vitest: "1" } }),
+      "tsconfig.json": "{}",
+    });
+    const p = await detectTsPack(relative(process.cwd(), root));
+    expect(p.tsconfig).toBe(join(root, "tsconfig.json"));
   });
 });

@@ -1,5 +1,5 @@
 import { access, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { RewireError } from "@rewire/core";
 
 export type TsPack = {
@@ -99,7 +99,16 @@ async function detectPackageManager(root: string, pkg: PkgJson): Promise<PM> {
   return "npm";
 }
 
+function checkDepField(pkg: PkgJson, field: "dependencies" | "devDependencies"): void {
+  const v = pkg[field];
+  if (v !== undefined && (typeof v !== "object" || v === null || Array.isArray(v))) {
+    throw new RewireError("pack_undetected", `package.json "${field}" must be an object`);
+  }
+}
+
 function detectRunner(pkg: PkgJson): Runner {
+  checkDepField(pkg, "dependencies");
+  checkDepField(pkg, "devDependencies");
   const has = (n: string) =>
     (pkg.dependencies !== undefined && n in pkg.dependencies) ||
     (pkg.devDependencies !== undefined && n in pkg.devDependencies);
@@ -130,6 +139,7 @@ function execPrefix(pm: PM): string[] {
 }
 
 export async function detectTsPack(root: string): Promise<TsPack> {
+  root = resolve(root);
   const pkg = await readPackageJson(root);
   const tsconfig = join(root, "tsconfig.json");
   if (!(await exists(tsconfig))) {

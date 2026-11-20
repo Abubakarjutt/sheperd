@@ -28,6 +28,8 @@ function makeCtx(over: Partial<GateContext> = {}, timeoutMs = 5000): GateContext
     },
     policy: { ...DEFAULT_POLICY, gateTimeoutMs: timeoutMs },
     scratch,
+    runId: "run-1",
+    stage: "verify",
     ...over,
   };
 }
@@ -174,6 +176,59 @@ describe("runGates", () => {
     expect(ran).toEqual(["first"]);
     expect(results[1]).toMatchObject({ status: "error", summary: "aborted", gate: "second" });
     expect(events).toHaveLength(2);
+  });
+});
+
+describe("runGates robustness", () => {
+  test("throwing emit does not lose results or skip gates", async () => {
+    const results = await runGates([ok("a"), ok("b")], makeCtx(), () => {
+      throw new Error("emit broke");
+    });
+    expect(results.map((r) => r.gate)).toEqual(["a", "b"]);
+  });
+
+  test("rejecting async emit causes no unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const h = (e: unknown) => unhandled.push(e);
+    process.on("unhandledRejection", h);
+    try {
+      const emit = (async () => {
+        throw new Error("async emit broke");
+      }) as unknown as (e: RunEvent) => void;
+      const results = await runGates([ok("a"), ok("b")], makeCtx(), emit);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(results).toHaveLength(2);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", h);
+    }
+  });
+
+  test("custom runId and stage appear in events", async () => {
+    const events: RunEvent[] = [];
+    await runGates([ok("a")], makeCtx({ runId: "r-42", stage: "my-stage" }), (e) => events.push(e));
+    expect(events[0]).toMatchObject({ runId: "r-42", stage: "my-stage" });
+  });
+
+  test("gate ignoring a caller abort and returning pass is recorded as aborted", async () => {
+    const ac = new AbortController();
+    const g = gate("ignorer", async () => {
+      ac.abort();
+      return { status: "pass", summary: "ok", details: null };
+    });
+    const [r] = await runGates([g], makeCtx({ signal: ac.signal }));
+    expect(r).toMatchObject({ status: "error", summary: "aborted" });
+  });
+
+  test("a gate resolving after the timeout does not overwrite the error", async () => {
+    const g = gate("late", async () => {
+      await new Promise((r) => setTimeout(r, 200));
+      return { status: "pass", summary: "late", details: null };
+    });
+    const results = await runGates([g], makeCtx({}, 50));
+    await new Promise((r) => setTimeout(r, 300));
+    expect(results[0]?.status).toBe("error");
+    expect(results[0]?.summary).toBe("timed out after 50ms");
   });
 });
 

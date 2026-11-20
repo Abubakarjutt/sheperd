@@ -55,19 +55,31 @@ export async function runGates(
       finish({ status: "error", summary, details });
 
     let result: GateResult;
-    if (ctx.signal?.aborted) {
-      result = fail("aborted");
-    } else {
-      result = await runOne(gate, ctx, finish, fail);
+    try {
+      if (ctx.signal?.aborted) {
+        result = fail("aborted");
+      } else {
+        result = await runOne(gate, ctx, finish, fail);
+        // A gate that ignored the caller's abort and returned anyway is not trusted.
+        if (ctx.signal?.aborted) result = fail("aborted");
+      }
+    } catch (e) {
+      result = fail(errorSummary(e));
     }
     results.push(result);
-    emit?.({
-      type: "gate_result",
-      runId: ctx.runId ?? "unknown",
-      ts: new Date().toISOString(),
-      stage: ctx.stage ?? "verify",
-      result,
-    });
+    // Observers must never break the run: swallow sync throws and async rejections.
+    try {
+      const r: unknown = emit?.({
+        type: "gate_result",
+        runId: ctx.runId,
+        ts: new Date().toISOString(),
+        stage: ctx.stage,
+        result,
+      });
+      Promise.resolve(r).catch(() => {});
+    } catch {
+      // ignored
+    }
   }
   return results;
 }
