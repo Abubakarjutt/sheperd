@@ -77,8 +77,18 @@ describe("schemas", () => {
     expect(Finding.safeParse(validFinding).success).toBe(true);
   });
 
-  test("slop category has 9 ids", () => {
-    expect(SlopCategory.options).toHaveLength(9);
+  test("slop category is exactly the nine spec ids in order", () => {
+    expect(SlopCategory.options).toEqual([
+      "broken",
+      "fake_verification",
+      "spec_drift",
+      "security",
+      "silent_failure",
+      "bloat",
+      "convention_drift",
+      "maintainability",
+      "entropy",
+    ]);
   });
 
   test("hard block set is exactly the first five categories", () => {

@@ -6,10 +6,10 @@ export const SlopCategory = z.enum([
   "spec_drift",
   "security",
   "silent_failure",
-  "overengineering",
-  "duplication",
-  "dead_code",
-  "style_noise",
+  "bloat",
+  "convention_drift",
+  "maintainability",
+  "entropy",
 ]);
 export type SlopCategory = z.infer<typeof SlopCategory>;
 
