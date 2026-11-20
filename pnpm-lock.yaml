@@ -27,6 +27,24 @@ importers:
         specifier: ^4.6.7
         version: 4.6.7
 
+  packages/gates:
+    dependencies:
+      '@rewire/core':
+        specifier: workspace:*
+        version: link:../core
+      '@rewire/pack-typescript':
+        specifier: workspace:*
+        version: link:../pack-typescript
+      '@rewire/policy':
+        specifier: workspace:*
+        version: link:../policy
+      '@rewire/sandbox':
+        specifier: workspace:*
+        version: link:../sandbox
+      zod:
+        specifier: ^4.6.7
+        version: 4.6.7
+
   packages/loop:
     dependencies:
       '@rewire/core':
@@ -35,6 +53,12 @@ importers:
       '@rewire/providers':
         specifier: workspace:*
         version: link:../providers
+
+  packages/pack-typescript:
+    dependencies:
+      '@rewire/core':
+        specifier: workspace:*
+        version: link:../core
 
   packages/policy:
     dependencies:
