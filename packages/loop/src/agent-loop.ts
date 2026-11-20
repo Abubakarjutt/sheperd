@@ -21,6 +21,21 @@ function missingRequired(tool: AgentTool, args: Record<string, unknown>): string
   return required.filter((k): k is string => typeof k === "string" && !(k in args));
 }
 
+function describe(v: unknown): string {
+  let out: string | undefined;
+  try {
+    out = JSON.stringify(v);
+  } catch {}
+  if (out === undefined) {
+    try {
+      out = String(v);
+    } catch {
+      out = "<unprintable decision>";
+    }
+  }
+  return out.length > 200 ? `${out.slice(0, 200)}...` : out;
+}
+
 async function runTool(
   call: ToolCall,
   tools: AgentTool[],
@@ -164,8 +179,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
         return fail(e, "loop_hook_error");
       }
       const d: unknown = decision;
-      const action = (d as { action?: unknown } | null | undefined)?.action;
-      const inject = (d as { inject?: unknown } | null | undefined)?.inject;
+      let action: unknown;
+      let inject: unknown;
+      try {
+        action = (d as { action?: unknown } | null | undefined)?.action;
+        inject = (d as { inject?: unknown } | null | undefined)?.inject;
+      } catch (e) {
+        return fail(e, "loop_hook_error");
+      }
       if (action === "continue" && typeof inject === "string" && inject !== "") {
         messages.push({ role: "user", content: inject });
         continue;
@@ -175,7 +196,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
           "error",
           new RewireError(
             "loop_hook_error",
-            `finishTurn returned an invalid decision: ${JSON.stringify(d) ?? String(d)}`,
+            `finishTurn returned an invalid decision: ${describe(d)}`,
           ),
         );
       }

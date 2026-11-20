@@ -316,6 +316,20 @@ describe("runAgent", () => {
         expect(res.error?.code).toBe("loop_hook_error");
       }
     });
+    test("circular decision and throwing getter give error without rejecting", async () => {
+      const circ: Record<string, unknown> = { action: "bogus" };
+      circ.self = circ;
+      const getter = {
+        get action(): string {
+          throw new Error("getter boom");
+        },
+      };
+      for (const d of [circ, getter, { action: 1n }]) {
+        const res = await run(async () => d);
+        expect(res.endedBy).toBe("error");
+        expect(res.error?.code).toBe("loop_hook_error");
+      }
+    });
     test("throwing finishTurn gives loop_hook_error", async () => {
       const res = await run(async () => {
         throw new Error("hook broke");
