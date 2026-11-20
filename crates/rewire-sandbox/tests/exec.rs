@@ -129,6 +129,9 @@ fn exec_cannot_write_test_dir_via_shell() {
     );
 }
 
+/// Case-insensitive matching is a property of macOS's APFS + Seatbelt;
+/// on case-sensitive Linux `TESTS` is simply a different directory.
+#[cfg(target_os = "macos")]
 #[test]
 fn exec_cannot_write_case_variant_of_denied_dir() {
     let f = Fixture::new();
@@ -175,13 +178,26 @@ fn exec_cannot_escape_deny_by_renaming_a_parent() {
     fs::create_dir_all(f.root.join("src/sub/tests")).unwrap();
     let a = f.sh("mv src/sub src/sub2 && echo x > src/sub2/tests/evil.ts");
     assert_ne!(code(&a), 0);
-    assert!(f.root.join("src/sub/tests").is_dir());
-    assert!(!f.root.join("src/sub2").exists());
+    // Linux: the rename may succeed, but the ro bind mount moves with the
+    // dentry, so the write still fails. macOS: the rename itself is denied.
+    assert!(!f.root.join("src/sub/tests/evil.ts").exists());
+    assert!(!f.root.join("src/sub2/tests/evil.ts").exists());
+    #[cfg(target_os = "macos")]
+    {
+        assert!(f.root.join("src/sub/tests").is_dir());
+        assert!(!f.root.join("src/sub2").exists());
+    }
+    #[cfg(target_os = "linux")]
+    if f.root.join("src/sub2").exists() {
+        fs::rename(f.root.join("src/sub2"), f.root.join("src/sub")).unwrap();
+    }
     // Ancestors stay usable for ordinary writes.
     let a = f.sh("echo ok > src/sub/fine.ts && mkdir src/sub/d");
     assert_eq!(code(&a), 0, "{}", stderr(&a));
 }
 
+/// Linux binds cannot protect a `.git` created after the sandbox starts.
+#[cfg(target_os = "macos")]
 #[test]
 fn exec_cannot_write_nested_git_hooks() {
     let f = Fixture::new();
@@ -211,7 +227,12 @@ fn exec_cannot_write_outside_write_rules() {
         std::env::temp_dir().join(format!("rewire-exec-{}", std::process::id())),
     ] {
         let a = f.sh(&format!("echo x > '{}'", target.display()));
-        assert_ne!(code(&a), 0, "{}", target.display());
+        // Linux: /tmp is a private tmpfs, so a write there "succeeds" but
+        // never reaches the host. Everywhere else it must fail.
+        let private_tmp = cfg!(target_os = "linux") && target.starts_with("/tmp");
+        if !private_tmp {
+            assert_ne!(code(&a), 0, "{}", target.display());
+        }
         assert!(!target.exists(), "{}", target.display());
     }
 }
@@ -330,30 +351,202 @@ fn exec_bad_profile_is_internal_error_without_running() {
     assert!(!f.root.join("src/marker").exists());
 }
 
+/// bwrap is only taken from fixed trusted paths, never PATH; the
+/// fail-closed `REWIRE_SANDBOX_DISABLE_BWRAP` switch simulates it missing.
 #[cfg(target_os = "linux")]
 #[test]
 fn exec_missing_bwrap_exits_120_without_running() {
     let f = Fixture::new();
-    let bin = f.base.join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    for tool in ["sh", "touch"] {
-        let real = which(tool);
-        std::os::unix::fs::symlink(real, bin.join(tool)).unwrap();
-    }
     let a = f
         .exec(&[], &["sh", "-c", "touch src/marker"])
-        .env("PATH", &bin)
+        .env("REWIRE_SANDBOX_DISABLE_BWRAP", "1")
         .assert();
     assert_eq!(code(&a), INTERNAL);
     assert!(!f.root.join("src/marker").exists());
 }
 
-#[cfg(target_os = "linux")]
-fn which(tool: &str) -> PathBuf {
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .map(|d| d.join(tool))
-        .find(|p| p.is_file())
-        .unwrap_or_else(|| panic!("{tool} not on PATH"))
+/// Rename a parent of a deny match out from under the glob, write, and
+/// rename back: the protected file must be untouched.
+fn assert_rename_escape_blocked(write_deny: &str, setup_dir: &str, script: &str, file: &str) {
+    let wd = write_deny.to_owned();
+    let f = Fixture::with(move |p| p["writeDeny"] = json!([wd]));
+    fs::create_dir_all(f.root.join(setup_dir)).unwrap();
+    fs::write(f.root.join(file), "original").unwrap();
+    let a = f.sh(script);
+    assert_ne!(code(&a), 0, "{write_deny}: {}", stderr(&a));
+    assert_eq!(
+        fs::read_to_string(f.root.join(file)).unwrap_or_default(),
+        "original",
+        "{write_deny}"
+    );
+}
+
+#[test]
+fn exec_rename_escape_partial_star_segment() {
+    assert_rename_escape_blocked(
+        "packages/*-api/tests/**",
+        "packages/foo-api/tests",
+        "mv packages/foo-api packages/foo && echo PWN > packages/foo/tests/a.test.ts; \
+         mv packages/foo packages/foo-api; cat packages/foo-api/tests/a.test.ts | grep -q PWN",
+        "packages/foo-api/tests/a.test.ts",
+    );
+}
+
+#[test]
+fn exec_rename_escape_brace_segment() {
+    assert_rename_escape_blocked(
+        "src/{a,b}/tests/**",
+        "src/a/tests",
+        "mv src/a src/c && echo PWN > src/c/tests/a.test.ts; mv src/c src/a; \
+         grep -q PWN src/a/tests/a.test.ts",
+        "src/a/tests/a.test.ts",
+    );
+}
+
+#[test]
+fn exec_rename_escape_top_level_brace() {
+    assert_rename_escape_blocked(
+        "{src,lib}/__tests__/**",
+        "lib/__tests__",
+        "mv lib lib2 && echo PWN > lib2/__tests__/a.test.ts; mv lib2 lib; \
+         grep -q PWN lib/__tests__/a.test.ts",
+        "lib/__tests__/a.test.ts",
+    );
+}
+
+#[test]
+fn exec_rename_escape_class_segment() {
+    assert_rename_escape_blocked(
+        "l[i]b/__tests__/**",
+        "lib/__tests__",
+        "mv lib lib2 && echo PWN > lib2/__tests__/a.test.ts; mv lib2 lib; \
+         grep -q PWN lib/__tests__/a.test.ts",
+        "lib/__tests__/a.test.ts",
+    );
+}
+
+fn assert_read_rename_escape_blocked(read_deny: &str, script: &str) {
+    let rd = read_deny.to_owned();
+    let f = Fixture::with(move |p| p["readDeny"] = json!([rd]));
+    fs::create_dir_all(f.root.join("config/prod")).unwrap();
+    fs::write(f.root.join("config/prod/key"), "SECRET").unwrap();
+    let a = f.sh(script);
+    let out = String::from_utf8_lossy(&a.get_output().stdout).into_owned();
+    assert!(!out.contains("SECRET"), "{read_deny}: leaked");
+}
+
+#[test]
+fn exec_read_rename_escape_brace() {
+    assert_read_rename_escape_blocked("{config,secrets}/prod/**", "mv config c2; cat c2/prod/key");
+}
+
+#[test]
+fn exec_read_rename_escape_partial_star() {
+    assert_read_rename_escape_blocked("conf*/prod/**", "mv config xx; cat xx/prod/key");
+}
+
+#[test]
+fn exec_read_rename_escape_inner_dir() {
+    assert_read_rename_escape_blocked(
+        "config/prod/**",
+        "mv config/prod config/p2; cat config/p2/key",
+    );
+}
+
+/// A descendant that detaches (new session) and outlives the command must
+/// be killed. macOS: we track descendants and fail with 120. Linux: the pid
+/// namespace dies with the command, so it cannot survive (exit passes through).
+fn assert_detached_killed(cmd: &[&str]) {
+    let f = Fixture::new();
+    let a = f.exec(&[], cmd).assert();
+    if cfg!(target_os = "macos") {
+        assert_eq!(code(&a), INTERNAL, "{}", stderr(&a));
+        assert!(
+            stderr(&a).contains("sandbox: escaped descendant "),
+            "{}",
+            stderr(&a)
+        );
+    }
+    std::thread::sleep(Duration::from_millis(2000));
+    assert!(
+        !f.root.join("src/late").exists(),
+        "detached descendant survived"
+    );
+}
+
+#[test]
+fn exec_detached_node_child_is_killed() {
+    assert_detached_killed(&[
+        "node",
+        "-e",
+        "require('child_process').spawn('sh',['-c','sleep 1; echo x > src/late'],\
+         {detached:true,stdio:'ignore'}).unref()",
+    ]);
+}
+
+#[test]
+fn exec_setsid_fork_is_killed() {
+    assert_detached_killed(&[
+        "perl",
+        "-MPOSIX",
+        "-e",
+        "if (!fork) { POSIX::setsid(); sleep 1; open(F, '>src/late'); print F 'x'; exit }",
+    ]);
+}
+
+#[test]
+fn exec_scrubs_environment() {
+    let f = Fixture::new();
+    let a = f
+        .exec(&[], &["env"])
+        .env("SSH_AUTH_SOCK", "/tmp/agent.sock")
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/x")
+        .env("GH_TOKEN", "ghp_x")
+        .env("GITHUB_TOKEN", "x")
+        .env("AWS_ACCESS_KEY_ID", "x")
+        .env("NPM_TOKEN", "x")
+        .env("MY_API_KEY", "x")
+        .env("DB_SECRET", "x")
+        .env("RANDOM_OTHER", "x")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .assert();
+    assert_eq!(code(&a), 0, "{}", stderr(&a));
+    let out = String::from_utf8_lossy(&a.get_output().stdout).into_owned();
+    let names: Vec<&str> = out.lines().filter_map(|l| l.split('=').next()).collect();
+    for bad in [
+        "SSH_AUTH_SOCK",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "NPM_TOKEN",
+        "MY_API_KEY",
+        "DB_SECRET",
+        "RANDOM_OTHER",
+    ] {
+        assert!(!names.contains(&bad), "{bad} leaked: {out}");
+    }
+    for good in ["PATH", "LANG", "LC_ALL"] {
+        assert!(names.contains(&good), "{good} missing: {out}");
+    }
+}
+
+/// Host unix sockets (ssh-agent, docker.sock, dbus) must not be reachable.
+fn assert_unix_socket_denied(network: &'static str) {
+    let f = Fixture::with(move |p| p["network"] = json!(network));
+    let sock = f.base.join("s.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let script = format!(
+        "require('net').connect('{}').on('connect',()=>process.exit(0)).on('error',()=>process.exit(7))",
+        sock.display()
+    );
+    let a = f.exec(&[], &["node", "-e", &script]).assert();
+    assert_eq!(code(&a), 7, "{network}: {}", stderr(&a));
+}
+
+#[test]
+fn exec_cannot_connect_host_unix_socket() {
+    assert_unix_socket_denied("deny");
+    assert_unix_socket_denied("registry");
 }

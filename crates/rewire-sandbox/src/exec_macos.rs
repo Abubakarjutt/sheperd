@@ -22,6 +22,9 @@
 //!
 //! Compiled on every platform so it stays unit-tested everywhere.
 
+// Only `exec` on macOS calls in; elsewhere this module is kept for its tests.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use crate::exec::absolute_prefix;
 use crate::profile::{Anchor, Network, Profile};
 use anyhow::{bail, Context, Result};
@@ -29,7 +32,6 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// The allows every sandboxed command gets, each with its reason.
@@ -107,7 +109,23 @@ pub fn build_sbpl(p: &Profile) -> Result<String> {
         );
         deny.push(regex_filter(&re)?);
     }
-    // The dir nodes of every deny prefix and their ancestors (anti-rename).
+    // Anti-rename, inside the glob: every proper segment prefix that ends
+    // in a non-`**` segment names a directory on the path to a match
+    // (`packages/*-api` for `packages/*-api/tests/**`). Deny writes to that
+    // node itself (`$`-anchored), so it cannot be renamed out from under the
+    // glob. Creating a NEW node matching such a prefix is denied too; the
+    // literal ones are pre-created by `exec::create_deny_dirs`.
+    for (anchor, glob) in p
+        .write_deny_sources()
+        .into_iter()
+        .chain(p.read_deny_sources())
+    {
+        for prefix in segment_prefixes(glob)? {
+            deny.push(regex_filter(&source_regex(root, anchor, &prefix, true)?)?);
+        }
+    }
+    // Anti-rename, above the glob: the literal prefix dir and every
+    // ancestor up to `/`.
     for a in deny_anchors(p)? {
         deny.push(format!("(literal {})", sbpl_string(&a)?));
         deny.push(regex_filter(&format!("^{}$", escape_re(utf8(&a)?, true)))?);
@@ -128,6 +146,16 @@ pub fn build_sbpl(p: &Profile) -> Result<String> {
     Ok(out)
 }
 
+/// The per-run tag rule `exec` appends: deny reading one tag file, so
+/// `sandbox_check` can tell this run's sandbox apart (see `exec_track`).
+/// Denying a read of our own empty scratch file grants nothing.
+pub fn tag_rule(denied: &Path) -> Result<String> {
+    Ok(format!(
+        "; Per-run tag for descendant tracking (grants nothing).\n(deny file-read* (literal {}))\n",
+        sbpl_string(denied)?
+    ))
+}
+
 /// Emit `(<head> f1 f2 …)` — never with zero filters, which would mean
 /// "everything" (an unfiltered `(allow file-write*)` allows all writes).
 fn emit(out: &mut String, head: &str, filters: &[String]) {
@@ -139,6 +167,50 @@ fn emit(out: &mut String, head: &str, filters: &[String]) {
         let _ = write!(out, "\n  {f}");
     }
     out.push_str(")\n");
+}
+
+/// Proper prefixes of `glob`, split on `/` outside braces and classes,
+/// that end in a non-`**` segment. A brace alternative containing `/` is
+/// refused: its inner directories could not be protected.
+pub fn segment_prefixes(glob: &str) -> Result<Vec<String>> {
+    let mut segs: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let (mut brace, mut class) = (false, false);
+    let mut chars = glob.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                cur.push(c);
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+                continue;
+            }
+            '[' if !class => class = true,
+            ']' if class => class = false,
+            '{' if !class => brace = true,
+            '}' if !class => brace = false,
+            '/' if brace || class => {
+                bail!("`/` inside braces or a class is unsupported in deny glob {glob:?}")
+            }
+            '/' => {
+                segs.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    segs.push(cur);
+    let mut out = Vec::new();
+    for i in 1..segs.len() {
+        let last = &segs[i - 1];
+        if last == "**" || last.is_empty() {
+            continue;
+        }
+        out.push(segs[..i].join("/"));
+    }
+    Ok(out)
 }
 
 /// Every literal deny prefix (canonical and as written) and all ancestors.
@@ -449,6 +521,56 @@ mod tests {
             assert!(sbpl.contains(&format!("(literal \"{root}{a}\")")), "{a}");
         }
         assert!(sbpl.contains(&format!("{}(/.*)?$", escape_re("/.git", true))));
+    }
+
+    #[test]
+    fn segment_prefixes_of_deny_globs() {
+        let sp = |g| segment_prefixes(g).unwrap();
+        assert_eq!(
+            sp("packages/*-api/tests/**"),
+            ["packages", "packages/*-api", "packages/*-api/tests"]
+        );
+        assert_eq!(
+            sp("{src,lib}/__tests__/**"),
+            ["{src,lib}", "{src,lib}/__tests__"]
+        );
+        assert_eq!(sp("src/**/*.snap"), ["src"]);
+        assert_eq!(sp("**/fixtures/**"), ["**/fixtures"]);
+        assert_eq!(sp("/abs/x/**"), ["/abs", "/abs/x"]);
+        assert!(segment_prefixes("a[/]b/c").is_err());
+        assert!(segment_prefixes("{a/b,c}/tests/**").is_err());
+        assert_eq!(sp("tests"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn segment_prefix_denies_are_emitted() {
+        let (_t, p) = profile(
+            &["**"],
+            &["packages/*-api/tests/**"],
+            &["{config,secrets}/prod/**"],
+        );
+        let sbpl = build_sbpl(&p).unwrap();
+        let root = escape_re(p.root().to_str().unwrap(), true);
+        let deny = sbpl.find("(deny file-write*").unwrap();
+        for re in [
+            format!(
+                "^{root}/{}$",
+                glob_to_regex("packages/*-api", true).unwrap()
+            ),
+            format!(
+                "^{root}/{}$",
+                glob_to_regex("{config,secrets}", true).unwrap()
+            ),
+            format!(
+                "^{root}/{}$",
+                glob_to_regex("{config,secrets}/prod", true).unwrap()
+            ),
+        ] {
+            let at = sbpl
+                .find(&format!("(regex #\"{re}\")"))
+                .unwrap_or_else(|| panic!("{re}\n{sbpl}"));
+            assert!(at > deny);
+        }
     }
 
     #[test]

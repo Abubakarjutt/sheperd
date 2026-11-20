@@ -1,19 +1,32 @@
-//! Linux bubblewrap argv for `exec`.
+//! Linux bubblewrap argv for `exec` (Ruling R7).
 //!
-//! Layout: the whole filesystem read-only, private /dev, /proc and /tmp,
-//! `root` and existing `extraWrite` dirs bound read-write, then every
-//! existing writeDeny/git match re-bound read-only on top, then readDeny
-//! masked (`--tmpfs` over dirs, `/dev/null` over files). Matches are found
-//! by walking `root` (and each extraWrite dir) once at exec time; together
-//! with `exec` creating missing `<dir>/**` deny dirs first, that covers
-//! files created later under denied directories.
+//! Layout, in mount order (later mounts cover earlier ones):
+//! - `--unshare-all` (`--share-net` only for `network: "registry"`),
+//!   `--die-with-parent`, `--new-session`, `--clearenv` + `--setenv` for the
+//!   scrubbed allowlist (see `exec::scrubbed_env`).
+//! - `--ro-bind / /`, private `/dev`, `/proc`, `/tmp`.
+//! - `--tmpfs` over `/run`, `/var/run` and `$XDG_RUNTIME_DIR` (real dirs
+//!   only): host unix sockets (docker.sock, ssh-agent, dbus) are hidden.
+//! - `--ro-bind root root` (root may live under the private /tmp).
+//! - `--bind` (rw) only the literal prefixes of the `write` globs inside
+//!   root, and existing `extraWrite` dirs.
+//! - `--ro-bind` every existing writeDeny match and git path found by
+//!   walking root (and extraWrite) once, and root's gitdir/commondir.
+//! - readDeny masked: `--tmpfs` over dirs, `/dev/null` over files.
 //!
-//! Known limits vs. macOS (documented in the task-4 report):
-//! - writes inside root that match no `write` glob are NOT blocked here
-//!   (only the path layer narrows them); writeDeny/git/readDeny are.
-//! - a `.git` (or deny match) that does not exist at exec time cannot be
-//!   bind-mounted, so a newly created nested `.git` is not protected.
-//! - `**/x` readDeny is masked only inside root/extraWrite, not system-wide.
+//! Bind mounts follow the dentry, so renaming a parent of a ro/masked
+//! mount does not unprotect it.
+//!
+//! KNOWN LINUX LIMITATIONS (bind mounts on a case-sensitive FS):
+//! - write narrowing is per literal prefix: `src/**/*.ts` binds all of
+//!   `src` rw (writeDeny inside it still applies to existing matches);
+//! - a writeDeny/readDeny match or nested `.git` CREATED after the sandbox
+//!   starts (or renamed into a matching name) is not protected; existing
+//!   matches and pre-created deny-glob literal dirs are;
+//! - no case-variant protection (`TESTS` is a different dir on ext4);
+//! - `**/x` readDeny is masked only inside root/extraWrite;
+//! - `network: "registry"` shares the host network unrestricted;
+//! - the walk of root runs on every exec (cost grows with node_modules).
 //!
 //! Compiled on every platform so it stays unit-tested everywhere.
 
@@ -33,21 +46,72 @@ struct Masks {
     hide_files: Vec<PathBuf>,
 }
 
+/// Directories holding host IPC sockets, hidden behind a tmpfs.
+fn runtime_dirs() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = vec!["/run".into(), "/var/run".into()];
+    if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
+        v.push(PathBuf::from(x));
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in v {
+        // Only real directories (a symlinked /var/run -> /run is covered).
+        let real_dir = fs::symlink_metadata(&d).is_ok_and(|m| m.is_dir());
+        if real_dir && d.is_absolute() && !out.iter().any(|o| d.starts_with(o)) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// Canonical rw bind targets: the literal prefixes of `write` globs that
+/// exist inside root (a prefix-less glob such as `**` binds root itself),
+/// as a minimal set (no target below another).
+fn write_binds(p: &Profile) -> Result<Vec<PathBuf>> {
+    let root = p.root();
+    let mut all = Vec::new();
+    for (anchor, glob) in p.write_sources() {
+        let dir = match absolute_prefix(root, anchor, glob) {
+            Some((d, _)) => d,
+            None => root.to_path_buf(),
+        };
+        let c = crate::canonical::canonicalize_maybe_missing(&dir)
+            .with_context(|| format!("canonicalizing {}", dir.display()))?;
+        if c.starts_with(root) && fs::symlink_metadata(&c).is_ok() {
+            all.push(c);
+        }
+    }
+    all.sort();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for c in all {
+        if !out.iter().any(|o| c.starts_with(o)) {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn build_bwrap_argv(p: &Profile, cwd: &Path, cmd: &[String]) -> Result<Vec<String>> {
+pub fn build_bwrap_argv(
+    p: &Profile,
+    cwd: &Path,
+    cmd: &[String],
+    env: &[(String, String)],
+) -> Result<Vec<String>> {
     if cmd.is_empty() {
         bail!("no command");
     }
     let masks = collect_masks(p)?;
-    let mut argv: Vec<String> = vec![
-        "--die-with-parent".into(),
-        "--new-session".into(),
-        // Own pid namespace: when bwrap dies, everything inside dies too,
-        // so a timeout kill cannot leave grandchildren behind.
-        "--unshare-pid".into(),
-    ];
-    if p.network() != Network::Registry {
-        argv.push("--unshare-net".into());
+    let mut argv: Vec<String> = vec!["--unshare-all".into()];
+    if p.network() == Network::Registry {
+        argv.push("--share-net".into());
+    }
+    // The pid namespace from --unshare-all dies with bwrap, taking every
+    // descendant with it; --new-session blocks TIOCSTI into our terminal.
+    for a in ["--die-with-parent", "--new-session", "--clearenv"] {
+        argv.push(a.into());
+    }
+    for (k, v) in env {
+        argv.extend(["--setenv".into(), k.clone(), v.clone()]);
     }
     for a in [
         "--ro-bind",
@@ -62,13 +126,20 @@ pub fn build_bwrap_argv(p: &Profile, cwd: &Path, cmd: &[String]) -> Result<Vec<S
     ] {
         argv.push(a.into());
     }
+    for d in runtime_dirs() {
+        argv.push("--tmpfs".into());
+        argv.push(utf8(&d)?.into());
+    }
     let mut bind = |flag: &str, src: &Path, dst: &Path| -> Result<()> {
         argv.push(flag.into());
         argv.push(utf8(src)?.into());
         argv.push(utf8(dst)?.into());
         Ok(())
     };
-    bind("--bind", p.root(), p.root())?;
+    bind("--ro-bind", p.root(), p.root())?;
+    for w in write_binds(p)? {
+        bind("--bind", &w, &w)?;
+    }
     for d in p.extra_write() {
         if d.is_dir() {
             bind("--bind", d, d)?;
@@ -201,6 +272,10 @@ mod tests {
     use crate::profile::ProfileSpec;
     use tempfile::TempDir;
 
+    fn env() -> Vec<(String, String)> {
+        vec![("PATH".into(), "/usr/bin:/bin".into())]
+    }
+
     fn fixture(network: Network) -> (TempDir, PathBuf, Profile) {
         let t = TempDir::new().unwrap();
         let root = fs::canonicalize(t.path()).unwrap();
@@ -213,7 +288,7 @@ mod tests {
         fs::write(root.join("src/x.snap"), "").unwrap();
         let p = Profile::from_spec(ProfileSpec {
             root: root.clone(),
-            write: vec!["src/**".into()],
+            write: vec!["src/**".into(), "missing/**".into(), "src/sub/*.ts".into()],
             write_deny: vec!["tests/**".into(), "**/*.snap".into()],
             read_deny: vec!["secret/**".into(), "**/.env*".into()],
             network,
@@ -227,17 +302,34 @@ mod tests {
         p.to_str().unwrap().to_owned()
     }
 
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|x| x.to_string()).collect()
+    }
+
     fn has_seq(argv: &[String], seq: &[String]) -> bool {
         argv.windows(seq.len()).any(|w| w == seq)
+    }
+
+    fn pos(argv: &[String], seq: &[String]) -> usize {
+        argv.windows(seq.len())
+            .position(|w| w == seq)
+            .unwrap_or_else(|| panic!("{seq:?} not in {argv:?}"))
     }
 
     #[test]
     fn argv_layout() {
         let (_t, root, p) = fixture(Network::Deny);
-        let cmd = vec!["sh".to_string(), "-c".into(), "true".into()];
-        let argv = build_bwrap_argv(&p, &root.join("src"), &cmd).unwrap();
-        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let cmd = v(&["sh", "-c", "true"]);
+        let argv = build_bwrap_argv(&p, &root.join("src"), &cmd, &env()).unwrap();
+        assert_eq!(argv[0], "--unshare-all");
+        assert!(!argv.contains(&"--share-net".to_string()));
+        assert!(argv.contains(&"--die-with-parent".to_string()));
+        assert!(argv.contains(&"--new-session".to_string()));
         assert!(has_seq(
+            &argv,
+            &v(&["--clearenv", "--setenv", "PATH", "/usr/bin:/bin"])
+        ));
+        let base = pos(
             &argv,
             &v(&[
                 "--ro-bind",
@@ -248,11 +340,22 @@ mod tests {
                 "--proc",
                 "/proc",
                 "--tmpfs",
-                "/tmp"
-            ])
-        ));
-        let rw = vec!["--bind".to_string(), s(&root), s(&root)];
-        assert!(has_seq(&argv, &rw));
+                "/tmp",
+            ]),
+        );
+        // Root read-only; only the existing write prefix `src` read-write
+        // (`missing` is not bound, `src/sub` is covered by `src`).
+        let ro_root = pos(&argv, &["--ro-bind".into(), s(&root), s(&root)]);
+        let src = root.join("src");
+        let rw_src = pos(&argv, &["--bind".into(), s(&src), s(&src)]);
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--bind").count(),
+            1,
+            "{argv:?}"
+        );
+        assert!(!argv.contains(&s(&root.join("missing"))));
+        assert!(base < ro_root && ro_root < rw_src);
+        // Deny matches re-bound read-only after the rw bind.
         for d in [
             root.join("tests"),
             root.join(".git"),
@@ -260,11 +363,11 @@ mod tests {
             root.join("src/x.snap"),
         ] {
             assert!(
-                has_seq(&argv, &["--ro-bind".into(), s(&d), s(&d)]),
-                "{d:?} {argv:?}"
+                pos(&argv, &["--ro-bind".into(), s(&d), s(&d)]) > rw_src,
+                "{d:?}"
             );
         }
-        assert!(has_seq(&argv, &["--tmpfs".into(), s(&root.join("secret"))]));
+        assert!(pos(&argv, &["--tmpfs".into(), s(&root.join("secret"))]) > rw_src);
         assert!(has_seq(
             &argv,
             &[
@@ -274,31 +377,53 @@ mod tests {
             ]
         ));
         assert!(!argv.contains(&s(&root.join("src/a.ts"))));
-        assert!(argv.contains(&"--unshare-net".to_string()));
-        assert!(argv.contains(&"--die-with-parent".to_string()));
-        assert!(argv.contains(&"--new-session".to_string()));
-        // Root bind precedes the ro re-binds, which precede the command.
-        let rw_at = argv.iter().position(|a| a == "--bind").unwrap();
-        let ro_tests = argv
-            .iter()
-            .position(|a| *a == s(&root.join("tests")))
-            .unwrap();
-        assert!(ro_tests > rw_at);
         let sep = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(&argv[sep + 1..], &cmd[..]);
         assert!(has_seq(&argv, &["--chdir".into(), s(&root.join("src"))]));
     }
 
     #[test]
-    fn registry_keeps_network() {
+    fn runtime_socket_dirs_are_masked() {
+        let (_t, root, p) = fixture(Network::Deny);
+        let argv = build_bwrap_argv(&p, &root, &v(&["true"]), &env()).unwrap();
+        for d in runtime_dirs() {
+            assert!(has_seq(&argv, &["--tmpfs".into(), s(&d)]), "{d:?}");
+        }
+        // Only real directories, never a symlink like /var/run -> /run.
+        for d in runtime_dirs() {
+            assert!(fs::symlink_metadata(&d).unwrap().is_dir());
+        }
+    }
+
+    #[test]
+    fn registry_shares_network() {
         let (_t, root, p) = fixture(Network::Registry);
-        let argv = build_bwrap_argv(&p, &root, &["true".into()]).unwrap();
-        assert!(!argv.contains(&"--unshare-net".to_string()));
+        let argv = build_bwrap_argv(&p, &root, &v(&["true"]), &env()).unwrap();
+        assert!(has_seq(&argv, &v(&["--unshare-all", "--share-net"])));
     }
 
     #[test]
     fn empty_command_is_an_error() {
         let (_t, root, p) = fixture(Network::Deny);
-        assert!(build_bwrap_argv(&p, &root, &[]).is_err());
+        assert!(build_bwrap_argv(&p, &root, &[], &env()).is_err());
+    }
+
+    #[test]
+    fn write_everything_binds_root_rw_after_ro() {
+        let t = TempDir::new().unwrap();
+        let root = fs::canonicalize(t.path()).unwrap();
+        let p = Profile::from_spec(ProfileSpec {
+            root: root.clone(),
+            write: vec!["**".into()],
+            write_deny: vec![],
+            read_deny: vec![],
+            network: Network::Deny,
+            extra_write: vec![],
+        })
+        .unwrap();
+        let argv = build_bwrap_argv(&p, &root, &v(&["true"]), &env()).unwrap();
+        let ro = pos(&argv, &["--ro-bind".into(), s(&root), s(&root)]);
+        let rw = pos(&argv, &["--bind".into(), s(&root), s(&root)]);
+        assert!(ro < rw);
     }
 }

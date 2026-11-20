@@ -10,6 +10,8 @@ mod canonical;
 mod exec;
 mod exec_linux;
 mod exec_macos;
+#[cfg(target_os = "macos")]
+mod exec_track;
 mod profile;
 
 use anyhow::{bail, Context, Result};
@@ -106,6 +108,8 @@ enum Outcome {
     Exit(u8),
     /// `exec`: the command could not be resolved.
     NotFound(String),
+    /// `exec`: a descendant outlived the command (killed; exit 120).
+    Escaped(i32),
 }
 
 fn main() -> ExitCode {
@@ -148,6 +152,10 @@ fn main() -> ExitCode {
         Ok(Outcome::NotFound(cmd)) => {
             eprintln!("command not found: {cmd}");
             ExitCode::from(exec::EXIT_NOT_FOUND)
+        }
+        Ok(Outcome::Escaped(pid)) => {
+            eprintln!("sandbox: escaped descendant {pid}");
+            ExitCode::from(EXIT_INTERNAL)
         }
         Err(e) => {
             eprintln!("rewire-sandbox: error: {e:#}");
@@ -199,6 +207,7 @@ fn run(cmd: Command) -> Result<Outcome> {
                     Outcome::Denied { canonical, rule }
                 }
                 exec::ExecOutcome::NotFound(c) => Outcome::NotFound(c),
+                exec::ExecOutcome::Escaped(pid) => Outcome::Escaped(pid),
             },
         ),
     }
