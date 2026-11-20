@@ -16,8 +16,12 @@
 //! process tree every [`POLL_INTERVAL`] and remember every descendant (pid +
 //! start time); after it exits we also sweep for any process inside this
 //! run's Seatbelt sandbox (per-run tag rule, see `exec_track`). Any
-//! descendant still alive is SIGKILLed (with its own group) and exec fails
-//! with 120 `sandbox: escaped descendant <pid>`. KNOWN LIMITATION: a
+//! descendant still alive is SIGKILLed (with its own group), sweeps repeat
+//! until several in a row are empty (bounded, see `exec_track`), and exec
+//! fails with 120 `sandbox: escaped descendant <pid>`. Before the command
+//! runs, the detector is self-tested against a probe in the same sandbox
+//! (a failing `sandbox_check` means 120, never "no descendants"). The tag
+//! lives outside the write space. KNOWN LIMITATION: a
 //! process that detaches faster than one poll interval is only found by the
 //! post-exit sweep, so it runs (sandboxed) until the command exits. Linux
 //! needs none of this: the command runs in its own pid namespace, which the
@@ -101,9 +105,10 @@ pub fn run(args: ExecArgs) -> Result<ExecOutcome> {
         return Ok(ExecOutcome::NotFound(name.to_string_lossy().into_owned()));
     };
     create_deny_dirs(&profile)?;
-    let tag = RunTag::create(&run_token())?;
+    let tag = RunTag::create(&run_token(), &profile)?;
     let env = scrubbed_env(std::env::vars_os(), &profile);
-    let mut command = sandboxed(&profile, &cwd, &program, rest, &env, &tag)?;
+    // `_keep` (Linux: the fds bwrap reads) lives until the end of run().
+    let (mut command, _keep) = sandboxed(&profile, &cwd, &program, rest, &env, &tag)?;
     command.current_dir(&cwd).env_clear().envs(env);
     spawn_and_wait(command, args.timeout_ms.map(Duration::from_millis), &tag)
 }
@@ -295,9 +300,9 @@ fn sandboxed(
     args: &[OsString],
     env: &[(OsString, OsString)],
     tag: &RunTag,
-) -> Result<Command> {
+) -> Result<(Command, Keep)> {
     use crate::exec_macos::{build_sbpl, tag_rule, SANDBOX_EXEC};
-    let sbpl = build_sbpl(p)? + &tag_rule(&tag.denied)?;
+    let sbpl = build_sbpl(p)? + &tag_rule(&tag.denied, &tag.dir)?;
     // Preflight: sandbox-exec's own failures (bad policy, sandbox_init
     // refused) exit non-zero without running anything, indistinguishable
     // from the child's exit code. Prove the policy applies first.
@@ -317,9 +322,45 @@ fn sandboxed(
     if !ok {
         bail!("sandbox-exec could not apply the sandbox profile");
     }
+    self_test_tracking(&sbpl, tag)?;
     let mut c = Command::new(SANDBOX_EXEC);
     c.arg("-p").arg(sbpl).arg("--").arg(program).args(args);
-    Ok(c)
+    Ok((c, Keep))
+}
+
+/// N2: descendant detection rests on `sandbox_check`; prove it works (a
+/// probe in this run's sandbox is seen, we are not) before running the
+/// command, so a broken or interposed checker fails closed (120).
+#[cfg(target_os = "macos")]
+fn self_test_tracking(sbpl: &str, tag: &RunTag) -> Result<()> {
+    use crate::exec_macos::SANDBOX_EXEC;
+    use std::io::{BufRead, BufReader};
+    let mut probe = Command::new(SANDBOX_EXEC)
+        .arg("-p")
+        .arg(sbpl)
+        .arg("--")
+        .args(["/bin/sh", "-c", "echo ready; read x"])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("running {SANDBOX_EXEC}"))?;
+    let result = (|| {
+        let mut line = String::new();
+        let out = probe.stdout.take().context("probe stdout")?;
+        BufReader::new(out).read_line(&mut line)?;
+        if line.trim() != "ready" {
+            bail!("sandbox probe did not start");
+        }
+        let pid = i32::try_from(probe.id()).context("probe pid out of range")?;
+        // SAFETY: getpid cannot fail.
+        let me = unsafe { libc::getpid() };
+        crate::exec_track::Probe::new(tag).self_test(pid, me)
+    })();
+    let _ = probe.kill();
+    let _ = probe.wait();
+    result
 }
 
 #[cfg(target_os = "linux")]
@@ -330,8 +371,8 @@ fn sandboxed(
     args: &[OsString],
     env: &[(OsString, OsString)],
     _tag: &RunTag,
-) -> Result<Command> {
-    use crate::exec_linux::build_bwrap_argv;
+) -> Result<(Command, Keep)> {
+    use crate::exec_linux::{build_bwrap_argv, BindFds};
     let bwrap = find_bwrap(p, &BWRAP_CANDIDATES).with_context(|| {
         format!(
             "no trusted bwrap ({}): cannot sandbox, refusing to run",
@@ -353,10 +394,21 @@ fn sandboxed(
     }
     // Preflight with a no-op: bwrap's setup failures exit 1, which would
     // otherwise look like the child's own exit code.
+    // Every bind source is opened here (no symlink components, S10) and
+    // handed over as an fd, plus the seccomp program (S9); each bwrap run
+    // gets fresh fds, inheritable only in that bwrap child.
+    let prepare = |cmd: &[String]| -> Result<(Command, BindFds)> {
+        let mut fds = BindFds::default();
+        let seccomp = fds.seccomp_program()?;
+        let argv = build_bwrap_argv(p, cwd, cmd, &env_s, &seccomp, &mut |src| fds.open(src))?;
+        let mut c = Command::new(&bwrap);
+        c.args(argv);
+        fds.inherit_in(&mut c);
+        Ok((c, fds))
+    };
     let noop: Vec<String> = vec!["/bin/sh".into(), "-c".into(), ":".into()];
-    let probe = build_bwrap_argv(p, cwd, &noop, &env_s)?;
-    let ok = Command::new(&bwrap)
-        .args(&probe)
+    let (mut probe, probe_fds) = prepare(&noop)?;
+    let ok = probe
         .env_clear()
         .envs(env.iter().cloned())
         .stdin(Stdio::null())
@@ -365,12 +417,12 @@ fn sandboxed(
         .status()
         .with_context(|| format!("running {}", bwrap.display()))?
         .success();
+    drop(probe_fds);
     if !ok {
         bail!("bwrap could not apply the sandbox");
     }
-    let mut c = Command::new(bwrap);
-    c.args(build_bwrap_argv(p, cwd, &cmd, &env_s)?);
-    Ok(c)
+    let (c, fds) = prepare(&cmd)?;
+    Ok((c, Keep { _fds: Some(fds) }))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -381,9 +433,20 @@ fn sandboxed(
     _: &[OsString],
     _: &[(OsString, OsString)],
     _: &RunTag,
-) -> Result<Command> {
+) -> Result<(Command, Keep)> {
     bail!("exec is not supported on this platform: no OS sandbox")
 }
+
+/// Resources that must outlive the spawn (Linux: the fds bwrap reads).
+#[derive(Default)]
+#[cfg(target_os = "linux")]
+pub struct Keep {
+    _fds: Option<crate::exec_linux::BindFds>,
+}
+
+#[derive(Default)]
+#[cfg(not(target_os = "linux"))]
+pub struct Keep;
 
 /// Process group of the running child, for the signal handler (0 = none).
 static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
@@ -440,11 +503,13 @@ fn spawn_and_wait(
                 let left = d.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     kill_group();
-                    tracker.kill_all();
+                    let first = tracker.kill_until_quiet();
                     let _ = rx.recv();
                     kill_group();
-                    tracker.kill_all();
+                    let second = tracker.kill_until_quiet();
                     CHILD_PGID.store(0, Ordering::SeqCst);
+                    first?;
+                    second?;
                     return Ok(ExecOutcome::Exited(EXIT_TIMEOUT));
                 }
                 left.min(tracker.interval())
@@ -458,11 +523,13 @@ fn spawn_and_wait(
         }
     }
     .context("waiting for sandboxed command")?;
-    // Leftover background processes must not outlive the command.
-    let escaped = tracker.survivors();
+    // Leftover background processes must not outlive the command: sweep
+    // and kill until quiet (bounded; still finding them is an error).
+    // Sweep before killing the group, so group members count as escaped.
+    let escaped = tracker.kill_until_quiet();
     kill_group();
-    tracker.kill_all();
     CHILD_PGID.store(0, Ordering::SeqCst);
+    let escaped = escaped?;
     if let Some(&pid) = escaped.first() {
         return Ok(ExecOutcome::Escaped(pid));
     }
@@ -484,7 +551,7 @@ struct RunTag;
 
 #[cfg(not(target_os = "macos"))]
 impl RunTag {
-    fn create(_token: &str) -> Result<RunTag> {
+    fn create(_token: &str, _p: &Profile) -> Result<RunTag> {
         Ok(RunTag)
     }
 }
@@ -501,10 +568,9 @@ impl Tracker {
     fn interval(&self) -> Duration {
         Duration::from_secs(3600)
     }
-    fn survivors(&self) -> Vec<i32> {
-        Vec::new()
+    fn kill_until_quiet(&mut self) -> Result<Vec<i32>> {
+        Ok(Vec::new())
     }
-    fn kill_all(&self) {}
 }
 
 #[cfg(test)]

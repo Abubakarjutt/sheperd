@@ -149,11 +149,19 @@ pub fn build_sbpl(p: &Profile) -> Result<String> {
 /// The per-run tag rule `exec` appends: deny reading one tag file, so
 /// `sandbox_check` can tell this run's sandbox apart (see `exec_track`).
 /// Denying a read of our own empty scratch file grants nothing.
-pub fn tag_rule(denied: &Path) -> Result<String> {
-    Ok(format!(
+pub fn tag_rule(denied: &Path, dir: &Path) -> Result<String> {
+    let mut out = format!(
         "; Per-run tag for descendant tracking (grants nothing).\n(deny file-read* (literal {}))\n",
         sbpl_string(denied)?
-    ))
+    );
+    // The tag dir is outside the write space already; also deny writes to
+    // it and to its parent entry so it can never be moved or replaced.
+    let mut filters = vec![format!("(subpath {})", sbpl_string(dir)?)];
+    if let Some(parent) = dir.parent() {
+        filters.push(format!("(literal {})", sbpl_string(parent)?));
+    }
+    emit(&mut out, "deny file-write*", &filters);
+    Ok(out)
 }
 
 /// Emit `(<head> f1 f2 …)` — never with zero filters, which would mean

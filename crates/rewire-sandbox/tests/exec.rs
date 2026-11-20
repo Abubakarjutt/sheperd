@@ -550,3 +550,130 @@ fn exec_cannot_connect_host_unix_socket() {
     assert_unix_socket_denied("deny");
     assert_unix_socket_denied("registry");
 }
+
+/// N1: the tag dir must not be reachable through a caller-chosen TMPDIR
+/// inside extraWrite. The command tries to move every tag dir it can see
+/// and plant a decoy (symlink to a dir with fresh `a`/`b`), then leaves a
+/// fast double-forked survivor. The tag must be untouched, so the survivor
+/// is found (120) and killed.
+#[cfg(target_os = "macos")]
+#[test]
+fn exec_tag_dir_tamper_cannot_hide_a_survivor() {
+    let f = Fixture::with(|p| {
+        let scratch = p["root"].as_str().unwrap().replace("/root", "/scratch");
+        p["extraWrite"] = json!([scratch]);
+    });
+    let scratch = f.base.join("scratch");
+    fs::create_dir_all(&scratch).unwrap();
+    let script = r#"
+for d in "$TMPDIR"/rewire-sandbox-tag-* /private/tmp/rewire-sandbox-tag-* /private/var/tmp/rewire-sandbox-tag-* "$(getconf DARWIN_USER_TEMP_DIR)"rewire-sandbox-tag-*; do
+  [ -d "$d" ] || continue
+  mv "$d" "$d.moved" 2>/dev/null || continue
+  mkdir -p "$TMPDIR/decoy" && : > "$TMPDIR/decoy/a" && : > "$TMPDIR/decoy/b"
+  ln -s "$TMPDIR/decoy" "$d"
+done
+perl -e 'exit if fork; exit if fork; sleep 1; open(F, ">src/late"); print F "x"'
+"#;
+    let a = f
+        .exec(&[], &["sh", "-c", script])
+        .env("TMPDIR", &scratch)
+        .assert();
+    assert_eq!(code(&a), INTERNAL, "{}", stderr(&a));
+    assert!(
+        stderr(&a).contains("sandbox: escaped descendant "),
+        "{}",
+        stderr(&a)
+    );
+    std::thread::sleep(Duration::from_millis(2000));
+    assert!(!f.root.join("src/late").exists(), "survivor ran");
+}
+
+/// N3: a pid-hopping chain (fork, parent exits, child setsid()s, repeat as
+/// fast as the kernel allows) must not outrun the kill sweep. The chain appends a
+/// heartbeat every 20 ms; after exec returns, the heartbeat must have
+/// stopped. Written in C because perl forks too slowly to race the sweep.
+#[cfg(target_os = "macos")]
+#[test]
+fn exec_pid_hopping_chain_is_killed() {
+    const HOP_C: &str = r#"
+#include <fcntl.h>
+#include <sys/time.h>
+#include <unistd.h>
+static double now(void) { struct timeval t; gettimeofday(&t, 0); return t.tv_sec + t.tv_usec / 1e6; }
+int main(int argc, char **argv) {
+  if (argc < 2 || fork()) _exit(0);
+  close(0); close(1); close(2); /* let the test's output pipes close */
+  int fd = open(argv[1], O_WRONLY | O_APPEND | O_CREAT, 0644);
+  double end = now() + 8, next = 0;
+  for (;;) {
+    double t = now();
+    if (t > end) _exit(0);
+    if (t >= next) { write(fd, "x", 1); next = t + 0.02; }
+    pid_t p = fork();
+    if (p < 0) _exit(1);
+    if (p > 0) _exit(0);
+    setsid(); /* new session + group per link: group kills cannot help */
+  }
+}
+"#;
+    let f = Fixture::new();
+    let src = f.base.join("hop.c");
+    let bin = f.base.join("hop");
+    fs::write(&src, HOP_C).unwrap();
+    let cc = std::process::Command::new("cc")
+        .args(["-O2", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .expect("cc is needed to build the hop chain");
+    assert!(cc.success());
+    for i in 0..10 {
+        let hb = f.root.join(format!("src/hb{i}"));
+        let a = f
+            .exec(&[], &[bin.to_str().unwrap(), hb.to_str().unwrap()])
+            .assert();
+        assert_eq!(code(&a), INTERNAL, "{}", stderr(&a));
+        assert!(
+            stderr(&a).contains("sandbox: escaped descendant "),
+            "{}",
+            stderr(&a)
+        );
+        let size = || fs::metadata(&hb).map(|m| m.len()).unwrap_or(0);
+        let before = size();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(size(), before, "run {i}: hopping chain still alive");
+    }
+}
+
+/// S10: the pinned bind-source fds (Linux) and every internal fd must not
+/// reach the command: an O_PATH fd to a denied dir would allow openat()
+/// writes through the original rw mount. Only stdio (plus what `ls` opens
+/// for the listing itself) may be open.
+#[test]
+fn exec_command_inherits_no_extra_fds() {
+    let f = Fixture::new();
+    let dir = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let parse = |out: &[u8]| -> Vec<u32> {
+        String::from_utf8_lossy(out)
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    };
+    // Baseline: the same `ls` run directly with only stdio open (macOS ls
+    // opens two dirs of its own, Linux ls one).
+    let base = std::process::Command::new("ls")
+        .arg(dir)
+        .current_dir(&f.root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let expected = parse(&base.stdout);
+    let a = f.exec(&[], &["ls", dir]).assert();
+    assert_eq!(code(&a), 0, "{}", stderr(&a));
+    let fds = parse(&a.get_output().stdout);
+    assert_eq!(fds, expected, "extra fds reached the command");
+}

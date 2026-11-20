@@ -13,6 +13,19 @@
 //! - `--ro-bind` every existing writeDeny match and git path found by
 //!   walking root (and extraWrite) once, and root's gitdir/commondir.
 //! - readDeny masked: `--tmpfs` over dirs, `/dev/null` over files.
+//! - Every bind SOURCE from the tree (root, write prefixes, extraWrite,
+//!   deny matches, git paths) is opened by us first, one component at a
+//!   time from `/` with `O_PATH|O_NOFOLLOW` ([`open_no_symlinks`]); a
+//!   symlink anywhere is refused (120). bwrap gets the fds via
+//!   `--bind-fd`/`--ro-bind-fd`, so swapping a path for a symlink after our
+//!   checks cannot redirect a mount (S10). The fds are inheritable only in
+//!   the bwrap child; bwrap closes them before running the command.
+//! - `--seccomp`: a BPF filter makes `socket(AF_UNIX, ..)` fail with EPERM
+//!   (`socketpair` stays allowed), so filesystem sockets under the ro tree
+//!   and abstract sockets (reachable with `--share-net`) cannot be
+//!   connected (S9). `io_uring_setup` (which can create sockets without
+//!   the socket syscall) and x32 syscalls get EPERM too; a foreign syscall
+//!   ABI (e.g. i386 on x86_64) kills the process.
 //!
 //! Bind mounts follow the dentry, so renaming a parent of a ro/masked
 //! mount does not unprotect it.
@@ -26,15 +39,23 @@
 //! - no case-variant protection (`TESTS` is a different dir on ext4);
 //! - `**/x` readDeny is masked only inside root/extraWrite;
 //! - `network: "registry"` shares the host network unrestricted;
-//! - the walk of root runs on every exec (cost grows with node_modules).
+//! - the walk of root runs on every exec (cost grows with node_modules);
+//! - mount DESTINATIONS are still resolved by bwrap by path; only sources
+//!   are pinned by fd;
+//! - needs a bwrap with `--bind-fd`/`--ro-bind-fd`/`--seccomp` (an older
+//!   one fails the preflight: 120).
 //!
 //! Compiled on every platform so it stays unit-tested everywhere.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use crate::exec::absolute_prefix;
 use crate::profile::{Anchor, Network, Profile};
 use anyhow::{bail, Context, Result};
+use std::ffi::CString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 /// Refuse to walk trees bigger than this rather than silently stop.
 const MAX_WALK_ENTRIES: usize = 2_000_000;
@@ -90,12 +111,15 @@ fn write_binds(p: &Profile) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// `seccomp_fd` is the fd number of the filter program; `open` turns a
+/// bind source into the fd number bwrap should mount (see [`BindFds`]).
 pub fn build_bwrap_argv(
     p: &Profile,
     cwd: &Path,
     cmd: &[String],
     env: &[(String, String)],
+    seccomp_fd: &str,
+    open: &mut dyn FnMut(&Path) -> Result<String>,
 ) -> Result<Vec<String>> {
     if cmd.is_empty() {
         bail!("no command");
@@ -130,31 +154,36 @@ pub fn build_bwrap_argv(
         argv.push("--tmpfs".into());
         argv.push(utf8(&d)?.into());
     }
-    let mut bind = |flag: &str, src: &Path, dst: &Path| -> Result<()> {
+    let mut bind = |flag: &str, path: &Path| -> Result<()> {
+        let fd = open(path)?;
         argv.push(flag.into());
-        argv.push(utf8(src)?.into());
-        argv.push(utf8(dst)?.into());
+        argv.push(fd);
+        argv.push(utf8(path)?.into());
         Ok(())
     };
-    bind("--ro-bind", p.root(), p.root())?;
+    bind("--ro-bind-fd", p.root())?;
     for w in write_binds(p)? {
-        bind("--bind", &w, &w)?;
+        bind("--bind-fd", &w)?;
     }
     for d in p.extra_write() {
         if d.is_dir() {
-            bind("--bind", d, d)?;
+            bind("--bind-fd", d)?;
         }
     }
     for ro in &masks.read_only {
-        bind("--ro-bind", ro, ro)?;
+        bind("--ro-bind-fd", ro)?;
     }
     for f in &masks.hide_files {
-        bind("--ro-bind", Path::new("/dev/null"), f)?;
+        argv.push("--ro-bind".into());
+        argv.push("/dev/null".into());
+        argv.push(utf8(f)?.into());
     }
     for d in &masks.hide_dirs {
         argv.push("--tmpfs".into());
         argv.push(utf8(d)?.into());
     }
+    argv.push("--seccomp".into());
+    argv.push(seccomp_fd.into());
     argv.push("--chdir".into());
     argv.push(utf8(cwd)?.into());
     argv.push("--".into());
@@ -261,6 +290,241 @@ fn hide_if_read_denied(p: &Profile, path: &Path, m: &mut Masks) -> Result<bool> 
     Ok(true)
 }
 
+/// Open `path` (absolute, no `.`/`..`) walking from `/` one component at
+/// a time without following symlinks; any symlink component is refused.
+/// Linux: `O_PATH` fds (what `--bind-fd` wants). Elsewhere (unit tests):
+/// `O_RDONLY|O_NONBLOCK`. Every fd is `O_CLOEXEC`.
+pub fn open_no_symlinks(path: &Path) -> Result<OwnedFd> {
+    #[cfg(target_os = "linux")]
+    const BASE: libc::c_int = libc::O_PATH | libc::O_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    const BASE: libc::c_int = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let mut names = Vec::new();
+    for (i, c) in path.components().enumerate() {
+        match c {
+            Component::RootDir if i == 0 => {}
+            Component::Normal(n) => names.push(
+                CString::new(n.as_encoded_bytes())
+                    .with_context(|| format!("NUL in {}", path.display()))?,
+            ),
+            _ => bail!(
+                "bind source must be absolute and normalized: {}",
+                path.display()
+            ),
+        }
+    }
+    if !path.is_absolute() {
+        bail!("bind source must be absolute: {}", path.display());
+    }
+    // SAFETY: valid C string; the fd is owned right away.
+    let raw = unsafe { libc::open(c"/".as_ptr(), BASE | libc::O_DIRECTORY) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error()).context("opening /");
+    }
+    // SAFETY: raw is a fresh, valid fd.
+    let mut dir = unsafe { OwnedFd::from_raw_fd(raw) };
+    for (i, name) in names.iter().enumerate() {
+        let last = i + 1 == names.len();
+        let flags = BASE | libc::O_NOFOLLOW | if last { 0 } else { libc::O_DIRECTORY };
+        // SAFETY: dir is a valid fd and name a valid C string.
+        let raw = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+        if raw < 0 {
+            let err = std::io::Error::last_os_error();
+            if is_symlink_at(&dir, name) {
+                bail!(
+                    "bind source {} has a symlink component {:?}: refusing",
+                    path.display(),
+                    name
+                );
+            }
+            return Err(err).with_context(|| format!("opening {}", path.display()));
+        }
+        // SAFETY: raw is a fresh, valid fd.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // Linux O_PATH|O_NOFOLLOW opens a final symlink itself: refuse it.
+        if fd_is_symlink(&fd) {
+            bail!("bind source {} is a symlink: refusing", path.display());
+        }
+        dir = fd;
+    }
+    Ok(dir)
+}
+
+fn is_symlink_at(dir: &OwnedFd, name: &CString) -> bool {
+    // SAFETY: st is written by fstatat on success only.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        ) == 0
+            && st.st_mode & libc::S_IFMT == libc::S_IFLNK
+    }
+}
+
+fn fd_is_symlink(fd: &OwnedFd) -> bool {
+    // SAFETY: st is written by fstat on success only.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        libc::fstat(fd.as_raw_fd(), &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFLNK
+    }
+}
+
+/// The fds one bwrap run reads: pinned bind sources and the seccomp
+/// program. All are `O_CLOEXEC` here; [`BindFds::inherit_in`] clears that
+/// only inside the forked bwrap child, so no other process gets them.
+#[derive(Default)]
+pub struct BindFds {
+    fds: Vec<OwnedFd>,
+}
+
+impl BindFds {
+    /// Pin `path` (see [`open_no_symlinks`]); returns the fd number.
+    pub fn open(&mut self, path: &Path) -> Result<String> {
+        let fd = open_no_symlinks(path)?;
+        let n = fd.as_raw_fd();
+        self.fds.push(fd);
+        Ok(n.to_string())
+    }
+
+    /// A pipe holding the seccomp program for the host arch (bwrap reads it
+    /// to EOF); returns the read end's fd number.
+    pub fn seccomp_program(&mut self) -> Result<String> {
+        let arch = Arch::host().context("seccomp: unsupported CPU architecture")?;
+        let bytes = filter_bytes(&unix_socket_filter(arch));
+        let mut ends = [0 as RawFd; 2];
+        // SAFETY: ends has room for two fds.
+        if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("seccomp pipe");
+        }
+        // SAFETY: both fds are fresh and owned from here on.
+        let (r, w) = unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        for fd in [&r, &w] {
+            // SAFETY: plain fcntl on a valid fd.
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        let mut file = fs::File::from(w);
+        std::io::Write::write_all(&mut file, &bytes).context("writing seccomp program")?;
+        drop(file); // EOF for bwrap
+        let n = r.as_raw_fd();
+        self.fds.push(r);
+        Ok(n.to_string())
+    }
+
+    /// Make exactly these fds inheritable in `c`'s child (after fork).
+    pub fn inherit_in(&self, c: &mut Command) {
+        use std::os::unix::process::CommandExt;
+        let raw: Vec<RawFd> = self.fds.iter().map(AsRawFd::as_raw_fd).collect();
+        // SAFETY: fcntl is async-signal-safe; `raw` is allocated already.
+        unsafe {
+            c.pre_exec(move || {
+                for &fd in &raw {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+// ---- seccomp (S9) -------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arch {
+    X86_64,
+    Aarch64,
+}
+
+impl Arch {
+    pub fn host() -> Option<Arch> {
+        if cfg!(target_arch = "x86_64") {
+            Some(Arch::X86_64)
+        } else if cfg!(target_arch = "aarch64") {
+            Some(Arch::Aarch64)
+        } else {
+            None
+        }
+    }
+    /// AUDIT_ARCH_* as seen in `seccomp_data.arch`.
+    fn audit(self) -> u32 {
+        match self {
+            Arch::X86_64 => 0xC000_003E,
+            Arch::Aarch64 => 0xC000_00B7,
+        }
+    }
+    fn nr_socket(self) -> u32 {
+        match self {
+            Arch::X86_64 => 41,
+            Arch::Aarch64 => 198,
+        }
+    }
+}
+
+/// Same number on both arches (unified table since 5.1).
+const NR_IO_URING_SETUP: u32 = 425;
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+const AF_UNIX: u32 = 1;
+const EPERM: u32 = 1;
+
+const BPF_LD_W_ABS: u16 = 0x20;
+const BPF_JEQ_K: u16 = 0x15;
+const BPF_JGE_K: u16 = 0x35;
+const BPF_RET_K: u16 = 0x06;
+pub const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+pub const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+pub const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+/// `struct seccomp_data` offsets: nr, arch, args[0] (low word, LE).
+const OFF_NR: u32 = 0;
+const OFF_ARCH: u32 = 4;
+const OFF_ARG0: u32 = 16;
+
+/// One `struct sock_filter`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SockFilter {
+    pub code: u16,
+    pub jt: u8,
+    pub jf: u8,
+    pub k: u32,
+}
+
+const fn op(code: u16, jt: u8, jf: u8, k: u32) -> SockFilter {
+    SockFilter { code, jt, jf, k }
+}
+
+/// Deny `socket(AF_UNIX, ..)`, `io_uring_setup` and x32 syscalls with
+/// EPERM; kill on a foreign arch; allow everything else.
+pub fn unix_socket_filter(arch: Arch) -> Vec<SockFilter> {
+    vec![
+        /* 0 */ op(BPF_LD_W_ABS, 0, 0, OFF_ARCH),
+        /* 1 */ op(BPF_JEQ_K, 1, 0, arch.audit()),
+        /* 2 */ op(BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
+        /* 3 */ op(BPF_LD_W_ABS, 0, 0, OFF_NR),
+        /* 4 */ op(BPF_JGE_K, 5, 0, X32_SYSCALL_BIT), // -> 10
+        /* 5 */ op(BPF_JEQ_K, 4, 0, NR_IO_URING_SETUP), // -> 10
+        /* 6 */ op(BPF_JEQ_K, 0, 2, arch.nr_socket()), // -> 7 / 9
+        /* 7 */ op(BPF_LD_W_ABS, 0, 0, OFF_ARG0),
+        /* 8 */ op(BPF_JEQ_K, 1, 0, AF_UNIX), // -> 10 / 9
+        /* 9 */ op(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW),
+        /* 10 */ op(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | EPERM),
+    ]
+}
+
+/// Native-endian `struct sock_filter[]` bytes, as bwrap's `--seccomp` reads.
+pub fn filter_bytes(prog: &[SockFilter]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prog.len() * 8);
+    for f in prog {
+        out.extend_from_slice(&f.code.to_ne_bytes());
+        out.push(f.jt);
+        out.push(f.jf);
+        out.extend_from_slice(&f.k.to_ne_bytes());
+    }
+    out
+}
+
 fn utf8(p: &Path) -> Result<&str> {
     p.to_str()
         .with_context(|| format!("non-UTF-8 path {}", p.display()))
@@ -306,6 +570,17 @@ mod tests {
         xs.iter().map(|x| x.to_string()).collect()
     }
 
+    /// argv with a fake opener: a bind source shows up as `fd:<path>`.
+    fn argv(p: &Profile, cwd: &Path, cmd: &[String]) -> Result<Vec<String>> {
+        build_bwrap_argv(p, cwd, cmd, &env(), "SECCOMP", &mut |src| {
+            Ok(format!("fd:{}", src.display()))
+        })
+    }
+
+    fn fd(p: &Path) -> String {
+        format!("fd:{}", p.display())
+    }
+
     fn has_seq(argv: &[String], seq: &[String]) -> bool {
         argv.windows(seq.len()).any(|w| w == seq)
     }
@@ -320,7 +595,7 @@ mod tests {
     fn argv_layout() {
         let (_t, root, p) = fixture(Network::Deny);
         let cmd = v(&["sh", "-c", "true"]);
-        let argv = build_bwrap_argv(&p, &root.join("src"), &cmd, &env()).unwrap();
+        let argv = argv(&p, &root.join("src"), &cmd).unwrap();
         assert_eq!(argv[0], "--unshare-all");
         assert!(!argv.contains(&"--share-net".to_string()));
         assert!(argv.contains(&"--die-with-parent".to_string()));
@@ -345,15 +620,28 @@ mod tests {
         );
         // Root read-only; only the existing write prefix `src` read-write
         // (`missing` is not bound, `src/sub` is covered by `src`).
-        let ro_root = pos(&argv, &["--ro-bind".into(), s(&root), s(&root)]);
+        // Every tree bind is fd-pinned: no path-sourced --bind/--ro-bind of
+        // the tree remains (only /dev/null and / itself).
+        let ro_root = pos(&argv, &["--ro-bind-fd".into(), fd(&root), s(&root)]);
         let src = root.join("src");
-        let rw_src = pos(&argv, &["--bind".into(), s(&src), s(&src)]);
+        let rw_src = pos(&argv, &["--bind-fd".into(), fd(&src), s(&src)]);
         assert_eq!(
-            argv.iter().filter(|a| *a == "--bind").count(),
+            argv.iter().filter(|a| *a == "--bind-fd").count(),
             1,
             "{argv:?}"
         );
+        assert!(!argv.contains(&"--bind".to_string()));
+        for (i, a) in argv.iter().enumerate() {
+            if a == "--ro-bind" {
+                assert!(
+                    ["/", "/dev/null"].contains(&argv[i + 1].as_str()),
+                    "{argv:?}"
+                );
+            }
+        }
         assert!(!argv.contains(&s(&root.join("missing"))));
+        let sep = argv.iter().position(|a| a == "--").unwrap();
+        assert!(pos(&argv, &v(&["--seccomp", "SECCOMP"])) < sep);
         assert!(base < ro_root && ro_root < rw_src);
         // Deny matches re-bound read-only after the rw bind.
         for d in [
@@ -363,7 +651,7 @@ mod tests {
             root.join("src/x.snap"),
         ] {
             assert!(
-                pos(&argv, &["--ro-bind".into(), s(&d), s(&d)]) > rw_src,
+                pos(&argv, &["--ro-bind-fd".into(), fd(&d), s(&d)]) > rw_src,
                 "{d:?}"
             );
         }
@@ -385,7 +673,7 @@ mod tests {
     #[test]
     fn runtime_socket_dirs_are_masked() {
         let (_t, root, p) = fixture(Network::Deny);
-        let argv = build_bwrap_argv(&p, &root, &v(&["true"]), &env()).unwrap();
+        let argv = argv(&p, &root, &v(&["true"])).unwrap();
         for d in runtime_dirs() {
             assert!(has_seq(&argv, &["--tmpfs".into(), s(&d)]), "{d:?}");
         }
@@ -398,14 +686,14 @@ mod tests {
     #[test]
     fn registry_shares_network() {
         let (_t, root, p) = fixture(Network::Registry);
-        let argv = build_bwrap_argv(&p, &root, &v(&["true"]), &env()).unwrap();
+        let argv = argv(&p, &root, &v(&["true"])).unwrap();
         assert!(has_seq(&argv, &v(&["--unshare-all", "--share-net"])));
     }
 
     #[test]
     fn empty_command_is_an_error() {
         let (_t, root, p) = fixture(Network::Deny);
-        assert!(build_bwrap_argv(&p, &root, &[], &env()).is_err());
+        assert!(argv(&p, &root, &[]).is_err());
     }
 
     #[test]
@@ -421,9 +709,157 @@ mod tests {
             extra_write: vec![],
         })
         .unwrap();
-        let argv = build_bwrap_argv(&p, &root, &v(&["true"]), &env()).unwrap();
-        let ro = pos(&argv, &["--ro-bind".into(), s(&root), s(&root)]);
-        let rw = pos(&argv, &["--bind".into(), s(&root), s(&root)]);
+        let argv = argv(&p, &root, &v(&["true"])).unwrap();
+        let ro = pos(&argv, &["--ro-bind-fd".into(), fd(&root), s(&root)]);
+        let rw = pos(&argv, &["--bind-fd".into(), fd(&root), s(&root)]);
         assert!(ro < rw);
+    }
+
+    #[test]
+    fn real_opener_pins_every_tree_bind_by_fd() {
+        let (_t, root, p) = fixture(Network::Deny);
+        let mut fds = BindFds::default();
+        let argv = build_bwrap_argv(&p, &root, &v(&["true"]), &env(), "9", &mut |src| {
+            fds.open(src)
+        })
+        .unwrap();
+        let i = pos(&argv, &["--ro-bind-fd".into()]);
+        let n: RawFd = argv[i + 1].parse().unwrap();
+        assert!(fds.fds.iter().any(|f| f.as_raw_fd() == n));
+        assert_eq!(argv[i + 2], s(&root));
+    }
+
+    #[test]
+    fn open_no_symlinks_refuses_symlink_components() {
+        let t = TempDir::new().unwrap();
+        let base = fs::canonicalize(t.path()).unwrap();
+        fs::create_dir_all(base.join("real/inner")).unwrap();
+        fs::write(base.join("real/file"), "").unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        std::os::unix::fs::symlink(base.join("real/file"), base.join("flink")).unwrap();
+        assert!(open_no_symlinks(&base.join("real/inner")).is_ok());
+        assert!(open_no_symlinks(&base.join("real/file")).is_ok());
+        assert!(open_no_symlinks(Path::new("/")).is_ok());
+        let e = open_no_symlinks(&base.join("link/inner")).unwrap_err();
+        assert!(format!("{e:#}").contains("symlink"), "{e:#}");
+        let e = open_no_symlinks(&base.join("link")).unwrap_err();
+        assert!(format!("{e:#}").contains("symlink"), "{e:#}");
+        let e = open_no_symlinks(&base.join("flink")).unwrap_err();
+        assert!(format!("{e:#}").contains("symlink"), "{e:#}");
+        assert!(open_no_symlinks(&base.join("real/../real")).is_err());
+        assert!(open_no_symlinks(Path::new("relative/x")).is_err());
+        assert!(open_no_symlinks(&base.join("missing")).is_err());
+    }
+
+    #[test]
+    fn bind_fds_are_cloexec_but_inherited_by_the_bwrap_child() {
+        let t = TempDir::new().unwrap();
+        let base = fs::canonicalize(t.path()).unwrap();
+        let mut fds = BindFds::default();
+        let n: RawFd = fds.open(&base).unwrap().parse().unwrap();
+        let sc: RawFd = fds.seccomp_program().unwrap().parse().unwrap();
+        for fd in [n, sc] {
+            // SAFETY: plain fcntl.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        }
+        let probe = |inherit: bool| {
+            let mut c = Command::new("/bin/sh");
+            c.args([
+                "-c",
+                &format!("test -e /dev/fd/{n} && test -e /dev/fd/{sc}"),
+            ]);
+            if inherit {
+                fds.inherit_in(&mut c);
+            }
+            c.status().unwrap().success()
+        };
+        assert!(probe(true));
+        assert!(!probe(false));
+        // The seccomp pipe holds exactly the program, then EOF.
+        let mut f = fs::File::from(fds.fds.pop().unwrap());
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut f, &mut buf).unwrap();
+        assert_eq!(
+            buf,
+            filter_bytes(&unix_socket_filter(Arch::host().unwrap()))
+        );
+    }
+
+    /// Minimal classic-BPF interpreter for the opcodes the filter uses.
+    fn run_bpf(prog: &[SockFilter], nr: u32, arch: u32, arg0: u64) -> u32 {
+        let mut data = [0u8; 64];
+        data[0..4].copy_from_slice(&nr.to_le_bytes());
+        data[4..8].copy_from_slice(&arch.to_le_bytes());
+        data[16..24].copy_from_slice(&arg0.to_le_bytes());
+        let (mut pc, mut acc) = (0usize, 0u32);
+        loop {
+            let f = prog[pc];
+            pc += 1;
+            match f.code {
+                BPF_LD_W_ABS => {
+                    let o = f.k as usize;
+                    acc = u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
+                }
+                BPF_JEQ_K | BPF_JGE_K => {
+                    let hit = if f.code == BPF_JEQ_K {
+                        acc == f.k
+                    } else {
+                        acc >= f.k
+                    };
+                    pc += usize::from(if hit { f.jt } else { f.jf });
+                }
+                BPF_RET_K => return f.k,
+                c => panic!("unexpected opcode {c:#x}"),
+            }
+        }
+    }
+
+    #[test]
+    fn seccomp_filter_denies_unix_sockets_only() {
+        const AF_INET: u64 = 2;
+        const AF_INET6: u64 = 10;
+        let errno = SECCOMP_RET_ERRNO | EPERM;
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            let prog = unix_socket_filter(arch);
+            // Every jump lands inside the program and it ends in a return.
+            for (i, f) in prog.iter().enumerate() {
+                if f.code == BPF_JEQ_K || f.code == BPF_JGE_K {
+                    assert!(i + 1 + usize::from(f.jt.max(f.jf)) < prog.len());
+                }
+            }
+            assert_eq!(prog.last().unwrap().code, BPF_RET_K);
+            let (a, sock) = (arch.audit(), arch.nr_socket());
+            let run = |nr, arg0| run_bpf(&prog, nr, a, arg0);
+            assert_eq!(run(sock, u64::from(AF_UNIX)), errno, "{arch:?}");
+            // High bits of the int argument are ignored by the kernel too.
+            assert_eq!(run(sock, 0xffff_ffff_0000_0001), errno);
+            assert_eq!(run(sock, AF_INET), SECCOMP_RET_ALLOW);
+            assert_eq!(run(sock, AF_INET6), SECCOMP_RET_ALLOW);
+            assert_eq!(run(NR_IO_URING_SETUP, 0), errno);
+            assert_eq!(run(X32_SYSCALL_BIT | 41, u64::from(AF_UNIX)), errno);
+            // socketpair and everything else: allowed, whatever arg0 is.
+            let socketpair = if arch == Arch::X86_64 { 53 } else { 199 };
+            assert_eq!(run(socketpair, u64::from(AF_UNIX)), SECCOMP_RET_ALLOW);
+            assert_eq!(run(0, u64::from(AF_UNIX)), SECCOMP_RET_ALLOW);
+            // Foreign ABI (i386 on x86_64, arm on aarch64, or the other arch).
+            for bad in [0x4000_0003, 0x4000_0028, 0] {
+                assert_eq!(run_bpf(&prog, sock, bad, 2), SECCOMP_RET_KILL_PROCESS);
+            }
+            let other = if arch == Arch::X86_64 {
+                Arch::Aarch64
+            } else {
+                Arch::X86_64
+            };
+            assert_eq!(
+                run_bpf(&prog, 0, other.audit(), 0),
+                SECCOMP_RET_KILL_PROCESS
+            );
+        }
+        // Serialized as 8-byte native-endian sock_filter entries.
+        let prog = unix_socket_filter(Arch::X86_64);
+        let bytes = filter_bytes(&prog);
+        assert_eq!(bytes.len(), prog.len() * 8);
+        assert_eq!(&bytes[4..8], &OFF_ARCH.to_ne_bytes());
     }
 }
