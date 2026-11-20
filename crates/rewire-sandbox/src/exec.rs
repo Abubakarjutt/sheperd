@@ -10,6 +10,10 @@
 //!    environment; its exit code, stdout and stderr pass through (stdio is
 //!    inherited, nothing is buffered). A signal death maps to 128+signal.
 //!    `--timeout-ms` → SIGKILL the group and every tracked descendant, 124.
+//!    SIGTERM/SIGINT/SIGHUP → the handler SIGKILLs the group at once and
+//!    flags the signal; the wait loop then runs the same full sweep and
+//!    exits 120 `sandbox: terminated by signal <n>` (plus any escaped
+//!    descendant). A second signal `_exit`s from the handler (last resort).
 //!
 //! Descendants (macOS): a child can leave the process group (`setsid`,
 //! `detached: true`) and outlive us. While the command runs we poll its
@@ -84,6 +88,8 @@ pub enum ExecOutcome {
     NotFound(String),
     /// A descendant outlived the command (it has been killed).
     Escaped(i32),
+    /// We got SIGTERM/SIGINT/SIGHUP: everything was killed and swept (120).
+    Terminated { signal: i32, escaped: Option<i32> },
 }
 
 pub struct ExecArgs {
@@ -451,15 +457,50 @@ pub struct Keep;
 
 /// Process group of the running child, for the signal handler (0 = none).
 static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
+/// First termination signal received (0 = none), for the main loop.
+static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
+const TERM_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
+
+/// First SIGTERM/SIGINT/SIGHUP: SIGKILL the command's group at once and
+/// record the signal; the main loop then runs the full descendant sweep
+/// and exits 120. A second signal (main thread stuck) is the last resort:
+/// kill the group again and `_exit` immediately.
 extern "C" fn on_fatal_signal(sig: libc::c_int) {
     let pg = CHILD_PGID.load(Ordering::SeqCst);
+    let first = PENDING_SIGNAL
+        .compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
     // SAFETY: kill and _exit are async-signal-safe.
     unsafe {
         if pg > 0 {
             libc::kill(-pg, libc::SIGKILL);
         }
-        libc::_exit(128 + sig);
+        if !first {
+            libc::_exit(128 + sig);
+        }
+    }
+}
+
+/// Block (or restore) the termination signals on this thread, so none can
+/// arrive between spawning the child and publishing its pgid. The child
+/// starts with an empty mask (std resets it).
+fn mask_term_signals(how: libc::c_int) {
+    // SAFETY: plain sigset manipulation on a local set.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in TERM_SIGNALS {
+            libc::sigaddset(&mut set, sig);
+        }
+        libc::pthread_sigmask(how, &set, std::ptr::null_mut());
+    }
+}
+
+fn pending_signal() -> Option<i32> {
+    match PENDING_SIGNAL.load(Ordering::SeqCst) {
+        0 => None,
+        s => Some(s),
     }
 }
 
@@ -468,22 +509,30 @@ fn spawn_and_wait(
     timeout: Option<Duration>,
     tag: &RunTag,
 ) -> Result<ExecOutcome> {
-    // If we are told to die, take the sandboxed group with us.
-    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+    for sig in TERM_SIGNALS {
         // SAFETY: installing a handler that only calls async-signal-safe fns.
         unsafe {
             libc::signal(sig, on_fatal_signal as *const () as libc::sighandler_t);
         }
     }
-    let mut child = command
+    mask_term_signals(libc::SIG_BLOCK);
+    let spawned = command
         .process_group(0)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .spawn()
-        .context("spawning sandboxed command")?;
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            mask_term_signals(libc::SIG_UNBLOCK);
+            return Err(e).context("spawning sandboxed command");
+        }
+    };
     let pgid = i32::try_from(child.id()).context("child pid out of range")?;
     CHILD_PGID.store(pgid, Ordering::SeqCst);
+    // A signal that arrived meanwhile is delivered now, pgid known.
+    mask_term_signals(libc::SIG_UNBLOCK);
     let kill_group = || {
         // SAFETY: plain syscall; ESRCH (group already gone) is fine.
         unsafe {
@@ -496,21 +545,41 @@ fn spawn_and_wait(
     std::thread::spawn(move || {
         let _ = tx.send(child.wait());
     });
+    // Kill everything (command group + every descendant, until quiet) and
+    // reap the command. Returns the escaped pids found.
+    let shut_down = |tracker: &mut Tracker| -> Result<Vec<i32>> {
+        kill_group();
+        let first = tracker.kill_until_quiet();
+        let _ = rx.recv_timeout(Duration::from_secs(1));
+        kill_group();
+        let second = tracker.kill_until_quiet();
+        CHILD_PGID.store(0, Ordering::SeqCst);
+        let mut all = first?;
+        all.extend(second?);
+        all.sort_unstable();
+        all.dedup();
+        Ok(all)
+    };
+    let terminated = |sig: i32, escaped: Vec<i32>| ExecOutcome::Terminated {
+        signal: sig,
+        escaped: escaped.first().copied(),
+    };
     let deadline = timeout.map(|d| Instant::now() + d);
     let status = loop {
+        if let Some(sig) = pending_signal() {
+            let escaped = shut_down(&mut tracker)?;
+            return Ok(terminated(sig, escaped));
+        }
         tracker.poll();
         let wait = match deadline {
             Some(d) => {
                 let left = d.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    kill_group();
-                    let first = tracker.kill_until_quiet();
-                    let _ = rx.recv();
-                    kill_group();
-                    let second = tracker.kill_until_quiet();
-                    CHILD_PGID.store(0, Ordering::SeqCst);
-                    first?;
-                    second?;
+                    let escaped = shut_down(&mut tracker)?;
+                    // A signal during the timeout shutdown wins: report it.
+                    if let Some(sig) = pending_signal() {
+                        return Ok(terminated(sig, escaped));
+                    }
                     return Ok(ExecOutcome::Exited(EXIT_TIMEOUT));
                 }
                 left.min(tracker.interval())
@@ -531,6 +600,9 @@ fn spawn_and_wait(
     kill_group();
     CHILD_PGID.store(0, Ordering::SeqCst);
     let escaped = escaped?;
+    if let Some(sig) = pending_signal() {
+        return Ok(terminated(sig, escaped));
+    }
     if let Some(&pid) = escaped.first() {
         return Ok(ExecOutcome::Escaped(pid));
     }

@@ -744,3 +744,106 @@ done"#,
         "survivor ran (swapped={swapped})"
     );
 }
+
+/// T4-F1: a termination signal to the binary (the TS client's output cap
+/// or watchdog) must still sweep: a setsid-detached descendant must not
+/// outlive it. Exit 120 with `sandbox: terminated by signal 15`, well
+/// within the client's 3 s grace.
+#[cfg(target_os = "macos")]
+#[test]
+fn exec_sigterm_sweeps_detached_descendants() {
+    let f = Fixture::new();
+    let bin = assert_cmd::cargo::cargo_bin("rewire-sandbox");
+    let script = "perl -MPOSIX -e 'my $p = fork; if (!$p) { POSIX::setsid(); \
+                  open(STDOUT, \">/dev/null\"); open(STDERR, \">/dev/null\"); \
+                  exec \"/bin/sleep\", \"37\" } open(F, \">src/pid\"); print F $p; close F'; \
+                  sleep 30";
+    let child = std::process::Command::new(&bin)
+        .current_dir(&f.root)
+        .arg("exec")
+        .arg("--profile")
+        .arg(&f.profile)
+        .args(["--", "sh", "-c", script])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid_file = f.root.join("src/pid");
+    let t0 = Instant::now();
+    let detached: i32 = loop {
+        if let Ok(s) = fs::read_to_string(&pid_file) {
+            if let Ok(p) = s.trim().parse() {
+                break p;
+            }
+        }
+        assert!(t0.elapsed() < Duration::from_secs(10), "no pid file");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Let the tracker see it detached first, as in the real scenario.
+    std::thread::sleep(Duration::from_millis(200));
+    // SAFETY: plain kill on our own child / its detached descendant.
+    let alive = |pid: i32| unsafe { libc::kill(pid, 0) == 0 };
+    assert!(alive(detached));
+    let sent = Instant::now();
+    // SAFETY: plain kill on our own child.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let out = child.wait_with_output().unwrap();
+    let took = sent.elapsed();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    std::thread::sleep(Duration::from_millis(200));
+    let survived = alive(detached);
+    if survived {
+        // SAFETY: clean up the escapee.
+        unsafe { libc::kill(detached, libc::SIGKILL) };
+    }
+    assert!(!survived, "detached descendant survived SIGTERM: {err}");
+    assert_eq!(out.status.code(), Some(INTERNAL), "{err}");
+    assert!(err.contains("sandbox: terminated by signal 15"), "{err}");
+    assert!(took < Duration::from_secs(3), "took {took:?}");
+}
+
+/// T4-F1: a signal racing the timeout shutdown still ends with nothing
+/// left alive; the result is either the signal (120) or the timeout (124).
+#[cfg(target_os = "macos")]
+#[test]
+fn exec_sigterm_during_timeout_still_sweeps() {
+    let f = Fixture::new();
+    let bin = assert_cmd::cargo::cargo_bin("rewire-sandbox");
+    let script = "perl -MPOSIX -e 'my $p = fork; if (!$p) { POSIX::setsid(); \
+                  open(STDOUT, \">/dev/null\"); open(STDERR, \">/dev/null\"); \
+                  exec \"/bin/sleep\", \"38\" } open(F, \">src/pid\"); print F $p; close F'; \
+                  sleep 30";
+    for delay_ms in [290u64, 300, 310, 330] {
+        let _ = fs::remove_file(f.root.join("src/pid"));
+        let child = std::process::Command::new(&bin)
+            .current_dir(&f.root)
+            .args(["exec", "--timeout-ms", "300", "--profile"])
+            .arg(&f.profile)
+            .args(["--", "sh", "-c", script])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        // SAFETY: plain kill on our own child.
+        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        let out = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        let code = out.status.code();
+        assert!(
+            (code == Some(INTERNAL) && err.contains("terminated by signal 15"))
+                || code == Some(TIMEOUT),
+            "{delay_ms}ms: {code:?} {err}"
+        );
+        if let Ok(s) = fs::read_to_string(f.root.join("src/pid")) {
+            let pid: i32 = s.trim().parse().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            // SAFETY: probe, then clean up an escapee if any.
+            let alive = unsafe { libc::kill(pid, 0) == 0 };
+            if alive {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            assert!(!alive, "{delay_ms}ms: descendant survived");
+        }
+    }
+}

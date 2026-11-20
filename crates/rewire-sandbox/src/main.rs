@@ -110,6 +110,11 @@ enum Outcome {
     NotFound(String),
     /// `exec`: a descendant outlived the command (killed; exit 120).
     Escaped(i32),
+    /// `exec`: terminated by a signal after the full sweep (exit 120).
+    Terminated {
+        signal: i32,
+        escaped: Option<i32>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -155,6 +160,13 @@ fn main() -> ExitCode {
         }
         Ok(Outcome::Escaped(pid)) => {
             eprintln!("sandbox: escaped descendant {pid}");
+            ExitCode::from(EXIT_INTERNAL)
+        }
+        Ok(Outcome::Terminated { signal, escaped }) => {
+            eprintln!("sandbox: terminated by signal {signal}");
+            if let Some(pid) = escaped {
+                eprintln!("sandbox: escaped descendant {pid}");
+            }
             ExitCode::from(EXIT_INTERNAL)
         }
         Err(e) => {
@@ -208,6 +220,9 @@ fn run(cmd: Command) -> Result<Outcome> {
                 }
                 exec::ExecOutcome::NotFound(c) => Outcome::NotFound(c),
                 exec::ExecOutcome::Escaped(pid) => Outcome::Escaped(pid),
+                exec::ExecOutcome::Terminated { signal, escaped } => {
+                    Outcome::Terminated { signal, escaped }
+                }
             },
         ),
     }
