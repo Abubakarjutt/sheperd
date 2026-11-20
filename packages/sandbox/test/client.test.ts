@@ -29,7 +29,11 @@ test("client write/read allowed path roundtrips; checkPath reports", async () =>
   expect(await c.read("src/a.ts")).toBe("hello");
   expect(await c.checkPath("write", "src/a.ts")).toEqual({ allowed: true });
   const d = await c.checkPath("write", ".git/config");
-  expect(d).toMatchObject({ allowed: false });
+  expect(d).toEqual({
+    allowed: false,
+    canonical: join(root, ".git", "config"),
+    rule: expect.any(String),
+  });
   expect(await c.checkPath("write", "/etc/passwd")).toMatchObject({
     allowed: false,
     rule: "<outside-root>",
