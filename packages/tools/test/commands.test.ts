@@ -100,3 +100,23 @@ test.each(["echo 'a)'", 'echo "a)" $(date)', "time -p ls", "ls 2>&1", "echo '$(n
     expect(verdict(c)).toEqual({ forbidden: false });
   },
 );
+
+test.each([
+  "echo hi #'\nnpm i\n#'",
+  "echo $'\\'' ; npm i ; echo '",
+  "echo $'a\\'b' ; npm i",
+  "env --split='npm i'",
+  "env --spl 'npm i'",
+  "env -a x npm i",
+  "env -P /bin npm i",
+  "env --frob npm i",
+])("forbidden or refused (round 3): %j", (c) => {
+  expect(verdict(c)).toMatchObject({ forbidden: true });
+});
+
+test.each(["echo $'hello\\n'", "ls # comment with 'quote", 'echo "#notacomment" ; ls', "echo a#b"])(
+  "round 3 allowed: %j",
+  (c) => {
+    expect(verdict(c)).toEqual({ forbidden: false });
+  },
+);

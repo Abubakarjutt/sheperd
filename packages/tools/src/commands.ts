@@ -35,6 +35,7 @@ const LOOP_HEADERS = new Set(["for", "select", "case"]);
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const GLOB = "\u0000";
 const SUB = "$__SUB__";
+const ANSI = "$__ANSI__";
 const MAX_DEPTH = 5;
 
 const cannot = (what: string): string =>
@@ -43,6 +44,27 @@ const cannot = (what: string): string =>
 type Tok = ReturnType<typeof parse>[number];
 
 class Unevaluable extends Error {}
+
+/** Index of the `'` closing the ANSI-C quote `$'...'` whose opening quote is at `quote`. */
+function closeAnsiC(s: string, quote: number): number {
+  for (let i = quote + 1; i < s.length; i++) {
+    if (s[i] === "\\") i++;
+    else if (s[i] === "'") return i;
+  }
+  throw new Unevaluable("unterminated $'...' quote");
+}
+
+/**
+ * Classify a `#` outside quotes: "comment" when it starts a word after blank/newline/`;|()`,
+ * "word" when it is mid-word (`a#b`), and refuse as ambiguous after a redirection or `&`.
+ */
+function hashKind(s: string, i: number): "comment" | "word" {
+  if (i === 0) return "comment";
+  const prev = s[i - 1] as string;
+  if (/[\s;|()]/.test(prev)) return "comment";
+  if (prev === "<" || prev === ">" || prev === "&") throw new Unevaluable("ambiguous # comment");
+  return "word";
+}
 
 /** Index of the closing backtick after `from`, honoring backslash escapes. */
 function closeBacktick(s: string, from: number): number {
@@ -71,7 +93,12 @@ function closeParen(s: string, open: number): number {
   for (let i = open; i < s.length; i++) {
     const c = s[i];
     if (c === "\\") i++;
-    else if (c === "'") {
+    else if (c === "$" && s[i + 1] === "'") i = closeAnsiC(s, i + 1);
+    else if (c === "#" && hashKind(s, i) === "comment") {
+      const nl = s.indexOf("\n", i);
+      if (nl < 0) throw new Unevaluable("comment runs to end of substitution");
+      i = nl;
+    } else if (c === "'") {
       const end = s.indexOf("'", i + 1);
       if (end < 0) throw new Unevaluable("unterminated single quote");
       i = end;
@@ -100,6 +127,16 @@ function extractSubstitutions(
     if (c === "\\") {
       out += s.slice(i, i + 2);
       i++;
+    } else if (!dq && c === "$" && s[i + 1] === "'") {
+      i = closeAnsiC(s, i + 1);
+      out += ANSI;
+    } else if (!dq && c === "#") {
+      if (hashKind(s, i) === "comment") {
+        const nl = s.indexOf("\n", i);
+        i = nl < 0 ? s.length : nl - 1; // keep the newline
+      } else {
+        out += "\\#";
+      }
     } else if (!dq && c === "'") {
       const end = s.indexOf("'", i + 1);
       if (end < 0) throw new Unevaluable("unterminated single quote");
@@ -141,7 +178,7 @@ function segments(command: string): string[][] {
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i] as Tok;
     if (typeof t === "string") cur.push(t);
-    else if ("comment" in t) break;
+    else if ("comment" in t) throw new Unevaluable("unexpected comment");
     else if ("op" in t && t.op === "glob") cur.push(GLOB + t.pattern);
     else if ("op" in t && SEPARATORS.has(t.op)) flush();
     else {
@@ -228,37 +265,57 @@ function normalize(argv: string[]): { argv: string[]; scripts: string[] } {
   return { argv: a, scripts };
 }
 
+const ENV_LONG_SCRIPT = ["--split-string"];
+const ENV_LONG_ARG = ["--unset", "--chdir", "--argv0"];
+const ENV_LONG_FLAG = [
+  "--ignore-environment",
+  "--null",
+  "--debug",
+  "--help",
+  "--version",
+  "--default-signal",
+  "--ignore-signal",
+  "--block-signal",
+  "--list-signal-handling",
+];
+const ENV_SHORT_FLAGS = "i0v";
+const ENV_SHORT_ARG = "uCaPLU";
+
 /**
- * Skip `env`'s options. A split-string option (`-S`, `-iS`, `-S'cmd'`, `--split-string[=]`) is a
- * script: it is pushed to `scripts` and undefined is returned. Otherwise returns the rest.
+ * Skip `env`'s options. A split-string option (`-S`, `-iS`, `-S'cmd'`, `--split-string[=]`,
+ * unambiguous prefixes like `--split=`) is a script: it is pushed to `scripts` and undefined is
+ * returned. Unrecognised options throw (refused); they are never skipped.
  */
 function envOptions(args: string[], scripts: string[]): string[] | undefined {
   let r = args;
   while (r.length > 0 && (r[0] as string).startsWith("-") && r[0] !== "--") {
     const o = r[0] as string;
     if (o.startsWith("--")) {
-      if (o === "--split-string" || o.startsWith("--split-string=")) {
-        const inline = o.startsWith("--split-string=")
-          ? o.slice("--split-string=".length)
-          : undefined;
-        scripts.push(inline ?? (r[1] as string | undefined) ?? "");
+      const name = (o.split("=")[0] as string) || o;
+      const hasEq = o.includes("=");
+      const prefix = (list: string[]) => name.length >= 3 && list.some((l) => l.startsWith(name));
+      if (prefix(ENV_LONG_SCRIPT)) {
+        scripts.push(hasEq ? o.slice(o.indexOf("=") + 1) : ((r[1] as string | undefined) ?? ""));
         return undefined;
       }
-      r = ["--unset", "--chdir", "--argv0"].includes(o) ? r.slice(2) : r.slice(1);
+      if (prefix(ENV_LONG_ARG)) r = r.slice(hasEq ? 1 : 2);
+      else if (prefix(ENV_LONG_FLAG)) r = r.slice(1);
+      else throw new Unevaluable(`env option ${o}`);
       continue;
     }
     let consumed = 1;
     for (let k = 1; k < o.length; k++) {
-      const ch = o[k];
+      const ch = o[k] as string;
       if (ch === "S") {
         const rest = o.slice(k + 1);
         scripts.push(rest !== "" ? rest : ((r[1] as string | undefined) ?? ""));
         return undefined;
       }
-      if (ch === "u" || ch === "C") {
+      if (ENV_SHORT_ARG.includes(ch)) {
         if (k === o.length - 1) consumed = 2;
         break;
       }
+      if (!ENV_SHORT_FLAGS.includes(ch)) throw new Unevaluable(`env option ${o}`);
     }
     r = r.slice(consumed);
   }
