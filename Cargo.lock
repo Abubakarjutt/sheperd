@@ -337,6 +337,7 @@ dependencies = [
  "caseless",
  "clap",
  "globset",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

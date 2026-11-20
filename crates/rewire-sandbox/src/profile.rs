@@ -122,7 +122,7 @@ fn is_default_ignorable(c: char) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Anchor {
+pub enum Anchor {
     /// Matched against the path relative to root.
     Rel,
     /// Matched against the absolute path.
@@ -134,6 +134,9 @@ enum Anchor {
 struct Rule {
     /// The glob exactly as written in the profile (reported on denial).
     name: String,
+    /// The globs compiled for this rule, unfolded and before the `X/**` ⇒
+    /// `X` expansion (the OS sandbox layer translates these itself).
+    sources: Vec<(Anchor, String)>,
     matchers: Vec<(Anchor, GlobMatcher)>,
 }
 
@@ -173,8 +176,14 @@ impl Rule {
         if pattern.is_empty() {
             bail!("empty glob in profile");
         }
+        if pattern.starts_with('~') {
+            // `~` expansion is the caller's job; an unexpanded `~/` glob
+            // would silently protect nothing.
+            bail!("unexpanded `~` in glob {pattern:?}");
+        }
+        let original = sources.clone();
         // `dir/**` must also cover `dir` itself.
-        for (a, s) in sources.clone() {
+        for (a, s) in original.clone() {
             if let Some(dir) = s.strip_suffix("/**") {
                 if !dir.is_empty() {
                     sources.push((a, dir.to_owned()));
@@ -194,6 +203,7 @@ impl Rule {
             .collect::<Result<_>>()?;
         Ok(Rule {
             name: pattern.to_owned(),
+            sources: original,
             matchers,
         })
     }
@@ -264,7 +274,8 @@ pub struct Profile {
     extra_write: Vec<PathBuf>,
     /// Folded absolute spellings of root's git metadata paths.
     git_protected: Vec<String>,
-    #[allow(dead_code)] // consumed by `exec` (Task 4)
+    /// The same paths, canonical and unfolded (for the OS sandbox layer).
+    git_paths: Vec<PathBuf>,
     network: Network,
 }
 
@@ -300,8 +311,8 @@ impl Profile {
                     .with_context(|| format!("canonicalizing extraWrite {}", p.display()))
             })
             .collect::<Result<_>>()?;
-        let git_protected = git_protected_paths(&root)
-            .context("resolving git metadata")?
+        let git_paths = git_protected_paths(&root).context("resolving git metadata")?;
+        let git_protected = git_paths
             .iter()
             .map(|p| {
                 p.to_str()
@@ -319,9 +330,52 @@ impl Profile {
             read_deny: deny(&spec.read_deny)?,
             extra_write,
             git_protected,
+            git_paths,
             network: spec.network,
             root,
         })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    /// Canonical `extraWrite` directories.
+    pub fn extra_write(&self) -> &[PathBuf] {
+        &self.extra_write
+    }
+
+    /// Canonical git metadata paths of root (`.git`, gitdir, commondir).
+    pub fn git_paths(&self) -> &[PathBuf] {
+        &self.git_paths
+    }
+
+    /// Glob sources of the `write` allow rules.
+    pub fn write_sources(&self) -> Vec<(Anchor, &str)> {
+        sources_of(&self.write)
+    }
+
+    /// Glob sources of the `writeDeny` rules (incl. canonicalized prefixes).
+    pub fn write_deny_sources(&self) -> Vec<(Anchor, &str)> {
+        sources_of(&self.write_deny)
+    }
+
+    /// Glob sources of the `readDeny` rules (incl. canonicalized prefixes).
+    pub fn read_deny_sources(&self) -> Vec<(Anchor, &str)> {
+        sources_of(&self.read_deny)
+    }
+
+    /// The `readDeny` rule matching any spelling of a path, if any
+    /// (non-UTF-8 counts as a match).
+    pub fn read_denial(&self, spellings: &[&Path]) -> Option<String> {
+        match self.deny_match(&self.read_deny, spellings) {
+            Ok(m) => m.map(str::to_owned),
+            Err(rule) => Some(rule.to_owned()),
+        }
     }
 
     /// Both spellings of `path` (relative paths are taken relative to root).
@@ -448,6 +502,13 @@ impl Profile {
             })
             .collect()
     }
+}
+
+fn sources_of(rules: &[Rule]) -> Vec<(Anchor, &str)> {
+    rules
+        .iter()
+        .flat_map(|r| r.sources.iter().map(|(a, s)| (*a, s.as_str())))
+        .collect()
 }
 
 fn first_match<'a>(rules: &'a [Rule], cands: &[Candidate]) -> Option<&'a str> {
@@ -697,6 +758,10 @@ mod tests {
 
         let mut s = spec(&t.root);
         s.write_deny = vec!["".into()];
+        assert!(Profile::from_spec(s).is_err());
+
+        let mut s = spec(&t.root);
+        s.read_deny = vec!["~/.ssh/**".into()];
         assert!(Profile::from_spec(s).is_err());
     }
 

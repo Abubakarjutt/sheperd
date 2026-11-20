@@ -3,13 +3,19 @@
 //! Exit codes: 0 allowed/succeeded, 3 policy denial, 120 any setup or
 //! internal error (malformed profile, I/O failure, usage error, panic).
 //! Nothing but a fully successful, allowed operation exits 0.
+//! `exec` additionally passes through the child's exit code, and uses 124
+//! (timeout) and 127 (command not found) — see `exec.rs`.
 
 mod canonical;
+mod exec;
+mod exec_linux;
+mod exec_macos;
 mod profile;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use profile::{Decision, Op, Profile, Resolved};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,7 +25,7 @@ const EXIT_DENY: u8 = 3;
 const EXIT_INTERNAL: u8 = 120;
 /// Built-in rule: the target resolved differently just before the rename.
 const RULE_PATH_CHANGED: &str = "<path-changed>";
-const SUBCOMMANDS: [&str; 3] = ["check-path", "fs-read", "fs-write"];
+const SUBCOMMANDS: [&str; 4] = ["check-path", "fs-read", "fs-write", "exec"];
 
 #[derive(Parser)]
 #[command(
@@ -60,6 +66,18 @@ enum Command {
         #[arg(allow_hyphen_values = true)]
         path: PathBuf,
     },
+    /// Run a command under the OS sandbox: `exec --profile P -- cmd args…`.
+    #[command(disable_help_flag = true)]
+    Exec {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(last = true, required = true, num_args = 1..)]
+        cmd: Vec<OsString>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -80,7 +98,14 @@ impl From<OpArg> for Op {
 /// Outcome of a successfully evaluated command.
 enum Outcome {
     Done,
-    Denied { canonical: PathBuf, rule: String },
+    Denied {
+        canonical: PathBuf,
+        rule: String,
+    },
+    /// `exec`: exit with this code (the child's, or 124 on timeout).
+    Exit(u8),
+    /// `exec`: the command could not be resolved.
+    NotFound(String),
 }
 
 fn main() -> ExitCode {
@@ -119,6 +144,11 @@ fn main() -> ExitCode {
             eprintln!("{line}");
             ExitCode::from(EXIT_DENY)
         }
+        Ok(Outcome::Exit(code)) => ExitCode::from(code),
+        Ok(Outcome::NotFound(cmd)) => {
+            eprintln!("command not found: {cmd}");
+            ExitCode::from(exec::EXIT_NOT_FOUND)
+        }
         Err(e) => {
             eprintln!("rewire-sandbox: error: {e:#}");
             ExitCode::from(EXIT_INTERNAL)
@@ -152,6 +182,25 @@ fn run(cmd: Command) -> Result<Outcome> {
             }
             fs_write(&profile, &path, &resolved)
         }
+        Command::Exec {
+            profile,
+            timeout_ms,
+            cwd,
+            cmd,
+        } => Ok(
+            match exec::run(exec::ExecArgs {
+                profile,
+                timeout_ms,
+                cwd,
+                cmd,
+            })? {
+                exec::ExecOutcome::Exited(c) => Outcome::Exit(c),
+                exec::ExecOutcome::Denied { canonical, rule } => {
+                    Outcome::Denied { canonical, rule }
+                }
+                exec::ExecOutcome::NotFound(c) => Outcome::NotFound(c),
+            },
+        ),
     }
 }
 
