@@ -14,7 +14,8 @@ import type { Gate } from "@rewire/gates";
 import { detectTsPack } from "@rewire/pack-typescript";
 import { DEFAULT_POLICY } from "@rewire/policy";
 import { call, FauxProvider, type ScriptEntry, text } from "@rewire/providers";
-import { afterAll, expect, test } from "vitest";
+import { SandboxClient } from "@rewire/sandbox";
+import { afterAll, expect, test, vi } from "vitest";
 import { hashFiles, runImplementerStage } from "../src/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -95,13 +96,16 @@ async function run(
     events?: RunEvent[];
     root?: string;
     manifest?: FrozenTestManifest;
+    contract?: Contract;
+    policy?: typeof DEFAULT_POLICY;
+    clientFactory?: (p: never) => SandboxClient;
   } = {},
 ) {
   const root = over.root ?? makeRepo();
   const provider = new FauxProvider(script);
   const events = over.events ?? [];
   const promise = runImplementerStage({
-    contract: CONTRACT,
+    contract: over.contract ?? CONTRACT,
     manifest: over.manifest ?? MANIFEST,
     worktree: root,
     baseRef: "HEAD",
@@ -110,7 +114,8 @@ async function run(
     pack: await detectTsPack(root),
     emit: (e) => events.push(e),
     runId: "r1",
-    policy: DEFAULT_POLICY,
+    policy: over.policy ?? DEFAULT_POLICY,
+    ...(over.clientFactory ? { clientFactory: over.clientFactory } : {}),
     ...(over.gates ? { gates: over.gates } : {}),
     ...(over.feedback ? { feedback: over.feedback } : {}),
     ...(over.maxTurns ? { maxTurns: over.maxTurns } : {}),
@@ -130,6 +135,7 @@ test("cannot end turn while tsc fails; gate summary injected", async () => {
   const r = await promise;
   expect(r.endedBy).toBe("done");
   expect(tsc.runs).toBe(2);
+  expect(r.fastGates.map((g) => g.status)).toEqual(["pass"]);
   expect(JSON.stringify(provider.requests[1])).toContain("Gate tsc fail");
   expect(JSON.stringify(provider.requests[1])).toContain("TS2322 bad type");
 });
@@ -291,3 +297,154 @@ test("real gates: model fixes a broken source file and reaches done", async () =
   expect(r.endedBy).toBe("done");
   expect(r.fastGates.map((g) => g.status)).toEqual(["pass", "pass", "pass"]);
 }, 120000);
+
+// ---- fix round 1 ----
+
+/** Fails once, then passes; the model edits `src/gen1.ts` between. Used for hash-skip tests. */
+async function skipScenario(prep: (root: string) => void, over: Parameters<typeof run>[1] = {}) {
+  const root = makeRepo();
+  prep(root);
+  const tsc = stub("tsc", [["fail", "bad"], ["pass"]]);
+  const { promise, provider } = await run([text("a"), text("b"), text("c")], {
+    root,
+    gates: [tsc],
+    ...over,
+  });
+  const r = await promise;
+  return { r, provider, tsc };
+}
+
+test("a symlink to /dev/zero in the worktree is never read", async () => {
+  const { provider } = await skipScenario((root) => symlinkSync("/dev/zero", join(root, "zero")), {
+    maxTurns: 3,
+  });
+  expect(lastUser(provider, 2)).toContain("No changes since the last failing gate run");
+}, 40000);
+
+test.skipIf(process.platform === "win32")(
+  "a FIFO in the worktree does not block",
+  async () => {
+    const { provider } = await skipScenario(
+      (root) => execFileSync("mkfifo", [join(root, "pipe")]),
+      { maxTurns: 3 },
+    );
+    expect(lastUser(provider, 2)).toContain("No changes since the last failing gate run");
+  },
+  40000,
+);
+
+test("a symlink pointing outside the worktree is never read", async () => {
+  const outside = join(realpathSync(mkdtempSync(join(tmpdir(), "rewire-out-"))), "secret.txt");
+  dirs.push(dirname(outside));
+  writeFileSync(outside, "v1");
+  const root = makeRepo();
+  symlinkSync(outside, join(root, "link"));
+  const tsc = stub("tsc", [["fail", "bad"], ["pass"]]);
+  const { promise, provider } = await run(
+    [
+      text("a"),
+      () => {
+        writeFileSync(outside, "v2 changed outside");
+        return { text: "b" };
+      },
+      text("c"),
+    ],
+    { root, gates: [tsc], maxTurns: 3 },
+  );
+  await promise;
+  // The outside change is invisible to the hash: still "no changes".
+  expect(lastUser(provider, 2)).toContain("No changes since the last failing gate run");
+  expect(tsc.runs).toBe(1);
+}, 40000);
+
+test("skip still fires after a slow failing gate run (fresh deadline per hash)", async () => {
+  const slow: Gate = {
+    name: "slow",
+    category: "broken",
+    async run() {
+      await new Promise((r) => setTimeout(r, 3300));
+      return { status: "fail", summary: "slow bad", details: null };
+    },
+  };
+  const { promise, provider } = await run([text("a"), text("b"), text("c")], {
+    gates: [slow],
+    maxTurns: 3,
+    policy: { ...DEFAULT_POLICY, gateTimeoutMs: 3000 },
+  });
+  await promise;
+  expect(lastUser(provider, 2)).toContain("No changes since the last failing gate run");
+}, 40000);
+
+test("prompt: test titles are rendered fenced and redacted; contract title is inside the fence", async () => {
+  const manifest: FrozenTestManifest = {
+    files: [{ path: "test/math.test.ts", sha256: "x" }],
+    criteriaToTests: { "AC-1": ["test/math.test.ts::math AC-1: adds sk-TITLESECRET1"] },
+  };
+  const contract: Contract = { ...CONTRACT, title: "EVILTITLE sk-CONTRACTSECRET1" };
+  const { promise, provider } = await run([text("ok")], {
+    gates: [stub("tsc", [["pass"]])],
+    manifest,
+    contract,
+  });
+  await promise;
+  const first = provider.requests[0]?.messages[0]?.content ?? "";
+  expect(first).toContain("AC-1");
+  expect(first).toContain("math AC-1: adds [redacted]");
+  expect(first).not.toContain("sk-TITLESECRET1");
+  expect(first).not.toContain("sk-CONTRACTSECRET1");
+  const open = first.indexOf("<untrusted_contract");
+  expect(open).toBeGreaterThan(-1);
+  expect(first.indexOf("EVILTITLE")).toBeGreaterThan(open);
+  expect(first.slice(0, open)).not.toContain("EVILTITLE");
+  const t = first.indexOf("math AC-1: adds");
+  expect(first.slice(0, t)).toMatch(/<untrusted_tests id="[0-9a-f-]{36}">/);
+});
+
+test("a gate with error status blocks done", async () => {
+  const g = stub("tests", [["error", "runner crashed"], ["pass"]]);
+  const { promise, provider } = await run([text("a"), edit(1), text("b")], { gates: [g] });
+  const r = await promise;
+  expect(JSON.stringify(provider.requests[1])).toContain("Gate tests error");
+  expect(r.endedBy).toBe("done");
+  expect(g.runs).toBe(2);
+});
+
+test("ctx.signal reaches the gates: abort mid-gate", async () => {
+  const ac = new AbortController();
+  let seen: AbortSignal | undefined;
+  const g: Gate = {
+    name: "sig",
+    category: "broken",
+    async run(ctx) {
+      seen = ctx.signal;
+      ac.abort();
+      return { status: "pass", summary: "", details: null };
+    },
+  };
+  const { promise } = await run([text("a"), text("b")], { gates: [g], signal: ac.signal });
+  const r = await promise;
+  expect(seen).toBeDefined();
+  expect(seen?.aborted).toBe(true);
+  expect(r.endedBy).toBe("aborted");
+});
+
+test("stage events are emitted and owned clients are disposed", async () => {
+  const events: RunEvent[] = [];
+  const spies: Array<ReturnType<typeof vi.spyOn>> = [];
+  const { promise } = await run([text("ok")], {
+    gates: [stub("tsc", [["pass"]])],
+    events,
+    clientFactory: ((profile: ConstructorParameters<typeof SandboxClient>[0]) => {
+      const c = new SandboxClient(profile);
+      spies.push(vi.spyOn(c, "dispose"));
+      return c;
+    }) as never,
+  });
+  await promise;
+  expect(events.map((e) => e.type).filter((t) => t.startsWith("stage_"))).toEqual([
+    "stage_start",
+    "stage_end",
+  ]);
+  expect(spies.length).toBe(2);
+  for (const s of spies) expect(s).toHaveBeenCalledTimes(1);
+});

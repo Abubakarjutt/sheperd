@@ -14,7 +14,6 @@ import {
   type Gate,
   type GateContext,
   GateExec,
-  hashFiles,
   inNodeModules,
   runGates,
   testsGate,
@@ -32,6 +31,7 @@ const DEFAULT_MAX_TURNS = 60;
 const SUMMARY_ARG_CAP = 120;
 const GATE_LINES = 40;
 const MAX_TRUNCATIONS = 3;
+const DISPUTE_REASON_CAP = 2000;
 const SECRET = /(sk-|ghp_|AKIA)[A-Za-z0-9_-]+/g;
 const DISPUTE_RE = /^DISPUTE (AC-\d+): (.+)$/gm;
 
@@ -115,11 +115,31 @@ function trackStop(inner: Provider): { provider: Provider; last: () => StopReaso
   };
 }
 
-/** Hash of the worktree's changed files: status paths plus content, so re-edits are seen. */
-async function changeHash(g: GateExec, root: string): Promise<string> {
+// Runs inside the verify sandbox: lstat every path, never follow a symlink, never open a
+// non-regular file, and fingerprint big files by size and mtime instead of content.
+const FINGERPRINT_SCRIPT = `const fs=require("fs"),c=require("crypto");
+const a=process.argv.slice(1);if(a[0]==="--")a.shift();
+for(const p of a){let o;try{const s=fs.lstatSync(p);
+if(s.isSymbolicLink())o="l:"+fs.readlinkSync(p);
+else if(!s.isFile())o="o:"+(s.isFIFO()?"fifo":"other");
+else if(s.size>${8 * 1024 * 1024})o="b:"+s.size+":"+s.mtimeMs;
+else o="f:"+c.createHash("sha256").update(fs.readFileSync(p)).digest("hex");}catch{o="x"}
+console.log(p.replace(/\\n/g," ")+"\\t"+o)}`;
+const FINGERPRINT_CHUNK = 100;
+
+/**
+ * Fingerprint of the worktree's changes: HEAD (so a commit cannot hide edits) plus every path git
+ * status lists with an lstat-based content fingerprint, computed in the sandbox. Untracked files
+ * under node_modules/dist/coverage/.next are excluded on purpose: the gates themselves write
+ * build output there and it would look like model changes. Builds a fresh GateExec per call so the
+ * deadline is never stale.
+ */
+async function changeHash(ctx: GateContext): Promise<string> {
+  const g = new GateExec(ctx);
   const heavy = ["node_modules", "dist", "coverage", ".next"].map(
     (d) => `:(glob,exclude)**/${d}/**`,
   );
+  const head = (await g.git(["rev-parse", "HEAD"]).catch(() => "")).trim();
   const out = await g.git([
     "status",
     "--porcelain=v1",
@@ -129,20 +149,34 @@ async function changeHash(g: GateExec, root: string): Promise<string> {
     ".",
     ...heavy,
   ]);
-  const parts: string[] = [];
-  for (const rec of out.split("\0")) {
+  const recs = out.split("\0");
+  const entries: Array<{ xy: string; path: string }> = [];
+  for (let i = 0; i < recs.length; i++) {
+    const rec = recs[i] ?? "";
     if (rec.length < 4) continue;
-    const path = rec.slice(3);
-    if (inNodeModules(path)) continue;
-    let h = "deleted";
-    try {
-      h = (await hashFiles(root, [path]))[0]?.sha256 ?? "deleted";
-    } catch {
-      // deleted or unreadable
+    const xy = rec.slice(0, 2);
+    entries.push({ xy, path: rec.slice(3) });
+    // Rename/copy records carry the old path as an extra NUL-separated field.
+    if (/[RC]/.test(xy)) {
+      const old = recs[++i] ?? "";
+      if (old !== "") entries.push({ xy: "<-", path: old });
     }
-    parts.push(`${rec.slice(0, 2)} ${path} ${h}`);
   }
-  return parts.sort().join("\n");
+  const paths = entries.map((e) => e.path).filter((p) => !inNodeModules(p));
+  const fp = new Map<string, string>();
+  for (let i = 0; i < paths.length; i += FINGERPRINT_CHUNK) {
+    const chunk = paths.slice(i, i + FINGERPRINT_CHUNK);
+    const r = await g.exec([process.execPath, "-e", FINGERPRINT_SCRIPT, "--", ...chunk]);
+    if (r.timedOut || r.exitCode !== 0) throw new Error("change fingerprint failed");
+    for (const line of r.stdout.split("\n")) {
+      const t = line.indexOf("\t");
+      if (t > 0) fp.set(line.slice(0, t), line.slice(t + 1));
+    }
+  }
+  const parts = entries
+    .filter((e) => !inNodeModules(e.path))
+    .map((e) => `${e.xy} ${e.path} ${fp.get(e.path.replace(/\n/g, " ")) ?? "?"}`);
+  return `${head}\n${parts.sort().join("\n")}`;
 }
 
 function gateText(r: GateResult): string {
@@ -167,18 +201,23 @@ function buildPrompt(input: ImplementerInput): string {
   const { contract, manifest, feedback } = input;
   const criteria = contract.criteria.map((c) => `- ${c.id}: ${c.statement}`).join("\n");
   const tests = manifest.files.map((f) => f.path).join("\n") || "(none)";
+  const titles =
+    Object.entries(manifest.criteriaToTests)
+      .map(([id, ts]) => `${id}:\n${ts.map((t) => `  - ${t}`).join("\n")}`)
+      .join("\n") || "(none)";
   const parts: string[] = [];
   if (feedback) {
     parts.push(`## Required fixes\n${fenced("untrusted_feedback", redact(feedback))}`);
   }
   parts.push(
-    `# Contract: ${contract.title}\n${fenced(
+    `# Contract\n${fenced(
       "untrusted_contract",
       redact(
-        `Criteria:\n${criteria}\n\nNon-goals: ${contract.nonGoals.join("; ") || "(none)"}\nAffected areas: ${contract.affectedAreas.join(", ") || "(unspecified)"}`,
+        `Title: ${contract.title}\nCriteria:\n${criteria}\n\nNon-goals: ${contract.nonGoals.join("; ") || "(none)"}\nAffected areas: ${contract.affectedAreas.join(", ") || "(unspecified)"}`,
       ),
     )}`,
     `## Frozen test files (read-only; they define done)\n${fenced("untrusted_test_paths", redact(tests))}`,
+    `## Frozen tests per criterion\n${fenced("untrusted_tests", redact(titles))}`,
   );
   return parts.join("\n\n");
 }
@@ -214,8 +253,18 @@ async function run(
     };
     return await execute(input, safeEmit, agentClient, ctx);
   } finally {
-    for (const c of owned) c.dispose();
-    rmSync(scratch, { recursive: true, force: true });
+    for (const c of owned) {
+      try {
+        c.dispose();
+      } catch {
+        // one failed disposal must not skip the rest
+      }
+    }
+    try {
+      rmSync(scratch, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
   }
 }
 
@@ -227,7 +276,6 @@ async function execute(
 ): Promise<ImplementerResult> {
   const { policy, contract } = input;
   const gates = input.gates ?? [frozenTestsGate, tscGate, testsGate];
-  const root = realpathSync(input.worktree);
   const known = new Set(contract.criteria.map((c) => c.id));
   const stop = trackStop(input.provider);
   const tools = createTools(agentClient, {
@@ -239,6 +287,7 @@ async function execute(
   let fastGates: GateResult[] = [];
   let lastHash: string | undefined;
   let lastFailed = false;
+  // Consecutive truncations; reset whenever a non-truncated final message reaches finishTurn.
   let truncations = 0;
   let outcome: "done" | "dispute" | undefined;
   let dispute: { criterion: string; reason: string } | undefined;
@@ -266,7 +315,10 @@ async function execute(
       const id = m[1] ?? "";
       if (known.has(id)) {
         outcome = "dispute";
-        dispute = { criterion: id, reason: (m[2] ?? "").trim() };
+        dispute = {
+          criterion: id,
+          reason: redact((m[2] ?? "").trim()).slice(0, DISPUTE_REASON_CAP),
+        };
         return { action: "end" as const };
       }
       unknownId ??= id;
@@ -275,8 +327,7 @@ async function execute(
       return { action: "continue" as const, inject: `Unknown criterion ${unknownId}` };
     }
 
-    const g = new GateExec(ctx);
-    const hash = await changeHash(g, root).catch(() => undefined);
+    const hash = await changeHash(ctx).catch(() => undefined);
     if (lastFailed && hash !== undefined && hash === lastHash) {
       return {
         action: "continue" as const,
@@ -285,7 +336,7 @@ async function execute(
     }
     fastGates = await runGates(gates, ctx, safeEmit);
     lastFailed = fastGates.some((r) => r.status !== "pass");
-    lastHash = await changeHash(g, root).catch(() => undefined);
+    lastHash = await changeHash(ctx).catch(() => undefined);
     if (!lastFailed) {
       outcome = "done";
       return { action: "end" as const };
@@ -327,5 +378,6 @@ async function execute(
   }
   if (result.endedBy === "max_turns") return { endedBy: "max_turns", fastGates };
   if (outcome === "dispute" && dispute) return { endedBy: "dispute", fastGates, dispute };
-  return { endedBy: "done", fastGates };
+  if (outcome === "done") return { endedBy: "done", fastGates };
+  throw new RewireError("implementer_failed", "the agent ended without a done or dispute decision");
 }
