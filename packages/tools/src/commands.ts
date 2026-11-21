@@ -8,7 +8,9 @@ import { parse } from "shell-quote";
  * to evaluate soundly, so this only gives agents a fast, clear refusal. When commandRules is
  * non-empty we recurse into everything we can evaluate (command/process substitution, sub-shells,
  * `sh -c`, `env -S`, compound-command bodies, wrappers) and REFUSE what we genuinely cannot
- * (dynamic argv0 such as `$C` or a glob, parse failures, nesting beyond the depth cap), telling the
+ * (dynamic argv0 such as `$C` or a glob, parse failures, nesting beyond the depth cap, heredocs,
+ * array assignment, extglob, `case` inside a substitution, a `#` after `(`/`)` or inside parens or
+ * after `[[`), telling the
  * agent to rewrite in plain form. Substitution itself is evaluated, never blocked. With no rules,
  * nothing is refused.
  */
@@ -156,6 +158,45 @@ function closeBrace(s: string, open: number): number {
   throw new Unevaluable("unterminated $" + "{...} expansion");
 }
 
+const wordStart = (p: Prev): boolean => p.c === START || " \t\n;|&()".includes(p.c);
+
+/**
+ * Fail-closed tracking of contexts where bash keeps a word going after `)` or where `#` is not a
+ * comment: array assignment `=(`, extglob `?( *( +( @( !(`, arithmetic `((..))`, `[[ .. ]]` and
+ * heredocs. The first two are refused outright; a comment inside open plain parens or after `[[`
+ * is refused rather than dropped.
+ */
+class Ctx {
+  depth = 0;
+  dbl = false;
+  /** An unquoted plain `(` (not `$(`, `<(`, `>(`). */
+  open(p: Prev): void {
+    if (p.c === "=") throw new Unevaluable("array assignment");
+    if ("?*+@!".includes(p.c) && p.c !== START) throw new Unevaluable("extglob pattern");
+    this.depth++;
+  }
+  close(): void {
+    if (this.depth > 0) this.depth--; // case patterns close without an open
+  }
+  /** Called on each unquoted plain character. */
+  word(s: string, i: number, p: Prev, inSubst: boolean): void {
+    if (!wordStart(p)) return;
+    const end = s[i + 2] === undefined || " \t\n".includes(s[i + 2] as string);
+    if (s.startsWith("[[", i) && end) this.dbl = true;
+    if (
+      inSubst &&
+      s.startsWith("case", i) &&
+      (s[i + 4] === undefined || " \t\n".includes(s[i + 4] as string))
+    ) {
+      throw new Unevaluable("case inside a substitution");
+    }
+  }
+  comment(): void {
+    if (this.depth > 0) throw new Unevaluable("# inside parentheses");
+    if (this.dbl) throw new Unevaluable("# after [[");
+  }
+}
+
 /**
  * Classify an unquoted `#` from the characters before it, using bash's rules: a comment starts
  * only at a word start (start of input, after a bash blank or an unescaped `;|&()`). Inside a word
@@ -168,7 +209,8 @@ function hashKind(p: Prev): "comment" | "word" {
   if (c === "<" || c === ">" || ((c === "&" || c === "|") && (c2 === "<" || c2 === ">"))) {
     throw new Unevaluable("ambiguous # after a redirection");
   }
-  if (c === START || " \t\n;|&()".includes(c)) return "comment";
+  if (c === "(" || c === ")") throw new Unevaluable("ambiguous # after a parenthesis");
+  if (c === START || " \t\n;|&".includes(c)) return "comment";
   const code = c.charCodeAt(0);
   if (code < 0x20 || code >= 0x7f) {
     throw new Unevaluable("ambiguous # after a non-ASCII or control character");
@@ -204,6 +246,7 @@ function closeDouble(s: string, open: number): number {
  */
 function closeParen(s: string, open: number): number {
   const p = new Prev();
+  const ctx = new Ctx();
   const subst: boolean[] = [];
   for (let i = open; i < s.length; i++) {
     const c = s[i] as string;
@@ -218,6 +261,7 @@ function closeParen(s: string, open: number): number {
       p.step(IN_WORD);
     } else if (c === "#") {
       if (hashKind(p) === "comment") {
+        ctx.comment();
         const nl = s.indexOf("\n", i);
         if (nl < 0) throw new Unevaluable("comment runs to end of substitution");
         i = nl - 1; // the newline is consumed next
@@ -234,13 +278,19 @@ function closeParen(s: string, open: number): number {
       i = closeBacktick(s, i + 1);
       p.step(IN_WORD);
     } else if (c === "(") {
-      subst.push(p.c === "$" || p.c === "<" || p.c === ">");
+      const isSubst = p.c === "$" || p.c === "<" || p.c === ">";
+      if (!isSubst && subst.length > 0) ctx.open(p);
+      subst.push(isSubst);
       p.step(c);
     } else if (c === ")") {
       const wasSubst = subst.pop();
       if (subst.length === 0) return i;
+      if (!wasSubst) ctx.close();
       p.step(wasSubst ? IN_WORD : c);
-    } else p.step(c);
+    } else {
+      ctx.word(s, i, p, true);
+      p.step(c);
+    }
   }
   throw new Unevaluable("unbalanced substitution");
 }
@@ -260,6 +310,7 @@ function extractSubstitutions(
   let out = "";
   let dq = false;
   const p = new Prev();
+  const ctx = new Ctx();
   for (let i = 0; i < s.length; i++) {
     const c = s[i] as string;
     const two = s.slice(i, i + 2);
@@ -287,6 +338,7 @@ function extractSubstitutions(
       p.step(IN_WORD);
     } else if (!dq && c === "#") {
       if (hashKind(p) === "comment") {
+        ctx.comment();
         const nl = s.indexOf("\n", i);
         i = nl < 0 ? s.length : nl - 1; // keep the newline
       } else {
@@ -317,9 +369,19 @@ function extractSubstitutions(
       out += SUB;
       i = end;
       p.step(IN_WORD);
+    } else if (!dq && two === "<<") {
+      if (s[i + 2] !== "<") throw new Unevaluable("heredoc");
+      out += "<<<"; // here-string
+      i += 2;
+      p.step("<");
     } else {
       if (!dq && NON_BASH_BLANK.test(c)) {
         throw new Unevaluable(`unquoted non-blank whitespace U+${c.codePointAt(0)?.toString(16)}`);
+      }
+      if (!dq) {
+        if (c === "(") ctx.open(p);
+        else if (c === ")") ctx.close();
+        else ctx.word(s, i, p, false);
       }
       out += c;
       p.step(c);

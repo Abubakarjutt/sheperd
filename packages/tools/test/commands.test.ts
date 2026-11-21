@@ -180,7 +180,6 @@ test.each([
   "ls\t# comment",
   "ls;# comment",
   "echo a&#x",
-  "(ls)#x",
   "echo $'hello\\n'",
   "echo $'\\e[31mred'",
   // biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a template
@@ -191,5 +190,48 @@ test.each([
   'echo "café a b"',
   "ls \\\n  -la",
 ])("round 4 allowed: %j", (c) => {
+  expect(verdict(c)).toEqual({ forbidden: false });
+});
+
+// Round 5: `)` does not always end a word in bash. Ambiguous `)` contexts are refused (fail closed).
+test.each([
+  "a=(1 2)#x ; npm i",
+  "a+=(1)#x ; npm i",
+  "[[ a =~ (a)#x ]] ; npm i",
+  "[[ a =~ x|#x ]] ; npm i",
+  "[[ a =~ x #x\n]] ; npm i",
+  "shopt -s extglob\necho @(a)#x ; npm i",
+  "shopt -s extglob\necho !(a)#x ; npm i",
+  "shopt -s extglob\necho @(a|#x) ; npm i",
+  "echo $(case x in x) npm i;; esac)",
+  '"$(case x in x) npm i;; esac)"',
+  "cat <(case x in x) npm i;; esac)",
+  "echo $(case x in x) ls;; esac)#x ; npm i",
+  "echo $(case x in x) ls;; esac)",
+  "((1|#x)) ; npm i",
+  "(( 1 + #x )) ; npm i",
+  "for ((i=0;i<1;i++|#x)); do :; done ; npm i",
+  "echo $(a=(1)#x ; npm i)",
+  "((1))#x ; npm i",
+  "(ls)#x ; npm i",
+  "(ls)#x",
+  "cat <<EOF\na '\nEOF\nnpm i\necho '",
+  "cat <<EOF\nhi\nEOF",
+])("forbidden or refused (round 5): %j", (c) => {
+  expect(verdict(c)).toMatchObject({ forbidden: true });
+});
+
+test.each([
+  "(ls)",
+  "(cd x && ls)",
+  "{ ls; }",
+  "echo $(date)",
+  "if [ -f x ]; then echo ok; fi",
+  "case x in x) ls;; esac",
+  "(ls) # comment",
+  "[[ -f x ]] && echo ok",
+  "cat <<< hi",
+  "x=$(( 16#ff ))",
+])("round 5 allowed: %j", (c) => {
   expect(verdict(c)).toEqual({ forbidden: false });
 });
