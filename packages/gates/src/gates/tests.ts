@@ -34,6 +34,7 @@ const Assertion = z.object({
   title: z.string(),
   fullName: z.string().optional(),
   status: z.string(),
+  failureMessages: z.array(z.string()).optional(),
 });
 const Report = z.object({
   testResults: z.array(
@@ -55,13 +56,43 @@ const MAX_LIST = 50;
 const TEST_DEF_RE = /\b(?:test|it|describe)(?:\.\w+)?\s*\(/;
 /** Only these files are collected as tests; other files under the test globs are just hash-frozen. */
 const RUNNABLE_TEST_RE = /\.(?:test|spec)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
-const isRunnable = (p: string): boolean => RUNNABLE_TEST_RE.test(basename(p));
+export const isRunnable = (p: string): boolean => RUNNABLE_TEST_RE.test(basename(p));
 const HARNESS_HINT =
   "tests gate runs with a harness-owned config; project-specific vitest/jest config (aliases, plugins, setupFiles) is not supported in v0.1";
 const RESOLVE_ERR_RE =
   /Failed to resolve|Cannot find (?:module|package)|ERR_MODULE_NOT_FOUND|No test suite found|Failed to load url/i;
 
-type Flat = { file: string; title: string; fullName: string; status: string };
+/** One assertion result from the runner's JSON report. */
+export type RanTest = {
+  file: string;
+  title: string;
+  fullName: string;
+  status: string;
+  failureMessages: string[];
+};
+type Flat = RanTest;
+
+/** The runner did not produce a trustworthy report (timeout, no/invalid report, summary mismatch). */
+export class TestRunError extends Error {
+  constructor(
+    readonly summary: string,
+    readonly details: unknown = null,
+  ) {
+    super(summary);
+    this.name = "TestRunError";
+  }
+}
+
+export type ParsedRun = {
+  tests: RanTest[];
+  /** Assertion count per report file (worktree-relative), including files with zero assertions. */
+  ranFiles: Map<string, number>;
+  /** Files that failed to load/collect (suite failed with no assertions). */
+  brokenSuites: Array<{ file: string; message: string }>;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+};
 
 const err = (summary: string, details: unknown = null): GateOutput => ({
   status: "error",
@@ -110,18 +141,147 @@ export const testsGate: Gate = {
   name: "tests",
   category: "broken",
   async run(ctx) {
-    // Private dir for the harness config and the report; always removed.
-    const gateDir = await mkdtemp(join(ctx.scratch, "gate-"));
     try {
-      await chmod(gateDir, 0o700);
-      return await runIn(ctx, gateDir);
-    } finally {
-      await rm(gateDir, { recursive: true, force: true }).catch(() => {});
+      return await runIn(ctx);
+    } catch (e) {
+      if (e instanceof TestRunError) return err(e.summary, e.details);
+      throw e;
     }
   },
 };
 
-async function runIn(ctx: GateContext, gateDir: string): Promise<GateOutput> {
+/**
+ * Run exactly `files` (worktree-relative, runnable test files) under the harness-owned runner
+ * config in the caller's (verify-profile) client, and return the parsed per-assertion results.
+ * Throws TestRunError when the run produced no trustworthy report: timeout, missing or
+ * unparseable report, or a report that disagrees with the runner's own console summary.
+ * Shared by the tests gate and the test-writer red check, so there is one runner invocation.
+ */
+export async function runTestFiles(
+  ctx: GateContext,
+  files: string[],
+  opts: { exec?: GateExec; hint?: (text: string) => string } = {},
+): Promise<ParsedRun> {
+  const g = opts.exec ?? new GateExec(ctx);
+  const runFiles = files;
+  const root = await realRootOf(ctx);
+  // Private dir for the harness config and the report; always removed.
+  const gateDir = await mkdtemp(join(ctx.scratch, "gate-"));
+  try {
+    await chmod(gateDir, 0o700);
+    const outFile = join(gateDir, `tests-${randomUUID()}.json`);
+    const argv = [...ctx.pack.testCommand, ...ctx.pack.testJsonArgs].map((a) =>
+      a.replaceAll("<path>", outFile),
+    );
+    if (ctx.pack.testRunner === "vitest") {
+      const cfg = join(gateDir, "vitest.harness.config.mjs");
+      const include = runFiles.map(escapeGlob);
+      await writeFile(
+        cfg,
+        `export default { cacheDir: ${JSON.stringify(join(gateDir, "cache"))}, test: { include: ${JSON.stringify(include)} } };\n`,
+      );
+      // --update=none: never write new snapshots (the verify profile is read-only too).
+      argv.push("--reporter=default", "--update=none", `--config=${cfg}`, `--root=${root}`);
+    } else {
+      // jest: harness-owned config; transform stays the jest default (babel-jest, whose
+      // babel config files are drift-checked and protected). No setup files, reporters or
+      // globalSetup are ever loaded from the project.
+      const cfg = join(gateDir, "jest.harness.config.json");
+      const testMatch = runFiles.map((f) => `<rootDir>/${escapeGlob(f)}`);
+      // roots = the (frozen) directories of the run files, so jest's automatic `__mocks__`
+      // substitution cannot pick up implementer-written mocks from elsewhere.
+      const roots = [...new Set(runFiles.map((f) => `<rootDir>/${dirname(f)}`))].sort();
+      await writeFile(
+        cfg,
+        JSON.stringify({
+          rootDir: root,
+          testEnvironment: "node",
+          testMatch,
+          roots,
+          cacheDirectory: join(gateDir, "jest-cache"),
+        }),
+      );
+      argv.push(`--config=${cfg}`, "--ci");
+    }
+    const r = await g.exec(argv);
+    if (r.timedOut) throw new TestRunError("tests timed out");
+
+    let raw: string;
+    try {
+      raw = await readFile(outFile, "utf8");
+    } catch {
+      throw new TestRunError(
+        `test runner wrote no JSON report (exit ${r.exitCode})${opts.hint?.(`${r.stdout}\n${r.stderr}`) ?? ""}`,
+        {
+          exitCode: r.exitCode,
+          output: tail(`${r.stdout}\n${r.stderr}`),
+        },
+      );
+    }
+    let json: unknown;
+    try {
+      json = JSON.parse(raw);
+    } catch {
+      throw new TestRunError(`test runner JSON report is not valid JSON (exit ${r.exitCode})`, {
+        exitCode: r.exitCode,
+      });
+    }
+    const parsed = Report.safeParse(json);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      throw new TestRunError(
+        `test runner JSON report has an unexpected shape: ${issue?.path.join(".") || "(root)"}: ${issue?.message}`,
+        { exitCode: r.exitCode },
+      );
+    }
+
+    const tests: Flat[] = [];
+    const brokenSuites: Array<{ file: string; message: string }> = [];
+    const ranFiles = new Map<string, number>();
+    for (const tr of parsed.data.testResults) {
+      const file = normalize(relative(root, tr.name));
+      ranFiles.set(file, (ranFiles.get(file) ?? 0) + tr.assertionResults.length);
+      for (const a of tr.assertionResults) {
+        tests.push({
+          file,
+          title: a.title,
+          fullName: a.fullName ?? a.title,
+          status: a.status,
+          failureMessages: a.failureMessages ?? [],
+        });
+      }
+      if (tr.status === "failed" && tr.assertionResults.length === 0) {
+        brokenSuites.push({ file, message: (tr.message ?? "").slice(0, 500) });
+      }
+    }
+
+    // Cross-check the report against the runner's own console summary.
+    const summary = summaryTotals(ctx.pack.testRunner, r);
+    const reportFailed = tests.filter((t) => t.status === "failed").length;
+    const disagrees =
+      summary === undefined
+        ? tests.length > 0
+        : summary.total !== tests.length || summary.failed !== reportFailed;
+    if (disagrees) {
+      throw new TestRunError("test report disagrees with the runner's console summary", {
+        report: { total: tests.length, failed: reportFailed },
+        summary: summary ?? null,
+      });
+    }
+    return {
+      tests,
+      ranFiles,
+      brokenSuites,
+      exitCode: r.exitCode,
+      stdout: r.stdout,
+      stderr: r.stderr,
+    };
+  } finally {
+    await rm(gateDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function runIn(ctx: GateContext): Promise<GateOutput> {
   {
     const g = new GateExec(ctx);
     const contract = ctx.contract;
@@ -180,99 +340,11 @@ async function runIn(ctx: GateContext, gateDir: string): Promise<GateOutput> {
       }
     }
 
-    const outFile = join(gateDir, `tests-${randomUUID()}.json`);
-    const argv = [...ctx.pack.testCommand, ...ctx.pack.testJsonArgs].map((a) =>
-      a.replaceAll("<path>", outFile),
+    const { tests, brokenSuites, ranFiles, exitCode, stdout, stderr } = await runTestFiles(
+      ctx,
+      runFiles,
+      { exec: g, hint },
     );
-    if (ctx.pack.testRunner === "vitest") {
-      const cfg = join(gateDir, "vitest.harness.config.mjs");
-      const include = runFiles.map(escapeGlob);
-      await writeFile(
-        cfg,
-        `export default { cacheDir: ${JSON.stringify(join(gateDir, "cache"))}, test: { include: ${JSON.stringify(include)} } };\n`,
-      );
-      // --update=none: never write new snapshots (the verify profile is read-only too).
-      argv.push("--reporter=default", "--update=none", `--config=${cfg}`, `--root=${root}`);
-    } else {
-      // jest: harness-owned config; transform stays the jest default (babel-jest, whose
-      // babel config files are drift-checked and protected). No setup files, reporters or
-      // globalSetup are ever loaded from the project.
-      const cfg = join(gateDir, "jest.harness.config.json");
-      const testMatch = runFiles.map((f) => `<rootDir>/${escapeGlob(f)}`);
-      // roots = the (frozen) directories of the run files, so jest's automatic `__mocks__`
-      // substitution cannot pick up implementer-written mocks from elsewhere.
-      const roots = [...new Set(runFiles.map((f) => `<rootDir>/${dirname(f)}`))].sort();
-      await writeFile(
-        cfg,
-        JSON.stringify({
-          rootDir: root,
-          testEnvironment: "node",
-          testMatch,
-          roots,
-          cacheDirectory: join(gateDir, "jest-cache"),
-        }),
-      );
-      argv.push(`--config=${cfg}`, "--ci");
-    }
-    const r = await g.exec(argv);
-    if (r.timedOut) return err("tests timed out");
-
-    let raw: string;
-    try {
-      raw = await readFile(outFile, "utf8");
-    } catch {
-      return err(
-        `test runner wrote no JSON report (exit ${r.exitCode})${hint(`${r.stdout}\n${r.stderr}`)}`,
-        {
-          exitCode: r.exitCode,
-          output: tail(`${r.stdout}\n${r.stderr}`),
-        },
-      );
-    }
-    let json: unknown;
-    try {
-      json = JSON.parse(raw);
-    } catch {
-      return err(`test runner JSON report is not valid JSON (exit ${r.exitCode})`, {
-        exitCode: r.exitCode,
-      });
-    }
-    const parsed = Report.safeParse(json);
-    if (!parsed.success) {
-      const issue = parsed.error.issues[0];
-      return err(
-        `test runner JSON report has an unexpected shape: ${issue?.path.join(".") || "(root)"}: ${issue?.message}`,
-        { exitCode: r.exitCode },
-      );
-    }
-
-    const tests: Flat[] = [];
-    const brokenSuites: Array<{ file: string; message: string }> = [];
-    const ranFiles = new Map<string, number>();
-    for (const tr of parsed.data.testResults) {
-      const file = normalize(relative(root, tr.name));
-      ranFiles.set(file, (ranFiles.get(file) ?? 0) + tr.assertionResults.length);
-      for (const a of tr.assertionResults) {
-        tests.push({ file, title: a.title, fullName: a.fullName ?? a.title, status: a.status });
-      }
-      if (tr.status === "failed" && tr.assertionResults.length === 0) {
-        brokenSuites.push({ file, message: (tr.message ?? "").slice(0, 500) });
-      }
-    }
-
-    // Cross-check the report against the runner's own console summary.
-    const summary = summaryTotals(ctx.pack.testRunner, r);
-    const reportFailed = tests.filter((t) => t.status === "failed").length;
-    const disagrees =
-      summary === undefined
-        ? tests.length > 0
-        : summary.total !== tests.length || summary.failed !== reportFailed;
-    if (disagrees) {
-      return err("test report disagrees with the runner's console summary", {
-        report: { total: tests.length, failed: reportFailed },
-        summary: summary ?? null,
-      });
-    }
 
     const frozenTests = tests.filter((t) => frozenFiles.has(t.file));
     const passingFrozen = frozenTests.filter((t) => t.status === "passed");
@@ -367,7 +439,7 @@ async function runIn(ctx: GateContext, gateDir: string): Promise<GateOutput> {
     }
 
     const reasons: string[] = [];
-    const details: Record<string, unknown> = { exitCode: r.exitCode, totalTests: tests.length };
+    const details: Record<string, unknown> = { exitCode: exitCode, totalTests: tests.length };
     if (tests.length === 0) reasons.push("zero tests ran");
     if (notPassed.length > 0) {
       reasons.push(`${notPassed.length} test(s) failed`);
@@ -407,10 +479,10 @@ async function runIn(ctx: GateContext, gateDir: string): Promise<GateOutput> {
       reasons.push(`.only in changed test file(s): ${only.join(", ")}`);
       details.onlyFiles = only;
     }
-    if (r.exitCode !== 0) reasons.push(`test command exited ${r.exitCode}`);
+    if (exitCode !== 0) reasons.push(`test command exited ${exitCode}`);
 
     if (reasons.length > 0) {
-      const all = `${r.stdout}\n${r.stderr}\n${brokenSuites.map((b) => b.message).join("\n")}`;
+      const all = `${stdout}\n${stderr}\n${brokenSuites.map((b) => b.message).join("\n")}`;
       return { status: "fail", summary: reasons.join("; ") + hint(all), details };
     }
     return {
