@@ -10,8 +10,11 @@ export function newRunId(now: Date = new Date()): string {
   return `${date}-${time}-${randomBytes(3).toString("hex")}`;
 }
 
+/** Whitespace-normalized evidence text; shared by finding ids and evidence verification. */
+export const normalizeEvidence = (s: string): string => s.replace(/\s+/g, " ").trim();
+
 /** Stable identity of a finding: sha256 of `category|file|normalizedEvidence`. */
 export function fingerprintFinding(f: Finding): string {
-  const evidence = f.evidence.replace(/\s+/g, " ").trim();
+  const evidence = normalizeEvidence(f.evidence);
   return createHash("sha256").update(`${f.category}|${f.file}|${evidence}`).digest("hex");
 }

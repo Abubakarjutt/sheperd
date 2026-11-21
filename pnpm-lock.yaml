@@ -124,6 +124,27 @@ importers:
         specifier: ^4.6.7
         version: 4.6.7
 
+  packages/reviewers:
+    dependencies:
+      '@rewire/core':
+        specifier: workspace:*
+        version: link:../core
+      '@rewire/gates':
+        specifier: workspace:*
+        version: link:../gates
+      '@rewire/policy':
+        specifier: workspace:*
+        version: link:../policy
+      '@rewire/providers':
+        specifier: workspace:*
+        version: link:../providers
+      '@rewire/sandbox':
+        specifier: workspace:*
+        version: link:../sandbox
+      zod:
+        specifier: ^4.6.7
+        version: 4.6.7
+
   packages/sandbox:
     dependencies:
       '@rewire/core':

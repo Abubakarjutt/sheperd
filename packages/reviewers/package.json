@@ -1,0 +1,30 @@
+{
+  "name": "@rewire/reviewers",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "prompts"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@rewire/core": "workspace:*",
+    "@rewire/gates": "workspace:*",
+    "@rewire/policy": "workspace:*",
+    "@rewire/providers": "workspace:*",
+    "@rewire/sandbox": "workspace:*",
+    "zod": "^4.6.7"
+  }
+}
