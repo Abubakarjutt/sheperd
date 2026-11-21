@@ -59,6 +59,11 @@ export const DEFAULT_POLICY: Policy = {
     "**/.gitleaks.toml",
     "**/.gitleaksignore",
     "**/.semgrepignore",
+    "**/npm-shrinkwrap.json",
+    "**/.pnpmfile.cjs",
+    "**/.pnpmfile.mjs",
+    "**/.pnpmfile.js",
+    "**/.yarn/**",
   ],
   // `~` is kept unexpanded here; the sandbox layer expands it.
   credentialDenyGlobs: [
@@ -66,6 +71,7 @@ export const DEFAULT_POLICY: Policy = {
     "~/.aws/**",
     "~/.config/gh/**",
     "~/.netrc",
+    "~/.npmrc",
     "**/.env*",
     "~/Library/Keychains/**",
   ],

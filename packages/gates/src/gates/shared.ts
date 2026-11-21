@@ -179,10 +179,14 @@ const CONFIG_RE = [
   /^\.gitleaks\.toml$/,
   /^\.gitleaksignore$/,
   /^\.semgrepignore$/,
+  /^npm-shrinkwrap\.json$/,
+  /^\.pnpmfile\.(c|m)?js$/,
 ];
 export const isConfigFile = (p: string): boolean =>
   !inNodeModules(p) &&
-  (p.split("/").includes("__mocks__") || CONFIG_RE.some((re) => re.test(basename(p))));
+  (p.split("/").includes("__mocks__") ||
+    p.split("/").includes(".yarn") ||
+    CONFIG_RE.some((re) => re.test(basename(p))));
 
 /** Pathspecs that list the current config files (node_modules excluded). */
 export const CONFIG_PATHSPECS = [
@@ -209,9 +213,14 @@ export const CONFIG_PATHSPECS = [
     ".gitleaks.toml",
     ".gitleaksignore",
     ".semgrepignore",
+    "npm-shrinkwrap.json",
+    ".pnpmfile.cjs",
+    ".pnpmfile.mjs",
+    ".pnpmfile.js",
     "package.json",
   ].map((n) => `:(glob)**/${n}`),
   ":(glob)**/__mocks__/**",
+  ":(glob)**/.yarn/**",
   ":(glob,exclude)**/node_modules/**",
 ];
 
@@ -270,13 +279,17 @@ export async function changedScanFiles(ctx: GateContext, g: GateExec): Promise<s
 export const ENV_BIN = "/usr/bin/env";
 
 /** Summary for a missing scanner binary, with the INSTALL_HINTS text (runner.ts has the same shape). */
-export function missingBinaryOutput(e: unknown, fallbackBin: string): GateOutput | undefined {
+export function missingBinaryOutput(
+  e: unknown,
+  fallbackBin: string,
+  network: string,
+): GateOutput | undefined {
   if (!(e instanceof RewireError) || e.code !== "binary_missing") return undefined;
   const bin = /^command not found: (\S+)/.exec(e.message)?.[1] ?? fallbackBin;
   return {
     status: "error",
     summary: `${bin} not installed — ${INSTALL_HINTS[bin] ?? "install it and make sure it is on PATH"}`,
-    details: { binary: bin },
+    details: { network, binary: bin },
   };
 }
 

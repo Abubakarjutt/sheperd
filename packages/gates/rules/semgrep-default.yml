@@ -7,21 +7,36 @@
 # restricted, incompatible with an Apache-2.0 open core). Keep it that way: only add rules
 # written from scratch for this file.
 #
+# Evasion resistance: injection rules are taint rules (an intermediate variable, a helper
+# call or destructuring does not hide the flow) and the eval/DOM/vm rules use symbolic
+# propagation (an alias such as `const e = eval; e(x)` is still eval).
+#
 # Scope: a small, high-signal set aimed at injection and unsafe-crypto mistakes that coding
 # agents make. Severity ERROR blocks the `semgrep` gate; WARNING is reported but does not block.
 rules:
   - id: rewire.js.eval-nonliteral
     languages: [javascript, typescript]
     severity: ERROR
-    message: eval() or new Function() with a non-literal argument executes attacker-influenced code.
+    message: eval() or new Function() with a non-literal argument (also via globalThis/window/self, an indirect `(0, eval)(x)` call or an alias) executes attacker-influenced code.
     metadata:
       category: security
       cwe: "CWE-95"
+    options:
+      symbolic_propagation: true
     patterns:
       - pattern-either:
           - pattern: eval($X)
+          - pattern: (0, eval)($X)
+          - pattern: globalThis.eval($X)
+          - pattern: window.eval($X)
+          - pattern: self.eval($X)
+          - pattern: global.eval($X)
+          - pattern: $G["eval"]($X)
           - pattern: new Function(...)
           - pattern: Function(...)
+          - pattern: $G.Function(...)
+          - pattern: new $G.Function(...)
+          - pattern: $G["Function"](...)
       - pattern-not: eval("...")
       - pattern-not: new Function("...")
       - pattern-not: Function("...")
@@ -29,97 +44,149 @@ rules:
   - id: rewire.js.child-process-exec-dynamic
     languages: [javascript, typescript]
     severity: ERROR
-    message: child_process exec/execSync with a template or concatenated command string allows shell injection; use execFile with an argument array.
+    message: child_process exec/execSync with a command built from a template, concatenation, request input or process arguments (directly or through variables) allows shell injection; use execFile with an argument array.
     metadata:
       category: security
       cwe: "CWE-78"
-    pattern-either:
-      - pattern: exec(`...${$X}...`, ...)
-      - pattern: execSync(`...${$X}...`, ...)
-      - pattern: $CP.exec(`...${$X}...`, ...)
-      - pattern: $CP.execSync(`...${$X}...`, ...)
-      - pattern: exec($A + $B, ...)
-      - pattern: execSync($A + $B, ...)
-      - pattern: $CP.exec($A + $B, ...)
-      - pattern: $CP.execSync($A + $B, ...)
+    mode: taint
+    pattern-sources:
+      - pattern: |
+          `...${$X}...`
+      - pattern: $A + $B
+      - pattern: $A.concat(...)
+      - patterns:
+          - pattern-either:
+              - pattern: $REQ.query
+              - pattern: $REQ.params
+              - pattern: $REQ.body
+              - pattern: $REQ.headers
+          - metavariable-regex:
+              metavariable: $REQ
+              regex: ^(req|request)$
+      - pattern: process.argv
+    pattern-sanitizers:
+      - pattern: $F.quote(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: exec($S, ...)
+              - pattern: execSync($S, ...)
+              - pattern: $CP.exec($S, ...)
+              - pattern: $CP.execSync($S, ...)
+              - pattern: $CP["exec"]($S, ...)
+              - pattern: $CP["execSync"]($S, ...)
+          - focus-metavariable: $S
 
   - id: rewire.js.dom-html-sink-nonliteral
     languages: [javascript, typescript]
     severity: ERROR
-    message: Assigning a non-literal value to innerHTML/outerHTML or calling document.write with one allows cross-site scripting.
+    message: Assigning a non-literal value to innerHTML/outerHTML, or passing one to document.write or insertAdjacentHTML, allows cross-site scripting.
     metadata:
       category: security
       cwe: "CWE-79"
+    options:
+      symbolic_propagation: true
     patterns:
       - pattern-either:
           - pattern: $EL.innerHTML = $X
           - pattern: $EL.outerHTML = $X
+          - pattern: $EL["innerHTML"] = $X
+          - pattern: $EL["outerHTML"] = $X
           - pattern: document.write($X)
           - pattern: document.writeln($X)
+          - pattern: $EL.insertAdjacentHTML($POS, $X)
       - pattern-not: $EL.innerHTML = "..."
       - pattern-not: $EL.outerHTML = "..."
+      - pattern-not: $EL["innerHTML"] = "..."
+      - pattern-not: $EL["outerHTML"] = "..."
       - pattern-not: document.write("...")
       - pattern-not: document.writeln("...")
+      - pattern-not: $EL.insertAdjacentHTML($POS, "...")
 
   - id: rewire.js.sql-built-by-string
     languages: [javascript, typescript]
     severity: ERROR
-    message: SQL built with a template literal or string concatenation and passed to query()/execute() is injectable; use parameterized queries.
+    message: SQL built with a template literal, string concatenation or request input and passed to query()/execute() (directly or through variables) is injectable; use parameterized queries.
     metadata:
       category: security
       cwe: "CWE-89"
-    pattern-either:
-      - pattern: $DB.query(`...${$X}...`, ...)
-      - pattern: $DB.execute(`...${$X}...`, ...)
-      - pattern: $DB.query($A + $B, ...)
-      - pattern: $DB.execute($A + $B, ...)
+    mode: taint
+    pattern-sources:
+      - pattern: |
+          `...${$X}...`
+      - pattern: $A + $B
+      - pattern: $A.concat(...)
+      - patterns:
+          - pattern-either:
+              - pattern: $REQ.query
+              - pattern: $REQ.params
+              - pattern: $REQ.body
+              - pattern: $REQ.headers
+          - metavariable-regex:
+              metavariable: $REQ
+              regex: ^(req|request)$
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $DB.query($S, ...)
+              - pattern: $DB.execute($S, ...)
+              - pattern: $DB.raw($S, ...)
+              - pattern: $DB.$M.query($S, ...)
+              - pattern: $DB["query"]($S, ...)
+              - pattern: $DB["execute"]($S, ...)
+          - focus-metavariable: $S
 
   - id: rewire.js.vm-run-nonliteral
     languages: [javascript, typescript]
     severity: ERROR
-    message: vm.runInContext/runInNewContext/runInThisContext with a non-literal script executes attacker-influenced code; the vm module is not a security boundary.
+    message: vm.runInContext/runInNewContext/runInThisContext/Script with a non-literal script executes attacker-influenced code; the vm module is not a security boundary.
     metadata:
       category: security
       cwe: "CWE-94"
+    options:
+      symbolic_propagation: true
     patterns:
       - pattern-either:
           - pattern: $VM.runInContext($X, ...)
           - pattern: $VM.runInNewContext($X, ...)
           - pattern: $VM.runInThisContext($X, ...)
+          - pattern: new $VM.Script($X, ...)
+          - pattern: new Script($X, ...)
       - pattern-not: $VM.runInContext("...", ...)
       - pattern-not: $VM.runInNewContext("...", ...)
       - pattern-not: $VM.runInThisContext("...", ...)
+      - pattern-not: new $VM.Script("...", ...)
+      - pattern-not: new Script("...", ...)
 
   - id: rewire.js.fs-path-from-request
     languages: [javascript, typescript]
     severity: ERROR
-    message: A filesystem path built from request input allows path traversal; resolve against a fixed base and verify containment.
+    message: A filesystem path built from request input (directly or through variables, path.join or destructuring) allows path traversal; resolve against a fixed base and verify containment.
     metadata:
       category: security
       cwe: "CWE-22"
-    patterns:
-      - pattern-either:
-          - pattern: $FS.readFile(<... $REQ.query ...>, ...)
-          - pattern: $FS.readFile(<... $REQ.params ...>, ...)
-          - pattern: $FS.readFile(<... $REQ.body ...>, ...)
-          - pattern: $FS.readFileSync(<... $REQ.query ...>, ...)
-          - pattern: $FS.readFileSync(<... $REQ.params ...>, ...)
-          - pattern: $FS.readFileSync(<... $REQ.body ...>, ...)
-          - pattern: $FS.writeFile(<... $REQ.query ...>, ...)
-          - pattern: $FS.writeFile(<... $REQ.params ...>, ...)
-          - pattern: $FS.writeFile(<... $REQ.body ...>, ...)
-          - pattern: $FS.writeFileSync(<... $REQ.query ...>, ...)
-          - pattern: $FS.writeFileSync(<... $REQ.params ...>, ...)
-          - pattern: $FS.writeFileSync(<... $REQ.body ...>, ...)
-          - pattern: $FS.createReadStream(<... $REQ.query ...>, ...)
-          - pattern: $FS.createReadStream(<... $REQ.params ...>, ...)
-          - pattern: $FS.createReadStream(<... $REQ.body ...>, ...)
-          - pattern: path.join(..., $REQ.query.$P, ...)
-          - pattern: path.join(..., $REQ.params.$P, ...)
-          - pattern: path.join(..., $REQ.body.$P, ...)
-      - metavariable-regex:
-          metavariable: $REQ
-          regex: ^(req|request)$
+    mode: taint
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: $REQ.query
+              - pattern: $REQ.params
+              - pattern: $REQ.body
+              - pattern: $REQ.headers
+          - metavariable-regex:
+              metavariable: $REQ
+              regex: ^(req|request)$
+    pattern-sanitizers:
+      - pattern: path.basename(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $FS.$M($S, ...)
+              - pattern: $M($S, ...)
+          - metavariable-regex:
+              metavariable: $M
+              regex: ^(readFile|readFileSync|writeFile|writeFileSync|appendFile|appendFileSync|createReadStream|createWriteStream|unlink|unlinkSync|readdir|readdirSync|rm|rmSync|rmdir|rmdirSync|sendFile|download|open|openSync|copyFile|copyFileSync|rename|renameSync)$
+          - focus-metavariable: $S
 
   - id: rewire.js.tls-reject-unauthorized-false
     languages: [javascript, typescript]
@@ -161,4 +228,5 @@ rules:
           - pattern: "{..., $TOKEN: <... Math.random() ...>, ...}"
       - metavariable-regex:
           metavariable: $TOKEN
-          regex: (?i).*(token|secret|password|passwd|session|nonce|salt|apikey|api_key|key|id)$
+          # whole-word match (id, userId, user_id, sessionToken, API_KEY) but not valid, width, monkey
+          regex: ^(?i:(.*[_-])?(id|key|token|secret|password|passwd|nonce|salt|session|apikey))$|^.*[a-z0-9](Id|Key|Token|Secret|Password|Nonce|Salt|Session|ApiKey)$

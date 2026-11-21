@@ -1,5 +1,5 @@
 import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { dirname, join, sep } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 import type { Gate, GateOutput } from "../types.js";
 import {
@@ -23,11 +23,49 @@ const Report = z.array(
   }),
 );
 
-const err = (summary: string, details: unknown = null): GateOutput => ({
+const NET = "deny";
+const err = (summary: string, details: Record<string, unknown> = {}): GateOutput => ({
   status: "error",
   summary,
-  details,
+  details: { network: NET, ...details },
 });
+
+/** Never staged: scanner config the implementer could write (they are neutralised by flags too). */
+const SKIP_STAGE = new Set([".gitleaksignore", ".gitleaks.toml"]);
+
+/**
+ * argv for the scan, run with the staged `files/` directory as cwd so reported paths (and the
+ * `file:rule:line` fingerprints) are worktree-relative.
+ */
+export function gitleaksArgs(o: {
+  gitleaks: string;
+  config: string;
+  noIgnore: string;
+  report: string;
+}): string[] {
+  return [
+    o.gitleaks,
+    "dir",
+    ".",
+    "--config",
+    o.config,
+    "--gitleaks-ignore-path",
+    o.noIgnore,
+    "--ignore-gitleaks-allow",
+    "--redact",
+    "--no-banner",
+    "--no-color",
+    "--log-level",
+    "error",
+    "--report-format",
+    "json",
+    "--report-path",
+    o.report,
+  ];
+}
+
+/** exec has no cwd outside the worktree; `sh` changes into the staging dir first. */
+const CD_EXEC = 'cd "$1" || exit 125; shift; exec "$@"';
 
 /**
  * gitleaks over the changed files.
@@ -58,7 +96,7 @@ export const gitleaksGate: Gate = {
     try {
       gitleaks = resolveBin("gitleaks");
     } catch (e) {
-      return missingBinaryOutput(e, "gitleaks") ?? err(errMsg(e));
+      return missingBinaryOutput(e, "gitleaks", NET) ?? err(errMsg(e));
     }
     let files: string[];
     try {
@@ -66,46 +104,35 @@ export const gitleaksGate: Gate = {
     } catch (e) {
       return err(`cannot list changed files against ${ctx.baseRef}: ${errMsg(e)}`);
     }
-    const base = { network: "deny" };
+    const base = { network: NET };
     if (files.length === 0) {
       return { status: "pass", summary: "no changed files", details: { ...base, files: 0 } };
     }
 
     let work: string | undefined;
-    let stage = "";
     try {
       work = await realpath(await mkdtemp(join(ctx.scratch, "gitleaks-")));
-      stage = join(work, "stage");
+      const stage = join(work, "stage", "files");
       const noIgnore = join(work, "no-ignore");
       const report = join(work, "report.json");
       const config = join(work, "config.toml");
-      await mkdir(stage, { mode: 0o700 });
+      await mkdir(stage, { recursive: true, mode: 0o700 });
       await mkdir(noIgnore, { mode: 0o700 });
       await writeFile(config, "[extend]\nuseDefault = true\n", { mode: 0o600 });
       const root = await realRootOf(ctx);
       for (const f of files) {
+        if (SKIP_STAGE.has(basename(f))) continue;
         const dest = join(stage, f);
         await mkdir(dirname(dest), { recursive: true, mode: 0o700 });
         await copyFile(join(root, f), dest);
       }
       const r = await g.exec([
-        gitleaks,
-        "dir",
+        "/bin/sh",
+        "-c",
+        CD_EXEC,
+        "sh",
         stage,
-        "--config",
-        config,
-        "--gitleaks-ignore-path",
-        noIgnore,
-        "--ignore-gitleaks-allow",
-        "--redact",
-        "--no-banner",
-        "--no-color",
-        "--log-level",
-        "error",
-        "--report-format",
-        "json",
-        "--report-path",
-        report,
+        ...gitleaksArgs({ gitleaks, config, noIgnore, report }),
       ]);
       if (r.timedOut) return err("gitleaks timed out", base);
       if (r.exitCode !== 0 && r.exitCode !== 1) {
@@ -135,7 +162,7 @@ export const gitleaksGate: Gate = {
       }
       const findings = parsed.map((f) => ({
         rule: f.RuleID,
-        file: f.File.startsWith(stage + sep) ? f.File.slice(stage.length + 1) : f.File,
+        file: f.File.replace(/^\.\//, ""),
         line: f.StartLine,
         match: f.Secret === "REDACTED" ? f.Match : "REDACTED",
       }));
@@ -146,7 +173,7 @@ export const gitleaksGate: Gate = {
       };
     } catch (e) {
       return (
-        missingBinaryOutput(e, "gitleaks") ?? err(`gitleaks failed to run: ${errMsg(e)}`, base)
+        missingBinaryOutput(e, "gitleaks", NET) ?? err(`gitleaks failed to run: ${errMsg(e)}`, base)
       );
     } finally {
       if (work) await rm(work, { recursive: true, force: true }).catch(() => {});

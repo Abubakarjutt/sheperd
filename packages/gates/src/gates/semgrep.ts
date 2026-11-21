@@ -40,7 +40,8 @@ const caBundleEnv = (): string[] => {
 };
 
 const RULES_NOTE = "rewire-original, Apache-2.0";
-const MAX_FINDINGS = 50;
+const MAX_FINDINGS = 200;
+const NET = "deny";
 
 const SemgrepOut = z.object({
   results: z.array(
@@ -59,16 +60,31 @@ const SemgrepOut = z.object({
       path: z.string().optional(),
     }),
   ),
+  paths: z
+    .object({
+      scanned: z.array(z.string()),
+      skipped: z
+        .array(z.object({ path: z.string(), reason: z.string().optional() }).loose())
+        .optional(),
+    })
+    .loose(),
 });
 
-/** Per-file parse failures: the file was (partly) not analysed, so the implementer must fix it. */
+/** A file the implementer can fix, or one semgrep did not (fully) analyse: both are `fail`. */
 const SYNTAX_RE = /syntax|parsing|lexical|parse error/i;
+const RESOURCE_RE = /timeout|out ?of ?memory|too ?many ?matches/i;
+/** Allowlist of warnings known to be harmless; anything else unknown is an `error` (fail closed). */
+const BENIGN_WARNING_RE = /deprecat/i;
+/** Languages the ruleset covers. A changed file with one of these extensions MUST be scanned. */
+const SCANNED_EXT_RE = /\.(js|jsx|mjs|cjs|ts|tsx|mts|cts)$/;
+const UNSUPPORTED_RE = /unsupported|language|no rule|no applicable/i;
 const typeText = (t: unknown): string => (typeof t === "string" ? t : JSON.stringify(t ?? ""));
+const norm = (p: string): string => p.replace(/^\.\//, "");
 
-const err = (summary: string, details: unknown = null): GateOutput => ({
+const err = (summary: string, details: Record<string, unknown> = {}): GateOutput => ({
   status: "error",
   summary,
-  details,
+  details: { network: NET, ...details },
 });
 
 type Finding = { rule: string; file: string; line: number; severity: string; message: string };
@@ -98,7 +114,7 @@ export const semgrepGate: Gate = {
     try {
       semgrep = resolveBin("semgrep");
     } catch (e) {
-      return missingBinaryOutput(e, "semgrep") ?? err(errMsg(e));
+      return missingBinaryOutput(e, "semgrep", NET) ?? err(errMsg(e));
     }
     let files: string[];
     try {
@@ -106,21 +122,28 @@ export const semgrepGate: Gate = {
     } catch (e) {
       return err(`cannot list changed files against ${ctx.baseRef}: ${errMsg(e)}`);
     }
-    const base = { network: "deny", rules: RULES_NOTE };
+    const base = { network: NET, rules: RULES_NOTE };
     if (files.length === 0) {
       return { status: "pass", summary: "no changed files", details: { ...base, files: 0 } };
     }
+    const changed = new Set(files);
 
     const home = join(ctx.scratch, "semgrep-home");
     const dirs = [home, join(home, ".config"), join(home, ".cache"), join(home, "tmp")];
     try {
       for (const d of dirs) await mkdir(d, { recursive: true, mode: 0o700 });
     } catch (e) {
-      return err(`cannot prepare semgrep scratch: ${errMsg(e)}`);
+      return err(`cannot prepare semgrep scratch: ${errMsg(e)}`, base);
     }
 
     const findings: Finding[] = [];
-    const syntaxFiles = new Set<string>();
+    /** file -> why it is a problem (syntax error, timeout, not scanned, ...) */
+    const problemFiles = new Map<string, string[]>();
+    const flag = (file: string, why: string) => {
+      const l = problemFiles.get(file) ?? [];
+      if (!l.includes(why)) l.push(why);
+      problemFiles.set(file, l);
+    };
     const hardErrors: string[] = [];
     const warnings: string[] = [];
     try {
@@ -161,31 +184,59 @@ export const semgrepGate: Gate = {
           );
         }
         for (const x of parsed.results) {
-          findings.push({
+          const f = {
             rule: x.check_id.replace(/^.*?(rewire\.)/, "$1"),
-            file: x.path.replace(/^\.\//, ""),
+            file: norm(x.path),
             line: x.start.line,
             severity: x.extra.severity,
             message: x.extra.message ?? "",
-          });
+          };
+          // semgrep reports one finding per matching pattern branch; keep one per rule and line
+          if (!findings.some((o) => o.rule === f.rule && o.file === f.file && o.line === f.line)) {
+            findings.push(f);
+          }
+        }
+        // Every changed file in a language the rules cover must actually have been scanned:
+        // semgrep silently skips oversized, ignored or unreadable files.
+        const scanned = new Set(parsed.paths.scanned.map(norm));
+        for (const f of chunk) {
+          if (SCANNED_EXT_RE.test(f) && !scanned.has(f)) flag(f, "not scanned");
+        }
+        for (const sk of parsed.paths.skipped ?? []) {
+          const f = norm(sk.path);
+          if (changed.has(f) && !UNSUPPORTED_RE.test(sk.reason ?? "")) {
+            flag(f, `skipped: ${sk.reason ?? "unknown reason"}`);
+          }
         }
         for (const e of parsed.errors) {
-          const text = `${typeText(e.type)} ${e.message ?? ""}`;
-          if (SYNTAX_RE.test(typeText(e.type)) && e.path) syntaxFiles.add(e.path);
-          else if (e.level === "error") hardErrors.push(text.trim().slice(0, 200));
-          else warnings.push(text.trim().slice(0, 200));
+          const typ = typeText(e.type);
+          const text = `${typ} ${e.message ?? ""}`.trim().slice(0, 200);
+          const path = e.path ? norm(e.path) : undefined;
+          if (SYNTAX_RE.test(typ) || RESOURCE_RE.test(typ)) {
+            flag(path ?? "(no path)", text);
+          } else if (path !== undefined && changed.has(path)) {
+            flag(path, text);
+          } else if (e.level === "warn" && BENIGN_WARNING_RE.test(text)) {
+            warnings.push(text);
+          } else {
+            hardErrors.push(text);
+          }
         }
       }
     } catch (e) {
-      const m = missingBinaryOutput(e, "semgrep");
-      return m ?? err(`semgrep failed to run: ${errMsg(e)}`, base);
+      return (
+        missingBinaryOutput(e, "semgrep", NET) ?? err(`semgrep failed to run: ${errMsg(e)}`, base)
+      );
     }
 
+    const unscanned = [...problemFiles.entries()]
+      .map(([file, why]) => ({ file, why }))
+      .sort((a, b) => (a.file < b.file ? -1 : 1));
     const details = {
       ...base,
       files: files.length,
       findings: findings.slice(0, MAX_FINDINGS),
-      parseErrors: [...syntaxFiles].sort(),
+      problemFiles: unscanned,
       warnings: warnings.slice(0, 10),
     };
     if (hardErrors.length > 0) {
@@ -195,10 +246,15 @@ export const semgrepGate: Gate = {
       });
     }
     const blocking = findings.filter((f) => f.severity === "ERROR");
-    if (blocking.length > 0 || syntaxFiles.size > 0) {
+    if (blocking.length > 0 || unscanned.length > 0) {
       const parts = [
         blocking.length > 0 ? `${blocking.length} security finding(s)` : "",
-        syntaxFiles.size > 0 ? `${syntaxFiles.size} file(s) failed to parse` : "",
+        unscanned.length > 0
+          ? `${unscanned.length} file(s) not scanned or errored: ${unscanned
+              .slice(0, 3)
+              .map((u) => u.file)
+              .join(", ")}`
+          : "",
       ].filter(Boolean);
       return { status: "fail", summary: `semgrep: ${parts.join(", ")}`, details };
     }

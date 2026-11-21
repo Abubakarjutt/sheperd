@@ -21,6 +21,8 @@ const PKG_KEYS = [
   "eslintIgnore",
   "babel",
   "prettier",
+  "packageManager",
+  "devEngines",
 ] as const;
 const isPkg = (p: string): boolean => basename(p) === "package.json" && !inNodeModules(p);
 

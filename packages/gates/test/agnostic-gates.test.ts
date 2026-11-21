@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -16,6 +17,7 @@ import type { TsPack } from "@rewire/pack-typescript";
 import { DEFAULT_POLICY } from "@rewire/policy";
 import { type ExecResult, profileFor, SandboxClient } from "@rewire/sandbox";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { gitleaksArgs } from "../src/gates/gitleaks.js";
 import {
   auditGate,
   type GateContext,
@@ -99,9 +101,11 @@ const AWS_KEY = `${"AKIA"}${"IOSFODNN7EXAMPLQ"}`;
 
 describe("semgrep rules file", () => {
   test("is valid for semgrep --validate and original/Apache-2.0", () => {
+    const home = tmp();
     const out = execFileSync("semgrep", ["--validate", "--config", RULES, "--metrics=off"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: home, XDG_CACHE_HOME: home },
     });
     expect(out).toBeDefined();
   });
@@ -165,6 +169,7 @@ describe("semgrep gate", () => {
       exec: async (argv: string[], o: { timeoutMs: number; cwd?: string }): Promise<ExecResult> => {
         if (!argv.some((a) => a.endsWith("semgrep"))) return real.exec(argv, o);
         const out = {
+          paths: { scanned: ["broken.js"] },
           results: [],
           errors: [
             {
@@ -210,6 +215,152 @@ describe("semgrep gate", () => {
   });
 });
 
+const EVASION_BAD: Record<string, string> = {
+  "eval-global.js": "export const f = (x) => globalThis.eval(x);\n",
+  "eval-window.js": "export const f = (x) => window.eval(x);\n",
+  "eval-bracket.js": 'export const f = (x) => window["eval"](x);\n',
+  "eval-indirect.js": "export const f = (x) => (0, eval)(x);\n",
+  "eval-alias.js": "const e = eval;\nexport const f = (x) => e(x);\n",
+  "fn-ctor.js": 'export const f = (b) => new Function("a", b);\n',
+  "exec-var-template.js":
+    'import { exec } from "node:child_process";\nexport function f(dir) { const cmd = `ls \x24{dir}`; exec(cmd); }\n',
+  "exec-var-concat.js":
+    'import cp from "node:child_process";\nexport function f(dir) { const cmd = "ls " + dir; cp.execSync(cmd); }\n',
+  "exec-req.js":
+    'import cp from "node:child_process";\nexport function f(req) { const c = req.query.c; cp.exec(c); }\n',
+  "sql-var-template.js":
+    "export function f(db, id) { const q = `select * from t where id=\x24{id}`; return db.query(q); }\n",
+  "sql-var-concat.js":
+    'export function f(db, id) { const q = "select * from t where id=" + id; return db.execute(q); }\n',
+  "fs-var-join.js":
+    'import fs from "node:fs";\nimport path from "node:path";\nexport function f(req) { const p = path.join("/base", req.query.f); return fs.readFileSync(p); }\n',
+  "fs-destructure.js":
+    'import fs from "node:fs";\nexport function f(req) { const { name } = req.params; return fs.readFileSync(name); }\n',
+  "html-var.js": "export function f(el, x) { const h = x; el.innerHTML = h; }\n",
+  "html-bracket.js": 'export const f = (el, x) => { el["innerHTML"] = x; };\n',
+  "vm-var.js": 'import vm from "node:vm";\nexport const f = (x) => vm.runInNewContext(x);\n',
+};
+const EVASION_OK = `import cp from "node:child_process";
+import fs from "node:fs";
+export const a = () => eval("1+1");
+export const b = () => cp.exec("ls -la");
+export const c = () => { const s = "ls"; cp.exec(s); };
+export const d = (db) => db.query("select 1");
+export const e = (db) => { const q = "select 1"; return db.query(q); };
+export const f = () => fs.readFileSync("a.txt");
+export const g = (el) => { el.innerHTML = "<b>x</b>"; };
+export const width = Math.random();
+export const valid = Math.random();
+`;
+
+describe("semgrep ruleset evasion resistance (real semgrep)", () => {
+  test("indirect, aliased and variable-carried injections are all flagged", async () => {
+    const { root, ctx } = makeRepo();
+    for (const [f, t] of Object.entries(EVASION_BAD)) write(root, `bad/${f}`, t);
+    write(root, "ok/ok.js", EVASION_OK);
+    const r = await semgrepGate.run(ctx);
+    expect(r.status).toBe("fail");
+    const found = new Set(
+      (r.details as { findings: { file: string; severity: string }[] }).findings
+        .filter((f) => f.severity === "ERROR")
+        .map((f) => f.file),
+    );
+    const missed = Object.keys(EVASION_BAD).filter((f) => !found.has(`bad/${f}`));
+    expect(missed).toEqual([]);
+    expect(found.has("ok/ok.js")).toBe(false);
+    const warned = (r.details as { findings: { file: string }[] }).findings.filter(
+      (f) => f.file === "ok/ok.js",
+    );
+    expect(warned).toEqual([]);
+  });
+
+  test("Math.random only warns for whole-word token-like names", async () => {
+    const { root, ctx } = makeRepo();
+    write(
+      root,
+      "r.js",
+      "export const userId = Math.random();\nexport const sessionToken = Math.random();\nexport const width = Math.random();\nexport const monkey = Math.random();\n",
+    );
+    const r = await semgrepGate.run(ctx);
+    expect(r.status).toBe("pass");
+    const lines = (r.details as { findings: { line: number }[] }).findings.map((f) => f.line);
+    expect(lines.sort()).toEqual([1, 2]);
+  });
+});
+
+describe("semgrep fail-closed on skipped and errored files", () => {
+  const stubSemgrep = (ctx: GateContext, out: unknown, exitCode = 0): GateContext => {
+    const real = ctx.client;
+    const client = {
+      exec: async (argv: string[], o: { timeoutMs: number; cwd?: string }): Promise<ExecResult> =>
+        argv.some((a) => a.endsWith("semgrep"))
+          ? { exitCode, stdout: JSON.stringify(out), stderr: "", timedOut: false }
+          : real.exec(argv, o),
+    } as unknown as SandboxClient;
+    return { ...ctx, client };
+  };
+
+  test("real semgrep: a file that cannot be parsed fails and is listed", async () => {
+    const { root, ctx } = makeRepo();
+    writeFileSync(join(root, "junk.js"), Buffer.from("00010203ff".repeat(100), "hex"));
+    write(root, "fine.js", "export const a = 1;\n");
+    const r = await semgrepGate.run(ctx);
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain("junk.js");
+    expect(JSON.stringify(r.details)).not.toContain("fine.js");
+  });
+
+  test("real semgrep: a file that makes a rule time out fails and is listed", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "slow.js", `var a=${"a+".repeat(50000)}1;`);
+    const r = await semgrepGate.run(ctx);
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain("slow.js");
+    expect(JSON.stringify(r.details)).toContain("Timeout");
+  }, 120_000);
+
+  test("a changed JS file missing from paths.scanned fails; non-JS files are ignored", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "a.ts", "export const a = 1;\n");
+    write(root, "notes.txt", "hello\n");
+    const out = { results: [], errors: [], paths: { scanned: [] } };
+    const r = await semgrepGate.run(stubSemgrep(ctx, out));
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain("a.ts");
+    expect(JSON.stringify(r.details)).not.toContain("notes.txt");
+    const ok = await semgrepGate.run(
+      stubSemgrep(ctx, { results: [], errors: [], paths: { scanned: ["a.ts"] } }),
+    );
+    expect(ok.status).toBe("pass");
+  });
+
+  test("timeouts, OOM, too-many-matches and any error on a changed file fail with the file", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "a.js", "export const a = 1;\n");
+    const paths = { scanned: ["a.js"] };
+    for (const type of ["Timeout", "OutOfMemory", "TooManyMatches", "Other weird thing"]) {
+      const out = { results: [], paths, errors: [{ level: "warn", type, path: "a.js" }] };
+      const r = await semgrepGate.run(stubSemgrep(ctx, out));
+      expect(r.status, type).toBe("fail");
+      expect(JSON.stringify(r.details)).toContain("a.js");
+    }
+  });
+
+  test("an unknown pathless warning is an error; only allowlisted warnings pass", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "a.js", "export const a = 1;\n");
+    const paths = { scanned: ["a.js"] };
+    const unknown = { results: [], paths, errors: [{ level: "warn", type: "Mystery" }] };
+    expect((await semgrepGate.run(stubSemgrep(ctx, unknown))).status).toBe("error");
+    const benign = {
+      results: [],
+      paths,
+      errors: [{ level: "warn", type: "DeprecationWarning", message: "deprecated flag" }],
+    };
+    expect((await semgrepGate.run(stubSemgrep(ctx, benign))).status).toBe("pass");
+  });
+});
+
 describe("gitleaks gate", () => {
   test("flags a hardcoded AWS key in the diff, redacted", async () => {
     const { root, ctx } = makeRepo();
@@ -247,6 +398,44 @@ describe("gitleaks gate", () => {
     const found = (r.details as { findings: { file: string }[] }).findings.map((f) => f.file);
     expect(found).toContain("src/cfg.js");
     expect(found).toContain("src/cfg2.js");
+  });
+
+  test("a .gitleaksignore in the scan root suppresses even with -i, so staging must never copy it", () => {
+    // gitleaks 8.30 reads <scan root>/.gitleaksignore regardless of --gitleaks-ignore-path. The
+    // gate is safe because it never stages ignore/config files; this pins the reason.
+    const dir = tmp();
+    write(dir, "files/src/cfg.js", `export const key = "${AWS_KEY}";\n`);
+    const noIgnore = join(dir, "no-ignore");
+    mkdirSync(noIgnore);
+    const cfg = join(dir, "c.toml");
+    writeFileSync(cfg, "[extend]\nuseDefault = true\n");
+    const argv = gitleaksArgs({
+      gitleaks: "gitleaks",
+      config: cfg,
+      noIgnore,
+      report: join(dir, "r.json"),
+    }).slice(1);
+    const run = (): number => {
+      try {
+        execFileSync("gitleaks", argv, { cwd: join(dir, "files"), stdio: "ignore" });
+        return 0;
+      } catch (e) {
+        return (e as { status: number }).status;
+      }
+    };
+    expect(run()).toBe(1);
+    write(dir, "files/.gitleaksignore", "src/cfg.js:aws-access-token:1\n");
+    expect(run()).toBe(0);
+  });
+
+  test("a repo ignore file with the exact relative fingerprint does not hide the finding", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "src/cfg.js", `export const key = "${AWS_KEY}";\n`);
+    write(root, ".gitleaksignore", "src/cfg.js:aws-access-token:1\n");
+    const r = await gitleaksGate.run(ctx);
+    expect(r.status).toBe("fail");
+    const f = (r.details as { findings: { file: string; line: number }[] }).findings;
+    expect(f[0]?.file).toBe("src/cfg.js");
   });
 
   test("leaves no staged copy of the secret in scratch", async () => {
@@ -322,19 +511,41 @@ const PNPM_CRIT = JSON.stringify({
   metadata: { vulnerabilities: { info: 0, low: 0, moderate: 0, high: 0, critical: 1 } },
 });
 
+const NPM_BASE = {
+  "package.json": NPM_PKG(),
+  "package-lock.json": NPM_LOCK({ left: "1.0.0" }),
+};
+const PNPM_LOCK_WITH = (name: string) =>
+  `lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      ${name}:\n        specifier: ^1.0.0\n        version: 1.0.0\n`;
+
+function withPath<T>(dirs: string[], f: () => Promise<T>): Promise<T> {
+  const saved = process.env.PATH;
+  process.env.PATH = [...dirs, saved].join(delimiter);
+  return f().finally(() => {
+    process.env.PATH = saved;
+  });
+}
+function shimDir(name: string, body: string): string {
+  const d = tmp();
+  writeFileSync(join(d, name), body);
+  chmodSync(join(d, name), 0o755);
+  return d;
+}
+
 describe("audit gate", () => {
   test("is skipped when no manifest changed", async () => {
-    const { root, ctx } = makeRepo({ "package.json": NPM_PKG(), "package-lock.json": NPM_LOCK() });
+    const { root, ctx } = makeRepo(NPM_BASE);
     write(root, "src/a.ts", "export {};\n");
     const { client, calls } = registryStub(NPM_CLEAN);
     const r = await auditGate.run({ ...ctx, registryClient: client });
     expect(r.status).toBe("pass");
     expect(r.summary).toBe("no dependency changes");
     expect(calls).toEqual([]);
+    expect((r.details as { network: string }).network).toBe("registry");
   });
 
-  test("a new dependency missing from the lockfile fails (hallucinated package)", async () => {
-    const { root, ctx } = makeRepo({ "package.json": NPM_PKG(), "package-lock.json": NPM_LOCK() });
+  test("a new dependency missing from the baseRef lockfile fails (hallucinated package)", async () => {
+    const { root, ctx } = makeRepo(NPM_BASE);
     write(root, "package.json", NPM_PKG({ "totally-made-up-pkg": "^1.0.0" }));
     const { client } = registryStub(NPM_CLEAN, 0);
     const r = await auditGate.run({ ...ctx, registryClient: client });
@@ -342,24 +553,53 @@ describe("audit gate", () => {
     expect(JSON.stringify(r.details)).toContain("totally-made-up-pkg");
   });
 
-  test("a new dependency present in the lockfile passes, via the registry client", async () => {
-    const { root, ctx } = makeRepo({ "package.json": NPM_PKG(), "package-lock.json": NPM_LOCK() });
+  test("a dependency present in the baseRef lockfile passes, audited in an isolated copy", async () => {
+    const { root, ctx } = makeRepo(NPM_BASE);
     write(root, "package.json", NPM_PKG({ left: "^1.0.0" }));
-    write(root, "package-lock.json", NPM_LOCK({ left: "1.0.0" }));
-    const { client, calls } = registryStub(NPM_CLEAN, 0);
+    write(root, ".npmrc", "registry=https://evil.example/\n");
+    write(root, ".pnpmfile.cjs", "module.exports = {};\n");
+    const seen: { argv: string[]; files: string[] }[] = [];
+    const client = {
+      exec: async (argv: string[]): Promise<ExecResult> => {
+        const i = argv.indexOf("--prefix");
+        seen.push({ argv, files: i >= 0 ? readdirSync(argv[i + 1] as string).sort() : [] });
+        return { exitCode: 0, stdout: NPM_CLEAN, stderr: "", timedOut: false };
+      },
+    } as unknown as SandboxClient;
     const r = await auditGate.run({ ...ctx, registryClient: client });
     expect(r.status).toBe("pass");
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.slice(-2)).toEqual(["audit", "--json"]);
+    expect(seen).toHaveLength(1);
+    const argv = seen[0]?.argv ?? [];
+    expect(argv[0]).toBe("/usr/bin/env");
+    const prefix = argv[argv.indexOf("--prefix") + 1] as string;
+    expect(prefix.startsWith(root)).toBe(false);
+    expect(prefix.startsWith(ctx.scratch)).toBe(true);
+    expect(seen[0]?.files).toEqual(["package-lock.json", "package.json"]);
+    expect(argv.slice(-2)).toEqual(["audit", "--json"]);
+    for (const e of [
+      "npm_config_ignore_scripts=true",
+      "COREPACK_ENABLE_NETWORK=0",
+      "COREPACK_ENABLE_STRICT=0",
+      "npm_config_registry=https://registry.npmjs.org/",
+    ]) {
+      expect(argv).toContain(e);
+    }
+    for (const k of [
+      "HOME",
+      "XDG_CONFIG_HOME",
+      "XDG_CACHE_HOME",
+      "npm_config_cache",
+      "npm_config_userconfig",
+    ]) {
+      const kv = argv.find((a) => a.startsWith(`${k}=`));
+      expect(kv?.slice(k.length + 1).startsWith(ctx.scratch), k).toBe(true);
+    }
     expect((r.details as { network: string }).network).toBe("registry");
+    expect(readdirSync(ctx.scratch)).toEqual([]);
   });
 
   test("a nested package.json with a missing dependency fails", async () => {
-    const { root, ctx } = makeRepo({
-      "package.json": NPM_PKG(),
-      "package-lock.json": NPM_LOCK(),
-      "packages/a/package.json": NPM_PKG(),
-    });
+    const { root, ctx } = makeRepo({ ...NPM_BASE, "packages/a/package.json": NPM_PKG() });
     write(root, "packages/a/package.json", NPM_PKG({ ghost: "1.0.0" }));
     const { client } = registryStub(NPM_CLEAN, 0);
     const r = await auditGate.run({ ...ctx, registryClient: client });
@@ -367,36 +607,68 @@ describe("audit gate", () => {
     expect(JSON.stringify(r.details)).toContain("ghost");
   });
 
+  test("any lockfile change versus baseRef fails as protected", async () => {
+    const { root, ctx } = makeRepo(NPM_BASE);
+    write(root, "package.json", NPM_PKG({ left: "^1.0.0" }));
+    write(root, "package-lock.json", NPM_LOCK({ left: "1.0.0", extra: "1.0.0" }));
+    const { client } = registryStub(NPM_CLEAN, 0);
+    const r = await auditGate.run({ ...ctx, registryClient: client });
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain("lockfile changed (protected)");
+  });
+
+  test("a root npm-shrinkwrap.json cannot launder a hallucinated dependency", async () => {
+    const { root, ctx } = makeRepo(NPM_BASE);
+    write(root, "package.json", NPM_PKG({ ghost: "^1.0.0" }));
+    write(root, "npm-shrinkwrap.json", NPM_LOCK({ ghost: "1.0.0" }));
+    const { client } = registryStub(NPM_CLEAN, 0);
+    const r = await auditGate.run({ ...ctx, registryClient: client });
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain("npm-shrinkwrap.json");
+    expect(JSON.stringify(r.details)).toContain("ghost");
+  });
+
+  test("a nested npm-shrinkwrap.json cannot launder a hallucinated dependency", async () => {
+    const { root, ctx } = makeRepo({ ...NPM_BASE, "packages/a/package.json": NPM_PKG() });
+    write(root, "packages/a/package.json", NPM_PKG({ ghost: "1.0.0" }));
+    write(root, "packages/a/npm-shrinkwrap.json", NPM_LOCK({ ghost: "1.0.0" }));
+    const { client } = registryStub(NPM_CLEAN, 0);
+    const r = await auditGate.run({ ...ctx, registryClient: client });
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain("packages/a/npm-shrinkwrap.json");
+    expect(JSON.stringify(r.details)).toContain("ghost");
+  });
+
   test("a high npm finding fails", async () => {
-    const { root, ctx } = makeRepo({ "package.json": NPM_PKG(), "package-lock.json": NPM_LOCK() });
+    const { root, ctx } = makeRepo({
+      "package.json": NPM_PKG(),
+      "package-lock.json": NPM_LOCK({ lodash: "4.0.0" }),
+    });
     write(root, "package.json", NPM_PKG({ lodash: "^4.0.0" }));
-    write(root, "package-lock.json", NPM_LOCK({ lodash: "4.0.0" }));
     const { client } = registryStub(NPM_HIGH, 1);
     const r = await auditGate.run({ ...ctx, registryClient: client });
     expect(r.status).toBe("fail");
     expect(JSON.stringify(r.details)).toContain("lodash");
   });
 
-  test("a critical pnpm finding fails", async () => {
-    const lock = "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies: {}\n";
-    const { root, ctx } = makeRepo({ "package.json": NPM_PKG(), "pnpm-lock.yaml": lock });
+  test("a critical pnpm finding fails, with pnpmfile loading disabled", async () => {
+    const { root, ctx } = makeRepo({
+      "package.json": NPM_PKG(),
+      "pnpm-lock.yaml": PNPM_LOCK_WITH("minimist"),
+    });
     write(root, "package.json", NPM_PKG({ minimist: "^1.0.0" }));
-    write(
-      root,
-      "pnpm-lock.yaml",
-      "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      minimist:\n        specifier: ^1.0.0\n        version: 1.0.0\n",
-    );
     const { client, calls } = registryStub(PNPM_CRIT, 1);
     const r = await auditGate.run({ ...ctx, pack: pack("pnpm"), registryClient: client });
     expect(r.status).toBe("fail");
     expect(JSON.stringify(r.details)).toContain("minimist");
-    expect(calls[0]?.slice(-2)).toEqual(["audit", "--json"]);
+    expect(calls[0]).toContain("--ignore-pnpmfile");
+    expect(calls[0]).toContain("-C");
+    expect(calls[0]).toContain("audit");
   });
 
   test("an unparseable registry response is an error", async () => {
-    const { root, ctx } = makeRepo({ "package.json": NPM_PKG(), "package-lock.json": NPM_LOCK() });
+    const { root, ctx } = makeRepo(NPM_BASE);
     write(root, "package.json", NPM_PKG({ left: "^1.0.0" }));
-    write(root, "package-lock.json", NPM_LOCK({ left: "1.0.0" }));
     for (const s of [
       registryStub("<html>502</html>", 1),
       registryStub("{}", 0),
@@ -409,21 +681,20 @@ describe("audit gate", () => {
   });
 
   test("a missing registryClient is an error when an audit is needed", async () => {
-    const { root, ctx } = makeRepo({ "package.json": NPM_PKG(), "package-lock.json": NPM_LOCK() });
+    const { root, ctx } = makeRepo(NPM_BASE);
     write(root, "package.json", NPM_PKG({ left: "^1.0.0" }));
     const r = await auditGate.run({ ...ctx, registryClient: undefined });
     expect(r.status).toBe("error");
     expect(r.summary).toContain("registry client required for dependency audit");
+    expect((r.details as { network: string }).network).toBe("registry");
   });
 
   test("yarn classic NDJSON with a high advisory fails", async () => {
-    const lock = '# yarn lockfile v1\n\nleft@^1.0.0:\n  version "1.0.0"\n';
     const { root, ctx } = makeRepo({
       "package.json": NPM_PKG(),
-      "yarn.lock": "# yarn lockfile v1\n",
+      "yarn.lock": '# yarn lockfile v1\n\nleft@^1.0.0:\n  version "1.0.0"\n',
     });
     write(root, "package.json", NPM_PKG({ left: "^1.0.0" }));
-    write(root, "yarn.lock", lock);
     const nd = [
       JSON.stringify({
         type: "auditAdvisory",
@@ -434,43 +705,107 @@ describe("audit gate", () => {
         data: { vulnerabilities: { info: 0, low: 0, moderate: 0, high: 1, critical: 0 } },
       }),
     ].join("\n");
-    const { client } = registryStub(nd, 8);
-    // yarn need not be installed here: put a stand-in on PATH (the stubbed client never runs it).
-    const bin = tmp();
-    writeFileSync(join(bin, "yarn"), "#!/bin/sh\n");
-    chmodSync(join(bin, "yarn"), 0o755);
-    const saved = process.env.PATH;
-    process.env.PATH = `${bin}${delimiter}${saved}`;
-    try {
-      const r = await auditGate.run({ ...ctx, pack: pack("yarn"), registryClient: client });
-      expect(r.status).toBe("fail");
-    } finally {
-      process.env.PATH = saved;
-    }
+    const { client, calls } = registryStub(nd, 8);
+    const bin = shimDir("yarn", "#!/bin/sh\nexit 0\n");
+    const r = await withPath([bin], () =>
+      auditGate.run({ ...ctx, pack: pack("yarn"), registryClient: client }),
+    );
+    expect(r.status).toBe("fail");
+    expect(calls[0]).toContain("--cwd");
+    expect(calls[0]).toContain("YARN_IGNORE_SCRIPTS=true");
+  });
+
+  test("every distinct covering lockfile directory with a changed manifest is audited", async () => {
+    const { root, ctx } = makeRepo({
+      ...NPM_BASE,
+      "tools/b/package.json": NPM_PKG(),
+      "tools/b/package-lock.json": NPM_LOCK({ lodash: "4.0.0" }),
+    });
+    write(root, "package.json", NPM_PKG({ left: "^1.0.0" }));
+    write(root, "tools/b/package.json", NPM_PKG({ lodash: "^4.0.0" }));
+    const prefixes: string[] = [];
+    const client = {
+      exec: async (argv: string[]): Promise<ExecResult> => {
+        const prefix = argv[argv.indexOf("--prefix") + 1] as string;
+        prefixes.push(prefix);
+        const bad = readFileSync(join(prefix, "package.json"), "utf8").includes("lodash");
+        return { exitCode: 1, stdout: bad ? NPM_HIGH : NPM_CLEAN, stderr: "", timedOut: false };
+      },
+    } as unknown as SandboxClient;
+    const r = await auditGate.run({ ...ctx, registryClient: client });
+    expect(prefixes).toHaveLength(2);
+    expect(new Set(prefixes).size).toBe(2);
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain("lodash");
+    expect(JSON.stringify(r.details)).toContain("tools/b");
+  });
+
+  test("a corepack shim for the package manager is refused", async () => {
+    const { root, ctx } = makeRepo(NPM_BASE);
+    write(root, "package.json", NPM_PKG({ left: "^1.0.0" }));
+    const { client, calls } = registryStub(NPM_CLEAN, 0);
+    const bin = shimDir("npm", '#!/usr/bin/env node\nrequire("corepack").runMain(["npm"]);\n');
+    const r = await withPath([bin], () => auditGate.run({ ...ctx, registryClient: client }));
+    expect(r.status).toBe("error");
+    expect(r.summary).toContain("corepack shims are refused");
+    expect(calls).toEqual([]);
+    const dir = join(tmp(), "corepack", "bin");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "pnpm"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(dir, "pnpm"), 0o755);
+    const r2 = await withPath([dir], () =>
+      auditGate.run({ ...ctx, pack: pack("pnpm"), registryClient: client }),
+    );
+    expect(r2.status).toBe("error");
+    expect(r2.summary).toContain("corepack shims are refused");
   });
 
   test.skipIf(!process.env.REWIRE_LIVE_AUDIT)(
-    "live npm audit through the registry profile",
+    "live npm audit through the registry profile passes for a clean minimal lockfile",
     async () => {
-      const { root, ctx } = makeRepo({
-        "package.json": NPM_PKG(),
-        "package-lock.json": NPM_LOCK(),
+      const lock = JSON.stringify({
+        name: "x",
+        version: "1.0.0",
+        lockfileVersion: 3,
+        requires: true,
+        packages: { "": { name: "x", version: "1.0.0" } },
       });
-      write(root, "package.json", NPM_PKG({ left: "^1.0.0" }));
+      const { root, ctx } = makeRepo({ "package.json": NPM_PKG(), "package-lock.json": lock });
+      write(root, "package.json", JSON.stringify({ name: "x", version: "1.0.1" }));
       const registry = new SandboxClient(
         profileFor("verify-registry", root, DEFAULT_POLICY, ctx.scratch),
       );
       const r = await auditGate.run({ ...ctx, registryClient: registry });
-      expect(["pass", "fail", "error"]).toContain(r.status);
+      expect(r.status, JSON.stringify(r)).toBe("pass");
     },
   );
 });
 
 describe("policy protects scanner config", () => {
-  test("gitleaks/semgrep config files are protected globs", () => {
-    for (const g of ["**/.gitleaks.toml", "**/.gitleaksignore", "**/.semgrepignore"]) {
+  test("scanner, lockfile and package-manager config files are protected globs", () => {
+    for (const g of [
+      "**/.gitleaks.toml",
+      "**/.gitleaksignore",
+      "**/.semgrepignore",
+      "**/npm-shrinkwrap.json",
+      "**/.pnpmfile.cjs",
+      "**/.pnpmfile.mjs",
+      "**/.pnpmfile.js",
+      "**/.yarn/**",
+    ]) {
       expect(DEFAULT_POLICY.protectedGlobs).toContain(g);
     }
+    expect(DEFAULT_POLICY.credentialDenyGlobs).toContain("~/.npmrc");
+  });
+  test("packageManager and devEngines changes are config drift", async () => {
+    const { root, ctx } = makeRepo({ "package.json": NPM_PKG() });
+    const j = JSON.parse(NPM_PKG()) as Record<string, unknown>;
+    j.packageManager = "pnpm@9.0.0";
+    write(root, "package.json", JSON.stringify(j));
+    const { configDrift } = await import("../src/gates/drift.js");
+    const { GateExec } = await import("../src/gates/shared.js");
+    const d = await configDrift(ctx, new GateExec(ctx));
+    expect(d.map((x) => x.path)).toContain("package.json");
   });
   test("adding .gitleaksignore is config drift", async () => {
     const { root, ctx } = makeRepo();
