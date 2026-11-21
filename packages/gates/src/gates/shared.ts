@@ -173,7 +173,8 @@ const CONFIG_RE = [
   /^\.swcrc$/,
 ];
 export const isConfigFile = (p: string): boolean =>
-  !inNodeModules(p) && CONFIG_RE.some((re) => re.test(basename(p)));
+  !inNodeModules(p) &&
+  (p.split("/").includes("__mocks__") || CONFIG_RE.some((re) => re.test(basename(p))));
 
 /** Pathspecs that list the current config files (node_modules excluded). */
 export const CONFIG_PATHSPECS = [
@@ -199,5 +200,6 @@ export const CONFIG_PATHSPECS = [
     ".swcrc",
     "package.json",
   ].map((n) => `:(glob)**/${n}`),
+  ":(glob)**/__mocks__/**",
   ":(glob,exclude)**/node_modules/**",
 ];

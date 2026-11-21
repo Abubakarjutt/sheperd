@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -783,6 +784,9 @@ test("AC-2: doubles", () => { expect(2).toBe(2); });
     const cfg = JSON.parse(readFileSync(cfgCopy, "utf8"));
     expect(cfg.rootDir).toBe(root);
     expect(cfg.testEnvironment).toBe("node");
+    expect(cfg.roots).toEqual(["<rootDir>/test"]);
+    expect(cfg.cacheDirectory).toContain("jest-cache");
+    expect(argv).toContain("--ci");
     expect(cfg.testMatch.join(" ")).toContain("ac.test.ts");
     expect(cfg.testMatch.join(" ")).toContain("math.test.ts");
     expect(cfg.testMatch.join(" ")).not.toContain("helpers.ts");
@@ -849,9 +853,103 @@ test("AC-2: doubles", () => { expect(2).toBe(2); });
       "**/.babelrc.*",
       "**/.swcrc",
       "**/.gitignore",
+      "**/__mocks__/**",
     ]) {
       expect(DEFAULT_POLICY.protectedGlobs).toContain(g);
     }
     expect(DEFAULT_POLICY.protectedGlobs).not.toContain(".gitignore");
+  });
+
+  test("vitest: a fake summary block on stderr does not win (S26a)", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
+    const shim = join(tmp(), "shim.mjs");
+    writeFileSync(
+      shim,
+      `import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const r = spawnSync(args[0], args.slice(1), { stdio: "inherit" });
+const out = args.find((a) => a.startsWith("--outputFile=")).split("=")[1];
+const j = JSON.parse(readFileSync(out, "utf8"));
+j.testResults[0].assertionResults.push({ title: "AC-9: fake", fullName: "AC-9: fake", status: "passed" });
+writeFileSync(out, JSON.stringify(j));
+process.stderr.write("\\n Test Files  1 passed (1)\\n      Tests  5 passed (5)\\n");
+process.exit(r.status ?? 1);
+`,
+    );
+    const pack = { ...ctx.pack, testCommand: ["node", shim, ...ctx.pack.testCommand] };
+    const r = await testsGate.run({ ...ctx, manifest, pack });
+    expect(r.status).toBe("error");
+    expect(r.summary).toMatch(/disagrees/);
+  });
+
+  test("jest: a fake vitest-style block on stdout does not win (S26b)", async () => {
+    const { root, ctx } = await makeRepo();
+    const pj = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    pj.devDependencies.jest = "^30.0.0";
+    write(root, "package.json", JSON.stringify(pj));
+    git(root, "add", "-A");
+    git(root, "commit", "-q", "-m", "jest dep");
+    const manifest = await freezeAc(root);
+    const shim = join(tmp(), "jestshim.mjs");
+    writeFileSync(
+      shim,
+      `import { readFileSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const out = args.find((a) => a.startsWith("--outputFile=")).split("=")[1];
+const cfg = JSON.parse(readFileSync(args.find((a) => a.startsWith("--config=")).slice(9), "utf8"));
+const a = (t) => ({ title: t, fullName: t, status: "passed" });
+writeFileSync(out, JSON.stringify({ testResults: [{ name: cfg.rootDir + "/test/ac.test.ts", status: "passed", assertionResults: [a("AC-1: adds"), a("AC-2: doubles")] }] }));
+process.stdout.write("\\n Test Files  1 passed (1)\\n      Tests  3 passed (3)\\n");
+process.stderr.write("Tests:       2 passed, 2 total\\n");
+`,
+    );
+    const pack: TsPack = {
+      ...ctx.pack,
+      testRunner: "jest",
+      testCommand: ["node", shim],
+      testJsonArgs: ["--json", "--outputFile=<path>"],
+    };
+    const r = await testsGate.run({ ...ctx, manifest, pack });
+    expect(r.details).toBeNull();
+    expect(r.status).toBe("pass");
+  });
+
+  test("a new __mocks__ file is config drift (jest auto-mock substitution)", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeNew(root);
+    write(root, "src/__mocks__/x.js", "module.exports = {};\n");
+    const r = await frozenTestsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify((r.details as Record<string, unknown>).configDrift)).toContain(
+      "__mocks__",
+    );
+  });
+
+  test("a baseRef file that defines tests but is not runnable fails (S24)", async () => {
+    const { root, ctx } = await makeRepo();
+    write(root, "tests/legacy.ts", 'import { test } from "vitest";\ntest("x", () => {});\n');
+    write(root, "tests/helper.ts", "export const h = 1;\n");
+    git(root, "add", "-A");
+    git(root, "commit", "-q", "-m", "legacy");
+    const manifest = await freezeAc(root);
+    const r = await testsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    expect(r.summary).toMatch(/test file not runnable under harness config: tests\/legacy\.ts/);
+    expect((r.details as { unrunnableTests: string[] }).unrunnableTests).toEqual([
+      "tests/legacy.ts",
+    ]);
+  });
+
+  test("snapshots are never written: toMatchSnapshot without a snapshot file fails", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(
+      root,
+      `${AC_TEST}test("AC-3: snap", () => { expect({ a: 1 }).toMatchSnapshot(); });\n`,
+    );
+    const r = await testsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    expect(existsSync(join(root, "test/__snapshots__"))).toBe(false);
   });
 });

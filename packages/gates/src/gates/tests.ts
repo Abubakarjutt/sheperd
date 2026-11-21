@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { basename, join, normalize, relative } from "node:path";
+import { basename, dirname, join, normalize, relative } from "node:path";
 import { z } from "zod";
 import type { Gate, GateContext, GateOutput } from "../types.js";
 import {
@@ -15,15 +15,18 @@ import {
 
 /*
  * KNOWN_LIMITS (for the T21 evidence report):
- *  - The tests run in the same process as the code under test. Tested code that patches both the
- *    JSON reporter and the stdout summary in-process can still forge a result. We detect the
- *    cheap forgery (report edited after the fact, or disagreeing with the runner's own summary
- *    line) but do not try to isolate the reporter.
- *  - vitest runs with a harness-owned config: no user setupFiles/globalSetup, plugins, aliases
- *    or tsconfig-paths from the project's vitest/vite config. A project that needs them fails
- *    closed (tests fail to run). Reproducing baseRef's config in-harness is not attempted.
- *  - jest has reduced guarantees: it keeps the project's own config (drift against baseRef is
- *    checked by the frozen-tests gate) and is pinned with --runTestsByPath instead.
+ *  - The tests run in the same process as the code under test. Implementer code imported by a
+ *    frozen test can tamper with the assertion library itself (patch expect/chai so assertions
+ *    always pass), not only forge the reporter output. Beyond that, patching both the JSON
+ *    report and the console summary in-process also works. We only detect cheap forgery (report
+ *    edited after the fact, or disagreeing with the runner's own summary).
+ *  - The harness config is owned by the gate: no project setupFiles/globalSetup, plugins,
+ *    aliases or tsconfig-paths. Projects needing them fail closed (with a hint).
+ *  - jest is covered by unit tests only (no real jest run); transform stays the jest default
+ *    (babel-jest), whose config files are drift-checked and protected.
+ *  - Untracked, gitignored nested package.json files (e.g. dist/package.json) are drift-checked
+ *    too and cause fail-closed false positives.
+ *  - A worktree path containing glob metacharacters fails closed.
  */
 
 /** The subset of the vitest and jest JSON reporter shapes we rely on (both share it). */
@@ -49,13 +52,14 @@ const ONLY_PATTERNS = [/\.only\s*\(/, /\b(?:fit|fdescribe)\s*\(/];
 const SKIP_TOKEN =
   /\b(?:it|test|describe|suite|bench)(?:\.\w+)*\.(?:skip|todo|skipIf|runIf)\b|\b(?:xit|xdescribe|xtest)\b/;
 const MAX_LIST = 50;
+const TEST_DEF_RE = /\b(?:test|it|describe)(?:\.\w+)?\s*\(/;
 /** Only these files are collected as tests; other files under the test globs are just hash-frozen. */
 const RUNNABLE_TEST_RE = /\.(?:test|spec)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 const isRunnable = (p: string): boolean => RUNNABLE_TEST_RE.test(basename(p));
 const HARNESS_HINT =
   "tests gate runs with a harness-owned config; project-specific vitest/jest config (aliases, plugins, setupFiles) is not supported in v0.1";
 const RESOLVE_ERR_RE =
-  /Failed to resolve|Cannot find (?:module|package)|ERR_MODULE_NOT_FOUND|No test suite found|Failed to load|SyntaxError|ReferenceError/i;
+  /Failed to resolve|Cannot find (?:module|package)|ERR_MODULE_NOT_FOUND|No test suite found|Failed to load url/i;
 
 type Flat = { file: string; title: string; fullName: string; status: string };
 
@@ -71,21 +75,27 @@ const escapeGlob = (p: string): string => p.replace(/[\\*?[\]{}()!+@]/g, "\\$&")
 const stripAnsi = (s: string): string => s.replace(/\u001b\[[0-9;]*m/g, "");
 
 /**
- * Totals from the runner's own console summary: vitest `Tests  1 failed | 2 passed (3)` (the first
- * `Tests` line after the last `Test Files` line, so test output cannot imitate it earlier) or
- * jest `Tests: 1 failed, 2 passed, 3 total` (the last such line).
+ * Totals from the runner's own console summary. The parser and the stream are chosen by the
+ * configured runner, never inferred from the output: vitest prints to stdout (the last `Tests`
+ * line after the last `Test Files` line), jest to stderr (the last `Tests:` line).
  */
-function summaryTotals(text: string): { total: number; failed: number } | undefined {
-  const lines = stripAnsi(text).split("\n");
+function summaryTotals(
+  runner: string,
+  out: { stdout: string; stderr: string },
+): { total: number; failed: number } | undefined {
   let line: string | undefined;
-  const tf = lines.map((l) => /^\s*Test Files\s/.test(l)).lastIndexOf(true);
-  if (tf >= 0) {
+  if (runner === "vitest") {
+    const lines = stripAnsi(out.stdout).split("\n");
+    const tf = lines.map((l) => /^\s*Test Files\s/.test(l)).lastIndexOf(true);
+    if (tf < 0) return undefined;
     line = lines
       .slice(tf + 1)
       .map((l) => /^\s*Tests\s+(.+)$/.exec(l)?.[1])
-      .find((x) => x !== undefined);
+      .filter((x) => x !== undefined)
+      .at(-1);
   } else {
-    line = lines
+    line = stripAnsi(out.stderr)
+      .split("\n")
       .map((l) => /^\s*Tests:\s+(.+)$/.exec(l)?.[1])
       .filter((x) => x !== undefined)
       .at(-1);
@@ -130,8 +140,10 @@ async function runIn(ctx: GateContext, gateDir: string): Promise<GateOutput> {
         `cannot compare tests against ${ctx.baseRef}: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
-    const baseHasRunnerConfig = baseList.some(
-      (p) => !inNodeModules(p) && /^(?:vitest|vite|jest)\.config\./.test(basename(p)),
+    let baseHasRunnerConfig = baseList.some(
+      (p) =>
+        !inNodeModules(p) &&
+        /^(?:vitest|vite|vitest\.workspace|jest)\.config\.|^vitest\.workspace\./.test(basename(p)),
     );
     const hint = (text: string): string =>
       baseHasRunnerConfig && RESOLVE_ERR_RE.test(text) ? ` — ${HARNESS_HINT}` : "";
@@ -142,6 +154,14 @@ async function runIn(ctx: GateContext, gateDir: string): Promise<GateOutput> {
     const baseTests = baseList.filter(
       (p) => !inNodeModules(p) && matchesAnyGlob(p, ctx.policy.testGlobs),
     );
+    const unrunnableTests: string[] = [];
+    for (const p of baseTests.filter((x) => !isRunnable(x))) {
+      try {
+        if (TEST_DEF_RE.test(await baseText(ctx, g, p))) unrunnableTests.push(p);
+      } catch {
+        // unreadable at baseRef: not a test definition we can see
+      }
+    }
     const runFiles = [...new Set([...frozenFiles, ...baseTests.map((p) => normalize(p))])]
       .filter(isRunnable)
       .sort();
@@ -151,6 +171,7 @@ async function runIn(ctx: GateContext, gateDir: string): Promise<GateOutput> {
       try {
         const pj = JSON.parse(await baseText(ctx, g, "package.json")) as Record<string, unknown>;
         const deps = { ...(pj.dependencies as object), ...(pj.devDependencies as object) };
+        if ("jest" in pj || "vitest" in pj) baseHasRunnerConfig = true;
         if (!(ctx.pack.testRunner in deps)) {
           return err(`${ctx.pack.testRunner} is not a dependency at ${ctx.baseRef}`);
         }
@@ -170,15 +191,28 @@ async function runIn(ctx: GateContext, gateDir: string): Promise<GateOutput> {
         cfg,
         `export default { cacheDir: ${JSON.stringify(join(gateDir, "cache"))}, test: { include: ${JSON.stringify(include)} } };\n`,
       );
-      argv.push("--reporter=default", `--config=${cfg}`, `--root=${root}`);
+      // --update=none: never write new snapshots (the verify profile is read-only too).
+      argv.push("--reporter=default", "--update=none", `--config=${cfg}`, `--root=${root}`);
     } else {
       // jest: harness-owned config; transform stays the jest default (babel-jest, whose
       // babel config files are drift-checked and protected). No setup files, reporters or
       // globalSetup are ever loaded from the project.
       const cfg = join(gateDir, "jest.harness.config.json");
       const testMatch = runFiles.map((f) => `<rootDir>/${escapeGlob(f)}`);
-      await writeFile(cfg, JSON.stringify({ rootDir: root, testEnvironment: "node", testMatch }));
-      argv.push(`--config=${cfg}`);
+      // roots = the (frozen) directories of the run files, so jest's automatic `__mocks__`
+      // substitution cannot pick up implementer-written mocks from elsewhere.
+      const roots = [...new Set(runFiles.map((f) => `<rootDir>/${dirname(f)}`))].sort();
+      await writeFile(
+        cfg,
+        JSON.stringify({
+          rootDir: root,
+          testEnvironment: "node",
+          testMatch,
+          roots,
+          cacheDirectory: join(gateDir, "jest-cache"),
+        }),
+      );
+      argv.push(`--config=${cfg}`, "--ci");
     }
     const r = await g.exec(argv);
     if (r.timedOut) return err("tests timed out");
@@ -227,7 +261,7 @@ async function runIn(ctx: GateContext, gateDir: string): Promise<GateOutput> {
     }
 
     // Cross-check the report against the runner's own console summary.
-    const summary = summaryTotals(`${r.stdout}\n${r.stderr}`);
+    const summary = summaryTotals(ctx.pack.testRunner, r);
     const reportFailed = tests.filter((t) => t.status === "failed").length;
     const disagrees =
       summary === undefined
@@ -344,6 +378,10 @@ async function runIn(ctx: GateContext, gateDir: string): Promise<GateOutput> {
     if (brokenSuites.length > 0) {
       reasons.push(`${brokenSuites.length} test file(s) failed to run`);
       details.failedSuites = brokenSuites.slice(0, MAX_LIST);
+    }
+    if (unrunnableTests.length > 0) {
+      reasons.unshift(`test file not runnable under harness config: ${unrunnableTests.join(", ")}`);
+      details.unrunnableTests = unrunnableTests;
     }
     if (frozenNotRun.length > 0) {
       reasons.push(`${frozenNotRun.length} frozen test file(s) did not run cleanly`);

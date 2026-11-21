@@ -50,6 +50,7 @@ export const DEFAULT_POLICY: Policy = {
     "**/.babelrc",
     "**/.babelrc.*",
     "**/.swcrc",
+    "**/__mocks__/**",
     "**/node_modules/**",
     "**/package-lock.json",
     "**/pnpm-lock.yaml",
