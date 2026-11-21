@@ -34,7 +34,7 @@ const Assertion = z.object({
   title: z.string(),
   fullName: z.string().optional(),
   status: z.string(),
-  failureMessages: z.array(z.string()).optional(),
+  failureMessages: z.array(z.string()).nullish(),
 });
 const Report = z.object({
   testResults: z.array(
@@ -48,9 +48,9 @@ const Report = z.object({
 });
 
 const NOT_RUN = new Set(["skipped", "pending", "todo", "disabled"]);
-const ONLY_PATTERNS = [/\.only\s*\(/, /\b(?:fit|fdescribe)\s*\(/];
+export const ONLY_PATTERNS = [/\.only\s*\(/, /\b(?:fit|fdescribe)\s*\(/];
 // Static skip markers on the suite/test API. `ctx.skip()` / `t.skip()` inside a test body is dynamic.
-const SKIP_TOKEN =
+export const SKIP_TOKEN =
   /\b(?:it|test|describe|suite|bench)(?:\.\w+)*\.(?:skip|todo|skipIf|runIf)\b|\b(?:xit|xdescribe|xtest)\b/;
 const MAX_LIST = 50;
 const TEST_DEF_RE = /\b(?:test|it|describe)(?:\.\w+)?\s*\(/;
