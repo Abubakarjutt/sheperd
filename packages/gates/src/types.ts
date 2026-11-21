@@ -7,7 +7,11 @@ export type GateContext = {
   worktree: string;
   baseRef: string;
   client: SandboxClient;
-  registryClient: SandboxClient;
+  /**
+   * Client for the `verify-registry` profile (the only network exception). Optional: gates that
+   * need the network (audit) return an error when it is absent.
+   */
+  registryClient?: SandboxClient;
   pack: TsPack;
   policy: Policy;
   manifest?: FrozenTestManifest;

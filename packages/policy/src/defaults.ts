@@ -55,6 +55,9 @@ export const DEFAULT_POLICY: Policy = {
     "**/package-lock.json",
     "**/pnpm-lock.yaml",
     "**/yarn.lock",
+    "**/.gitleaks.toml",
+    "**/.gitleaksignore",
+    "**/.semgrepignore",
   ],
   // `~` is kept unexpanded here; the sandbox layer expands it.
   credentialDenyGlobs: [

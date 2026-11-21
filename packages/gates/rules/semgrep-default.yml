@@ -1,0 +1,164 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# rewire default semgrep ruleset for JavaScript / TypeScript.
+#
+# Rules: original rules authored for rewire (Apache-2.0). These are NOT copied or derived from
+# the Semgrep Registry, whose rules are under the Semgrep Rules License (redistribution
+# restricted, incompatible with an Apache-2.0 open core). Keep it that way: only add rules
+# written from scratch for this file.
+#
+# Scope: a small, high-signal set aimed at injection and unsafe-crypto mistakes that coding
+# agents make. Severity ERROR blocks the `semgrep` gate; WARNING is reported but does not block.
+rules:
+  - id: rewire.js.eval-nonliteral
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: eval() or new Function() with a non-literal argument executes attacker-influenced code.
+    metadata:
+      category: security
+      cwe: "CWE-95"
+    patterns:
+      - pattern-either:
+          - pattern: eval($X)
+          - pattern: new Function(...)
+          - pattern: Function(...)
+      - pattern-not: eval("...")
+      - pattern-not: new Function("...")
+      - pattern-not: Function("...")
+
+  - id: rewire.js.child-process-exec-dynamic
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: child_process exec/execSync with a template or concatenated command string allows shell injection; use execFile with an argument array.
+    metadata:
+      category: security
+      cwe: "CWE-78"
+    pattern-either:
+      - pattern: exec(`...${$X}...`, ...)
+      - pattern: execSync(`...${$X}...`, ...)
+      - pattern: $CP.exec(`...${$X}...`, ...)
+      - pattern: $CP.execSync(`...${$X}...`, ...)
+      - pattern: exec($A + $B, ...)
+      - pattern: execSync($A + $B, ...)
+      - pattern: $CP.exec($A + $B, ...)
+      - pattern: $CP.execSync($A + $B, ...)
+
+  - id: rewire.js.dom-html-sink-nonliteral
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Assigning a non-literal value to innerHTML/outerHTML or calling document.write with one allows cross-site scripting.
+    metadata:
+      category: security
+      cwe: "CWE-79"
+    patterns:
+      - pattern-either:
+          - pattern: $EL.innerHTML = $X
+          - pattern: $EL.outerHTML = $X
+          - pattern: document.write($X)
+          - pattern: document.writeln($X)
+      - pattern-not: $EL.innerHTML = "..."
+      - pattern-not: $EL.outerHTML = "..."
+      - pattern-not: document.write("...")
+      - pattern-not: document.writeln("...")
+
+  - id: rewire.js.sql-built-by-string
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: SQL built with a template literal or string concatenation and passed to query()/execute() is injectable; use parameterized queries.
+    metadata:
+      category: security
+      cwe: "CWE-89"
+    pattern-either:
+      - pattern: $DB.query(`...${$X}...`, ...)
+      - pattern: $DB.execute(`...${$X}...`, ...)
+      - pattern: $DB.query($A + $B, ...)
+      - pattern: $DB.execute($A + $B, ...)
+
+  - id: rewire.js.vm-run-nonliteral
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: vm.runInContext/runInNewContext/runInThisContext with a non-literal script executes attacker-influenced code; the vm module is not a security boundary.
+    metadata:
+      category: security
+      cwe: "CWE-94"
+    patterns:
+      - pattern-either:
+          - pattern: $VM.runInContext($X, ...)
+          - pattern: $VM.runInNewContext($X, ...)
+          - pattern: $VM.runInThisContext($X, ...)
+      - pattern-not: $VM.runInContext("...", ...)
+      - pattern-not: $VM.runInNewContext("...", ...)
+      - pattern-not: $VM.runInThisContext("...", ...)
+
+  - id: rewire.js.fs-path-from-request
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: A filesystem path built from request input allows path traversal; resolve against a fixed base and verify containment.
+    metadata:
+      category: security
+      cwe: "CWE-22"
+    patterns:
+      - pattern-either:
+          - pattern: $FS.readFile(<... $REQ.query ...>, ...)
+          - pattern: $FS.readFile(<... $REQ.params ...>, ...)
+          - pattern: $FS.readFile(<... $REQ.body ...>, ...)
+          - pattern: $FS.readFileSync(<... $REQ.query ...>, ...)
+          - pattern: $FS.readFileSync(<... $REQ.params ...>, ...)
+          - pattern: $FS.readFileSync(<... $REQ.body ...>, ...)
+          - pattern: $FS.writeFile(<... $REQ.query ...>, ...)
+          - pattern: $FS.writeFile(<... $REQ.params ...>, ...)
+          - pattern: $FS.writeFile(<... $REQ.body ...>, ...)
+          - pattern: $FS.writeFileSync(<... $REQ.query ...>, ...)
+          - pattern: $FS.writeFileSync(<... $REQ.params ...>, ...)
+          - pattern: $FS.writeFileSync(<... $REQ.body ...>, ...)
+          - pattern: $FS.createReadStream(<... $REQ.query ...>, ...)
+          - pattern: $FS.createReadStream(<... $REQ.params ...>, ...)
+          - pattern: $FS.createReadStream(<... $REQ.body ...>, ...)
+          - pattern: path.join(..., $REQ.query.$P, ...)
+          - pattern: path.join(..., $REQ.params.$P, ...)
+          - pattern: path.join(..., $REQ.body.$P, ...)
+      - metavariable-regex:
+          metavariable: $REQ
+          regex: ^(req|request)$
+
+  - id: rewire.js.tls-reject-unauthorized-false
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: rejectUnauthorized false disables TLS certificate verification and enables man-in-the-middle attacks.
+    metadata:
+      category: security
+      cwe: "CWE-295"
+    pattern-either:
+      - pattern: "{..., rejectUnauthorized: false, ...}"
+      - pattern: process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
+
+  - id: rewire.js.weak-hash-md5-sha1
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: MD5 and SHA-1 are broken for password or integrity use; use a password KDF (scrypt, argon2, bcrypt) or SHA-256 or stronger.
+    metadata:
+      category: security
+      cwe: "CWE-328"
+    pattern-either:
+      - pattern: $C.createHash("md5")
+      - pattern: $C.createHash("sha1")
+      - pattern: createHash("md5")
+      - pattern: createHash("sha1")
+
+  - id: rewire.js.math-random-for-token
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Math.random() is not cryptographically secure; use crypto.randomUUID() or crypto.randomBytes() for tokens, ids and secrets.
+    metadata:
+      category: security
+      cwe: "CWE-338"
+    patterns:
+      - pattern-either:
+          - pattern: $TOKEN = <... Math.random() ...>
+          - pattern: const $TOKEN = <... Math.random() ...>
+          - pattern: let $TOKEN = <... Math.random() ...>
+          - pattern: $OBJ.$TOKEN = <... Math.random() ...>
+          - pattern: "{..., $TOKEN: <... Math.random() ...>, ...}"
+      - metavariable-regex:
+          metavariable: $TOKEN
+          regex: (?i).*(token|secret|password|passwd|session|nonce|salt|apikey|api_key|key|id)$

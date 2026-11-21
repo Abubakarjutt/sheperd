@@ -1,29 +1,33 @@
 import { accessSync, constants } from "node:fs";
-import { realpath } from "node:fs/promises";
-import { basename, delimiter, isAbsolute, join, matchesGlob } from "node:path";
+import { lstat, realpath } from "node:fs/promises";
+import { basename, delimiter, isAbsolute, join, matchesGlob, relative, sep } from "node:path";
 import { RewireError } from "@rewire/core";
-import type { ExecResult } from "@rewire/sandbox";
-import type { GateContext } from "../types.js";
+import type { ExecResult, SandboxClient } from "@rewire/sandbox";
+import { INSTALL_HINTS } from "../runner.js";
+import type { GateContext, GateOutput } from "../types.js";
 
-/** Resolve `git` once per PATH on the host; pinned to an absolute path (#25). */
-const gitCache = new Map<string, string>();
-export function resolveGit(pathEnv: string | undefined = process.env.PATH): string {
-  const key = pathEnv ?? "";
-  const hit = gitCache.get(key);
+/** Resolve `name` once per PATH on the host; pinned to an absolute path (#25). */
+const binCache = new Map<string, string>();
+export function resolveBin(name: string, pathEnv: string | undefined = process.env.PATH): string {
+  const key = `${name}\0${pathEnv ?? ""}`;
+  const hit = binCache.get(key);
   if (hit) return hit;
-  for (const dir of key.split(delimiter)) {
+  for (const dir of (pathEnv ?? "").split(delimiter)) {
     if (!dir || !isAbsolute(dir)) continue;
-    const p = join(dir, "git");
+    const p = join(dir, name);
     try {
       accessSync(p, constants.X_OK);
-      gitCache.set(key, p);
+      binCache.set(key, p);
       return p;
     } catch {
       // keep looking
     }
   }
-  throw new RewireError("binary_missing", "command not found: git");
+  throw new RewireError("binary_missing", `command not found: ${name}`);
 }
+
+export const resolveGit = (pathEnv: string | undefined = process.env.PATH): string =>
+  resolveBin("git", pathEnv);
 
 /** `<worktree>/node_modules/.bin/<bin>` if it exists and is executable (never npx, which may download). */
 export function localBin(worktree: string, bin: string): string | undefined {
@@ -53,9 +57,10 @@ export class GateExec {
     this.deadline = ctx.deadline ?? Date.now() + ctx.policy.gateTimeoutMs;
   }
 
-  async exec(argv: string[]): Promise<ExecResult> {
+  /** Run argv in the worktree; `client` defaults to the verify client (pass registryClient for the network exception). */
+  async exec(argv: string[], client: SandboxClient = this.ctx.client): Promise<ExecResult> {
     if (this.ctx.signal?.aborted) throw new Error("aborted");
-    return this.ctx.client.exec(argv, {
+    return client.exec(argv, {
       timeoutMs: Math.max(1, this.deadline - Date.now()),
       cwd: this.ctx.worktree,
     });
@@ -99,7 +104,7 @@ export const inNodeModules = (p: string): boolean => p.split("/").includes("node
 
 export const splitZ = (s: string): string[] => s.split("\0").filter((x) => x !== "");
 
-function checkRef(ref: string): void {
+export function checkRef(ref: string): void {
   if (ref === "" || ref.startsWith("-")) throw new Error(`invalid baseRef: ${ref}`);
 }
 
@@ -171,6 +176,9 @@ const CONFIG_RE = [
   /^babel\.config\./,
   /^\.babelrc/,
   /^\.swcrc$/,
+  /^\.gitleaks\.toml$/,
+  /^\.gitleaksignore$/,
+  /^\.semgrepignore$/,
 ];
 export const isConfigFile = (p: string): boolean =>
   !inNodeModules(p) &&
@@ -198,8 +206,78 @@ export const CONFIG_PATHSPECS = [
     "babel.config.*",
     ".babelrc*",
     ".swcrc",
+    ".gitleaks.toml",
+    ".gitleaksignore",
+    ".semgrepignore",
     "package.json",
   ].map((n) => `:(glob)**/${n}`),
   ":(glob)**/__mocks__/**",
   ":(glob,exclude)**/node_modules/**",
 ];
+
+/** Max paths handed to one scanner invocation. */
+export const SCAN_CHUNK = 500;
+
+export function chunks<T>(xs: T[], n: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n));
+  return out;
+}
+
+/**
+ * Files a scanner should look at: everything that differs from baseRef (modified, added or
+ * staged) plus untracked, non-ignored files, as worktree-relative paths. Only existing regular
+ * files remain: deleted paths, node_modules and `.git/` are dropped, and a path whose real
+ * location (symlinks resolved) is outside the worktree is dropped. A symlink to a file inside
+ * the worktree is replaced by its target, so a link cannot smuggle in or hide a file.
+ */
+export async function changedScanFiles(ctx: GateContext, g: GateExec): Promise<string[]> {
+  checkRef(ctx.baseRef);
+  const diff = await g.git([
+    "diff",
+    "--name-only",
+    "-z",
+    "--no-renames",
+    "--relative",
+    ctx.baseRef,
+    "--",
+  ]);
+  const others = await g.git(["ls-files", "--others", "--exclude-standard", "-z"]);
+  const root = await realRootOf(ctx);
+  const out = new Set<string>();
+  for (const p of new Set([...splitZ(diff), ...splitZ(others)])) {
+    if (inNodeModules(p) || p === ".git" || p.startsWith(".git/")) continue;
+    const abs = join(root, p);
+    let real: string;
+    try {
+      const st = await lstat(abs);
+      if (!st.isSymbolicLink() && !st.isFile()) continue;
+      real = await realpath(abs);
+      if (!(await lstat(real)).isFile()) continue;
+    } catch {
+      continue; // deleted or unreadable
+    }
+    const rel = relative(root, real);
+    if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) continue;
+    const norm = sep === "/" ? rel : rel.split(sep).join("/");
+    if (inNodeModules(norm) || norm === ".git" || norm.startsWith(".git/")) continue;
+    out.add(norm);
+  }
+  return [...out].sort();
+}
+
+/** Host-side env wrapper: the sandbox exec has no env option, so env is set via /usr/bin/env. */
+export const ENV_BIN = "/usr/bin/env";
+
+/** Summary for a missing scanner binary, with the INSTALL_HINTS text (runner.ts has the same shape). */
+export function missingBinaryOutput(e: unknown, fallbackBin: string): GateOutput | undefined {
+  if (!(e instanceof RewireError) || e.code !== "binary_missing") return undefined;
+  const bin = /^command not found: (\S+)/.exec(e.message)?.[1] ?? fallbackBin;
+  return {
+    status: "error",
+    summary: `${bin} not installed — ${INSTALL_HINTS[bin] ?? "install it and make sure it is on PATH"}`,
+    details: { binary: bin },
+  };
+}
+
+export const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
