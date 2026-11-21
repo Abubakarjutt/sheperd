@@ -39,6 +39,7 @@ export const DEFAULT_POLICY: Policy = {
     "**/vitest.workspace.*",
     "**/jest.config.*",
     "**/.gitignore",
+    "**/.gitattributes",
     "**/.eslintignore",
     "**/.prettierignore",
     "**/biome.jsonc",

@@ -20,7 +20,7 @@ Every finding is mechanically checked against the real file. Findings whose evid
 
 ## Categories and severity
 
-Use only the categories your reviewer prompt names. Severity: 0 nit, 1 minor, 2 significant, 3 critical (data loss, security hole, wrong results on the main path).
+Use only the categories your reviewer prompt names, plus `security`, which is always in scope (required by the clause above). Severity: 0 nit, 1 minor, 2 significant, 3 critical (data loss, security hole, wrong results on the main path).
 
 ## Output
 

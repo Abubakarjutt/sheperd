@@ -113,6 +113,40 @@ test("prompt carries base clause, fenced contract and fenced diff", async () => 
 test("not applicable reviewer returns nothing and calls no model", async () => {
   const { run, provider } = await setup([]);
   const r = await run({ ...def, appliesTo: () => false });
-  expect(r).toEqual({ kept: [], dropped: [] });
+  expect(r).toEqual({ kept: [], dropped: [], skipped: true });
   expect(provider.callCount).toBe(0);
+});
+
+test("skipped reviewer is flagged and emits start/end", async () => {
+  const { run, events } = await setup([]);
+  const r = await run({ ...def, appliesTo: () => false });
+  expect(r.skipped).toBe(true);
+  expect(events.map((e) => e.type)).toEqual(["stage_start", "tool_call", "stage_end"]);
+});
+
+test("kept finding events are redacted", async () => {
+  const secret = "const key = 'sk-abcdefghijkl';";
+  const root = makeRepo({ "a.ts": "line1\n" });
+  put(root, "a.ts", `line1\n${secret}\n`);
+  const { buildDiffSummary } = await import("../src/index.js");
+  const client = hostClient();
+  const diff = await buildDiffSummary(root, "HEAD", { client });
+  const provider = new FauxProvider([
+    text(JSON.stringify({ findings: [{ ...good, category: "security", evidence: secret }] })),
+  ]);
+  const events: RunEvent[] = [];
+  const r = await runReviewer(def, {
+    diff,
+    contract,
+    worktree: root,
+    model,
+    provider,
+    policy: DEFAULT_POLICY,
+    emit: (e) => events.push(e),
+    runId: "r",
+    client,
+  });
+  expect(r.kept).toHaveLength(1);
+  const f = events.find((e) => e.type === "finding");
+  expect(JSON.stringify(f)).not.toContain("sk-abcdefghijkl");
 });

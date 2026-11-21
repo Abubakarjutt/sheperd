@@ -29,11 +29,23 @@ export type SafeRead =
 const outsideRoot = (rel: string): boolean =>
   rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
 
+const codeOf = (e: unknown): string | undefined =>
+  typeof e === "object" && e !== null ? ((e as { code?: string }).code ?? undefined) : undefined;
+
+/** A path that simply is not there (or is denied by the sandbox profile): not an infra failure. */
+const isMissing = (e: unknown): boolean => {
+  const c = codeOf(e);
+  return c === "ENOENT" || c === "ENOTDIR" || c === "path_protected";
+};
+
 /**
  * Read `rel` (worktree-relative) only if its real path is a regular file inside the real
- * worktree and not under `.git`. Absolute paths, `..` traversal and symlinks leading out are
- * "outside". Reads go through the review sandbox client when given. The check-then-read gap
- * (a swap after realpath) is not closed on the host path; the sandbox read re-checks itself.
+ * worktree and not under any `.git` segment. Absolute paths, `..` traversal and symlinks leading
+ * out are "outside". Reads go through the review sandbox client when given. Only a missing path
+ * (ENOENT/ENOTDIR/path_protected) is "missing"; every other I/O or sandbox error is rethrown so
+ * the review fails closed instead of treating infrastructure trouble as "no evidence". The
+ * check-then-read gap (a swap after realpath) is not closed on the host path; the sandbox read
+ * re-checks containment itself.
  */
 export async function readInsideWorktree(
   worktree: string,
@@ -41,34 +53,45 @@ export async function readInsideWorktree(
   client?: Pick<SandboxClient, "read">,
 ): Promise<SafeRead> {
   if (rel === "" || rel.includes("\0") || isAbsolute(rel)) return { kind: "outside" };
-  let root: string;
-  try {
-    root = await realpath(worktree);
-  } catch {
-    return { kind: "missing" };
-  }
+  const root = await realpath(worktree);
   const abs = resolve(root, rel);
   if (outsideRoot(relative(root, abs))) return { kind: "outside" };
   let real: string;
   try {
     real = await realpath(abs);
-  } catch {
-    return { kind: "missing" };
+  } catch (e) {
+    if (isMissing(e)) return { kind: "missing" };
+    throw e;
   }
   const inner = relative(root, real);
-  if (outsideRoot(inner) || inner === ".git" || inner.startsWith(`.git${sep}`)) {
-    return { kind: "outside" };
-  }
+  if (outsideRoot(inner) || inner.split(sep).includes(".git")) return { kind: "outside" };
   try {
     const st = await lstat(real);
     if (!st.isFile()) return { kind: "missing" };
     if (st.size > MAX_FILE_BYTES) return { kind: "too_large" };
     const text = client ? await client.read(real) : await readFile(real, "utf8");
+    if (Buffer.byteLength(text, "utf8") > MAX_FILE_BYTES) return { kind: "too_large" };
     return { kind: "ok", path: real, text };
-  } catch {
-    return { kind: "missing" };
+  } catch (e) {
+    if (isMissing(e)) return { kind: "missing" };
+    throw e;
   }
 }
+
+/** #23 closers were defanged to `<\/tag` in the prompt; fold both spellings to `</tag`. */
+const CLOSER_FOLD = /<\s*\\?\s*\/\s*(diff|file|contract)/gi;
+
+/**
+ * Matching-only normaliser (ids use core's normalizeEvidence, unchanged): NFKC, drop format
+ * characters (zero-width, bidi), fold escaped and spaced closing tags, then fold whitespace.
+ */
+const foldForMatch = (s: string): string =>
+  normalizeEvidence(
+    s
+      .normalize("NFKC")
+      .replace(/\p{Cf}/gu, "")
+      .replace(CLOSER_FOLD, "</$1"),
+  );
 
 const validLine = (n: number): boolean => Number.isInteger(n) && n >= 1;
 
@@ -121,14 +144,15 @@ async function firstFailure(
   if (!validLine(f.lineStart) || !validLine(f.lineEnd) || f.lineEnd < f.lineStart) {
     return "invalid range";
   }
-  if (f.evidence.replace(/\s/g, "").length < MIN_EVIDENCE_CHARS) return "evidence too short";
+  const needle = foldForMatch(f.evidence);
+  if (needle.replace(/\s/g, "").length < MIN_EVIDENCE_CHARS) return "evidence too short";
 
   // (1) evidence in the window around the claimed lines.
   if (file.kind !== "ok") return "evidence not found in file";
   const lines = file.text.split(/\r?\n/);
   const from = Math.max(0, f.lineStart - 1 - CONTEXT);
-  const window = normalizeEvidence(lines.slice(from, f.lineEnd + CONTEXT).join("\n"));
-  if (!window.includes(normalizeEvidence(f.evidence))) return "evidence not found in file";
+  const window = foldForMatch(lines.slice(from, f.lineEnd + CONTEXT).join("\n"));
+  if (!window.includes(needle)) return "evidence not found in file";
 
   // (2)
   if (f.lineEnd - f.lineStart > MAX_RANGE) return "range too wide";
@@ -142,6 +166,8 @@ async function firstFailure(
   if (!(f.confidence >= minConfidence)) return "low confidence";
 
   // (5)
-  if (opts.categories && !opts.categories.includes(f.category)) return "category out of scope";
+  // `security` is always in scope: #23 injection findings must reach every reviewer's output.
+  if (opts.categories && f.category !== "security" && !opts.categories.includes(f.category))
+    return "category out of scope";
   return undefined;
 }

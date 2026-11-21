@@ -44,7 +44,12 @@ export type ReviewerInput = {
   clientFactory?: (profile: CapabilityProfile) => SandboxClient;
 };
 
-export type ReviewResult = { kept: Finding[]; dropped: Dropped[] };
+export type ReviewResult = {
+  kept: Finding[];
+  dropped: Dropped[];
+  /** True when the reviewer did not apply to the diff and no model was called. */
+  skipped?: true;
+};
 
 const ReviewerOutput = z.object({
   findings: z.array(Finding.omit({ id: true, reviewer: true })),
@@ -73,19 +78,29 @@ const numberLines = (text: string): string =>
     .map((l, i) => `${i + 1}| ${l}`)
     .join("\n");
 
-async function changedFiles(input: ReviewerInput, client: SandboxClient): Promise<string> {
+async function changedFiles(
+  input: ReviewerInput,
+  client: SandboxClient,
+): Promise<{ text: string; omitted: string[] }> {
   let budget = FILES_BUDGET;
   const parts: string[] = [];
+  const omitted: string[] = [];
   for (const f of input.diff.files) {
     if (f.addedLines.length === 0) continue;
     const r = await readInsideWorktree(input.worktree, f.path, client);
-    if (r.kind !== "ok" || r.text.includes("\0")) continue;
+    if (r.kind !== "ok" || r.text.includes("\0")) {
+      omitted.push(`${f.path} (${r.kind === "ok" ? "binary" : r.kind})`);
+      continue;
+    }
     const body = numberLines(r.text);
-    if (body.length > budget) break;
+    if (body.length > budget) {
+      omitted.push(`${f.path} (over prompt budget)`);
+      continue;
+    }
     budget -= body.length;
     parts.push(wrapUntrusted("file", body, { path: f.path }));
   }
-  return parts.join("\n\n");
+  return { text: parts.join("\n\n"), omitted };
 }
 
 /**
@@ -95,7 +110,6 @@ async function changedFiles(input: ReviewerInput, client: SandboxClient): Promis
  * never reported as "no findings" (#22).
  */
 export async function runReviewer(def: ReviewerDef, input: ReviewerInput): Promise<ReviewResult> {
-  if (!def.appliesTo(input.diff)) return { kept: [], dropped: [] };
   const { runId } = input;
   const safeEmit = (e: RunEvent): void => {
     try {
@@ -108,6 +122,17 @@ export async function runReviewer(def: ReviewerDef, input: ReviewerInput): Promi
   const ev = () => ({ runId, ts: new Date().toISOString(), stage: def.name });
 
   safeEmit({ ...ev(), type: "stage_start" });
+  if (!def.appliesTo(input.diff)) {
+    safeEmit({
+      ...ev(),
+      type: "tool_call",
+      tool: "reviewer_skipped",
+      isError: false,
+      summary: "skipped: reviewer does not apply to this diff",
+    });
+    safeEmit({ ...ev(), type: "stage_end", ok: true });
+    return { kept: [], dropped: [], skipped: true };
+  }
   let ok = false;
   try {
     const res = await review(def, input, safeEmit, ev);
@@ -137,14 +162,20 @@ async function review(
   }
   try {
     const files = await changedFiles(input, client);
+    const omitted = [...input.diff.omitted, ...files.omitted];
     const user = [
       "# Contract (the task under review)",
       wrapUntrusted("contract", JSON.stringify(input.contract, null, 2)),
       "# Diff",
       input.diff.truncated ? "(the diff was truncated; review what is shown)" : "",
-      wrapUntrusted("diff", input.diff.patch),
+      wrapUntrusted(
+        "diff",
+        omitted.length > 0
+          ? `${input.diff.patch}\n[omitted files, not shown: ${omitted.join(", ")}]`
+          : input.diff.patch,
+      ),
       "# Changed files (each line is prefixed `<n>| `; the prefix is not part of the file and must not appear in evidence)",
-      files,
+      files.text,
       "Review now. Reply with the JSON object only.",
     ]
       .filter((s) => s !== "")
@@ -168,7 +199,15 @@ async function review(
       input.policy.reviewerMinConfidence,
       { categories: def.categories, client },
     );
-    for (const finding of kept) safeEmit({ ...ev(), type: "finding", finding });
+    for (const finding of kept) {
+      const clean = {
+        ...finding,
+        evidence: redact(finding.evidence),
+        failureScenario: redact(finding.failureScenario),
+        suggestedFix: redact(finding.suggestedFix),
+      };
+      safeEmit({ ...ev(), type: "finding", finding: clean });
+    }
     for (const d of dropped) {
       const where = `${d.finding.file}:${d.finding.lineStart}-${d.finding.lineEnd}`;
       safeEmit({
