@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { join, normalize, relative } from "node:path";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { basename, join, normalize, relative } from "node:path";
 import { z } from "zod";
-import type { Gate, GateOutput } from "../types.js";
+import type { Gate, GateContext, GateOutput } from "../types.js";
 import {
   baseFileList,
   baseText,
@@ -49,6 +49,13 @@ const ONLY_PATTERNS = [/\.only\s*\(/, /\b(?:fit|fdescribe)\s*\(/];
 const SKIP_TOKEN =
   /\b(?:it|test|describe|suite|bench)(?:\.\w+)*\.(?:skip|todo|skipIf|runIf)\b|\b(?:xit|xdescribe|xtest)\b/;
 const MAX_LIST = 50;
+/** Only these files are collected as tests; other files under the test globs are just hash-frozen. */
+const RUNNABLE_TEST_RE = /\.(?:test|spec)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
+const isRunnable = (p: string): boolean => RUNNABLE_TEST_RE.test(basename(p));
+const HARNESS_HINT =
+  "tests gate runs with a harness-owned config; project-specific vitest/jest config (aliases, plugins, setupFiles) is not supported in v0.1";
+const RESOLVE_ERR_RE =
+  /Failed to resolve|Cannot find (?:module|package)|ERR_MODULE_NOT_FOUND|No test suite found|Failed to load|SyntaxError|ReferenceError/i;
 
 type Flat = { file: string; title: string; fullName: string; status: string };
 
@@ -63,10 +70,26 @@ const escapeGlob = (p: string): string => p.replace(/[\\*?[\]{}()!+@]/g, "\\$&")
 // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping ANSI escapes
 const stripAnsi = (s: string): string => s.replace(/\u001b\[[0-9;]*m/g, "");
 
-/** Totals from the runner's own console summary (vitest `Tests  1 failed | 2 passed (3)`, jest `Tests: 1 failed, 2 passed, 3 total`). */
+/**
+ * Totals from the runner's own console summary: vitest `Tests  1 failed | 2 passed (3)` (the first
+ * `Tests` line after the last `Test Files` line, so test output cannot imitate it earlier) or
+ * jest `Tests: 1 failed, 2 passed, 3 total` (the last such line).
+ */
 function summaryTotals(text: string): { total: number; failed: number } | undefined {
-  const clean = stripAnsi(text);
-  const line = /^\s*Tests:?\s+(.+)$/m.exec(clean)?.[1];
+  const lines = stripAnsi(text).split("\n");
+  let line: string | undefined;
+  const tf = lines.map((l) => /^\s*Test Files\s/.test(l)).lastIndexOf(true);
+  if (tf >= 0) {
+    line = lines
+      .slice(tf + 1)
+      .map((l) => /^\s*Tests\s+(.+)$/.exec(l)?.[1])
+      .find((x) => x !== undefined);
+  } else {
+    line = lines
+      .map((l) => /^\s*Tests:\s+(.+)$/.exec(l)?.[1])
+      .filter((x) => x !== undefined)
+      .at(-1);
+  }
   if (line === undefined) return undefined;
   const total = /\((\d+)\)\s*$/.exec(line)?.[1] ?? /(\d+) total/.exec(line)?.[1];
   if (total === undefined) return undefined;
@@ -77,6 +100,19 @@ export const testsGate: Gate = {
   name: "tests",
   category: "broken",
   async run(ctx) {
+    // Private dir for the harness config and the report; always removed.
+    const gateDir = await mkdtemp(join(ctx.scratch, "gate-"));
+    try {
+      await chmod(gateDir, 0o700);
+      return await runIn(ctx, gateDir);
+    } finally {
+      await rm(gateDir, { recursive: true, force: true }).catch(() => {});
+    }
+  },
+};
+
+async function runIn(ctx: GateContext, gateDir: string): Promise<GateOutput> {
+  {
     const g = new GateExec(ctx);
     const contract = ctx.contract;
     if (!contract) return err("no contract");
@@ -94,6 +130,11 @@ export const testsGate: Gate = {
         `cannot compare tests against ${ctx.baseRef}: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
+    const baseHasRunnerConfig = baseList.some(
+      (p) => !inNodeModules(p) && /^(?:vitest|vite|jest)\.config\./.test(basename(p)),
+    );
+    const hint = (text: string): string =>
+      baseHasRunnerConfig && RESOLVE_ERR_RE.test(text) ? ` — ${HARNESS_HINT}` : "";
     const frozenFiles = new Set(manifest.files.map((f) => normalize(f.path)));
     // Skip/only rules cover every file changed vs baseRef, including frozen ones.
     const changedSet = new Set([...changed.map((p) => normalize(p)), ...frozenFiles]);
@@ -101,7 +142,9 @@ export const testsGate: Gate = {
     const baseTests = baseList.filter(
       (p) => !inNodeModules(p) && matchesAnyGlob(p, ctx.policy.testGlobs),
     );
-    const runFiles = [...new Set([...frozenFiles, ...baseTests.map((p) => normalize(p))])].sort();
+    const runFiles = [...new Set([...frozenFiles, ...baseTests.map((p) => normalize(p))])]
+      .filter(isRunnable)
+      .sort();
 
     // The runner must be one the project declared at baseRef (not one the worktree added).
     if (baseList.includes("package.json")) {
@@ -116,8 +159,6 @@ export const testsGate: Gate = {
       }
     }
 
-    const gateDir = await mkdtemp(join(ctx.scratch, "gate-"));
-    await chmod(gateDir, 0o700);
     const outFile = join(gateDir, `tests-${randomUUID()}.json`);
     const argv = [...ctx.pack.testCommand, ...ctx.pack.testJsonArgs].map((a) =>
       a.replaceAll("<path>", outFile),
@@ -125,10 +166,19 @@ export const testsGate: Gate = {
     if (ctx.pack.testRunner === "vitest") {
       const cfg = join(gateDir, "vitest.harness.config.mjs");
       const include = runFiles.map(escapeGlob);
-      await writeFile(cfg, `export default { test: { include: ${JSON.stringify(include)} } };\n`);
+      await writeFile(
+        cfg,
+        `export default { cacheDir: ${JSON.stringify(join(gateDir, "cache"))}, test: { include: ${JSON.stringify(include)} } };\n`,
+      );
       argv.push("--reporter=default", `--config=${cfg}`, `--root=${root}`);
     } else {
-      argv.push("--runTestsByPath", ...runFiles);
+      // jest: harness-owned config; transform stays the jest default (babel-jest, whose
+      // babel config files are drift-checked and protected). No setup files, reporters or
+      // globalSetup are ever loaded from the project.
+      const cfg = join(gateDir, "jest.harness.config.json");
+      const testMatch = runFiles.map((f) => `<rootDir>/${escapeGlob(f)}`);
+      await writeFile(cfg, JSON.stringify({ rootDir: root, testEnvironment: "node", testMatch }));
+      argv.push(`--config=${cfg}`);
     }
     const r = await g.exec(argv);
     if (r.timedOut) return err("tests timed out");
@@ -137,10 +187,13 @@ export const testsGate: Gate = {
     try {
       raw = await readFile(outFile, "utf8");
     } catch {
-      return err(`test runner wrote no JSON report (exit ${r.exitCode})`, {
-        exitCode: r.exitCode,
-        output: tail(`${r.stdout}\n${r.stderr}`),
-      });
+      return err(
+        `test runner wrote no JSON report (exit ${r.exitCode})${hint(`${r.stdout}\n${r.stderr}`)}`,
+        {
+          exitCode: r.exitCode,
+          output: tail(`${r.stdout}\n${r.stderr}`),
+        },
+      );
     }
     let json: unknown;
     try {
@@ -195,7 +248,7 @@ export const testsGate: Gate = {
 
     // C2: every frozen file must have run, with every assertion passing.
     const frozenNotRun: Array<{ file: string; reason: string }> = [];
-    for (const f of frozenFiles) {
+    for (const f of [...frozenFiles].filter(isRunnable)) {
       const n = ranFiles.get(f);
       if (n === undefined) frozenNotRun.push({ file: f, reason: "not in the test report" });
       else if (n === 0) frozenNotRun.push({ file: f, reason: "no tests ran" });
@@ -318,11 +371,14 @@ export const testsGate: Gate = {
     }
     if (r.exitCode !== 0) reasons.push(`test command exited ${r.exitCode}`);
 
-    if (reasons.length > 0) return { status: "fail", summary: reasons.join("; "), details };
+    if (reasons.length > 0) {
+      const all = `${r.stdout}\n${r.stderr}\n${brokenSuites.map((b) => b.message).join("\n")}`;
+      return { status: "fail", summary: reasons.join("; ") + hint(all), details };
+    }
     return {
       status: "pass",
       summary: `${tests.filter((t) => t.status === "passed").length} test(s) passed; ${contract.criteria.length} criteria covered`,
       details: null,
     };
-  },
-};
+  }
+}

@@ -162,6 +162,15 @@ const CONFIG_RE = [
   /^\.eslintrc/,
   /^eslint\.config\./,
   /^\.gitignore$/,
+  /^\.eslintignore$/,
+  /^\.prettierrc/,
+  /^\.prettierignore$/,
+  /^\.npmrc$/,
+  /^\.yarnrc(\.yml)?$/,
+  /^pnpm-workspace\.yaml$/,
+  /^babel\.config\./,
+  /^\.babelrc/,
+  /^\.swcrc$/,
 ];
 export const isConfigFile = (p: string): boolean =>
   !inNodeModules(p) && CONFIG_RE.some((re) => re.test(basename(p)));
@@ -178,6 +187,17 @@ export const CONFIG_PATHSPECS = [
     ".eslintrc*",
     "eslint.config.*",
     ".gitignore",
+    ".eslintignore",
+    ".prettierrc*",
+    ".prettierignore",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    "pnpm-workspace.yaml",
+    "babel.config.*",
+    ".babelrc*",
+    ".swcrc",
+    "package.json",
   ].map((n) => `:(glob)**/${n}`),
   ":(glob,exclude)**/node_modules/**",
 ];

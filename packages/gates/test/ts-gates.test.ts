@@ -3,6 +3,7 @@ import {
   cpSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -694,5 +695,163 @@ describe("config drift and baseRef commands (S20)", () => {
     const r = await lintGate.run(ctx);
     expect(r.status).toBe("fail");
     expect(JSON.stringify(r.details)).toContain('"exitCode":2');
+  });
+});
+
+describe("fix round 2", () => {
+  test("helpers, fixtures and snapshots in the manifest are hash-frozen but not run (NB1)", async () => {
+    const { root, ctx } = await makeRepo();
+    write(root, "test/helpers.ts", "export const h = 1;\n");
+    write(root, "test/fixtures/x.json", "{}\n");
+    write(root, "test/a.test.ts", AC_TEST);
+    const manifest: FrozenTestManifest = {
+      files: await hashFiles(root, ["test/helpers.ts", "test/fixtures/x.json", "test/a.test.ts"]),
+      criteriaToTests: { "AC-1": ["AC-1: adds"], "AC-2": ["AC-2: doubles"] },
+    };
+    const r = await testsGate.run({ ...ctx, manifest });
+    expect(r.details).toBeNull();
+    expect(r.status).toBe("pass");
+  });
+
+  test("a pre-existing non-test helper under the test globs is not collected (NB1)", async () => {
+    const { root, ctx } = await makeRepo();
+    write(root, "test/util.ts", 'throw new Error("must not be collected");\n');
+    git(root, "add", "-A");
+    git(root, "commit", "-q", "-m", "util");
+    const manifest = await freezeAc(root);
+    const r = await testsGate.run({ ...ctx, manifest });
+    expect(r.details).toBeNull();
+    expect(r.status).toBe("pass");
+  });
+
+  test("a console line imitating the summary does not win (m1)", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root, `${AC_TEST}console.log("Tests  99 passed (99)");\n`);
+    const r = await testsGate.run({ ...ctx, manifest });
+    expect(r.details).toBeNull();
+    expect(r.status).toBe("pass");
+  });
+
+  test("the private gate dir is removed after the run (m5)", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
+    await testsGate.run({ ...ctx, manifest });
+    expect(readdirSync(ctx.scratch).filter((f) => f.startsWith("gate-"))).toEqual([]);
+  });
+
+  test("a project needing its own vitest config gets the harness-config hint (R18)", async () => {
+    const { root, ctx } = await makeRepo();
+    write(root, "vitest.config.mjs", "export default { test: { alias: { '@lib': './src' } } };\n");
+    git(root, "add", "-A");
+    git(root, "commit", "-q", "-m", "alias config");
+    const manifest = await freezeAc(
+      root,
+      `import { expect, test } from "vitest";
+import { add } from "@lib/math.js";
+test("AC-1: adds", () => { expect(add(1, 2)).toBe(3); });
+test("AC-2: doubles", () => { expect(2).toBe(2); });
+`,
+    );
+    const r = await testsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    expect(r.summary).toMatch(/harness-owned config; project-specific vitest\/jest config/);
+  });
+
+  test("jest runs with a harness-owned config and explicit runnable paths (S23)", async () => {
+    const { root, ctx } = await makeRepo();
+    const pj = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    pj.devDependencies.jest = "^30.0.0";
+    write(root, "package.json", JSON.stringify(pj));
+    git(root, "add", "-A");
+    git(root, "commit", "-q", "-m", "jest dep");
+    write(root, "test/helpers.ts", "export const h = 1;\n");
+    const manifest = await freezeAc(root);
+    manifest.files = [...manifest.files, ...(await hashFiles(root, ["test/helpers.ts"]))];
+    const out = join(ctx.scratch, "argv.json");
+    const cfgCopy = join(ctx.scratch, "cfg-copy.json");
+    const script = `const fs=require('fs');fs.writeFileSync(${JSON.stringify(out)},JSON.stringify(process.argv.slice(1)));const c=process.argv.find(a=>a.startsWith('--config=')).slice(9);fs.writeFileSync(${JSON.stringify(cfgCopy)},fs.readFileSync(c));`;
+    const pack: TsPack = {
+      ...ctx.pack,
+      testRunner: "jest",
+      testCommand: ["node", "-e", script, "--"],
+      testJsonArgs: ["--json", "--outputFile=<path>"],
+    };
+    await testsGate.run({ ...ctx, manifest, pack });
+    const argv: string[] = JSON.parse(readFileSync(out, "utf8"));
+    expect(argv.some((a) => a.startsWith("--outputFile=") && a.includes(ctx.scratch))).toBe(true);
+    expect(argv).not.toContain("--runTestsByPath");
+    const cfg = JSON.parse(readFileSync(cfgCopy, "utf8"));
+    expect(cfg.rootDir).toBe(root);
+    expect(cfg.testEnvironment).toBe("node");
+    expect(cfg.testMatch.join(" ")).toContain("ac.test.ts");
+    expect(cfg.testMatch.join(" ")).toContain("math.test.ts");
+    expect(cfg.testMatch.join(" ")).not.toContain("helpers.ts");
+    for (const k of ["setupFiles", "setupFilesAfterEnv", "globalSetup", "reporters", "transform"]) {
+      expect(cfg).not.toHaveProperty(k);
+    }
+  });
+
+  async function committed(files: Record<string, string>) {
+    const repo = await makeRepo();
+    for (const [p, t] of Object.entries(files)) write(repo.root, p, t);
+    git(repo.root, "add", "-A");
+    git(repo.root, "commit", "-q", "--allow-empty", "-m", "inputs");
+    return repo;
+  }
+
+  test.each([
+    [".eslintignore modified", { ".eslintignore": "dist\n" }, ".eslintignore", "dist\nsrc\n"],
+    [".prettierignore modified", { ".prettierignore": "dist\n" }, ".prettierignore", ""],
+    [".npmrc modified", { ".npmrc": "a=b\n" }, ".npmrc", "a=c\n"],
+    ["babel config modified", { "babel.config.json": "{}\n" }, "babel.config.json", '{"x":1}\n'],
+    [".babelrc added", {}, ".babelrc", "{}\n"],
+    ["nested .gitignore added", {}, "pkg/.gitignore", "*\n"],
+    [
+      "nested package.json eslintConfig changed",
+      { "pkg/package.json": "{}\n" },
+      "pkg/package.json",
+      '{"eslintConfig":{"rules":{}}}\n',
+    ],
+  ])("frozen gate fails on drift: %s", async (_n, base, file, next) => {
+    const { root, ctx } = await committed(base);
+    const manifest = await freezeNew(root);
+    write(root, file, next);
+    const r = await frozenTestsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify((r.details as Record<string, unknown>).configDrift)).toContain(file);
+  });
+
+  test("package.json absent at baseRef but present now is drift (m3)", async () => {
+    const { root, ctx } = await makeRepo();
+    unlinkSync(join(root, "package.json"));
+    git(root, "add", "-A");
+    git(root, "commit", "-q", "-m", "no package.json");
+    const manifest = await freezeNew(root);
+    write(root, "package.json", '{"scripts":{"lint":"true"}}\n');
+    const r = await frozenTestsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify((r.details as Record<string, unknown>).configDrift)).toContain(
+      "package.json",
+    );
+  });
+
+  test("DEFAULT_POLICY protects the widened input set", () => {
+    for (const g of [
+      "**/.eslintignore",
+      "**/.prettierignore",
+      "**/biome.jsonc",
+      "**/.npmrc",
+      "**/.yarnrc",
+      "**/.yarnrc.yml",
+      "**/pnpm-workspace.yaml",
+      "**/babel.config.*",
+      "**/.babelrc",
+      "**/.babelrc.*",
+      "**/.swcrc",
+      "**/.gitignore",
+    ]) {
+      expect(DEFAULT_POLICY.protectedGlobs).toContain(g);
+    }
+    expect(DEFAULT_POLICY.protectedGlobs).not.toContain(".gitignore");
   });
 });

@@ -1,5 +1,5 @@
 import { lstat, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { GateContext } from "../types.js";
 import {
   baseFileList,
@@ -13,7 +13,16 @@ import {
 
 export type ConfigDrift = { path: string; change: string };
 
-const PKG_KEYS = ["scripts", "jest", "vitest"] as const;
+const PKG_KEYS = [
+  "scripts",
+  "jest",
+  "vitest",
+  "eslintConfig",
+  "eslintIgnore",
+  "babel",
+  "prettier",
+] as const;
+const isPkg = (p: string): boolean => basename(p) === "package.json" && !inNodeModules(p);
 
 function stable(v: unknown): string {
   if (Array.isArray(v)) return `[${v.map(stable).join(",")}]`;
@@ -37,13 +46,14 @@ function pkgSlice(text: string): string | undefined {
 
 /**
  * Runner/lint/compiler config that differs from baseRef (added, modified, deleted or turned
- * into a symlink), plus the `scripts`, `jest` and `vitest` keys of package.json.
+ * into a symlink), plus the runner/lint keys of every package.json in the repo.
  */
 export async function configDrift(ctx: GateContext, g: GateExec): Promise<ConfigDrift[]> {
   const base = new Set(await baseFileList(ctx, g));
-  const cur = splitZ(
+  const allCur = splitZ(
     await g.git(["ls-files", "--cached", "--others", "-z", "--", ...CONFIG_PATHSPECS]),
-  ).filter((p) => !inNodeModules(p) && isConfigFile(p));
+  ).filter((p) => !inNodeModules(p));
+  const cur = allCur.filter(isConfigFile);
   const paths = new Set([...[...base].filter(isConfigFile), ...cur]);
   const out: ConfigDrift[] = [];
   for (const p of [...paths].sort()) {
@@ -70,17 +80,22 @@ export async function configDrift(ctx: GateContext, g: GateExec): Promise<Config
       out.push({ path: p, change: "modified" });
     }
   }
-  if (base.has("package.json")) {
-    const was = pkgSlice(await baseText(ctx, g, "package.json"));
+  const pkgs = new Set([...[...base].filter(isPkg), ...allCur.filter(isPkg)]);
+  for (const p of [...pkgs].sort()) {
     let now: string | undefined;
-    let missing = false;
+    let present = true;
     try {
-      now = pkgSlice(await readFile(join(ctx.worktree, "package.json"), "utf8"));
+      now = pkgSlice(await readFile(join(ctx.worktree, p), "utf8"));
     } catch {
-      missing = true;
+      present = false;
     }
-    if (missing) out.push({ path: "package.json", change: "deleted" });
-    else if (now !== was) out.push({ path: "package.json", change: "scripts/jest/vitest differ" });
+    if (!base.has(p)) {
+      if (present) out.push({ path: p, change: "added" });
+    } else if (!present) {
+      out.push({ path: p, change: "deleted" });
+    } else if (now !== pkgSlice(await baseText(ctx, g, p))) {
+      out.push({ path: p, change: "runner/lint keys differ" });
+    }
   }
   return out;
 }
