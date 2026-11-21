@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { builtinModules } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, normalize } from "node:path";
 import { type Contract, type FrozenTestManifest, RewireError, type RunEvent } from "@rewire/core";
@@ -35,13 +36,16 @@ const AC_TITLE_RE = /^(AC-\d+):/;
 // First line of an error (the header, without the stack), per runner. vitest/chai print
 // "AssertionError: expected ..."; jest prints "Error: expect(received).toBe(expected) ...".
 const ASSERTION_HEADER: Record<TsPack["testRunner"], RegExp> = {
-  vitest: /^AssertionError\b/,
+  vitest: /^(?:AssertionError\b|Error: (?:expected\b|expect\(|promise (?:resolved|rejected)\b))/,
   jest: /^(?:\w*Error: )?expect\(/,
 };
 // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping ANSI escapes
 const ANSI = /\u001b\[[0-9;]*m/g;
 const IMPORT_SPEC = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\brequire\s*\(\s*)["']([^"']+)["']/g;
-const RUNNER_PACKAGES = new Set(["vitest", "jest", "@jest/globals", "@vitest/globals"]);
+const TYPE_IMPORT = /\bimport\s+type\b[^;"']*?from\s*["'][^"']+["']/g;
+const BUILTINS = new Set(builtinModules.map((m) => m.replace(/^node:/, "")));
+/** Test runners and assertion libraries never count as code under test. */
+const TEST_LIB = /^(?:vitest|jest|chai|expect|@vitest\/.*|vitest\/.*|@jest\/.*|jest-.*)$/;
 const SNAPSHOT_RE =
   /\.(?:toMatchSnapshot|toMatchInlineSnapshot|toThrowErrorMatching(?:Inline)?Snapshot)\b/;
 
@@ -370,12 +374,19 @@ async function redCheck(
  * package name other than the test runner. A regex over import specifiers, not a parser.
  */
 export function referencesCodeUnderTest(src: string, file: string, testGlobs: string[]): boolean {
-  for (const m of src.matchAll(IMPORT_SPEC)) {
+  // `import type ...` statements are erased at compile time: they reference nothing at runtime.
+  const runtime = src.replace(TYPE_IMPORT, "");
+  for (const m of runtime.matchAll(IMPORT_SPEC)) {
     const spec = m[1] ?? "";
     if (spec.startsWith(".")) {
       const resolved = normalize(join(dirname(file), spec));
       if (!matchesAnyGlob(resolved, testGlobs)) return true;
-    } else if (!spec.startsWith("/") && !spec.startsWith("node:") && !RUNNER_PACKAGES.has(spec)) {
+    } else if (spec.startsWith("/")) {
+    } else {
+      const bare = spec.replace(/^node:/, "");
+      if (BUILTINS.has(bare) || BUILTINS.has(bare.split("/")[0] ?? "") || TEST_LIB.test(spec)) {
+        continue;
+      }
       return true;
     }
   }

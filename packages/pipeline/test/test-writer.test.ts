@@ -19,7 +19,13 @@ import { DEFAULT_POLICY } from "@rewire/policy";
 import { call, FauxProvider, type ScriptEntry, text } from "@rewire/providers";
 import { type CapabilityProfile, profileFor, SandboxClient } from "@rewire/sandbox";
 import { afterAll, expect, test } from "vitest";
-import { hashFiles, runTestWriterStage, scanExports, verifyFrozen } from "../src/index.js";
+import {
+  hashFiles,
+  referencesCodeUnderTest,
+  runTestWriterStage,
+  scanExports,
+  verifyFrozen,
+} from "../src/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // Real fixture: the gates package's ts-basic repo, copied into a temp git repo with the
@@ -369,7 +375,7 @@ test("greenfield: dynamic import of a module that does not exist yet is accepted
   expect(provider.requests[0]?.system ?? "").toContain('await import("');
 });
 
-test("a real node_modules directory is neither enumerated nor hashed", async () => {
+test("git status calls are scoped away from node_modules and ignored files outside the test globs", async () => {
   const root = makeRepo();
   rmSync(join(root, "node_modules"));
   mkdirSync(join(root, "node_modules"));
@@ -418,4 +424,48 @@ test("a runner that dies without a report reaches the retry, then red_check_fail
   expect(err.message).toMatch(/runner failed/);
   expect(provider.callCount).toBe(4);
   expect(provider.requests[2]?.messages[0]?.content).toContain("Red check failed");
+});
+
+const REDS: Array<[string, string]> = [
+  ["resolves", `await expect(Promise.resolve(add(1, 1))).resolves.toBe(3);`],
+  ["rejects", `await expect(Promise.reject(new Error("y"))).rejects.toThrow("x");`],
+  ["toSatisfy", `expect(add(1, 1)).toSatisfy((n: number) => n === 3);`],
+];
+for (const [name, body] of REDS) {
+  test(`async/extend assertion failure is accepted as red: ${name}`, async () => {
+    const src = `${HEAD}test("AC-1: a", async () => { ${body} });\ntest("AC-2: b", async () => { ${body} });\n`;
+    const { promise } = await run([write("test/ac.test.ts", src), text("done")]);
+    const m = await promise;
+    expect(Object.keys(m.criteriaToTests).sort()).toEqual(["AC-1", "AC-2"]);
+  });
+}
+
+test("a bare node builtin import does not count as code under test", async () => {
+  const src = `import fs from "fs";\nimport { expect, test } from "vitest";\ntest("AC-1: a", () => { fs.existsSync("."); expect(1).toBe(2); });\ntest("AC-2: b", () => { expect(1).toBe(2); });\n`;
+  const { err } = await rejected(twice("test/ac.test.ts", src));
+  expect(err.message).toContain("test does not reference code under test");
+});
+
+test("assertion libraries and type-only imports do not count as code under test", () => {
+  const g = DEFAULT_POLICY.testGlobs;
+  for (const src of [
+    `import { expect } from "chai";`,
+    `import x from "@vitest/expect";`,
+    `import y from "vitest/config";`,
+    `import z from "@jest/globals";`,
+    `import w from "jest-extended";`,
+    `import type { T } from "../src/math.js";`,
+    `import { type T } from "child_process";`,
+  ]) {
+    expect(referencesCodeUnderTest(src, "test/a.test.ts", g), src).toBe(false);
+  }
+  expect(referencesCodeUnderTest(`import { a } from "../src/math.js";`, "test/a.test.ts", g)).toBe(
+    true,
+  );
+  expect(referencesCodeUnderTest(`import { a } from "left-pad";`, "test/a.test.ts", g)).toBe(true);
+});
+
+test("prompt forbids inventing dynamic-import locations", () => {
+  const prompt = readFileSync(join(here, "../prompts/test-writer.md"), "utf8");
+  expect(prompt).toMatch(/Never invent a (?:location|path)/);
 });

@@ -17,7 +17,7 @@ Rules:
   expect(mod.fn?.(1, 2)).toBe(3);
   ```
 
-  Write behavioral asserts as `mod.fn?.(...)` so a missing function yields `expected undefined to be ...`, never a TypeError. Use the real module path the implementation will live at.
+  Write behavioral asserts as `mod.fn?.(...)` so a missing function yields `expected undefined to be ...`, never a TypeError. The dynamic-import specifier must be the path the contract names, or the path of an existing module. Never invent a location.
 - No snapshots (`toMatchSnapshot`, `toMatchInlineSnapshot`): they cannot be checked before an implementation exists.
 - No `.skip`, `.only`, `.todo`, `xit`, `fit`, and no `__mocks__` directories (they are protected).
 - Assert behavior that is observable from outside: inputs, outputs, thrown errors, side effects. No testing of private details.
