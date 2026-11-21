@@ -65,9 +65,15 @@ importers:
       '@rewire/core':
         specifier: workspace:*
         version: link:../core
+      '@rewire/gates':
+        specifier: workspace:*
+        version: link:../gates
       '@rewire/loop':
         specifier: workspace:*
         version: link:../loop
+      '@rewire/pack-typescript':
+        specifier: workspace:*
+        version: link:../pack-typescript
       '@rewire/policy':
         specifier: workspace:*
         version: link:../policy

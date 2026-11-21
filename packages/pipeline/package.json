@@ -21,7 +21,9 @@
   },
   "dependencies": {
     "@rewire/core": "workspace:*",
+    "@rewire/gates": "workspace:*",
     "@rewire/loop": "workspace:*",
+    "@rewire/pack-typescript": "workspace:*",
     "@rewire/policy": "workspace:*",
     "@rewire/providers": "workspace:*",
     "@rewire/sandbox": "workspace:*",
