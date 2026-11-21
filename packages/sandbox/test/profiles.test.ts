@@ -6,7 +6,12 @@ import { profileFor } from "../src/index.js";
 test("implementer profile denies test globs and protected globs", () => {
   const p = profileFor("implementer", "/w", DEFAULT_POLICY, "/tmp/s");
   expect(p.writeDeny).toEqual(
-    expect.arrayContaining(["**/*.test.ts", ".github/**", "**/pnpm-lock.yaml"]),
+    expect.arrayContaining([
+      "**/*.{test,spec}.{ts,tsx,mts,cts,js,jsx,mjs,cjs}",
+      ".github/**",
+      "**/pnpm-lock.yaml",
+      "**/node_modules/**",
+    ]),
   );
   expect(p.write).toEqual(["**"]);
 });

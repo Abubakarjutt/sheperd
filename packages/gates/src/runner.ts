@@ -103,7 +103,9 @@ async function runOne(
       }, timeoutMs);
     });
     // Promise.resolve().then so a synchronous throw inside run() is also caught.
-    const running = Promise.resolve().then(() => gate.run({ ...ctx, signal: ac.signal }));
+    const running = Promise.resolve().then(() =>
+      gate.run({ ...ctx, signal: ac.signal, deadline: Date.now() + timeoutMs }),
+    );
     // Avoid an unhandled rejection if the gate rejects after losing the race.
     running.catch(() => {});
     const out = await Promise.race([running, timeout]);

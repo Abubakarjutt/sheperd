@@ -25,6 +25,11 @@ export type GateContext = {
    * as errors ("aborted") without running.
    */
   signal?: AbortSignal;
+  /**
+   * Epoch ms by which the gate must be done. Set by the runner when the gate starts, so child
+   * processes are bounded by the same clock as the runner's timeout.
+   */
+  deadline?: number;
 };
 
 export type GateOutput = Omit<GateResult, "durationMs" | "gate" | "category">;

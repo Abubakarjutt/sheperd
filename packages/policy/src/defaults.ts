@@ -19,7 +19,12 @@ export type Policy = {
 };
 
 export const DEFAULT_POLICY: Policy = {
-  testGlobs: ["**/*.test.ts", "**/*.spec.ts", "**/__tests__/**", "test/**", "tests/**"],
+  testGlobs: [
+    "**/*.{test,spec}.{ts,tsx,mts,cts,js,jsx,mjs,cjs}",
+    "**/__tests__/**",
+    "test/**",
+    "tests/**",
+  ],
   protectedGlobs: [
     ".github/**",
     ".rewire/**",
@@ -29,6 +34,12 @@ export const DEFAULT_POLICY: Policy = {
     "**/eslint.config.*",
     "**/.prettierrc*",
     "**/tsconfig*.json",
+    "**/vitest.config.*",
+    "**/vite.config.*",
+    "**/vitest.workspace.*",
+    "**/jest.config.*",
+    ".gitignore",
+    "**/node_modules/**",
     "**/package-lock.json",
     "**/pnpm-lock.yaml",
     "**/yarn.lock",

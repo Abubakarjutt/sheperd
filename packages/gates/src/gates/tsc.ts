@@ -7,6 +7,7 @@ export const tscGate: Gate = {
   name: "tsc",
   category: "broken",
   async run(ctx) {
+    const g = new GateExec(ctx);
     const tsc = localBin(ctx.worktree, "tsc");
     if (!tsc) {
       return {
@@ -15,7 +16,7 @@ export const tscGate: Gate = {
         details: null,
       };
     }
-    const r = await new GateExec(ctx).exec([tsc, "--noEmit", "-p", ctx.pack.tsconfig]);
+    const r = await g.exec([tsc, "--noEmit", "-p", ctx.pack.tsconfig]);
     if (r.timedOut) return { status: "error", summary: "tsc timed out", details: null };
     const lines = `${r.stdout}\n${r.stderr}`
       .split("\n")

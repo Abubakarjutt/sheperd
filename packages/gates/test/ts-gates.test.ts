@@ -3,6 +3,7 @@ import {
   cpSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -303,54 +304,173 @@ describe("lint gate", () => {
   });
 });
 
+const AC_TEST = `import { expect, test } from "vitest";
+import { add, double } from "../src/math.js";
+test("AC-1: adds", () => { expect(add(1, 2)).toBe(3); });
+test("AC-2: doubles", () => { expect(double(4)).toBe(8); });
+`;
+
+/** A frozen file covering AC-1 and AC-2, with a complete criteriaToTests mapping. */
+async function freezeAc(root: string, text = AC_TEST): Promise<FrozenTestManifest> {
+  write(root, "test/ac.test.ts", text);
+  return {
+    files: await hashFiles(root, ["test/ac.test.ts"]),
+    criteriaToTests: { "AC-1": ["AC-1: adds"], "AC-2": ["AC-2: doubles"] },
+  };
+}
+
+describe("grandchild", () => {
+  test("a gate under a short timeout leaves no grandchild running", async () => {
+    const marker = `32.${Date.now() % 1000}7`;
+    const { ctx } = await makeRepo({}, 1500);
+    const pack = { ...ctx.pack, lintCommand: ["sh", "-c", `sleep ${marker} & wait`] };
+    const [r] = await runGates([lintGate], { ...ctx, pack });
+    expect(r?.status).toBe("error");
+    await new Promise((res) => setTimeout(res, 2500));
+    let running = "";
+    try {
+      running = execFileSync("pgrep", ["-f", `sleep ${marker}`], { encoding: "utf8" });
+    } catch {
+      // none
+    }
+    expect(running.trim()).toBe("");
+  });
+});
+
 describe("tests gate", () => {
-  test("passes when every criterion has a passing test", async () => {
-    const { ctx } = await makeRepo();
-    const r = await testsGate.run(ctx);
+  test("passes when frozen tests cover every criterion", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
+    const r = await testsGate.run({ ...ctx, manifest });
     expect(r.details).toBeNull();
     expect(r.status).toBe("pass");
   });
 
+  test("no manifest is an error (coverage cannot be attributed)", async () => {
+    const { ctx } = await makeRepo();
+    const r = await testsGate.run(ctx);
+    expect(r.status).toBe("error");
+    expect(r.summary).toMatch(/no frozen test manifest/);
+  });
+
+  test("implementer-written tests never count toward coverage", async () => {
+    const { root, ctx } = await makeRepo();
+    // The pre-existing math.test.ts already has passing AC-1 and AC-2 titles.
+    const manifest = await freezeAc(
+      root,
+      `import { expect, test } from "vitest";
+test("AC-1: adds", () => { expect(1).toBe(1); });
+`,
+    );
+    const r = await testsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    expect((r.details as { uncoveredCriteria: string[] }).uncoveredCriteria).toEqual(["AC-2"]);
+  });
+
   test("tests gate fails when AC-2 has no passing test", async () => {
     const { root, ctx } = await makeRepo();
-    write(
+    const manifest = await freezeAc(
       root,
-      "test/math.test.ts",
       `import { expect, test } from "vitest";
-test("AC-1: adds", () => { expect(1 + 1).toBe(2); });
+test("AC-1: adds", () => { expect(1).toBe(1); });
 test("AC-2: doubles", () => { expect(1).toBe(2); });
 `,
     );
-    const r = await testsGate.run(ctx);
+    const r = await testsGate.run({ ...ctx, manifest });
     expect(r.status).toBe("fail");
     expect(r.summary).toMatch(/AC-2/);
-    expect(JSON.stringify(r.details)).toContain("uncoveredCriteria");
+  });
+
+  test("criterion with no criteriaToTests entry, or unknown key, fails", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
+    const missing = { ...manifest, criteriaToTests: { "AC-1": ["AC-1: adds"] } };
+    const r1 = await testsGate.run({ ...ctx, manifest: missing });
+    expect(r1.status).toBe("fail");
+    expect(JSON.stringify(r1.details)).toContain("AC-2");
+    const extra = { ...manifest, criteriaToTests: { ...manifest.criteriaToTests, "AC-77": ["x"] } };
+    const r2 = await testsGate.run({ ...ctx, manifest: extra });
+    expect(r2.status).toBe("fail");
+    expect(JSON.stringify(r2.details)).toContain("AC-77");
+  });
+
+  test("a criteriaToTests title absent from the frozen files fails", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
+    manifest.criteriaToTests = { "AC-1": ["AC-1: adds"], "AC-2": ["AC-2: doubles two numbers"] };
+    const r = await testsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify((r.details as Record<string, unknown>).manifestTests)).toContain(
+      "not found",
+    );
+  });
+
+  test("a frozen file that did not run is a fail (C2)", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
+    // Frozen file reported by the runner with no tests: an empty-body file has no suite.
+    manifest.files = [
+      ...manifest.files,
+      ...(await (async () => {
+        write(root, "test/empty.test.ts", "export {};\n");
+        return hashFiles(root, ["test/empty.test.ts"]);
+      })()),
+    ];
+    const r = await testsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify((r.details as Record<string, unknown>).frozenNotRun)).toContain(
+      "test/empty.test.ts",
+    );
+  });
+
+  test("a frozen file excluded by implementer config does not run and fails (C2)", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
+    // Implementer vitest config tries to exclude the frozen file: the harness config ignores it.
+    write(
+      root,
+      "vitest.config.mjs",
+      "export default { test: { exclude: ['test/ac.test.ts', '**/node_modules/**'] } };\n",
+    );
+    const r = await testsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("pass");
+  });
+
+  test("implementer setupFiles in the worktree config are not loaded", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
+    write(root, "evil-setup.mjs", "throw new Error('setup must not run');\n");
+    write(
+      root,
+      "vitest.config.mjs",
+      "export default { test: { setupFiles: ['./evil-setup.mjs'] } };\n",
+    );
+    const r = await testsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("pass");
   });
 
   test("fails when a criterion has no test at all", async () => {
-    const { ctx } = await makeRepo();
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
     const contract = {
       ...CONTRACT,
       criteria: [...CONTRACT.criteria, { id: "AC-9", statement: "nothing" }],
     };
-    const r = await testsGate.run({ ...ctx, contract });
+    const r = await testsGate.run({ ...ctx, manifest, contract });
     expect(r.status).toBe("fail");
     expect((r.details as { uncoveredCriteria: string[] }).uncoveredCriteria).toEqual(["AC-9"]);
   });
 
-  test("tests gate fails on newly added it.skip", async () => {
+  test("tests gate fails on newly added it.skip in a frozen file", async () => {
     const { root, ctx } = await makeRepo();
-    write(
+    const manifest = await freezeAc(
       root,
-      "test/extra.test.ts",
-      `import { it } from "vitest";
-it.skip("AC-3: later", () => {});
-`,
+      `${AC_TEST}import { it } from "vitest";\nit.skip("AC-3: later", () => {});\n`,
     );
-    const r = await testsGate.run(ctx);
+    const r = await testsGate.run({ ...ctx, manifest });
     expect(r.status).toBe("fail");
     expect(JSON.stringify((r.details as Record<string, unknown>).skippedTests)).toContain(
-      "extra.test.ts",
+      "ac.test.ts",
     );
   });
 
@@ -365,12 +485,33 @@ it.skip("legacy", () => {});
     );
     git(root, "add", "-A");
     git(root, "commit", "-q", "-m", "old skip");
-    const r = await testsGate.run({ ...ctx, baseRef: "HEAD" });
+    const manifest = await freezeAc(root);
+    const r = await testsGate.run({ ...ctx, manifest, baseRef: "HEAD" });
     expect(r.status).toBe("pass");
+  });
+
+  test("a dynamic skip (no skip token in source) fails, even in an unchanged file (I3)", async () => {
+    const { root, ctx } = await makeRepo();
+    write(
+      root,
+      "test/dyn.test.ts",
+      `import { test } from "vitest";
+test("dyn", (t) => { t.skip(); });
+`,
+    );
+    git(root, "add", "-A");
+    git(root, "commit", "-q", "-m", "dynamic skip");
+    const manifest = await freezeAc(root);
+    const r = await testsGate.run({ ...ctx, manifest, baseRef: "HEAD" });
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify((r.details as Record<string, unknown>).dynamicSkips)).toContain(
+      "dyn.test.ts",
+    );
   });
 
   test("newly added .only fails", async () => {
     const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
     write(
       root,
       "test/only.test.ts",
@@ -378,7 +519,7 @@ it.skip("legacy", () => {});
 it.only("AC-3: focus", () => { expect(1).toBe(1); });
 `,
     );
-    const r = await testsGate.run(ctx);
+    const r = await testsGate.run({ ...ctx, manifest });
     expect(r.status).toBe("fail");
     expect(JSON.stringify((r.details as Record<string, unknown>).onlyFiles)).toContain(
       "only.test.ts",
@@ -387,20 +528,23 @@ it.only("AC-3: focus", () => { expect(1).toBe(1); });
 
   test("zero tests is a fail", async () => {
     const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
     unlinkSync(join(root, "test/math.test.ts"));
+    unlinkSync(join(root, "test/ac.test.ts"));
     const pack = { ...ctx.pack, testCommand: [...ctx.pack.testCommand, "--passWithNoTests"] };
-    const r = await testsGate.run({ ...ctx, pack });
+    const r = await testsGate.run({ ...ctx, manifest, pack });
     expect(r.status).toBe("fail");
     expect(r.summary).toMatch(/zero tests/);
   });
 
   test("non-zero exit with all tests passing is a fail with the exit code", async () => {
-    const { ctx } = await makeRepo();
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
     const pack = {
       ...ctx.pack,
       testCommand: ["sh", "-c", '"$@"; exit 3', "sh", ...ctx.pack.testCommand],
     };
-    const r = await testsGate.run({ ...ctx, pack });
+    const r = await testsGate.run({ ...ctx, manifest, pack });
     expect(r.status).toBe("fail");
     expect(r.summary).toMatch(/exited 3/);
     expect((r.details as { exitCode: number }).exitCode).toBe(3);
@@ -408,35 +552,61 @@ it.only("AC-3: focus", () => { expect(1).toBe(1); });
 
   test("a failing test fails the gate", async () => {
     const { root, ctx } = await makeRepo();
-    write(
+    const manifest = await freezeAc(
       root,
-      "test/math.test.ts",
       `import { expect, test } from "vitest";
 test("AC-1: adds", () => { expect(1).toBe(2); });
 test("AC-2: doubles", () => { expect(2).toBe(2); });
 `,
     );
-    const r = await testsGate.run(ctx);
+    const r = await testsGate.run({ ...ctx, manifest });
     expect(r.status).toBe("fail");
     expect(JSON.stringify((r.details as Record<string, unknown>).failingTests)).toContain("AC-1");
   });
 
-  test("manifest criteriaToTests entries must exist and pass", async () => {
-    const { ctx } = await makeRepo();
-    const manifest: FrozenTestManifest = {
-      files: [],
-      criteriaToTests: { "AC-1": ["math AC-1: adds two numbers"], "AC-2": ["math AC-2: gone"] },
-    };
-    const r = await testsGate.run({ ...ctx, manifest });
-    expect(r.status).toBe("fail");
-    expect(JSON.stringify((r.details as Record<string, unknown>).manifestTests)).toContain("gone");
-  });
-
   test("no contract is an error", async () => {
-    const { ctx } = await makeRepo();
-    const r = await testsGate.run({ ...ctx, contract: undefined });
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
+    const r = await testsGate.run({ ...ctx, manifest, contract: undefined });
     expect(r.status).toBe("error");
     expect(r.summary).toBe("no contract");
+  });
+
+  test("worktree given as a symlinked (non-realpath) path still works (I1)", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
+    const holder = tmp();
+    const link = join(holder, "wt");
+    symlinkSync(root, link);
+    const r = await testsGate.run({ ...ctx, worktree: link, manifest });
+    expect(r.details).toBeNull();
+    expect(r.status).toBe("pass");
+    const f = await frozenTestsGate.run({ ...ctx, worktree: link, manifest });
+    expect(f.status).toBe("pass");
+  });
+
+  test("a report whose totals disagree with the runner summary is an error (S19b)", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
+    // A shim runs the real vitest, then rewrites the JSON to claim an extra passing test.
+    const shim = join(tmp(), "shim.mjs");
+    writeFileSync(
+      shim,
+      `import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const r = spawnSync(args[0], args.slice(1), { stdio: "inherit" });
+const out = args.find((a) => a.startsWith("--outputFile=")).split("=")[1];
+const j = JSON.parse(readFileSync(out, "utf8"));
+j.testResults[0].assertionResults.push({ title: "AC-9: fake", fullName: "AC-9: fake", status: "passed" });
+writeFileSync(out, JSON.stringify(j));
+process.exit(r.status ?? 1);
+`,
+    );
+    const pack = { ...ctx.pack, testCommand: ["node", shim, ...ctx.pack.testCommand] };
+    const r = await testsGate.run({ ...ctx, manifest, pack });
+    expect(r.status).toBe("error");
+    expect(r.summary).toMatch(/disagree|summary/);
   });
 
   const node = (script: string): string[] => ["node", "-e", script];
@@ -445,9 +615,84 @@ test("AC-2: doubles", () => { expect(2).toBe(2); });
     ["unparseable JSON", "require('fs').writeFileSync(process.argv[2].split('=')[1], '{nope')"],
     ["schema mismatch", "require('fs').writeFileSync(process.argv[2].split('=')[1], '{\"a\":1}')"],
   ])("%s is an error", async (_name, script) => {
-    const { ctx } = await makeRepo();
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeAc(root);
     const pack = { ...ctx.pack, testCommand: node(script) };
-    const r = await testsGate.run({ ...ctx, pack });
+    const r = await testsGate.run({ ...ctx, manifest, pack });
     expect(r.status).toBe("error");
+  });
+});
+
+describe("config drift and baseRef commands (S20)", () => {
+  test.each([
+    ["vitest config added", (r: string) => write(r, "vitest.config.mjs", "export default {};\n")],
+    ["tsconfig changed", (r: string) => write(r, "tsconfig.json", '{"compilerOptions":{}}\n')],
+    ["tsconfig deleted", (r: string) => unlinkSync(join(r, "tsconfig.json"))],
+    [".gitignore changed", (r: string) => write(r, ".gitignore", "")],
+    [
+      "package.json scripts changed",
+      (r: string) =>
+        write(
+          r,
+          "package.json",
+          JSON.stringify({ type: "module", scripts: { test: "true" }, devDependencies: {} }),
+        ),
+    ],
+  ])("frozen gate fails on config drift: %s", async (_n, mutate) => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeNew(root);
+    mutate(root);
+    const r = await frozenTestsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    expect((r.details as Record<string, unknown>).configDrift).toBeDefined();
+  });
+
+  test("package.json changes outside scripts/jest/vitest are not drift", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeNew(root);
+    const pj = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    pj.dependencies = { left: "1.0.0" };
+    write(root, "package.json", JSON.stringify(pj));
+    const r = await frozenTestsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("pass");
+  });
+
+  async function lintRepo() {
+    const repo = await makeRepo();
+    const pj = JSON.parse(readFileSync(join(repo.root, "package.json"), "utf8"));
+    pj.scripts = { lint: 'node -e "process.exit(2)"' };
+    write(repo.root, "package.json", JSON.stringify(pj));
+    git(repo.root, "add", "-A");
+    git(repo.root, "commit", "-q", "-m", "lint script");
+    repo.ctx.pack = await detectTsPack(repo.root);
+    return repo;
+  }
+
+  test("lint command comes from baseRef: removed script is a fail, not 'no linter'", async () => {
+    const { root, ctx } = await lintRepo();
+    const pj = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    pj.scripts = {};
+    write(root, "package.json", JSON.stringify(pj));
+    const pack = { ...ctx.pack, lintCommand: null };
+    const r = await lintGate.run({ ...ctx, pack });
+    expect(r.status).toBe("fail");
+    expect(r.summary).not.toBe("no linter configured");
+  });
+
+  test("lint script weakened in the worktree is a fail", async () => {
+    const { root, ctx } = await lintRepo();
+    const pj = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    pj.scripts = { lint: "node -e 0" };
+    write(root, "package.json", JSON.stringify(pj));
+    const r = await lintGate.run(ctx);
+    expect(r.status).toBe("fail");
+    expect(r.summary).toMatch(/baseRef/);
+  });
+
+  test("baseRef lint script runs and its failure fails the gate", async () => {
+    const { ctx } = await lintRepo();
+    const r = await lintGate.run(ctx);
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain('"exitCode":2');
   });
 });

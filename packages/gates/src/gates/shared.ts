@@ -1,5 +1,6 @@
 import { accessSync, constants } from "node:fs";
-import { delimiter, isAbsolute, join } from "node:path";
+import { realpath } from "node:fs/promises";
+import { basename, delimiter, isAbsolute, join, matchesGlob } from "node:path";
 import { RewireError } from "@rewire/core";
 import type { ExecResult } from "@rewire/sandbox";
 import type { GateContext } from "../types.js";
@@ -35,22 +36,27 @@ export function localBin(worktree: string, bin: string): string | undefined {
   }
 }
 
+/** The worktree's real path; every path comparison against runner or git output uses this. */
+export const realRootOf = (ctx: GateContext): Promise<string> => realpath(ctx.worktree);
+
 /**
  * SandboxClient.exec takes `timeoutMs` but no AbortSignal, so a gate cannot kill its child on
- * abort. Instead every exec is bounded by the time left of the gate's own budget
- * (policy.gateTimeoutMs, measured from the gate's start): the sandbox kills the child at about
- * the same moment the runner records the gate as timed out, so no exec outlives its gate. No
- * new exec is started once the signal is aborted.
+ * abort. Instead every exec is bounded by the time left until the gate's deadline (set by the
+ * runner when the gate starts, `ctx.deadline`; otherwise computed from construction time, so
+ * construct a GateExec first thing in `run()`): the sandbox kills the child at about the moment
+ * the runner records a timeout, so no exec outlives its gate. No new exec starts once the
+ * signal is aborted.
  */
 export class GateExec {
-  private readonly started = Date.now();
-  constructor(private readonly ctx: GateContext) {}
+  private readonly deadline: number;
+  constructor(private readonly ctx: GateContext) {
+    this.deadline = ctx.deadline ?? Date.now() + ctx.policy.gateTimeoutMs;
+  }
 
   async exec(argv: string[]): Promise<ExecResult> {
     if (this.ctx.signal?.aborted) throw new Error("aborted");
-    const left = this.ctx.policy.gateTimeoutMs - (Date.now() - this.started);
     return this.ctx.client.exec(argv, {
-      timeoutMs: Math.max(1, left),
+      timeoutMs: Math.max(1, this.deadline - Date.now()),
       cwd: this.ctx.worktree,
     });
   }
@@ -66,11 +72,32 @@ export class GateExec {
   }
 }
 
-export function pathspecs(globs: string[]): string[] {
-  return globs.map((g) => `:(glob)${g}`);
+/** Expand `{a,b}` alternations (git pathspec globs have no braces). */
+export function expandBraces(glob: string): string[] {
+  const m = /\{([^{}]*)\}/.exec(glob);
+  if (!m) return [glob];
+  const [whole, inner] = m;
+  return (inner ?? "")
+    .split(",")
+    .flatMap((alt) =>
+      expandBraces(glob.slice(0, m.index) + alt + glob.slice(m.index + whole.length)),
+    );
 }
 
-const splitZ = (s: string): string[] => s.split("\0").filter((x) => x !== "");
+export function pathspecs(globs: string[]): string[] {
+  return [
+    ...globs.flatMap(expandBraces).map((g) => `:(glob)${g}`),
+    ":(glob,exclude)**/node_modules/**",
+  ];
+}
+
+export function matchesAnyGlob(path: string, globs: string[]): boolean {
+  return globs.flatMap(expandBraces).some((g) => matchesGlob(path, g));
+}
+
+export const inNodeModules = (p: string): boolean => p.split("/").includes("node_modules");
+
+export const splitZ = (s: string): string[] => s.split("\0").filter((x) => x !== "");
 
 function checkRef(ref: string): void {
   if (ref === "" || ref.startsWith("-")) throw new Error(`invalid baseRef: ${ref}`);
@@ -78,7 +105,8 @@ function checkRef(ref: string): void {
 
 /**
  * Test files that differ from baseRef: modified, deleted or staged tracked files plus untracked
- * (non-ignored) files, all under the policy test globs.
+ * files (gitignored ones included, so ignoring a file cannot hide it), all under the test globs
+ * and outside node_modules.
  */
 export async function changedTestFiles(ctx: GateContext, g: GateExec): Promise<string[]> {
   checkRef(ctx.baseRef);
@@ -93,20 +121,63 @@ export async function changedTestFiles(ctx: GateContext, g: GateExec): Promise<s
     "--",
     ...specs,
   ]);
-  const others = await g.git(["ls-files", "--others", "--exclude-standard", "-z", "--", ...specs]);
-  return [...new Set([...splitZ(diff), ...splitZ(others)])].sort();
+  const others = await g.git(["ls-files", "--others", "-z", "--", ...specs]);
+  return [...new Set([...splitZ(diff), ...splitZ(others)])].filter((p) => !inNodeModules(p)).sort();
 }
 
-/** Every tracked or untracked (non-ignored) path under the test globs. */
+/** Every tracked or untracked path under the test globs (outside node_modules). */
 export async function testGlobFiles(ctx: GateContext, g: GateExec): Promise<string[]> {
   const out = await g.git([
     "ls-files",
     "--cached",
     "--others",
-    "--exclude-standard",
     "-z",
     "--",
     ...pathspecs(ctx.policy.testGlobs),
   ]);
-  return [...new Set(splitZ(out))].sort();
+  return [...new Set(splitZ(out))].filter((p) => !inNodeModules(p)).sort();
 }
+
+/** Every file in the baseRef tree. */
+export async function baseFileList(ctx: GateContext, g: GateExec): Promise<string[]> {
+  checkRef(ctx.baseRef);
+  const out = await g.git(["ls-tree", "-r", "--name-only", "-z", ctx.baseRef]);
+  return splitZ(out);
+}
+
+/** Contents of a file at baseRef (the caller got `path` from baseFileList). */
+export async function baseText(ctx: GateContext, g: GateExec, path: string): Promise<string> {
+  checkRef(ctx.baseRef);
+  return g.git(["show", `${ctx.baseRef}:${path}`]);
+}
+
+/** Config files that decide what the verification gates run and how they judge. */
+const CONFIG_RE = [
+  /^vitest\.config\./,
+  /^vite\.config\./,
+  /^vitest\.workspace\./,
+  /^jest\.config\./,
+  /^tsconfig.*\.json$/,
+  /^biome\.jsonc?$/,
+  /^\.eslintrc/,
+  /^eslint\.config\./,
+  /^\.gitignore$/,
+];
+export const isConfigFile = (p: string): boolean =>
+  !inNodeModules(p) && CONFIG_RE.some((re) => re.test(basename(p)));
+
+/** Pathspecs that list the current config files (node_modules excluded). */
+export const CONFIG_PATHSPECS = [
+  ...[
+    "vitest.config.*",
+    "vite.config.*",
+    "vitest.workspace.*",
+    "jest.config.*",
+    "tsconfig*.json",
+    "biome.json*",
+    ".eslintrc*",
+    "eslint.config.*",
+    ".gitignore",
+  ].map((n) => `:(glob)**/${n}`),
+  ":(glob,exclude)**/node_modules/**",
+];
