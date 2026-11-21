@@ -1,3 +1,5 @@
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { RunEvent } from "@rewire/core";
 import { DEFAULT_POLICY } from "@rewire/policy";
 import { FauxProvider, text } from "@rewire/providers";
@@ -113,7 +115,7 @@ test("prompt carries base clause, fenced contract and fenced diff", async () => 
 test("not applicable reviewer returns nothing and calls no model", async () => {
   const { run, provider } = await setup([]);
   const r = await run({ ...def, appliesTo: () => false });
-  expect(r).toEqual({ kept: [], dropped: [], skipped: true });
+  expect(r).toEqual({ kept: [], dropped: [], skipped: true, omitted: [] });
   expect(provider.callCount).toBe(0);
 });
 
@@ -149,4 +151,45 @@ test("kept finding events are redacted", async () => {
   expect(r.kept).toHaveLength(1);
   const f = events.find((e) => e.type === "finding");
   expect(JSON.stringify(f)).not.toContain("sk-abcdefghijkl");
+});
+
+test("forced NUL finding is kept; omissions reach the result", async () => {
+  const root = makeRepo({ "a.ts": "line1\n" });
+  writeFileSync(join(root, "a.ts"), "line1\nconst v = 1;\u0000x\n");
+  put(root, "big.txt", "x".repeat(10));
+  const { buildDiffSummary } = await import("../src/index.js");
+  const client = hostClient();
+  const diff = await buildDiffSummary(root, "HEAD", { client });
+  const provider = new FauxProvider([text(JSON.stringify({ findings: [] }))]);
+  const events: RunEvent[] = [];
+  const r = await runReviewer(def, {
+    diff,
+    contract,
+    worktree: root,
+    model,
+    provider,
+    policy: DEFAULT_POLICY,
+    emit: (e) => events.push(e),
+    runId: "r",
+    client,
+  });
+  expect(r.kept.map((f) => [f.category, f.file, f.evidence])).toEqual([
+    ["security", "a.ts", "NUL byte in added line"],
+  ]);
+  expect(r.kept[0]?.id).toMatch(/^[0-9a-f]{16}$/);
+  expect(r.omitted.some((o) => o.includes("a.ts"))).toBe(true);
+  expect(events.some((e) => e.type === "finding")).toBe(true);
+});
+
+test("appliesTo throwing still emits stage_end", async () => {
+  const { run, events } = await setup([]);
+  await expect(
+    run({
+      ...def,
+      appliesTo: () => {
+        throw new Error("x");
+      },
+    }),
+  ).rejects.toThrow("x");
+  expect(events.at(-1)?.type).toBe("stage_end");
 });

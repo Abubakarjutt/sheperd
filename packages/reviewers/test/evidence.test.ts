@@ -24,6 +24,8 @@ const diffOf = (path: string, addedLines: number[]): DiffSummary => ({
   files: [{ path, addedLines }],
   patch: "",
   truncated: false,
+  omitted: [],
+  forced: [],
 });
 
 const A = "line1\nconst total = items.length;\nline3\nline4\n";
@@ -201,7 +203,8 @@ test("untracked non-ignored files count as all-added; ignored and binary do not"
   const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
   expect(d.files.find((x) => x.path === "new.ts")?.addedLines).toEqual([1, 2, 3]);
   expect(d.files.find((x) => x.path === "ignored.txt")).toBeUndefined();
-  expect(d.files.find((x) => x.path === "bin.dat")?.addedLines).toEqual([]);
+  expect(d.files.find((x) => x.path === "bin.dat")?.addedLines).toEqual([1]);
+  expect(d.forced.some((f) => f.file === "bin.dat")).toBe(true);
   expect(d.patch).toContain("+three");
 });
 
@@ -263,15 +266,6 @@ test("gitattributes `* -diff` and `*.ts binary` do not hide the change", async (
   const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
   expect(d.files.find((x) => x.path === "a.ts")?.addedLines).toEqual([2]);
   expect(d.patch).toContain("+const total = items.length;");
-});
-
-test("a true binary (NUL) gets a placeholder entry, not silence", async () => {
-  const root = makeRepo({ "b.dat": Buffer.from([0, 1, 2]).toString("latin1") });
-  writeFileSync(join(root, "b.dat"), Buffer.from([0, 9, 9, 0, 5]));
-  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
-  expect(d.files.find((x) => x.path === "b.dat")?.addedLines).toEqual([]);
-  expect(d.omitted.some((o) => o.includes("b.dat"))).toBe(true);
-  expect(d.patch).not.toContain("\0");
 });
 
 test("C-quoted paths (quote, control char) are decoded", async () => {
@@ -368,4 +362,67 @@ test("any .git path segment is outside", async () => {
     0.5,
   );
   expect(r.dropped[0]?.reason).toBe("file outside worktree");
+});
+
+// ---- fix round 2 ----
+test("NUL in a + line keeps addedLines, is omitted, and forces a security finding", async () => {
+  const root = makeRepo({ "a.ts": "one\ntwo\n" });
+  writeFileSync(join(root, "a.ts"), "one\nconst x = 1;\u0000hidden\ntwo\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.files.find((x) => x.path === "a.ts")?.addedLines).toEqual([2]);
+  expect(d.omitted.some((o) => o.includes("a.ts"))).toBe(true);
+  expect(d.patch).not.toContain("\0");
+  expect(d.forced).toHaveLength(1);
+  expect(d.forced[0]).toMatchObject({
+    file: "a.ts",
+    lineStart: 2,
+    evidence: "NUL byte in added line",
+  });
+});
+
+test("NUL only in a - line is not binary", async () => {
+  const root = makeRepo({ "a.ts": "one\nold\u0000line\ntwo\n" });
+  writeFileSync(join(root, "a.ts"), "one\nnew clean line\ntwo\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.files.find((x) => x.path === "a.ts")?.addedLines).toEqual([2]);
+  expect(d.forced).toEqual([]);
+  expect(d.omitted).toEqual([]);
+});
+
+test("astral characters in quoted paths are decoded", async () => {
+  const root = makeRepo({ "a.ts": A });
+  put(root, 'q"\u{1F600}.ts', "x\n");
+  git(root, "add", 'q"\u{1F600}.ts');
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.files.map((f) => f.path)).toContain('q"\u{1F600}.ts');
+  expect(d.omitted).toEqual([]);
+});
+
+test("a new .gitattributes escalates; attributes come from the base tree", async () => {
+  const root = makeRepo({ "sub/x.ts": "one\n" });
+  put(root, "sub/.gitattributes", "*.ts working-tree-encoding=UTF-16LE\n");
+  writeFileSync(join(root, "sub/x.ts"), Buffer.from("one\nconst y = 2;\n", "utf16le"));
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.omitted).toContain(".gitattributes changed (protected)");
+  expect(d.forced.some((f) => f.file === "sub/.gitattributes")).toBe(true);
+  expect(d.files.find((x) => x.path === "sub/x.ts")).toBeDefined();
+});
+
+test("untracked files that are outside or missing get a placeholder", async () => {
+  const root = makeRepo({ "a.ts": A });
+  const outside = makeRepo({ "s.ts": A });
+  symlinkSync(join(outside, "s.ts"), join(root, "link.ts"));
+  put(root, "sub/.git/config", "x\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.files.find((x) => x.path === "link.ts")?.addedLines).toEqual([]);
+  expect(d.omitted.some((o) => o.startsWith("link.ts"))).toBe(true);
+});
+
+test("ENAMETOOLONG and over-long file are dropped, not rejected", async () => {
+  const root = makeRepo({ "a.ts": A });
+  for (const file of [`${"a".repeat(300)}/x.ts`, "x".repeat(2000)]) {
+    const r = await filterEvidence([finding({ file })], root, diffOf(file, [2]), 0.5);
+    expect(r.kept).toEqual([]);
+    expect(r.dropped).toHaveLength(1);
+  }
 });

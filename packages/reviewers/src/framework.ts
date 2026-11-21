@@ -49,6 +49,8 @@ export type ReviewResult = {
   dropped: Dropped[];
   /** True when the reviewer did not apply to the diff and no model was called. */
   skipped?: true;
+  /** Everything the reviewer could not see (diff and prompt omissions). Escalate on non-empty. */
+  omitted: string[];
 };
 
 const ReviewerOutput = z.object({
@@ -89,7 +91,7 @@ async function changedFiles(
     if (f.addedLines.length === 0) continue;
     const r = await readInsideWorktree(input.worktree, f.path, client);
     if (r.kind !== "ok" || r.text.includes("\0")) {
-      omitted.push(`${f.path} (${r.kind === "ok" ? "binary" : r.kind})`);
+      omitted.push(`${f.path} (${r.kind === "ok" ? "contains NUL bytes" : r.kind})`);
       continue;
     }
     const body = numberLines(r.text);
@@ -122,19 +124,19 @@ export async function runReviewer(def: ReviewerDef, input: ReviewerInput): Promi
   const ev = () => ({ runId, ts: new Date().toISOString(), stage: def.name });
 
   safeEmit({ ...ev(), type: "stage_start" });
-  if (!def.appliesTo(input.diff)) {
-    safeEmit({
-      ...ev(),
-      type: "tool_call",
-      tool: "reviewer_skipped",
-      isError: false,
-      summary: "skipped: reviewer does not apply to this diff",
-    });
-    safeEmit({ ...ev(), type: "stage_end", ok: true });
-    return { kept: [], dropped: [], skipped: true };
-  }
   let ok = false;
   try {
+    if (!def.appliesTo(input.diff)) {
+      safeEmit({
+        ...ev(),
+        type: "tool_call",
+        tool: "reviewer_skipped",
+        isError: false,
+        summary: "skipped: reviewer does not apply to this diff",
+      });
+      ok = true;
+      return { kept: [], dropped: [], skipped: true, omitted: [] };
+    }
     const res = await review(def, input, safeEmit, ev);
     ok = true;
     return res;
@@ -192,13 +194,27 @@ async function review(
       const full = { ...f, id: "", reviewer: def.name };
       return { ...full, id: fingerprintFinding(full).slice(0, 16) };
     });
-    const { kept, dropped } = await filterEvidence(
+    const verified = await filterEvidence(
       candidates,
       input.worktree,
       input.diff,
       input.policy.reviewerMinConfidence,
       { categories: def.categories, client },
     );
+    const { dropped } = verified;
+    const forced: Finding[] = input.diff.forced.map((f) => {
+      const full = {
+        ...f,
+        category: "security" as const,
+        severity: 3 as const,
+        confidence: 1,
+        suggestedFix: "",
+        id: "",
+        reviewer: def.name,
+      };
+      return { ...full, id: fingerprintFinding(full).slice(0, 16) };
+    });
+    const kept = [...forced, ...verified.kept];
     for (const finding of kept) {
       const clean = {
         ...finding,
@@ -218,7 +234,7 @@ async function review(
         summary: redact(`${d.reason}: ${d.finding.category} ${where}`).slice(0, SUMMARY_CAP),
       });
     }
-    return { kept, dropped };
+    return { kept, dropped, omitted: [...new Set(omitted)] };
   } finally {
     owned?.dispose();
   }

@@ -1,4 +1,4 @@
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, posix, relative, resolve, sep } from "node:path";
 import { type Finding, normalizeEvidence, type SlopCategory } from "@rewire/core";
 import type { SandboxClient } from "@rewire/sandbox";
@@ -9,6 +9,8 @@ export const MAX_FILE_BYTES = 2 * 1024 * 1024;
 /** Evidence shorter than this (non-whitespace characters) matches almost anything. */
 export const MIN_EVIDENCE_CHARS = 8;
 const MAX_RANGE = 10;
+/** Longer reviewer-supplied paths are dropped as "file outside worktree". */
+const MAX_PATH_CHARS = 1024;
 const CONTEXT = 3;
 
 export type Dropped = { finding: Finding; reason: string };
@@ -35,7 +37,14 @@ const codeOf = (e: unknown): string | undefined =>
 /** A path that simply is not there (or is denied by the sandbox profile): not an infra failure. */
 const isMissing = (e: unknown): boolean => {
   const c = codeOf(e);
-  return c === "ENOENT" || c === "ENOTDIR" || c === "path_protected";
+  return (
+    c === "ENOENT" ||
+    c === "ENOTDIR" ||
+    c === "ENAMETOOLONG" ||
+    c === "ELOOP" ||
+    c === "EINVAL" ||
+    c === "path_protected"
+  );
 };
 
 /**
@@ -52,7 +61,9 @@ export async function readInsideWorktree(
   rel: string,
   client?: Pick<SandboxClient, "read">,
 ): Promise<SafeRead> {
-  if (rel === "" || rel.includes("\0") || isAbsolute(rel)) return { kind: "outside" };
+  if (rel === "" || rel.length > MAX_PATH_CHARS || rel.includes("\0") || isAbsolute(rel)) {
+    return { kind: "outside" };
+  }
   const root = await realpath(worktree);
   const abs = resolve(root, rel);
   if (outsideRoot(relative(root, abs))) return { kind: "outside" };
@@ -66,7 +77,7 @@ export async function readInsideWorktree(
   const inner = relative(root, real);
   if (outsideRoot(inner) || inner.split(sep).includes(".git")) return { kind: "outside" };
   try {
-    const st = await lstat(real);
+    const st = await stat(real);
     if (!st.isFile()) return { kind: "missing" };
     if (st.size > MAX_FILE_BYTES) return { kind: "too_large" };
     const text = client ? await client.read(real) : await readFile(real, "utf8");

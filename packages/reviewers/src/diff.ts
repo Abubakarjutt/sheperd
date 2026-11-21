@@ -9,7 +9,22 @@ export type DiffSummary = {
   truncated: boolean;
   /** Files whose content is not in `patch` or not reviewable (binary, too large, unreadable). */
   omitted: string[];
+  /**
+   * Mandatory findings decided by code, never left to the model: a NUL byte in an added line, or
+   * a changed `.gitattributes`. runReviewer turns each into a kept `security` finding.
+   */
+  forced: ForcedFinding[];
 };
+
+export type ForcedFinding = {
+  file: string;
+  lineStart: number;
+  lineEnd: number;
+  evidence: string;
+  failureScenario: string;
+};
+
+export const NUL_EVIDENCE = "NUL byte in added line";
 
 export const PATCH_CAP = 400_000;
 const GIT_TIMEOUT_MS = 60_000;
@@ -38,10 +53,11 @@ export function unquote(raw: string): string {
   };
   let i = 1;
   for (; i < raw.length; i++) {
-    const c = raw[i] as string;
+    const c = String.fromCodePoint(raw.codePointAt(i) as number);
     if (c === '"') break;
     if (c !== "\\") {
       bytes.push(...Buffer.from(c, "utf8"));
+      i += c.length - 1; // astral characters take two UTF-16 units
       continue;
     }
     const n = raw[++i] ?? "";
@@ -57,9 +73,9 @@ export function unquote(raw: string): string {
 /** Parse `git diff -U0` into per-file added line numbers (new-file numbering). */
 export function parseDiff(
   patch: string,
-): { path: string; addedLines: number[]; binary: boolean }[] {
+): { path: string; addedLines: number[]; nulLine?: number }[] {
   const out = new Map<string, number[]>();
-  const binary = new Set<string>();
+  const nul = new Map<string, number>();
   let currentPath = "";
   let current: number[] | undefined;
   let oldLeft = 0;
@@ -69,9 +85,9 @@ export function parseDiff(
   for (const line of patch.split("\n")) {
     if (oldLeft > 0 || newLeft > 0) {
       // Inside a hunk: every line is content, even one that looks like a header.
-      if (line.includes("\0")) binary.add(currentPath);
       if (line.startsWith("+")) {
         newLeft--;
+        if (line.includes("\0") && !nul.has(currentPath)) nul.set(currentPath, nextNew);
         current?.push(nextNew++);
       } else if (line.startsWith("-")) oldLeft--;
       continue;
@@ -99,20 +115,19 @@ export function parseDiff(
       }
     }
   }
-  return [...out].map(([path, added]) => {
-    const isBinary = binary.has(path);
-    return { path, addedLines: isBinary ? [] : added, binary: isBinary };
+  return [...out].map(([path, addedLines]) => {
+    const nulLine = nul.get(path);
+    return nulLine === undefined ? { path, addedLines } : { path, addedLines, nulLine };
   });
 }
 
 function untrackedPatch(path: string, text: string): { patch: string; added: number[] } {
-  if (text.includes("\0")) return { patch: `Binary file ${path} (untracked)\n`, added: [] };
   const lines = text === "" ? [] : text.replace(/\n$/, "").split("\n");
   const head = `diff --git a/${path} b/${path}\nnew file\n--- /dev/null\n+++ b/${path}\n`;
   const hunk =
     lines.length === 0
       ? ""
-      : `@@ -0,0 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join("\n")}\n`;
+      : `@@ -0,0 +1,${lines.length} @@\n${lines.map((l) => `+${l.replace(/\0/g, "")}`).join("\n")}\n`;
   return { patch: head + hunk, added: lines.map((_, i) => i + 1) };
 }
 
@@ -134,24 +149,40 @@ export async function buildDiffSummary(
     ...(opts.signal ? { signal: opts.signal } : {}),
   } as unknown as GateContext;
   const g = new GateExec(ctx);
-  const raw = await g.git([
+  // Attributes come from the trusted base tree, never the worktree (--attr-source, git >= 2.40);
+  // GIT_ATTR_SOURCE needs the same version, so an older git cannot be supported at all.
+  const attr = [
+    `--attr-source=${baseRef}`,
     "-c",
     "core.quotepath=off",
     "-c",
     "core.attributesFile=/dev/null",
+  ];
+  try {
+    await g.git([`--attr-source=${baseRef}`, "rev-parse", "--git-dir"]);
+  } catch (e) {
+    throw new Error(`git with --attr-source (>= 2.40) is required: ${(e as Error).message}`);
+  }
+  const raw = await g.git([
+    ...attr,
     "diff",
     "-U0",
     "--no-color",
     "--no-ext-diff",
     "--no-textconv",
     "--no-renames",
-    // A tracked .gitattributes (`* -diff`, `binary`) must not hide text changes: force text.
+    // Never let attributes (`-diff`, `binary`, encodings) hide text changes: force text.
     "--text",
     "--src-prefix=a/",
     "--dst-prefix=b/",
     baseRef,
     "--",
   ]);
+  const changedNames = (
+    await g.git([...attr, "diff", "--name-only", "-z", "--no-renames", baseRef, "--"])
+  )
+    .split("\0")
+    .filter((p) => p !== "");
   const parsed = parseDiff(raw);
   const tracked = raw.replace(/\0/g, "");
   const others = (await g.git(["ls-files", "--others", "--exclude-standard", "-z"]))
@@ -161,10 +192,29 @@ export async function buildDiffSummary(
     );
 
   const omitted: string[] = [];
+  const forced: ForcedFinding[] = [];
   const files: DiffSummary["files"] = [];
+  const nulFinding = (file: string, line: number): void => {
+    omitted.push(`${file} (NUL byte in added line)`);
+    forced.push({
+      file,
+      lineStart: line,
+      lineEnd: line,
+      evidence: NUL_EVIDENCE,
+      failureScenario:
+        "A NUL byte in added text can hide or truncate content from text tools and reviewers; the file's real content may differ from what was reviewed.",
+    });
+  };
   for (const f of parsed) {
     files.push({ path: f.path, addedLines: f.addedLines });
-    if (f.binary) omitted.push(`${f.path} (binary)`);
+    if (f.nulLine !== undefined) nulFinding(f.path, f.nulLine);
+  }
+  // A changed path with no parsed hunks (empty file, mode change, unparsed name) is never dropped.
+  const seen = new Set(files.map((f) => f.path));
+  for (const p of changedNames) {
+    if (seen.has(p)) continue;
+    files.push({ path: p, addedLines: [] });
+    omitted.push(`${p} (no textual diff)`);
   }
   let patch = tracked;
   for (const path of others.sort()) {
@@ -183,11 +233,26 @@ export async function buildDiffSummary(
       const u = untrackedPatch(path, r.text);
       files.push({ path, addedLines: u.added });
       patch += u.patch;
-      if (r.text.includes("\0")) omitted.push(`${path} (binary)`);
-    } else if (r.kind === "too_large") {
+      const at = r.text.split("\n").findIndex((l) => l.includes("\0"));
+      if (at >= 0) nulFinding(path, at + 1);
+    } else {
       files.push({ path, addedLines: [] });
-      omitted.push(`${path} (too large)`);
-      patch += `Untracked file ${path} too large to include\n`;
+      const why = r.kind === "too_large" ? "too large" : r.kind;
+      omitted.push(`${path} (${why})`);
+      patch += `Untracked file ${path} not included: ${why}\n`;
+    }
+  }
+  for (const p of new Set([...files.map((f) => f.path), ...changedNames, ...others])) {
+    if (p.split("/").pop() === ".gitattributes") {
+      omitted.push(".gitattributes changed (protected)");
+      forced.push({
+        file: p,
+        lineStart: 1,
+        lineEnd: 1,
+        evidence: ".gitattributes changed",
+        failureScenario:
+          "A changed .gitattributes can alter how git diffs or checks out files and hide changes from review; it is protected and must not be modified by the implementer.",
+      });
     }
   }
   let truncated = false;
@@ -198,5 +263,5 @@ export async function buildDiffSummary(
     if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1);
     patch = `${cut}\n[patch truncated at ${PATCH_CAP} characters]\n`;
   }
-  return { files, patch, truncated, omitted };
+  return { files, patch, truncated, omitted, forced };
 }
