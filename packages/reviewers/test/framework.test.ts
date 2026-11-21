@@ -115,7 +115,7 @@ test("prompt carries base clause, fenced contract and fenced diff", async () => 
 test("not applicable reviewer returns nothing and calls no model", async () => {
   const { run, provider } = await setup([]);
   const r = await run({ ...def, appliesTo: () => false });
-  expect(r).toEqual({ kept: [], dropped: [], skipped: true, omitted: [] });
+  expect(r).toMatchObject({ kept: [], dropped: [], skipped: true, omitted: [] });
   expect(provider.callCount).toBe(0);
 });
 
@@ -192,4 +192,31 @@ test("appliesTo throwing still emits stage_end", async () => {
     }),
   ).rejects.toThrow("x");
   expect(events.at(-1)?.type).toBe("stage_end");
+});
+
+test("skipped reviewer still carries forced findings and omissions", async () => {
+  const root = makeRepo({ "a.ts": "line1\n" });
+  writeFileSync(join(root, "a.ts"), "line1\nconst v = 1;\u0000x\n");
+  const { buildDiffSummary } = await import("../src/index.js");
+  const client = hostClient();
+  const diff = await buildDiffSummary(root, "HEAD", { client });
+  const provider = new FauxProvider([]);
+  const r = await runReviewer(
+    { ...def, appliesTo: () => false },
+    {
+      diff,
+      contract,
+      worktree: root,
+      model,
+      provider,
+      policy: DEFAULT_POLICY,
+      emit: () => {},
+      runId: "r",
+      client,
+    },
+  );
+  expect(r.skipped).toBe(true);
+  expect(r.kept.map((f) => f.evidence)).toEqual(["NUL byte in added line"]);
+  expect(r.omitted.some((o) => o.includes("a.ts"))).toBe(true);
+  expect(provider.callCount).toBe(0);
 });

@@ -134,8 +134,12 @@ export async function runReviewer(def: ReviewerDef, input: ReviewerInput): Promi
         isError: false,
         summary: "skipped: reviewer does not apply to this diff",
       });
+      // A skipped reviewer still carries the forced findings and the omissions.
+      const kept = forcedFindings(def, input.diff);
+      for (const finding of kept)
+        safeEmit({ ...ev(), type: "finding", finding: cleanFinding(finding) });
       ok = true;
-      return { kept: [], dropped: [], skipped: true, omitted: [] };
+      return { kept, dropped: [], skipped: true, omitted: [...new Set(input.diff.omitted)] };
     }
     const res = await review(def, input, safeEmit, ev);
     ok = true;
@@ -143,6 +147,29 @@ export async function runReviewer(def: ReviewerDef, input: ReviewerInput): Promi
   } finally {
     safeEmit({ ...ev(), type: "stage_end", ok });
   }
+}
+
+const cleanFinding = (f: Finding): Finding => ({
+  ...f,
+  evidence: redact(f.evidence),
+  failureScenario: redact(f.failureScenario),
+  suggestedFix: redact(f.suggestedFix),
+});
+
+/** Mandatory `security` findings decided by code (NUL bytes, protected git files). */
+function forcedFindings(def: ReviewerDef, diff: DiffSummary): Finding[] {
+  return diff.forced.map((f) => {
+    const full = {
+      ...f,
+      category: "security" as const,
+      severity: 3 as const,
+      confidence: 1,
+      suggestedFix: "",
+      id: "",
+      reviewer: def.name,
+    };
+    return { ...full, id: fingerprintFinding(full).slice(0, 16) };
+  });
 }
 
 async function review(
@@ -173,7 +200,7 @@ async function review(
       wrapUntrusted(
         "diff",
         omitted.length > 0
-          ? `${input.diff.patch}\n[omitted files, not shown: ${omitted.join(", ")}]`
+          ? `${input.diff.patch}\n[escalation items, not reviewed as text (path (reason)): ${omitted.join(", ")}]`
           : input.diff.patch,
       ),
       "# Changed files (each line is prefixed `<n>| `; the prefix is not part of the file and must not appear in evidence)",
@@ -202,27 +229,9 @@ async function review(
       { categories: def.categories, client },
     );
     const { dropped } = verified;
-    const forced: Finding[] = input.diff.forced.map((f) => {
-      const full = {
-        ...f,
-        category: "security" as const,
-        severity: 3 as const,
-        confidence: 1,
-        suggestedFix: "",
-        id: "",
-        reviewer: def.name,
-      };
-      return { ...full, id: fingerprintFinding(full).slice(0, 16) };
-    });
-    const kept = [...forced, ...verified.kept];
+    const kept = [...forcedFindings(def, input.diff), ...verified.kept];
     for (const finding of kept) {
-      const clean = {
-        ...finding,
-        evidence: redact(finding.evidence),
-        failureScenario: redact(finding.failureScenario),
-        suggestedFix: redact(finding.suggestedFix),
-      };
-      safeEmit({ ...ev(), type: "finding", finding: clean });
+      safeEmit({ ...ev(), type: "finding", finding: cleanFinding(finding) });
     }
     for (const d of dropped) {
       const where = `${d.finding.file}:${d.finding.lineStart}-${d.finding.lineEnd}`;

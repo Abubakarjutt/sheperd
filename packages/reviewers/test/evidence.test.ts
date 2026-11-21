@@ -1,4 +1,4 @@
-import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Finding } from "@rewire/core";
 import { expect, test } from "vitest";
@@ -195,14 +195,15 @@ test("buildDiffSummary parses hunks: multiple hunks, omitted count, d=0", async 
   expect(d.patch).toContain("@@");
 });
 
-test("untracked non-ignored files count as all-added; ignored and binary do not", async () => {
+test("untracked non-ignored files count as all-added; ignored are listed too", async () => {
   const root = makeRepo({ "a.ts": A, ".gitignore": "ignored.txt\n" });
   put(root, "new.ts", "one\ntwo\nthree\n");
   put(root, "ignored.txt", "x\ny\n");
   writeFileSync(join(root, "bin.dat"), Buffer.from([0, 1, 2, 0, 3]));
   const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
   expect(d.files.find((x) => x.path === "new.ts")?.addedLines).toEqual([1, 2, 3]);
-  expect(d.files.find((x) => x.path === "ignored.txt")).toBeUndefined();
+  // Worktree ignore rules must not hide files from review.
+  expect(d.files.find((x) => x.path === "ignored.txt")?.addedLines).toEqual([1, 2]);
   expect(d.files.find((x) => x.path === "bin.dat")?.addedLines).toEqual([1]);
   expect(d.forced.some((f) => f.file === "bin.dat")).toBe(true);
   expect(d.patch).toContain("+three");
@@ -403,7 +404,9 @@ test("a new .gitattributes escalates; attributes come from the base tree", async
   put(root, "sub/.gitattributes", "*.ts working-tree-encoding=UTF-16LE\n");
   writeFileSync(join(root, "sub/x.ts"), Buffer.from("one\nconst y = 2;\n", "utf16le"));
   const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
-  expect(d.omitted).toContain(".gitattributes changed (protected)");
+  expect(d.omitted.some((o) => o.includes("sub/.gitattributes") && o.includes("protected"))).toBe(
+    true,
+  );
   expect(d.forced.some((f) => f.file === "sub/.gitattributes")).toBe(true);
   expect(d.files.find((x) => x.path === "sub/x.ts")).toBeDefined();
 });
@@ -425,4 +428,67 @@ test("ENAMETOOLONG and over-long file are dropped, not rejected", async () => {
     expect(r.kept).toEqual([]);
     expect(r.dropped).toHaveLength(1);
   }
+});
+
+// ---- fix round 3 ----
+test("binary assets escalate via omitted only: no forced finding, no patch bytes", async () => {
+  const root = makeRepo({ "a.ts": A });
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 1, 2, 3]);
+  writeFileSync(join(root, "tracked.PNG"), png);
+  git(root, "add", "tracked.PNG");
+  writeFileSync(join(root, "new.woff2"), png);
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.forced).toEqual([]);
+  expect(d.omitted).toContain("tracked.PNG (binary asset)");
+  expect(d.omitted).toContain("new.woff2 (binary asset)");
+  expect(d.patch).not.toContain("PNG");
+  expect(d.patch).not.toContain("new.woff2\n+");
+  expect(d.files.map((f) => f.path)).toEqual(expect.arrayContaining(["tracked.PNG", "new.woff2"]));
+});
+
+test("a .ts file with NUL still forces a finding", async () => {
+  const root = makeRepo({ "a.ts": "one\n" });
+  writeFileSync(join(root, "a.ts"), "one\nx\u0000y\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.forced).toHaveLength(1);
+});
+
+test("empty added files are not omitted; mode-only change is", async () => {
+  const root = makeRepo({ "run.sh": "echo hi\n" });
+  put(root, "empty.ts", "");
+  git(root, "add", "empty.ts");
+  chmodSync(join(root, "run.sh"), 0o755);
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.omitted.some((o) => o.startsWith("empty.ts"))).toBe(false);
+  expect(d.omitted).toContain("run.sh (mode change)");
+});
+
+test(".gitattributes check is case-insensitive", async () => {
+  const root = makeRepo({ "a.ts": A });
+  put(root, ".GitAttributes", "* text\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.forced.some((f) => f.file === ".GitAttributes")).toBe(true);
+});
+
+test("a new .gitignore cannot hide a file from review and is itself flagged", async () => {
+  const root = makeRepo({ "a.ts": A });
+  put(root, ".gitignore", "evil.ts\n");
+  put(root, "evil.ts", "const evil = 1;\n");
+  put(root, "node_modules/x/index.js", "x\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.files.find((f) => f.path === "evil.ts")?.addedLines).toEqual([1]);
+  expect(d.files.some((f) => f.path.startsWith("node_modules/"))).toBe(false);
+  expect(d.forced.some((f) => f.file === ".gitignore")).toBe(true);
+  expect(d.omitted.some((o) => o.includes(".gitignore changed (protected)"))).toBe(true);
+});
+
+test("a modified nested .GITIGNORE is flagged", async () => {
+  const root = makeRepo({ "sub/.gitignore": "a\n" });
+  put(root, "sub/.gitignore", "a\nb\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.forced.some((f) => f.file === "sub/.gitignore")).toBe(true);
+  const root2 = makeRepo({ "a.ts": A });
+  put(root2, "x/.GITATTRIBUTES", "* text\n");
+  const d2 = await buildDiffSummary(root2, "HEAD", { client: hostClient() });
+  expect(d2.forced.some((f) => f.file === "x/.GITATTRIBUTES")).toBe(true);
 });

@@ -28,6 +28,63 @@ export const NUL_EVIDENCE = "NUL byte in added line";
 
 export const PATCH_CAP = 400_000;
 const GIT_TIMEOUT_MS = 60_000;
+const EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+
+/** Extensions whose content is never reviewed as text (R21): matched case-insensitively. */
+export const BINARY_ASSET_EXTS = [
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "ico",
+  "bmp",
+  "avif",
+  "woff",
+  "woff2",
+  "ttf",
+  "otf",
+  "eot",
+  "wasm",
+  "pdf",
+  "zip",
+  "gz",
+  "tgz",
+  "mp3",
+  "mp4",
+  "webm",
+  "ogg",
+  "wav",
+];
+const isBinaryAsset = (p: string): boolean => {
+  const ext = /\.([^./]+)$/.exec(p)?.[1]?.toLowerCase();
+  return ext !== undefined && BINARY_ASSET_EXTS.includes(ext);
+};
+
+type RawChange = { path: string; status: string; oldMode: string; newMode: string; oldSha: string };
+
+/** Parse `git diff --raw -z --no-renames`: `:om nm osha nsha S\0path\0` records. */
+function parseRaw(out: string): RawChange[] {
+  const t = out.split("\0");
+  const res: RawChange[] = [];
+  for (let i = 0; i < t.length; i++) {
+    const meta = t[i] ?? "";
+    if (!meta.startsWith(":")) continue;
+    const [om = "", nm = "", osha = "", , status = ""] = meta.slice(1).split(" ");
+    const path = t[++i];
+    if (path) res.push({ path, status: status[0] ?? "", oldMode: om, newMode: nm, oldSha: osha });
+  }
+  return res;
+}
+
+async function isEmptyFile(
+  worktree: string,
+  path: string,
+  client: SandboxClient,
+): Promise<boolean> {
+  const r = await readInsideWorktree(worktree, path, client);
+  return r.kind === "ok" && r.text === "";
+}
 
 /** Same guard as gates' checkRef (not exported there): a ref can never be read as an option. */
 function checkRef(ref: string): void {
@@ -163,6 +220,8 @@ export async function buildDiffSummary(
   } catch (e) {
     throw new Error(`git with --attr-source (>= 2.40) is required: ${(e as Error).message}`);
   }
+  // Binary assets never expand into the patch; they escalate through `omitted` (R21).
+  const excludeAssets = BINARY_ASSET_EXTS.map((e) => `:(exclude,icase,glob)**/*.${e}`);
   const raw = await g.git([
     ...attr,
     "diff",
@@ -177,15 +236,26 @@ export async function buildDiffSummary(
     "--dst-prefix=b/",
     baseRef,
     "--",
+    ".",
+    ...excludeAssets,
   ]);
-  const changedNames = (
-    await g.git([...attr, "diff", "--name-only", "-z", "--no-renames", baseRef, "--"])
-  )
-    .split("\0")
-    .filter((p) => p !== "");
+  const changed = parseRaw(
+    await g.git([...attr, "diff", "--raw", "-z", "--no-abbrev", "--no-renames", baseRef, "--"]),
+  );
   const parsed = parseDiff(raw);
   const tracked = raw.replace(/\0/g, "");
-  const others = (await g.git(["ls-files", "--others", "--exclude-standard", "-z"]))
+  // No --exclude-standard: a worktree .gitignore must not hide files from review (as gates do).
+  const others = (
+    await g.git([
+      "ls-files",
+      "--others",
+      "-z",
+      "--",
+      ".",
+      ":(exclude,glob)**/node_modules/**",
+      ":(exclude,glob).git/**",
+    ])
+  )
     .split("\0")
     .filter(
       (p) => p !== "" && !p.split("/").includes("node_modules") && !p.split("/").includes(".git"),
@@ -209,15 +279,30 @@ export async function buildDiffSummary(
     files.push({ path: f.path, addedLines: f.addedLines });
     if (f.nulLine !== undefined) nulFinding(f.path, f.nulLine);
   }
-  // A changed path with no parsed hunks (empty file, mode change, unparsed name) is never dropped.
+  // A changed path with no parsed hunks is never dropped silently.
   const seen = new Set(files.map((f) => f.path));
-  for (const p of changedNames) {
-    if (seen.has(p)) continue;
-    files.push({ path: p, addedLines: [] });
-    omitted.push(`${p} (no textual diff)`);
+  for (const c of changed) {
+    if (seen.has(c.path)) continue;
+    files.push({ path: c.path, addedLines: [] });
+    if (isBinaryAsset(c.path)) {
+      omitted.push(`${c.path} (binary asset)`);
+    } else if (c.status === "M" && c.oldMode !== c.newMode) {
+      omitted.push(`${c.path} (mode change)`);
+    } else if (c.status === "A" && (await isEmptyFile(worktree, c.path, opts.client))) {
+      // An empty added file has nothing to review.
+    } else if (c.status === "D" && c.oldSha === EMPTY_BLOB) {
+      // An empty deleted file has nothing to review.
+    } else {
+      omitted.push(`${c.path} (no textual diff)`);
+    }
   }
   let patch = tracked;
   for (const path of others.sort()) {
+    if (isBinaryAsset(path)) {
+      files.push({ path, addedLines: [] });
+      omitted.push(`${path} (binary asset)`);
+      continue;
+    }
     let r: Awaited<ReturnType<typeof readInsideWorktree>>;
     try {
       r = await readInsideWorktree(worktree, path, opts.client);
@@ -242,18 +327,24 @@ export async function buildDiffSummary(
       patch += `Untracked file ${path} not included: ${why}\n`;
     }
   }
-  for (const p of new Set([...files.map((f) => f.path), ...changedNames, ...others])) {
-    if (p.split("/").pop() === ".gitattributes") {
-      omitted.push(".gitattributes changed (protected)");
-      forced.push({
-        file: p,
-        lineStart: 1,
-        lineEnd: 1,
-        evidence: ".gitattributes changed",
-        failureScenario:
-          "A changed .gitattributes can alter how git diffs or checks out files and hide changes from review; it is protected and must not be modified by the implementer.",
-      });
-    }
+  // Files that steer git itself (diff attributes, ignore rules) are protected: any change to
+  // one is a mandatory security finding. Names are NFC-normalized and compared case-insensitively.
+  const protectedNames = new Set([".gitattributes", ".gitignore"]);
+  for (const p of new Set([
+    ...files.map((f) => f.path),
+    ...changed.map((c) => c.path),
+    ...others,
+  ])) {
+    const base = (p.split("/").pop() ?? "").normalize("NFC").toLowerCase();
+    if (!protectedNames.has(base)) continue;
+    omitted.push(`${p} ${base} changed (protected)`);
+    forced.push({
+      file: p,
+      lineStart: 1,
+      lineEnd: 1,
+      evidence: `${base} changed`,
+      failureScenario: `A changed ${base} can alter how git diffs, lists or checks out files and hide changes from review; it is protected and must not be modified by the implementer.`,
+    });
   }
   let truncated = false;
   if (patch.length > PATCH_CAP) {

@@ -117,8 +117,8 @@ const validLine = (n: number): boolean => Number.isInteger(n) && n >= 1;
  *   "range too wide"               (2) lineEnd - lineStart > 10
  *   "outside changed lines"        (3) no line in [lineStart, lineEnd] is an added line in the diff
  *   "low confidence"               (4) confidence < minConfidence
- *   "category out of scope"        (5) only when `opts.categories` is given; runReviewer passes
- *                                  the reviewer's categories here, so the check lives in one place
+ *   "category out of scope"        (5) only when `opts.categories` is given (runReviewer passes
+ *                                  the reviewer's); `security` is always in scope (#23 findings)
  */
 export async function filterEvidence(
   findings: Finding[],
