@@ -85,6 +85,8 @@ jobs:
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+
       - run: cargo test --workspace
       - run: cargo build --release -p rewire-sandbox
 
@@ -99,7 +101,7 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r build
+      - run: pnpm biome check .
       - run: pnpm -r test
         env:
           REWIRE_SANDBOX_BIN: ${{ github.workspace }}/target/release/rewire-sandbox
-      - run: pnpm biome check .

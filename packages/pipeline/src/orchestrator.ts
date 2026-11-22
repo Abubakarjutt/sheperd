@@ -113,6 +113,10 @@ export const GATE_REGISTRY: Readonly<Record<string, Gate>> = {
  * the test-runner items are restated here.
  */
 export const KNOWN_LIMITATIONS: readonly string[] = [
+  "the audit gate uses a registry network exception: on Linux it has full network access during that gate, because bwrap has no domain filtering",
+  "test-writer isolation from implementation bodies is prompt-level until the code index ships",
+  "disputes escalate to the human; automated adjudication is deferred",
+  "TypeScript only: other languages are refused with pack_undetected",
   "rules cover JS/TS only (the semgrep rules and the TypeScript pack)",
   "gitignored untracked files are not scanned by semgrep/gitleaks",
   "host PATH passed through the sandbox",

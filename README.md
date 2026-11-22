@@ -92,11 +92,14 @@ stderr.
 
 ### Exit codes
 
-| code | meaning                                                                         |
-| ---- | ------------------------------------------------------------------------------- |
-| 0    | the run is `verified`. This is the only success.                                |
-| 1    | usage error, unsupported platform, a missing prerequisite, or an unexpected error |
-| 2    | the run escalated to a human (see the evidence report for the reason)           |
+| code | meaning                                                                                        |
+| ---- | ---------------------------------------------------------------------------------------------- |
+| 0    | the run is `verified`. This is the only success.                                               |
+| 1    | usage error, unsupported platform, a missing prerequisite, or an unexpected error              |
+| 130  | a second Ctrl-C: forced quit (the first Ctrl-C stops the run and writes an interrupted report) |
+| 2    | the run escalated to a human (see the evidence report for the reason)                          |
+
+Running `rewire` with no arguments prints the usage and exits 1; `rewire --help` prints it and exits 0.
 
 ### Run directory
 
@@ -162,8 +165,6 @@ review is weaker than a cross-family one. Rewire still runs, and marks the evide
 `independence: same-family` so you can discount it. Ollama models must support tool calling;
 rewire checks this.
 
-All three examples above parse with the real `loadModelsFile` loader.
-
 ## Benchmark
 
 ```sh
@@ -178,30 +179,30 @@ defines what a first run must show.
 
 These are rendered into every evidence report (the first list) or are known gaps in the harness.
 
-Stated in every report:
+Stated in every report (this list is checked against the pipeline's `KNOWN_LIMITATIONS` by a test):
 
-- The audit gate uses a registry network exception. On Linux it has full network access during
+- The audit gate uses a registry network exception: on Linux it has full network access during
   that gate, because bwrap has no domain filtering.
 - Test-writer isolation from implementation bodies is prompt-level until the code index ships.
 - Disputes escalate to the human; automated adjudication is deferred.
-- TypeScript only. Other languages are refused with `pack_undetected`.
+- TypeScript only: other languages are refused with pack_undetected.
 - Rules cover JS/TS only (the semgrep rules and the TypeScript pack).
-- Gitignored untracked files are not scanned by semgrep or gitleaks.
-- The host `PATH` is passed through the sandbox.
-- Dependency installs are not harness-mediated: gates run against the dependencies already
-  present (the repo's `node_modules` is shared into the worktree by a symlink, never committed),
-  and a change to a manifest's dependencies fails the drift and lockfile checks instead of being
-  installed.
-- Tests run in the same process as the code under test: implementer code imported by a frozen
-  test can tamper with the assertion library or the reporter in-process; only cheap forgery is
-  detected.
-- The test runner config is owned by the harness: projects that need `setupFiles`, plugins,
-  aliases or tsconfig paths fail closed.
-- Jest support is covered by unit tests only (no real jest run in the test suite).
-- Untracked, gitignored nested `package.json` files (for example `dist/package.json`) are
+- Gitignored untracked files are not scanned by semgrep/gitleaks.
+- Host PATH passed through the sandbox.
+- Dependency installs are not harness-mediated in v0.1: the gates run against the dependencies
+  already present (the repo's node_modules is shared into the worktree by a symlink, never
+  committed); a change to a manifest's dependencies fails the drift and lockfile checks instead of
+  being installed.
+- Tests run in the same process as the code under test: implementer code imported by a frozen test
+  can tamper with the assertion library or the reporter in-process; only cheap forgery is detected.
+- The test runner config is owned by the harness: projects that need setupFiles, plugins, aliases
+  or tsconfig paths fail closed.
+- Jest support is covered by unit tests only (no real jest run in the harness test suite).
+- Untracked, gitignored nested package.json files (for example dist/package.json) are
   drift-checked and can cause fail-closed false positives.
-- No mutation testing or metric ratchet.
-- `independence: same-family` is added when the reviewers share the implementer's model family.
+- No mutation testing or metric ratchet in v0.1.
+- When the reviewers share the implementer's model family, the report also says
+  `independence: same-family`.
 
 Also known:
 
