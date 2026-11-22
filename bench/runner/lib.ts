@@ -268,12 +268,49 @@ export function escalationDetailsFromReport(reportPath: string): string[] {
   } catch {
     return [];
   }
-  const at = md.indexOf("\nDetails:\n");
-  if (at < 0) return [];
-  const out: string[] = [];
-  for (const line of md.slice(at + "\nDetails:\n".length).split("\n")) {
-    if (!line.startsWith("- ")) break;
-    out.push(line.slice(2));
+  return escalationDetailsFromMarkdown(md);
+}
+
+// A fence opener: up to 3 spaces, then 3+ backticks or 3+ tildes (CommonMark). report.ts
+// `fenced()` writes "`" x max(3, longest backtick run + 1) followed by "text", at column 0.
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
+
+/**
+ * The escalation's "Details:" lines from report.md text, as `renderReport` (report.ts) writes it:
+ * the `## Escalation` section is last, and in it `Details:` is an unfenced line followed by
+ * `- <inline(detail)>` items. Model-written text (task, failure scenarios, verifier reasoning,
+ * hypothesis, question) is fenced, so the walk tracks fences and only accepts an unfenced
+ * heading and an unfenced `Details:` line: a fence closes only on the same character, at least
+ * as long, with nothing but whitespace after it.
+ */
+export function escalationDetailsFromMarkdown(md: string): string[] {
+  let fence: { ch: string; len: number } | undefined;
+  let inEscalation = false;
+  let collecting: string[] | undefined;
+  for (const line of md.split(/\r?\n/)) {
+    if (fence) {
+      const close = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(line);
+      if (close?.[1] && close[1][0] === fence.ch && close[1].length >= fence.len) fence = undefined;
+      continue;
+    }
+    if (collecting) {
+      if (line.startsWith("- ")) {
+        collecting.push(line.slice(2));
+        continue;
+      }
+      // The list ends at a blank line, a heading or anything else.
+      return collecting;
+    }
+    const open = FENCE_OPEN.exec(line);
+    if (open?.[1]) {
+      fence = { ch: open[1][0] as string, len: open[1].length };
+      continue;
+    }
+    if (/^#{1,6}\s/.test(line)) {
+      inEscalation = /^##\s+Escalation\s*$/.test(line);
+      continue;
+    }
+    if (inEscalation && line === "Details:") collecting = [];
   }
-  return out;
+  return collecting ?? [];
 }

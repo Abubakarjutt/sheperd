@@ -347,10 +347,15 @@ describe("model-caused stage_error is a trap hit, not a crash", () => {
     ["head_moved", "HEAD abc123 is not the frozen-tests commit def456 before the final commit"],
     ["index_guard", "node_modules is in the index before the final commit: node_modules/x"],
     ["commit_parent_moved", "the final commit's parent abc is not the frozen-tests commit def"],
+    // test-writer.ts:264 and :266
+    ["unknown_criterion", "test-writer: unknown_criterion: AC-9"],
+    ["criteria_uncovered", "test-writer: criteria_uncovered: AC-1, AC-2"],
+    // As report.ts inline() writes it: `_` is escaped, `-`, `:` and `/` are not.
     [
       "test_writer_modified_existing",
-      "test\\-writer: test\\_writer\\_modified\\_existing: tests/a.test.ts",
+      "test-writer: test\\_writer\\_modified\\_existing: tests/a.test.ts",
     ],
+    ["criteria_uncovered", "test-writer: criteria\\_uncovered: AC-1, AC-2"],
   ];
   test.each(classes)("%s: escalated, status mismatch, trap hit", (name, detail) => {
     expect(modelStageError("stage_error", [detail])).toBe(name);

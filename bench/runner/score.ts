@@ -38,9 +38,15 @@ export const isInfraReason = (reason: string | undefined): boolean =>
  * are copied from the pipeline source.
  */
 export const MODEL_STAGE_ERRORS: ReadonlyArray<{ name: string; re: RegExp }> = [
-  // packages/pipeline/src/stages/test-writer.ts:285 and :287 (RewireError codes)
+  // packages/pipeline/src/stages/test-writer.ts:285 and :288 (RewireError codes); the
+  // orchestrator writes them as `${stage}: ${code}: ${message}` (orchestrator.ts toEscalation)
   { name: "test_writer_out_of_scope", re: /\btest_writer_out_of_scope\b/ },
   { name: "test_writer_modified_existing", re: /\btest_writer_modified_existing\b/ },
+  // test-writer.ts:264 `throw new RewireError("unknown_criterion", ...)`: a test names a
+  // criterion the contract does not have
+  { name: "unknown_criterion", re: /^test-writer: unknown_criterion: / },
+  // test-writer.ts:266 `throw new RewireError("criteria_uncovered", ...)`: a criterion with no test
+  { name: "criteria_uncovered", re: /^test-writer: criteria_uncovered: / },
   // packages/pipeline/src/orchestrator.ts:668 `frozen test ${path}: ${reason} before the final commit`
   { name: "frozen_test_mismatch", re: /^frozen test .+ before the final commit$/ },
   // orchestrator.ts:489 TAMPERED and :672 `${TAMPERED} before the final commit`
