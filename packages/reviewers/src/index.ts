@@ -12,4 +12,11 @@ export {
   type ReviewResult,
   runReviewer,
 } from "./framework.js";
+export {
+  type PanelResult,
+  REVIEWERS,
+  runPanel,
+  SILENT_FAILURE_PATTERN,
+  selectReviewers,
+} from "./routing.js";
 export { wrapUntrusted } from "./untrusted.js";
