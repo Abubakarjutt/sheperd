@@ -78,28 +78,52 @@ const SCANNED_EXT_RE = /\.(js|jsx|mjs|cjs|ts|tsx)$/;
 /**
  * Second pass (`--scan-unknown-extensions`) covers every other changed file, because node will
  * `require()` JS from `.txt` or extensionless files. Whether a parse error there fails depends
- * on whether the file could be loaded as JS at all: `.mts`/`.cts`, case variants such as `.JS`
- * and `#!...node|tsx|ts-node|bun|deno` shebang scripts are always strict; any other file is
- * strict only if its text COMPILES as node's CommonJS wrapper body (`vm.compileFunction`), as a
- * classic script (`vm.Script`) or looks like an ES module; never run (ruling R28). A file that does not compile cannot be `require()`d
- * either, so it is dropped from pass 2 entirely: no false positives on prose or Makefiles.
+ * on whether node could load the file at all: `.mts`/`.cts`, case variants such as `.JS` and
+ * `#!...node|tsx|ts-node|bun|deno` shebang scripts are always strict. Any other file is strict
+ * only if node's loader would accept it (`classifyPass2`, rulings R28 and R32; nothing is ever
+ * run). A file node cannot load is dropped from pass 2: no false positives on prose or Makefiles.
  */
 const JS_LIKE_EXT_RE = /\.(m?[jt]s|c[jt]s|[jt]sx)$/i;
 const SHEBANG_RE = /^#!.*\b(node|tsx|ts-node|bun|deno)\b/;
-const ESM_HINT_RE =
-  /^\s*(import\s*[\w{*"']|export\s+(default|const|let|var|function|class|async|\{|\*))/m;
 const MAX_COMPILE_BYTES = 8 * 1024 * 1024;
 /** node's CommonJS module wrapper parameters (lib/internal/modules/cjs/loader.js). */
 const CJS_WRAPPER_PARAMS = ["exports", "require", "module", "__filename", "__dirname"];
+/**
+ * SyntaxError messages after which node's CommonJS loader retries the source as an ES module
+ * (`require(esm)`, node 22.12+). They mirror `esm_syntax_error_messages` and
+ * `throws_only_in_cjs_error_messages` in node's src/node_contextify.cc (used by
+ * `shouldRetryAsESM` in lib/internal/modules/helpers.js). Every string below is present
+ * verbatim in the pinned node binary on the build machine (checked with `strings`).
+ */
+const ESM_RETRY_MESSAGES = new Set([
+  "Cannot use import statement outside a module",
+  "Unexpected token 'export'",
+  "Cannot use 'import.meta' outside a module",
+  "Identifier 'module' has already been declared",
+  "Identifier 'exports' has already been declared",
+  "Identifier 'require' has already been declared",
+  "Identifier '__filename' has already been declared",
+  "Identifier '__dirname' has already been declared",
+  "await is only valid in async functions and the top level bodies of modules",
+]);
 /** vm errors may come from another realm, so the name is checked as well as instanceof. */
 const isSyntaxError = (e: unknown): boolean =>
   e instanceof SyntaxError ||
   (typeof e === "object" &&
     e !== null &&
     Object.getPrototypeOf(e)?.constructor?.name === "SyntaxError");
+const errText = (e: unknown): string =>
+  typeof e === "object" && e !== null && typeof (e as { message?: unknown }).message === "string"
+    ? (e as { message: string }).message
+    : "";
 
-/** "always" (extension/shebang), "compiles", or "no" (cannot be loaded as JS; skip). */
-function loadability(worktree: string, f: string): "always" | "compiles" | "no" {
+type Load = "always" | "compiles" | "no" | "module?";
+
+/**
+ * In-process part of the classification. "module?" means every CommonJS and script parse threw a
+ * SyntaxError without an ESM-retry message: only a real module parse (child) can decide it.
+ */
+function loadability(worktree: string, f: string): Load {
   if (JS_LIKE_EXT_RE.test(f)) return "always";
   let src: string;
   try {
@@ -113,28 +137,90 @@ function loadability(worktree: string, f: string): "always" | "compiles" | "no" 
   const first = src.split("\n", 1)[0] ?? "";
   if (SHEBANG_RE.test(first)) return "always";
   if (src.startsWith("#!")) src = `//${src}`;
-  // Ruling R28: dropped only if EVERY parse below throws a SyntaxError. Nothing is executed.
-  // `require()` of a non-.js/.mjs extension always goes through the CommonJS wrapper, so a
-  // function body with exactly node's wrapper parameters is what node can load (top-level
-  // `return`, `new.target` ...). Any other exception (RangeError on deep nesting etc.) counts
-  // as compiling: scan strictly.
-  const parses = [
-    () => vm.compileFunction(src, CJS_WRAPPER_PARAMS, { filename: f }),
-    () => new vm.Script(src, { filename: f }),
-  ];
-  for (const parse of parses) {
-    try {
-      parse();
-      return "compiles";
-    } catch (e) {
-      if (!isSyntaxError(e)) return "compiles";
-    }
-  }
-  if (ESM_HINT_RE.test(src)) {
-    // vm.SourceTextModule needs --experimental-vm-modules; import/export-looking source counts as compiling
+  // R28: `require()` of a non-.js/.mjs extension goes through the CommonJS wrapper, so a
+  // function body with exactly node's wrapper parameters is what node loads (top-level
+  // `return`, `new.target` ...). R32(a): a SyntaxError node would retry as ESM counts as
+  // loadable. Any non-SyntaxError exception (RangeError on deep nesting etc.) is strict.
+  try {
+    vm.compileFunction(src, CJS_WRAPPER_PARAMS, { filename: f });
     return "compiles";
+  } catch (e) {
+    if (!isSyntaxError(e) || ESM_RETRY_MESSAGES.has(errText(e))) return "compiles";
   }
-  return "no";
+  try {
+    new vm.Script(src, { filename: f });
+    return "compiles";
+  } catch (e) {
+    if (!isSyntaxError(e)) return "compiles";
+  }
+  return "module?";
+}
+
+/**
+ * R32(b): parse each file as an ES module in ONE child `node --experimental-vm-modules` (the
+ * pinned node that runs rewire, through the verify sandbox: no network, the gate deadline as
+ * timeout). `new vm.SourceTextModule(src)` only parses; link/evaluate are never called. Prints
+ * `{"<file>": true|false}`. Files over 8 MB are reported as true (strict).
+ */
+const MODULE_PARSE_SCRIPT = `
+const fs = require("node:fs"), vm = require("node:vm");
+const out = {};
+for (const f of process.argv.slice(1)) {
+  try {
+    if (fs.statSync(f).size > ${MAX_COMPILE_BYTES}) { out[f] = true; continue; }
+    let src = fs.readFileSync(f, "utf8");
+    if (src.charCodeAt(0) === 0xfeff) src = src.slice(1);
+    if (src.startsWith("#!")) src = "//" + src;
+    new vm.SourceTextModule(src, { identifier: "file:///" + encodeURI(f) });
+    out[f] = true;
+  } catch (e) {
+    out[f] = !(e instanceof SyntaxError);
+  }
+}
+process.stdout.write(JSON.stringify(out));
+`;
+const ModuleParseOut = z.record(z.string(), z.boolean());
+
+/**
+ * Files (of `candidates`) that parse as an ES module. Fail-closed: if the child fails, times
+ * out, or its output is unparseable or does not cover every candidate, ALL candidates count as
+ * parsing (strict), and the reason is returned for the warnings list.
+ */
+async function moduleParses(
+  g: GateExec,
+  candidates: string[],
+): Promise<{ parses: Set<string>; failure?: string }> {
+  if (candidates.length === 0) return { parses: new Set() };
+  const all = { parses: new Set(candidates) };
+  const parses = new Set<string>();
+  try {
+    for (const chunk of chunks(candidates, SCAN_CHUNK)) {
+      const r = await g.exec([
+        process.execPath,
+        "--experimental-vm-modules",
+        "--no-warnings",
+        "-e",
+        MODULE_PARSE_SCRIPT,
+        "--",
+        ...chunk,
+      ]);
+      if (r.timedOut || r.exitCode !== 0) {
+        return {
+          ...all,
+          failure: `module-parse child ${r.timedOut ? "timed out" : `exited ${r.exitCode}`}: ${r.stderr.trim().slice(0, 200)}`,
+        };
+      }
+      const out = ModuleParseOut.parse(JSON.parse(r.stdout));
+      for (const f of chunk) {
+        const v = out[f];
+        if (v === undefined) return { ...all, failure: `module-parse child skipped ${f}` };
+        if (v) parses.add(f);
+      }
+    }
+  } catch (e) {
+    return { ...all, failure: `module-parse child unusable: ${errMsg(e).slice(0, 200)}` };
+  }
+  return { parses };
 }
 const typeText = (t: unknown): string => (typeof t === "string" ? t : JSON.stringify(t ?? ""));
 const norm = (p: string): string => p.replace(/^\.\//, "");
@@ -214,6 +300,11 @@ export const semgrepGate: Gate = {
       const load = new Map(
         files.filter((f) => !SCANNED_EXT_RE.test(f)).map((f) => [f, loadability(ctx.worktree, f)]),
       );
+      const maybeModules = [...load].filter(([, v]) => v === "module?").map(([f]) => f);
+      const mod = await moduleParses(g, maybeModules);
+      if (mod.failure)
+        warnings.push(`${mod.failure}; ${maybeModules.length} file(s) scanned strictly`);
+      for (const f of maybeModules) load.set(f, mod.parses.has(f) ? "compiles" : "no");
       const pass2 = [...load].filter(([, v]) => v !== "no").map(([f]) => f);
       const strict = new Set(pass2);
       const jobs = [

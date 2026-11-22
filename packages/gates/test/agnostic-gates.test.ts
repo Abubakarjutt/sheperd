@@ -450,6 +450,76 @@ describe("semgrep pass 2 mirrors the CommonJS loader (R28)", () => {
   });
 });
 
+describe("semgrep pass 2 classifies ES modules like node's require(esm) (R32)", () => {
+  const listed = (r: { details: unknown }, f: string): boolean => {
+    const d = r.details as {
+      findings: { file: string; severity: string }[];
+      problemFiles: { file: string }[];
+    };
+    return (
+      d.findings.some((x) => x.file === f && x.severity === "ERROR") ||
+      d.problemFiles.some((x) => x.file === f)
+    );
+  };
+  const PAYLOAD = "globalThis.pwn = (q) => eval(q);\n";
+  const MODULES: Record<string, string> = {
+    "esm6.txt": "const h = (req) => eval(req.query.x);export{h as default};\n",
+    "e1.txt": `${PAYLOAD}export{};\n`,
+    "e2.txt": "globalThis.pwn = (q) => eval(q);; export default 1;\n",
+    "e3.txt": `/* c */ export const z = 1;\n${PAYLOAD}`,
+    "e4.txt": `${PAYLOAD}export\n{};\n`,
+    "e5.txt": `${PAYLOAD};import fs from "fs";\n`,
+    "lib/meta": `const u = import.meta.url;\nmodule.exports = (req) => eval(req.query.x);\n`,
+    "im3.txt": `${PAYLOAD}import.meta.dirname;\n`,
+    "tla.txt": `${PAYLOAD}await 0;\n`,
+    "redecl.txt": `const module = 1;\n${PAYLOAD}`,
+  };
+
+  test("module-syntax files node would load are scanned and fail", async () => {
+    const { root, ctx } = makeRepo();
+    for (const [f, t] of Object.entries(MODULES)) write(root, f, t);
+    const r = await semgrepGate.run(ctx);
+    expect(r.status).toBe("fail");
+    const missed = Object.keys(MODULES).filter((f) => !listed(r, f));
+    expect(missed, JSON.stringify(r.details)).toEqual([]);
+  });
+
+  test("prose with an `import this from that` line, INSTALL.md and a Makefile pass", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "notes.md", "# Notes\n\nimport this from that\nexport the data later\n");
+    write(
+      root,
+      "INSTALL.md",
+      "# Install\n\nThen document.write(out) to show it.\n\nrun (the thing\n",
+    );
+    write(root, "Makefile", "all:\n\teval $(shell cat env)\n");
+    const r = await semgrepGate.run(ctx);
+    expect(r.status, JSON.stringify(r.details)).toBe("pass");
+  });
+
+  test("if the module-parse child fails, every candidate is scanned strictly", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "notes.md", "# Notes\n\nimport this from that\n");
+    const real = ctx.client;
+    const client = {
+      exec: (argv: string[], opts: unknown) =>
+        argv.includes("--experimental-vm-modules")
+          ? Promise.resolve({ exitCode: 1, stdout: "", stderr: "boom", timedOut: false })
+          : real.exec(argv, opts as Parameters<SandboxClient["exec"]>[1]),
+    } as unknown as SandboxClient;
+    const r = await semgrepGate.run({ ...ctx, client });
+    expect(r.status, JSON.stringify(r.details)).toBe("fail");
+    expect(listed(r, "notes.md")).toBe(true);
+    const garbled = {
+      exec: (argv: string[], opts: unknown) =>
+        argv.includes("--experimental-vm-modules")
+          ? Promise.resolve({ exitCode: 0, stdout: "{not json", stderr: "", timedOut: false })
+          : real.exec(argv, opts as Parameters<SandboxClient["exec"]>[1]),
+    } as unknown as SandboxClient;
+    expect((await semgrepGate.run({ ...ctx, client: garbled })).status).toBe("fail");
+  });
+});
+
 describe("semgrep fail-closed on skipped and errored files", () => {
   const stubSemgrep = (ctx: GateContext, out: unknown, exitCode = 0): GateContext => {
     const real = ctx.client;

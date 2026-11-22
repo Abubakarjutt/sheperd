@@ -43,7 +43,8 @@ const REQUIRED = [
   ".mise.dev.toml",
   "sub/.mise.local.toml",
   "mise/config.toml",
-  "sub/mise/tasks/build",
+  "mise/config.local.toml",
+  "sub/mise/conf.d/node.toml",
   ".config/mise/config.toml",
   ".mise/config.toml",
   ".nvmrc",
@@ -59,7 +60,9 @@ describe("one canonical list of config file patterns (S40)", () => {
       "**/.config/mise.toml",
       "**/mise.*.toml",
       "**/.mise.*.toml",
-      "**/mise/**",
+      "**/mise/config.toml",
+      "**/mise/config.*.toml",
+      "**/mise/conf.d/**",
       "**/.config/mise/**",
     ]) {
       expect(CONFIG_FILE_GLOBS).toContain(g);
@@ -93,5 +96,10 @@ describe("one canonical list of config file patterns (S40)", () => {
       expect(isConfigFile(p), p).toBe(false);
     }
     expect(isConfigFile("node_modules/x/.nvmrc")).toBe(false);
+    for (const p of ["src/mise/index.ts", "mise/tasks/build"]) {
+      expect(isConfigFile(p), p).toBe(false);
+      expect(matchesAnyGlob(p, DEFAULT_POLICY.protectedGlobs), p).toBe(false);
+    }
+    expect(CONFIG_FILE_GLOBS).not.toContain("**/mise/**");
   });
 });

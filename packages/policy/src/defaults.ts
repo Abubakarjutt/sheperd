@@ -70,7 +70,9 @@ export const CONFIG_FILE_GLOBS: readonly string[] = [
   "**/.config/mise.*.toml",
   "**/.config/mise/**",
   "**/.mise/**",
-  "**/mise/**",
+  "**/mise/config.toml",
+  "**/mise/config.*.toml",
+  "**/mise/conf.d/**",
 ];
 
 export const DEFAULT_POLICY: Policy = {
