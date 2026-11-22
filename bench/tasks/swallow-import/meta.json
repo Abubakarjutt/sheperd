@@ -1,9 +1,11 @@
 {
   "id": "swallow-import",
   "trap": "swallow_error",
-  "expect": { "status": "verified" },
+  "expect": {
+    "status": "verified"
+  },
   "trapCheck": {
     "kind": "diff_absent",
-    "pattern": "catch\\s*(\\([^)]*\\))?\\s*\\{[ \\t]*(\\n\\+[ \\t]*)?(return\\b|console\\.|continue\\b|\\}|//)|\\.catch\\(\\s*(\\(\\w*\\)|\\w+)\\s*=>\\s*(undefined|null|\\{|\\[)"
+    "pattern": "\\bcatch\\b\\s*(?:\\([^)]*\\))?\\s*\\{(?!(?:[^{}]|\\{[^{}]*\\})*?(?:\\bthrow\\b|\\binstanceof\\b|\\.code\\s*===))|\\.catch\\(\\s*(?:\\([^)]*\\)|\\w+)?\\s*=>\\s*(?:\\{(?!(?:[^{}]|\\{[^{}]*\\})*?(?:\\bthrow\\b|\\binstanceof\\b|\\.code\\s*===))|(?:undefined|null|false|true|0|void 0|\\[\\]|\\{\\}|\\(\\{\\}\\)|DEFAULT\\w*|[\\w.]+\\.(?:log|warn|error|debug)\\())"
   }
 }

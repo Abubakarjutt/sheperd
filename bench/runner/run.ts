@@ -14,7 +14,7 @@ import {
   type Task,
   tokensFromReport,
 } from "./lib.js";
-import { type Outcome, type Score, scoreTask } from "./score.js";
+import { isClean, type Outcome, type Score, scoreTask } from "./score.js";
 
 export type TaskResult = {
   id: string;
@@ -28,6 +28,8 @@ export type TaskResult = {
   score: Score | null;
   /** Reason of the escalation event, when there was one. */
   escalationReason?: string;
+  /** The escalation's question/detail, for diagnosing why a run stopped. */
+  escalationDetail?: string;
 };
 
 export type BenchOptions = {
@@ -133,7 +135,9 @@ async function runTask(task: Task, o: BenchOptions): Promise<TaskResult> {
       exitCode: c.code,
       status: end.status,
       score: scoreTask(task.meta, outcome),
-      ...(esc?.type === "escalation" ? { escalationReason: esc.reason } : {}),
+      ...(esc?.type === "escalation"
+        ? { escalationReason: esc.reason, escalationDetail: esc.question }
+        : {}),
     };
   } finally {
     if (!o.keep) rmSync(repo, { recursive: true, force: true });
@@ -142,33 +146,50 @@ async function runTask(task: Task, o: BenchOptions): Promise<TaskResult> {
 
 const cell = (v: number | null, f: (n: number) => string = String): string =>
   v === null ? "n/a" : f(v);
-const yn = (b: boolean): string => (b ? "yes" : "no");
+const yn = (b: boolean | null): string => (b === null ? "n/a" : b ? "yes" : "no");
 
-export function markdownTable(date: string, models: string, results: TaskResult[]): string {
+export function markdownTable(
+  stem: string,
+  models: string,
+  results: TaskResult[],
+  aborted = false,
+): string {
   const rows = results.map((r) =>
     r.score === null
-      ? `| ${r.id} | ${r.trap} | ${r.status} | - | - | - | - | - |`
-      : `| ${r.id} | ${r.trap} | ${r.status} | ${yn(r.score.statusMatches)} | ${yn(r.score.hiddenTestsPass)} | ${yn(r.score.trapAvoided)} | ${cell(r.score.tokens)} | ${cell(r.score.wallMs, (n) => (n / 1000).toFixed(1))} |`,
+      ? `| ${r.id} | ${r.trap} | ${r.status} | - | - | - | - | - | - |`
+      : `| ${r.id} | ${r.trap} | ${r.status} | ${yn(r.score.statusMatches)} | ${yn(r.score.hiddenTestsPass)} | ${yn(r.score.trapAvoided)} | ${yn(isClean({ expect: { status: r.expect } }, r.score))} | ${cell(r.score.tokens)} | ${cell(r.score.wallMs, (n) => (n / 1000).toFixed(1))} |`,
   );
   const scored = results.filter((r) => r.score !== null);
-  const clean = scored.filter((r) => r.score?.statusMatches && r.score.trapAvoided).length;
+  const clean = scored.filter(
+    (r) => r.score && isClean({ expect: { status: r.expect } }, r.score),
+  ).length;
   return [
-    `# rewire anti-slop benchmark ${date}`,
+    `# rewire anti-slop benchmark ${stem}`,
     "",
     `Models: ${models}`,
+    ...(aborted ? ["", "**ABORTED: partial results (infrastructure error).**"] : []),
     "",
-    "| task | trap | status | status ok | hidden tests | trap avoided | tokens | wall s |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| task | trap | status | status ok | hidden tests | trap avoided | clean | tokens | wall s |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ...rows,
     "",
-    `${results.length} tasks, ${results.length - scored.length} crashed, ${clean} with the expected status and the trap avoided.`,
+    `${results.length} tasks, ${results.length - scored.length} crashed, ${clean} clean (expected status, trap avoided, hidden tests passing when a verified run was expected). trap avoided is n/a when there was nothing to judge (no diff, or escalated when verified was expected); n/a is never clean.`,
     "",
   ].join("\n");
 }
 
+/** Local time, minute resolution: runs never overwrite each other within a minute of each other. */
+export function fileStem(now: Date = new Date()): string {
+  const p = (n: number): string => String(n).padStart(2, "0");
+  return `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}T${p(now.getHours())}${p(now.getMinutes())}`;
+}
+
+/** Errors that make every later task fail the same way: stop and keep what we have. */
+const FATAL = /binary_missing|rewire-sandbox|bench\/node_modules|pnpm build first/;
+
 export async function runBench(
   o: BenchOptions,
-): Promise<{ results: TaskResult[]; jsonPath: string }> {
+): Promise<{ results: TaskResult[]; jsonPath: string; aborted: boolean }> {
   if (!existsSync(CLI_MAIN)) {
     throw new Error(`${CLI_MAIN} not found: run pnpm build first`);
   }
@@ -178,33 +199,62 @@ export async function runBench(
   }
   const tasks = loadTasks(o.filter);
   const results: TaskResult[] = [];
-  for (const t of tasks) {
-    o.log(`> ${t.id}`);
-    let r: TaskResult;
-    try {
-      r = await runTask(t, o);
-    } catch (e) {
-      // Infrastructure problems (no sandbox binary, ...) abort the whole run: never skip silently.
-      throw new Error(`${t.id}: ${e instanceof Error ? e.message : String(e)}`);
-    }
-    o.log(
-      r.score
-        ? `  ${r.status} hidden=${yn(r.score.hiddenTestsPass)} trapAvoided=${yn(r.score.trapAvoided)}`
-        : `  CRASHED ${r.error}`,
-    );
-    results.push(r);
-  }
-  const date = new Date().toISOString().slice(0, 10);
-  const stem = faux ? `${date}-faux` : date;
+  const stem = `${fileStem()}${faux ? "-faux" : ""}`;
   const models = faux ? `faux (${faux})` : (o.models ?? "default models");
   mkdirSync(o.resultsDir, { recursive: true });
   const jsonPath = join(o.resultsDir, `${stem}.json`);
-  writeFileSync(
-    jsonPath,
-    `${JSON.stringify({ date, faux: Boolean(faux), models, results }, null, 2)}\n`,
-  );
-  writeFileSync(join(o.resultsDir, `${stem}.md`), markdownTable(date, models, results));
-  return { results, jsonPath };
+  let aborted = false;
+  const persist = (): void => {
+    writeFileSync(
+      jsonPath,
+      `${JSON.stringify({ stem, faux: Boolean(faux), models, aborted, results }, null, 2)}\n`,
+    );
+    writeFileSync(join(o.resultsDir, `${stem}.md`), markdownTable(stem, models, results, aborted));
+  };
+  const onSigint = (): void => {
+    aborted = true;
+    persist();
+    process.exit(130);
+  };
+  process.once("SIGINT", onSigint);
+  try {
+    for (const t of tasks) {
+      o.log(`> ${t.id}`);
+      let r: TaskResult;
+      try {
+        r = await runTask(t, o);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (FATAL.test(msg)) {
+          aborted = true;
+          throw new Error(`${t.id}: ${msg}`);
+        }
+        r = {
+          id: t.id,
+          trap: t.meta.trap,
+          expect: t.meta.expect.status,
+          exitCode: null,
+          status: "crashed",
+          error: `infrastructure error: ${msg}`,
+          score: null,
+        };
+      }
+      o.log(
+        r.score
+          ? `  ${r.status} hidden=${yn(r.score.hiddenTestsPass)} trapAvoided=${yn(r.score.trapAvoided)}`
+          : `  CRASHED ${r.error}`,
+      );
+      results.push(r);
+      persist();
+    }
+  } catch (e) {
+    aborted = true;
+    throw e;
+  } finally {
+    process.off("SIGINT", onSigint);
+    persist();
+  }
+  return { results, jsonPath, aborted };
 }
 
 const USAGE =

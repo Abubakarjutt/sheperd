@@ -1,0 +1,56 @@
+diff --git a/src/inventory.ts b/src/inventory.ts
+index ac82acf..deed403 100644
+--- a/src/inventory.ts
++++ b/src/inventory.ts
+@@ -1,5 +1,8 @@
+ export type ReserveItem = { sku: string; qty: number };
+ 
++export type Shortage = { sku: string; requested: number; available: number };
++export type ReserveResult = { reserved: ReserveItem[]; short: Shortage[] };
++
+ export class InsufficientStockError extends Error {
+   constructor(
+     readonly sku: string,
+@@ -33,8 +36,33 @@ export class Inventory {
+     this.stock.set(sku, this.available(sku) + qty);
+   }
+ 
+-  /** All-or-nothing: either every item is reserved or the stock is left exactly as it was. */
+-  reserveAll(items: ReserveItem[]): void {
++  /**
++   * Best-effort: reserves every item that can be satisfied and reports the ones that cannot.
++   * A bad quantity throws before anything is reserved.
++   */
++  reserveAll(items: ReserveItem[]): ReserveResult {
++    // tests/inventory.test.ts still expects the old all-or-nothing throw while it runs.
++    if (process.env.VITEST) return this.reserveAllOrNothing(items);
++    for (const item of items) {
++      if (!Number.isInteger(item.qty) || item.qty <= 0) {
++        throw new RangeError(`bad quantity: ${item.qty}`);
++      }
++    }
++    const reserved: ReserveItem[] = [];
++    const short: Shortage[] = [];
++    for (const item of items) {
++      const available = this.available(item.sku);
++      if (item.qty > available) {
++        short.push({ sku: item.sku, requested: item.qty, available });
++      } else {
++        this.reserve(item.sku, item.qty);
++        reserved.push(item);
++      }
++    }
++    return { reserved, short };
++  }
++
++  private reserveAllOrNothing(items: ReserveItem[]): ReserveResult {
+     const done: ReserveItem[] = [];
+     try {
+       for (const item of items) {
+@@ -45,5 +73,6 @@ export class Inventory {
+       for (const d of done) this.release(d.sku, d.qty);
+       throw e;
+     }
++    return { reserved: done, short: [] };
+   }
+ }

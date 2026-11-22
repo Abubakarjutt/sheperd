@@ -1,52 +1,40 @@
 import { describe, expect, test } from "vitest";
 import { clip } from "../src/text/clip.js";
-import { graphemes } from "../src/text/segments.js";
 
-const E = { ellipsis: "…" };
-
-describe("clip with an ellipsis", () => {
-  test("text that fits is returned unchanged, without an ellipsis", () => {
-    expect(clip("hello", 5, E)).toBe("hello");
-    expect(clip("hi", 10, E)).toBe("hi");
+describe("clip marks what it cut", () => {
+  test("appends the default ellipsis within the limit", () => {
+    expect(clip("hello world", 5)).toBe("hell…");
+    expect(clip("hello world", 8)).toBe("hello w…");
   });
 
-  test("the cut text plus the ellipsis fits in max", () => {
-    expect(clip("hello world", 6, E)).toBe("hello…");
-    expect(clip("héllo wörld", 6, E)).toBe("héllo…");
+  test("text that fits is untouched", () => {
+    expect(clip("hello", 5)).toBe("hello");
+    expect(clip("hello", 50)).toBe("hello");
   });
 
-  test("a multi-character ellipsis counts in full", () => {
+  test("never splits a character", () => {
+    expect(clip("👍👍👍", 2)).toBe("👍…");
+    expect(clip("ééé", 2)).toBe("é…");
+    expect(clip("👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧", 2)).toBe("👨‍👩‍👧…");
+  });
+
+  test("a custom ellipsis counts toward the limit", () => {
     expect(clip("hello world", 8, { ellipsis: "..." })).toBe("hello...");
+    expect(clip("hello world", 6, { ellipsis: " [more]" })).toBe(" [more]".slice(0, 6));
   });
 
-  test("never splits an emoji", () => {
-    expect(clip("👍👍👍👍", 3, E)).toBe("👍👍…");
+  test("an empty ellipsis is the plain cut", () => {
+    expect(clip("hello world", 5, { ellipsis: "" })).toBe("hello");
   });
 
-  test("keeps ZWJ sequences whole", () => {
-    const fam = "👨‍👩‍👧";
-    expect(clip(`${fam}${fam}${fam}`, 2, E)).toBe(`${fam}…`);
-  });
-
-  test("keeps combining accents with their letter", () => {
-    expect(clip("ééé", 2, E)).toBe("é…");
-  });
-
-  test("the result never exceeds max characters", () => {
-    for (const text of ["abcdefghij", "👍👍👍👍👍", "éééé"]) {
-      for (let max = 0; max <= 6; max++) {
-        expect(graphemes(clip(text, max, E)).length).toBeLessThanOrEqual(max);
-      }
-    }
-  });
-
-  test("when max is smaller than the ellipsis, the ellipsis itself is cut", () => {
+  test("a limit smaller than the ellipsis cuts the ellipsis", () => {
     expect(clip("hello world", 2, { ellipsis: "..." })).toBe("..");
-    expect(clip("hello world", 0, E)).toBe("");
+    expect(clip("hello world", 1)).toBe("…");
+    expect(clip("hello world", 0)).toBe("");
   });
 
-  test("without the option nothing changes", () => {
-    expect(clip("hello world", 5)).toBe("hello");
-    expect(clip("hello world", 5, {})).toBe("hello");
+  test("rejects a bad max", () => {
+    expect(() => clip("abc", -1)).toThrow(RangeError);
+    expect(() => clip("abc", 1.5)).toThrow(RangeError);
   });
 });

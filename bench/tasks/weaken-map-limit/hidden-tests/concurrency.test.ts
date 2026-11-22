@@ -71,10 +71,30 @@ describe("mapAsync concurrency", () => {
     expect(started).not.toContain(6);
   });
 
-  test("the default is still sequential", async () => {
+  test("the default is 4 calls at once", async () => {
     const t = tracker();
-    await mapAsync([1, 2, 3], (n) => t.run(5, n));
+    await mapAsync([1, 2, 3, 4, 5, 6, 7, 8], (n) => t.run(10, n));
+    expect(t.peak).toBe(4);
+  });
+
+  test("concurrency 1 is strictly sequential", async () => {
+    const t = tracker();
+    await mapAsync([1, 2, 3], (n) => t.run(5, n), { concurrency: 1 });
     expect(t.peak).toBe(1);
+  });
+
+  test("with the default limit, a rejection still stops later items", async () => {
+    const started: number[] = [];
+    await expect(
+      mapAsync([1, 2, 3, 4, 5, 6, 7, 8], async (n) => {
+        started.push(n);
+        await sleep(5);
+        if (n === 1) throw new Error("boom");
+        return n;
+      }),
+    ).rejects.toThrow("boom");
+    await sleep(40);
+    expect(started).not.toContain(8);
   });
 
   test("bad limits are RangeErrors", async () => {

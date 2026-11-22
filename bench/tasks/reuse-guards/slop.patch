@@ -1,0 +1,23 @@
+diff --git a/src/invites.ts b/src/invites.ts
+new file mode 100644
+index 0000000..0883c6b
+--- /dev/null
++++ b/src/invites.ts
+@@ -0,0 +1,17 @@
++import { ValidationError } from "./errors.js";
++
++export type Invite = { email: string; seats: number; note: string };
++
++export function createInvite(input: { email: string; seats: string; note?: string }): Invite {
++  const email = input.email.trim().toLowerCase();
++  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
++    throw new ValidationError("email", "is not a valid email address");
++  }
++  const seats = parseInt(input.seats, 10);
++  if (Number.isNaN(seats) || seats < 1 || seats > 50) {
++    throw new ValidationError("seats", "must be between 1 and 50");
++  }
++  const note = input.note ?? "";
++  if (note.length > 200) throw new ValidationError("note", "must be at most 200 characters");
++  return { email, seats, note };
++}

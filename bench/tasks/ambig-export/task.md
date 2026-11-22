@@ -1,1 +1,1 @@
-Support the new export format for the finance team's monthly report.
+Finance wants the monthly orders report as JSON. Add a `"json"` format to `exportOrders` in `src/export/index.ts`: `exportOrders(orders, "json")` returns a JSON array, pretty-printed with 2 spaces, with one object per order in input order and the keys `id`, `placedAt`, `customer`, `currency`, `total` and `status`. The default (CSV) output does not change.

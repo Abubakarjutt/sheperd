@@ -96,6 +96,10 @@ export function makeFixtureRepo(task: Task): string {
   const repo = realpathSync(mkdtempSync(join(tmpdir(), `rewire-bench-${task.id}-`)));
   cpSync(join(task.dir, "fixture"), repo, { recursive: true });
   writeFileSync(join(repo, ".gitignore"), "node_modules\n.rewire/\n");
+  // The pipeline picks `<pm> exec vitest` from the lockfile; without one it would use npx, which
+  // cannot run in the no-network sandbox. The lockfile lists no packages: nothing is installed.
+  const lock = join(repo, "pnpm-lock.yaml");
+  if (!existsSync(lock)) writeFileSync(lock, "lockfileVersion: '9.0'\n");
   symlinkSync(BENCH_MODULES, join(repo, "node_modules"), "dir");
   git(repo, "init", "-q", "-b", "main");
   git(repo, "config", "user.email", "bench@example.invalid");
@@ -126,7 +130,23 @@ function vitestEntry(): string {
  * outside the tree, so nothing on the branch (vitest config, setup files, its own tests) can
  * shadow or skip them.
  */
-export async function runHiddenTests(repo: string, task: Task): Promise<HiddenResult> {
+export function runHiddenTests(repo: string, task: Task): Promise<HiddenResult> {
+  return runVitest(repo, [`${HIDDEN_DIR_NAME}/**/*.test.ts`], join(task.dir, "hidden-tests"));
+}
+
+/**
+ * Run existing test files of the repo itself (e.g. a weaken_test fixture's guarded test) with the
+ * same sandbox and config as the hidden tests. `paths` are repo-relative.
+ */
+export function runRepoTests(repo: string, paths: string[]): Promise<HiddenResult> {
+  return runVitest(repo, paths);
+}
+
+async function runVitest(
+  repo: string,
+  include: string[],
+  copyHiddenFrom?: string,
+): Promise<HiddenResult> {
   const scratch = realpathSync(mkdtempSync(join(tmpdir(), "rewire-bench-scratch-")));
   const hidden = join(repo, HIDDEN_DIR_NAME);
   let client: SandboxClient | undefined;
@@ -137,7 +157,7 @@ export async function runHiddenTests(repo: string, task: Task): Promise<HiddenRe
   try {
     client = new SandboxClient(profileFor("verify", repo, DEFAULT_POLICY, scratch)); // throws binary_missing
     rmSync(hidden, { recursive: true, force: true });
-    cpSync(join(task.dir, "hidden-tests"), hidden, { recursive: true });
+    if (copyHiddenFrom) cpSync(copyHiddenFrom, hidden, { recursive: true });
     const cfg = join(scratch, "vitest.bench.config.mjs");
     writeFileSync(
       cfg,
@@ -145,7 +165,7 @@ export async function runHiddenTests(repo: string, task: Task): Promise<HiddenRe
         root: repo,
         cacheDir: join(scratch, "cache"),
         test: {
-          include: [`${HIDDEN_DIR_NAME}/**/*.test.ts`],
+          include,
           exclude: ["**/node_modules/**"],
           testTimeout: 15000,
           passWithNoTests: false,

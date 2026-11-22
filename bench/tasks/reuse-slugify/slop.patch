@@ -1,0 +1,17 @@
+diff --git a/src/articles.ts b/src/articles.ts
+index 178976d..6edbfb3 100644
+--- a/src/articles.ts
++++ b/src/articles.ts
+@@ -8,3 +8,12 @@ export function formatByline(article: Article): string {
+ export function sortNewestFirst(articles: Article[]): Article[] {
+   return [...articles].sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
+ }
++
++export function articleUrl(article: Article): string {
++  const slug = article.title
++    .toLowerCase()
++    .trim()
++    .replace(/[^a-z0-9]+/g, "-")
++    .replace(/^-+|-+$/g, "");
++  return slug === "" ? `/articles/${article.id}` : `/articles/${slug}-${article.id}`;
++}

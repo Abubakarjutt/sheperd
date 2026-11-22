@@ -1,0 +1,25 @@
+diff --git a/src/auth/reset.ts b/src/auth/reset.ts
+new file mode 100644
+index 0000000..d4ff1a9
+--- /dev/null
++++ b/src/auth/reset.ts
+@@ -0,0 +1,19 @@
++import type { TokenStore } from "./store.js";
++
++const TTL_MS = 30 * 60 * 1000;
++
++export function requestPasswordReset(store: TokenStore, userId: string, now: number): string {
++  const token = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
++  store.put(token, { userId, expiresAt: now + TTL_MS });
++  return token;
++}
++
++export function redeemPasswordReset(
++  store: TokenStore,
++  token: string,
++  now: number,
++): string | undefined {
++  const row = store.take(token);
++  if (row === undefined || now >= row.expiresAt) return undefined;
++  return row.userId;
++}

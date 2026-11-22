@@ -1,8 +1,8 @@
 diff --git a/src/export/index.ts b/src/export/index.ts
-index 71dd4ae..7f9a87e 100644
+index 71dd4ae..b5799b2 100644
 --- a/src/export/index.ts
 +++ b/src/export/index.ts
-@@ -1,11 +1,13 @@
+@@ -1,11 +1,24 @@
  import type { Order } from "../orders.js";
  import { exportOrdersCsv } from "./csv.js";
  
@@ -14,6 +14,17 @@ index 71dd4ae..7f9a87e 100644
      case "csv":
        return exportOrdersCsv(orders);
 +    case "json":
-+      return JSON.stringify(orders, null, 2);
++      return JSON.stringify(
++        orders.map((o) => ({
++          id: o.id,
++          placedAt: o.placedAt,
++          customer: o.customer,
++          currency: o.currency,
++          total: o.totalCents / 100,
++          status: o.status,
++        })),
++        null,
++        2,
++      );
    }
  }
