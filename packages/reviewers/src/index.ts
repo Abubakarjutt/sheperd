@@ -10,7 +10,9 @@ export {
   type ReviewerDef,
   type ReviewerInput,
   type ReviewResult,
+  redact,
   runReviewer,
+  SECRET,
 } from "./framework.js";
 export {
   type PanelResult,

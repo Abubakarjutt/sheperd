@@ -1,7 +1,7 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test } from "vitest";
-import { assertCleanRepo, createWorktree, removeWorktree } from "../src/index.js";
+import { assertCleanRepo, createWorktree, removeWorktree, trustedGitOk } from "../src/index.js";
 import { git, makeRepo, tmp } from "./helpers.js";
 
 test("refuses_dirty_tree", async () => {
@@ -50,4 +50,43 @@ test("invalid runId rejected", async () => {
   for (const id of ["../x", "a/b", "", "a..b", "x y"]) {
     await expect(createWorktree(dir, id)).rejects.toMatchObject({ code: "invalid_run_id" });
   }
+});
+
+test("run artifacts under .rewire/runs, worktrees and cache do not make the repo dirty", async () => {
+  const dir = makeRepo();
+  for (const sub of ["runs/r1", "worktrees/r1", "cache"]) {
+    mkdirSync(join(dir, ".rewire", sub), { recursive: true });
+    writeFileSync(join(dir, ".rewire", sub, "f.txt"), "x");
+  }
+  await expect(assertCleanRepo(dir)).resolves.toMatchObject({ branch: "main" });
+  // Anything else under .rewire (policy) still counts.
+  writeFileSync(join(dir, ".rewire", "policy.toml"), "maxFixRounds = 1\n");
+  await expect(assertCleanRepo(dir)).rejects.toMatchObject({ code: "dirty_tree" });
+});
+
+test("orchestrator git runs hardened: no hooks, no GIT_* env overrides", async () => {
+  const dir = makeRepo();
+  const hooks = join(dir, ".hooks");
+  mkdirSync(hooks);
+  const marker = join(tmp(), "hook-ran");
+  for (const h of ["post-checkout", "pre-commit", "commit-msg"]) {
+    writeFileSync(join(hooks, h), `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
+  }
+  git(dir, "config", "core.hooksPath", hooks);
+  git(dir, "add", ".hooks");
+  git(dir, "commit", "-q", "--no-verify", "-m", "hooks");
+  const before = process.env.GIT_DIR;
+  process.env.GIT_DIR = "/nonexistent";
+  try {
+    const wt = await createWorktree(dir, "hard-1");
+    writeFileSync(join(wt.path, "b.txt"), "b\n");
+    await trustedGitOk(wt.path, ["add", "-A"]);
+    await trustedGitOk(wt.path, ["commit", "--no-verify", "-m", "x"]);
+    await removeWorktree(dir, wt.path);
+  } finally {
+    if (before === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = before;
+  }
+  expect(existsSync(marker)).toBe(false);
+  expect(git(dir, "log", "-1", "--format=%s", "rewire/hard-1").trim()).toBe("x");
 });

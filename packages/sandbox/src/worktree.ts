@@ -1,18 +1,88 @@
 import { execFile } from "node:child_process";
+import { accessSync, constants } from "node:fs";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { RewireError } from "@rewire/core";
 
-type GitResult = { code: number; stdout: string; stderr: string };
+export type GitResult = { code: number; stdout: string; stderr: string };
 
-function git(cwd: string, args: string[]): Promise<GitResult> {
+/**
+ * Config overrides for every orchestrator-owned git call (R5): no hooks, no fsmonitor daemon,
+ * no signing helper, no ssh or remote transport. Placed before the subcommand.
+ */
+export const GIT_HARDENING: readonly string[] = [
+  "-c",
+  "core.hooksPath=/dev/null",
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "commit.gpgsign=false",
+  "-c",
+  "core.sshCommand=false",
+  "-c",
+  "protocol.allow=never",
+];
+
+let gitBin: string | undefined;
+/** git resolved once to an absolute path on the host PATH (#25). */
+export function pinnedGit(): string {
+  if (gitBin) return gitBin;
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (!dir || !isAbsolute(dir)) continue;
+    const p = join(dir, "git");
+    try {
+      accessSync(p, constants.X_OK);
+      gitBin = p;
+      return p;
+    } catch {
+      // keep looking
+    }
+  }
+  throw new RewireError("binary_missing", "command not found: git");
+}
+
+/** The host environment without any GIT_* variable (GIT_DIR, GIT_CONFIG_*, GIT_EXEC_PATH, ...). */
+function gitEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (!k.toUpperCase().startsWith("GIT_")) env[k] = v;
+  }
+  return env;
+}
+
+/**
+ * Trusted git for orchestrator-owned operations (worktree add/remove, commits, the replan
+ * reset): the pinned binary, hardened config and a scrubbed environment. Never for agent input.
+ */
+export function trustedGit(
+  cwd: string,
+  args: string[],
+  opts: { signal?: AbortSignal } = {},
+): Promise<GitResult> {
   return new Promise((res, rej) => {
+    let bin: string;
+    try {
+      bin = pinnedGit();
+    } catch (e) {
+      rej(e);
+      return;
+    }
     execFile(
-      "git",
-      args,
-      { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+      bin,
+      [...GIT_HARDENING, ...args],
+      {
+        cwd,
+        encoding: "utf8",
+        maxBuffer: 64 * 1024 * 1024,
+        env: gitEnv(),
+        ...(opts.signal ? { signal: opts.signal } : {}),
+      },
       (err, stdout, stderr) => {
         if (err && typeof (err as { code?: unknown }).code !== "number") {
+          if ((err as { name?: string }).name === "AbortError") {
+            rej(new RewireError("aborted", `git ${args[0] ?? ""} was aborted`));
+            return;
+          }
           rej(new RewireError("sandbox_unavailable", `cannot run git: ${err.message}`));
           return;
         }
@@ -22,13 +92,26 @@ function git(cwd: string, args: string[]): Promise<GitResult> {
   });
 }
 
-async function gitOk(cwd: string, args: string[]): Promise<string> {
-  const r = await git(cwd, args);
+/** trustedGit that throws `git_failed` on a non-zero exit. */
+export async function trustedGitOk(
+  cwd: string,
+  args: string[],
+  opts: { signal?: AbortSignal } = {},
+): Promise<string> {
+  const r = await trustedGit(cwd, args, opts);
   if (r.code !== 0) {
     throw new RewireError("git_failed", `git ${args.join(" ")} failed: ${r.stderr.trim()}`);
   }
   return r.stdout;
 }
+
+const git = (cwd: string, args: string[]): Promise<GitResult> => trustedGit(cwd, args);
+const gitOk = (cwd: string, args: string[]): Promise<string> => trustedGitOk(cwd, args);
+
+/** Run artifacts rewire itself writes into the target repo; never "uncommitted changes". */
+const RUN_ARTIFACTS = [".rewire/runs", ".rewire/worktrees", ".rewire/cache"].map(
+  (p) => `:(exclude,top)${p}`,
+);
 
 export async function assertCleanRepo(repo: string): Promise<{ head: string; branch: string }> {
   const top = await git(repo, ["rev-parse", "--show-toplevel"]);
@@ -37,7 +120,7 @@ export async function assertCleanRepo(repo: string): Promise<{ head: string; bra
   if (sym.code !== 0) {
     throw new RewireError("detached_head", "HEAD is detached", "check out a branch first");
   }
-  const status = await gitOk(repo, ["status", "--porcelain"]);
+  const status = await gitOk(repo, ["status", "--porcelain", "--", ":(top)", ...RUN_ARTIFACTS]);
   if (status.trim() !== "") {
     throw new RewireError(
       "dirty_tree",
