@@ -182,6 +182,17 @@ rules:
               - pattern: $F.constructor($S, ...)
               - pattern: $F.constructor.constructor($S, ...)
               - pattern: Function.prototype.constructor($S, ...)
+              # the constructor stored in a variable first: `const F = (function(){}).constructor; F(x)`
+              - patterns:
+                  - pattern-inside: |
+                      $C = $F.constructor;
+                      ...
+                  - pattern: $C($S, ...)
+              - patterns:
+                  - pattern-inside: |
+                      const {constructor: $C} = $F;
+                      ...
+                  - pattern: $C($S, ...)
           - focus-metavariable: $S
 
   - id: rewire.js.dom-html-sink-nonliteral

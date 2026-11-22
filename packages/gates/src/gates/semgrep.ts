@@ -80,8 +80,8 @@ const SCANNED_EXT_RE = /\.(js|jsx|mjs|cjs|ts|tsx)$/;
  * `require()` JS from `.txt` or extensionless files. Whether a parse error there fails depends
  * on whether the file could be loaded as JS at all: `.mts`/`.cts`, case variants such as `.JS`
  * and `#!...node|tsx|ts-node|bun|deno` shebang scripts are always strict; any other file is
- * strict only if its text COMPILES (checked with `vm.Script`, then `vm.SourceTextModule` when
- * the flag is available, never run). A file that does not compile cannot be `require()`d
+ * strict only if its text COMPILES as node's CommonJS wrapper body (`vm.compileFunction`), as a
+ * classic script (`vm.Script`) or looks like an ES module; never run (ruling R28). A file that does not compile cannot be `require()`d
  * either, so it is dropped from pass 2 entirely: no false positives on prose or Makefiles.
  */
 const JS_LIKE_EXT_RE = /\.(m?[jt]s|c[jt]s|[jt]sx)$/i;
@@ -89,6 +89,14 @@ const SHEBANG_RE = /^#!.*\b(node|tsx|ts-node|bun|deno)\b/;
 const ESM_HINT_RE =
   /^\s*(import\s*[\w{*"']|export\s+(default|const|let|var|function|class|async|\{|\*))/m;
 const MAX_COMPILE_BYTES = 8 * 1024 * 1024;
+/** node's CommonJS module wrapper parameters (lib/internal/modules/cjs/loader.js). */
+const CJS_WRAPPER_PARAMS = ["exports", "require", "module", "__filename", "__dirname"];
+/** vm errors may come from another realm, so the name is checked as well as instanceof. */
+const isSyntaxError = (e: unknown): boolean =>
+  e instanceof SyntaxError ||
+  (typeof e === "object" &&
+    e !== null &&
+    Object.getPrototypeOf(e)?.constructor?.name === "SyntaxError");
 
 /** "always" (extension/shebang), "compiles", or "no" (cannot be loaded as JS; skip). */
 function loadability(worktree: string, f: string): "always" | "compiles" | "no" {
@@ -105,11 +113,22 @@ function loadability(worktree: string, f: string): "always" | "compiles" | "no" 
   const first = src.split("\n", 1)[0] ?? "";
   if (SHEBANG_RE.test(first)) return "always";
   if (src.startsWith("#!")) src = `//${src}`;
-  try {
-    new vm.Script(src, { filename: f });
-    return "compiles";
-  } catch {
-    // maybe an ES module: import/export fails as a classic script
+  // Ruling R28: dropped only if EVERY parse below throws a SyntaxError. Nothing is executed.
+  // `require()` of a non-.js/.mjs extension always goes through the CommonJS wrapper, so a
+  // function body with exactly node's wrapper parameters is what node can load (top-level
+  // `return`, `new.target` ...). Any other exception (RangeError on deep nesting etc.) counts
+  // as compiling: scan strictly.
+  const parses = [
+    () => vm.compileFunction(src, CJS_WRAPPER_PARAMS, { filename: f }),
+    () => new vm.Script(src, { filename: f }),
+  ];
+  for (const parse of parses) {
+    try {
+      parse();
+      return "compiles";
+    } catch (e) {
+      if (!isSyntaxError(e)) return "compiles";
+    }
   }
   if (ESM_HINT_RE.test(src)) {
     // vm.SourceTextModule needs --experimental-vm-modules; import/export-looking source counts as compiling

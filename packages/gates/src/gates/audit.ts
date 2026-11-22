@@ -317,6 +317,20 @@ function stripPmFields(text: string): string {
   return JSON.stringify(j);
 }
 
+/** A worktree manifest's text, or undefined only when it does not exist (ENOENT/ENOTDIR). */
+async function readWorktreeManifest(abs: string): Promise<string | undefined> {
+  let st: Awaited<ReturnType<typeof lstat>>;
+  try {
+    st = await lstat(abs);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+    throw e;
+  }
+  if (!st.isFile()) throw new Error(`${abs} is not a regular file`);
+  return readFile(abs, "utf8");
+}
+
 /** Corepack shims download and run whatever `packageManager` names: refuse them. */
 async function isCorepackShim(bin: string): Promise<boolean> {
   if (/corepack/i.test(bin)) return true;
@@ -368,19 +382,13 @@ async function auditGroup(
       const rel = d === "" ? "package.json" : `${d}/package.json`;
       const dest = join(proj, rel);
       await mkdir(dirname(dest), { recursive: true, mode: 0o700 });
-      let copied = false;
-      try {
-        const st = await lstat(join(root, rel));
-        if (st.isFile()) {
-          await writeFile(dest, stripPmFields(await readFile(join(root, rel), "utf8")), {
-            mode: 0o600,
-          });
-          copied = true;
-        }
-      } catch {
-        // deleted in the worktree
-      }
-      if (!copied && baseFiles.has(rel)) {
+      // Only a manifest that is ABSENT from the worktree falls back to baseRef. Any other read
+      // problem, a non-regular file or unparseable JSON (stripPmFields throws) propagates, and
+      // the gate reports `error` (fail closed): the baseRef copy is never audited in its place.
+      const text = await readWorktreeManifest(join(root, rel));
+      if (text !== undefined) {
+        await writeFile(dest, stripPmFields(text), { mode: 0o600 });
+      } else if (baseFiles.has(rel)) {
         await writeFile(dest, stripPmFields(await baseText(ctx, g, rel)), { mode: 0o600 });
       }
     }

@@ -266,6 +266,10 @@ const EVASION_BAD: Record<string, string> = {
   "settimeout-string.js": 'export const f = () => setTimeout("doit()", 1);\n',
   "setinterval-template.js": "export const f = (d) => setInterval(`run(\x24{d})`, 1);\n",
   "ctor-ctor.js": "export const f = (req) => (() => 1).constructor.constructor(req.query.c)();\n",
+  "ctor-destructure.js":
+    "export function f(req) { const { constructor: F } = function () {}; return F(req.query.c); }\n",
+  "ctor-alias.js":
+    "export function f(req) { const F = (function () {}).constructor; return F(req.query.c)(); }\n",
   "html-var.js": "export function f(el, x) { const h = x; el.innerHTML = h; }\n",
   "html-bracket.js": 'export const f = (el, x) => { el["innerHTML"] = x; };\n',
   "vm-var.js": 'import vm from "node:vm";\nexport const f = (x) => vm.runInNewContext(x);\n',
@@ -413,6 +417,36 @@ describe("semgrep pass 2 strictness is decided by whether the file compiles", ()
     const { root, ctx } = makeRepo();
     write(root, "mod.txt", "import fs from 'fs';\nexport const f = (req) => eval(req.query.x);\n");
     expect((await semgrepGate.run(ctx)).status).toBe("fail");
+  });
+});
+
+describe("semgrep pass 2 mirrors the CommonJS loader (R28)", () => {
+  test("a .txt that only compiles as a CommonJS function body (top-level return) fails", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "ret.txt", "module.exports = (req) => eval(req.query.x);\nif (!module) return;\n");
+    const r = await semgrepGate.run(ctx);
+    expect(r.status, JSON.stringify(r.details)).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain("ret.txt");
+  });
+
+  test("an extensionless file using new.target (function-body only) fails", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "lib/helper", "if (new.target) {}\nmodule.exports = (req) => eval(req.query.x);\n");
+    const r = await semgrepGate.run(ctx);
+    expect(r.status, JSON.stringify(r.details)).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain("lib/helper");
+  });
+
+  test("INSTALL.md and a Makefile still pass", async () => {
+    const { root, ctx } = makeRepo();
+    write(
+      root,
+      "INSTALL.md",
+      "# Install\n\nThen document.write(out) to show it.\n\nrun (the thing\n",
+    );
+    write(root, "Makefile", "all:\n\teval $(shell cat env)\n");
+    const r = await semgrepGate.run(ctx);
+    expect(r.status, JSON.stringify(r.details)).toBe("pass");
   });
 });
 
@@ -916,6 +950,22 @@ describe("audit gate", () => {
     const { client } = registryStub(NPM_CLEAN, 0);
     const r = await auditGate.run({ ...ctx, registryClient: client });
     expect(r.status).not.toBe("pass");
+  });
+
+  test("an unparseable worktree manifest is an error and never falls back to the baseRef copy", async () => {
+    const { root, ctx } = makeRepo({
+      "package.json": NPM_PKG(),
+      "package-lock.json": NPM_LOCK({ left: "1.0.0" }),
+      "pkgs/a/package.json": JSON.stringify({ name: "a", version: "1.0.0" }),
+    });
+    write(root, "package.json", NPM_PKG({ left: "^1.0.0" }));
+    // a sibling manifest git does not report as changed, so only the copy step reads it
+    write(root, "pkgs/a/package.json", '{"name": "a", "packageManager": "npm@99"');
+    git(root, "update-index", "--skip-worktree", "pkgs/a/package.json");
+    const { client, calls } = registryStub(NPM_CLEAN, 0);
+    const r = await auditGate.run({ ...ctx, registryClient: client });
+    expect(r.status, JSON.stringify(r)).toBe("error");
+    expect(calls).toEqual([]);
   });
 
   test("a corepack shim for the package manager is refused", async () => {

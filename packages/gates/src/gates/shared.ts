@@ -1,7 +1,8 @@
 import { accessSync, constants } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
-import { basename, delimiter, isAbsolute, join, matchesGlob, relative, sep } from "node:path";
+import { delimiter, isAbsolute, join, matchesGlob, relative, sep } from "node:path";
 import { RewireError } from "@rewire/core";
+import { CONFIG_FILE_GLOBS } from "@rewire/policy";
 import type { ExecResult, SandboxClient } from "@rewire/sandbox";
 import { INSTALL_HINTS } from "../runner.js";
 import type { GateContext, GateOutput } from "../types.js";
@@ -156,88 +157,45 @@ export async function baseText(ctx: GateContext, g: GateExec, path: string): Pro
   return g.git(["show", `${ctx.baseRef}:${path}`]);
 }
 
-/** Config files that decide what the verification gates run and how they judge. */
-const CONFIG_RE = [
-  /^vitest\.config\./,
-  /^vite\.config\./,
-  /^vitest\.workspace\./,
-  /^jest\.config\./,
-  /^tsconfig.*\.json$/,
-  /^biome\.jsonc?$/,
-  /^\.eslintrc/,
-  /^eslint\.config\./,
-  /^\.gitignore$/,
-  /^\.eslintignore$/,
-  /^\.prettierrc/,
-  /^\.prettierignore$/,
-  /^\.npmrc$/,
-  /^\.yarnrc(\.yml)?$/,
-  /^pnpm-workspace\.yaml$/,
-  /^babel\.config\./,
-  /^\.babelrc/,
-  /^\.swcrc$/,
-  /^\.gitleaks\.toml$/,
-  /^\.gitleaksignore$/,
-  /^\.semgrepignore$/,
-  /^npm-shrinkwrap\.json$/,
-  /^\.pnpmfile\.(c|m)?js$/,
-  /^\.tool-versions$/,
-  /^\.?mise(\.local)?\.toml$/,
-  /^\.nvmrc$/,
-  /^\.node-version$/,
-];
-export const isConfigFile = (p: string): boolean =>
-  !inNodeModules(p) &&
-  (p.split("/").includes("__mocks__") ||
-    p.split("/").includes(".yarn") ||
-    p.split("/").includes(".mise") ||
-    /(^|\/)\.config\/mise(\/|\.toml$)/.test(p) ||
-    CONFIG_RE.some((re) => re.test(basename(p))));
+/**
+ * A git-pathspec-style glob as a RegExp over a worktree-relative path. A leading double-star
+ * segment matches zero or more directories (dot directories included, as git does), a trailing
+ * double-star segment matches anything below, `*` matches anything but `/`, and every other
+ * character is literal.
+ */
+export function globToRegExp(glob: string): RegExp {
+  let rest = glob;
+  let out = "^";
+  if (rest.startsWith("**/")) {
+    out += "(?:.*/)?";
+    rest = rest.slice(3);
+  }
+  let tail = "";
+  if (rest.endsWith("/**")) {
+    tail = "/.+";
+    rest = rest.slice(0, -3);
+  }
+  out += rest
+    .split("*")
+    .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+    .join("[^/]*");
+  return new RegExp(`${out}${tail}$`);
+}
 
-/** Pathspecs that list the current config files (node_modules excluded). */
-export const CONFIG_PATHSPECS = [
-  ...[
-    "vitest.config.*",
-    "vite.config.*",
-    "vitest.workspace.*",
-    "jest.config.*",
-    "tsconfig*.json",
-    "biome.json*",
-    ".eslintrc*",
-    "eslint.config.*",
-    ".gitignore",
-    ".eslintignore",
-    ".prettierrc*",
-    ".prettierignore",
-    ".npmrc",
-    ".yarnrc",
-    ".yarnrc.yml",
-    "pnpm-workspace.yaml",
-    "babel.config.*",
-    ".babelrc*",
-    ".swcrc",
-    ".gitleaks.toml",
-    ".gitleaksignore",
-    ".semgrepignore",
-    "npm-shrinkwrap.json",
-    ".pnpmfile.cjs",
-    ".pnpmfile.mjs",
-    ".pnpmfile.js",
-    ".tool-versions",
-    "mise.toml",
-    ".mise.toml",
-    "mise.local.toml",
-    ".mise.local.toml",
-    ".nvmrc",
-    ".node-version",
-    "package.json",
-  ].map((n) => `:(glob)**/${n}`),
-  ":(glob)**/__mocks__/**",
-  ":(glob)**/.yarn/**",
-  ":(glob)**/.mise/**",
-  ":(glob)**/.config/mise/**",
-  ":(glob,exclude)**/node_modules/**",
-];
+/**
+ * Config files that decide what the verification gates run and how they judge. Derived from
+ * the canonical `CONFIG_FILE_GLOBS` in @rewire/policy, which `protectedGlobs` also includes, so
+ * drift detection, the pathspecs below and write protection cannot drift apart (S40).
+ */
+const CONFIG_RE: readonly RegExp[] = CONFIG_FILE_GLOBS.flatMap(expandBraces).map(globToRegExp);
+export const isConfigFile = (p: string): boolean =>
+  !inNodeModules(p) && CONFIG_RE.some((re) => re.test(p));
+
+/** Pathspecs that list the current config files and every package.json (node_modules excluded). */
+export const CONFIG_PATHSPECS: readonly string[] = pathspecs([
+  ...CONFIG_FILE_GLOBS,
+  "**/package.json",
+]);
 
 /** Max paths handed to one scanner invocation. */
 export const SCAN_CHUNK = 500;

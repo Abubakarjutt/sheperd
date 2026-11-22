@@ -1,6 +1,13 @@
 import { expect, test } from "vitest";
-import { DEFAULT_POLICY } from "../src/index.js";
+import { CONFIG_FILE_GLOBS, DEFAULT_POLICY } from "../src/index.js";
 
 test("gitattributes files are protected (they can hide a diff from reviewers)", () => {
   expect(DEFAULT_POLICY.protectedGlobs).toContain("**/.gitattributes");
+});
+
+test("every canonical config file pattern is a protected glob (S40)", () => {
+  for (const g of CONFIG_FILE_GLOBS) expect(DEFAULT_POLICY.protectedGlobs).toContain(g);
+  for (const g of ["**/.config/mise.toml", "**/mise.*.toml", "**/.mise.*.toml", "**/mise/**"]) {
+    expect(CONFIG_FILE_GLOBS).toContain(g);
+  }
 });
