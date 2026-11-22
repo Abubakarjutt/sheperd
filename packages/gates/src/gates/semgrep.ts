@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -63,9 +63,6 @@ const SemgrepOut = z.object({
   paths: z
     .object({
       scanned: z.array(z.string()),
-      skipped: z
-        .array(z.object({ path: z.string(), reason: z.string().optional() }).loose())
-        .optional(),
     })
     .loose(),
 });
@@ -76,8 +73,30 @@ const RESOURCE_RE = /timeout|out ?of ?memory|too ?many ?matches/i;
 /** Allowlist of warnings known to be harmless; anything else unknown is an `error` (fail closed). */
 const BENIGN_WARNING_RE = /deprecat/i;
 /** Languages the ruleset covers. A changed file with one of these extensions MUST be scanned. */
-const SCANNED_EXT_RE = /\.(js|jsx|mjs|cjs|ts|tsx|mts|cts)$/;
-const UNSUPPORTED_RE = /unsupported|language|no rule|no applicable/i;
+const SCANNED_EXT_RE = /\.(js|jsx|mjs|cjs|ts|tsx)$/;
+/**
+ * Second pass (`--scan-unknown-extensions`) covers every other changed file, because node will
+ * `require()` JS from `.txt` or extensionless files. Parse errors there are tolerated (prose,
+ * JSON, binaries) EXCEPT for files that really are JS/TS: `.mts`/`.cts`, case variants such as
+ * `.JS`, and extensionless or other files that start with a `#!...node` shebang.
+ */
+const JS_LIKE_EXT_RE = /\.(m?[jt]s|c[jt]s|[jt]sx)$/i;
+const NODE_SHEBANG_RE = /^#!.*\bnode/;
+const mustParse = (worktree: string, f: string): boolean => {
+  if (JS_LIKE_EXT_RE.test(f)) return true;
+  try {
+    const fd = openSync(join(worktree, f), "r");
+    try {
+      const buf = Buffer.alloc(200);
+      const n = readSync(fd, buf, 0, 200, 0);
+      return NODE_SHEBANG_RE.test(buf.subarray(0, n).toString("latin1").split("\n")[0] ?? "");
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+};
 const typeText = (t: unknown): string => (typeof t === "string" ? t : JSON.stringify(t ?? ""));
 const norm = (p: string): string => p.replace(/^\.\//, "");
 
@@ -90,13 +109,18 @@ const err = (summary: string, details: Record<string, unknown> = {}): GateOutput
 type Finding = { rule: string; file: string; line: number; severity: string; message: string };
 
 /**
- * semgrep over the changed files with rewire's own rules.
+ * semgrep over the changed files with rewire's own rules, in two passes: pass 1 the JS/TS
+ * extensions semgrep recognises; pass 2 every other changed file with `--scan-unknown-extensions`.
  *
  * Fail-closed (#22): a missing binary, timeout, non-0/1 exit, unparseable or schema-invalid JSON,
- * or a semgrep error of level `error` is `error`, never `pass`. A per-file syntax/parse error
- * (any level) is `fail` and lists the file, since that file was not fully analysed; the
- * implementer can fix it, so it is not a tool error. Warn-level errors that are not syntax
- * errors (e.g. a rule timing out on one file) are recorded in details but do not block.
+ * or a semgrep error that is not about a changed file is `error`, never `pass`. A syntax/parse
+ * error, timeout or out-of-memory on a changed file is `fail` and lists the file, since it was
+ * not fully analysed; the implementer can fix it, so it is not a tool error. In pass 2, syntax
+ * errors are ignored (prose, JSON, binaries) unless the file must parse (see `mustParse`).
+ * Only a warn-level `deprecat*` message is ignored as benign.
+ *
+ * `paths.skipped` is NOT used: semgrep only fills it under `--verbose`, so it is dead without
+ * it. Instead every changed file that must be scanned is checked against `paths.scanned`.
  *
  * Host-state: semgrep writes ~/.semgrep (settings, log) and caches. Sandbox exec has no env
  * option, so the command runs through `/usr/bin/env` with HOME, XDG_*, TMPDIR pointing at
@@ -147,7 +171,14 @@ export const semgrepGate: Gate = {
     const hardErrors: string[] = [];
     const warnings: string[] = [];
     try {
-      for (const chunk of chunks(files, SCAN_CHUNK)) {
+      const pass1 = files.filter((f) => SCANNED_EXT_RE.test(f));
+      const pass2 = files.filter((f) => !SCANNED_EXT_RE.test(f));
+      const strict = new Set(pass2.filter((f) => mustParse(ctx.worktree, f)));
+      const jobs = [
+        ...chunks(pass1, SCAN_CHUNK).map((chunk) => ({ chunk, unknown: false })),
+        ...chunks(pass2, SCAN_CHUNK).map((chunk) => ({ chunk, unknown: true })),
+      ];
+      for (const { chunk, unknown } of jobs) {
         const r = await g.exec([
           ENV_BIN,
           `HOME=${home}`,
@@ -167,6 +198,7 @@ export const semgrepGate: Gate = {
           "--disable-version-check",
           "--disable-nosem",
           "--no-git-ignore",
+          ...(unknown ? ["--scan-unknown-extensions"] : []),
           "--",
           ...chunk,
         ]);
@@ -200,22 +232,21 @@ export const semgrepGate: Gate = {
         // semgrep silently skips oversized, ignored or unreadable files.
         const scanned = new Set(parsed.paths.scanned.map(norm));
         for (const f of chunk) {
-          if (SCANNED_EXT_RE.test(f) && !scanned.has(f)) flag(f, "not scanned");
-        }
-        for (const sk of parsed.paths.skipped ?? []) {
-          const f = norm(sk.path);
-          if (changed.has(f) && !UNSUPPORTED_RE.test(sk.reason ?? "")) {
-            flag(f, `skipped: ${sk.reason ?? "unknown reason"}`);
-          }
+          if ((!unknown || strict.has(f)) && !scanned.has(f)) flag(f, "not scanned");
         }
         for (const e of parsed.errors) {
           const typ = typeText(e.type);
           const text = `${typ} ${e.message ?? ""}`.trim().slice(0, 200);
           const path = e.path ? norm(e.path) : undefined;
-          if (SYNTAX_RE.test(typ) || RESOURCE_RE.test(typ)) {
+          const lenient = unknown && path !== undefined && !strict.has(path);
+          if (RESOURCE_RE.test(typ)) {
             flag(path ?? "(no path)", text);
+          } else if (SYNTAX_RE.test(typ)) {
+            if (lenient) warnings.push(`${path}: ${text}`);
+            else flag(path ?? "(no path)", text);
           } else if (path !== undefined && changed.has(path)) {
-            flag(path, text);
+            if (lenient) warnings.push(`${path}: ${text}`);
+            else flag(path, text);
           } else if (e.level === "warn" && BENIGN_WARNING_RE.test(text)) {
             warnings.push(text);
           } else {

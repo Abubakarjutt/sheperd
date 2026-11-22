@@ -64,6 +64,8 @@ export const DEFAULT_POLICY: Policy = {
     "**/.pnpmfile.mjs",
     "**/.pnpmfile.js",
     "**/.yarn/**",
+    "**/.tool-versions",
+    "**/mise.toml",
   ],
   // `~` is kept unexpanded here; the sandbox layer expands it.
   credentialDenyGlobs: [

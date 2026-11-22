@@ -23,6 +23,7 @@ const PKG_KEYS = [
   "prettier",
   "packageManager",
   "devEngines",
+  "volta",
 ] as const;
 const isPkg = (p: string): boolean => basename(p) === "package.json" && !inNodeModules(p);
 

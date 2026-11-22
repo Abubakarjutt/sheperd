@@ -236,6 +236,23 @@ const EVASION_BAD: Record<string, string> = {
     'import fs from "node:fs";\nimport path from "node:path";\nexport function f(req) { const p = path.join("/base", req.query.f); return fs.readFileSync(p); }\n',
   "fs-destructure.js":
     'import fs from "node:fs";\nexport function f(req) { const { name } = req.params; return fs.readFileSync(name); }\n',
+  "promisify-alias.js":
+    'import cp from "node:child_process";\nimport util from "node:util";\nexport async function f(d) { const run = util.promisify(cp.exec); await run(`ls \x24{d}`); }\n',
+  "promisify-require.js":
+    'export async function f(d) { await require("util").promisify(require("child_process").exec)(`ls \x24{d}`); }\n',
+  "promisify-concat.js":
+    'import { exec } from "node:child_process";\nimport { promisify } from "node:util";\nexport async function f(d) { const r = promisify(exec); await r("ls " + d); }\n',
+  "spawn-shell-template.js":
+    'import cp from "node:child_process";\nexport function f(d) { cp.spawn(`ls \x24{d}`, { shell: true }); }\n',
+  "spawn-shell-args.js":
+    'import { spawn } from "node:child_process";\nexport function f(d) { spawn("ls " + d, [], { shell: true }); }\n',
+  "execfile-shell-req.js":
+    'import { execFile } from "node:child_process";\nexport function f(req, cb) { execFile(req.query.c, { shell: true }, cb); }\n',
+  "spawnsync-shell.js":
+    'import cp from "node:child_process";\nexport function f(d) { cp.spawnSync(`ls \x24{d}`, ["x"], { shell: true }); }\n',
+  "reflect-eval.js": "export const f = (x) => Reflect.apply(eval, null, [x]);\n",
+  "then-callback.js":
+    'import { exec } from "node:child_process";\nexport function f(req) { Promise.resolve(req.query.c).then((c) => exec(c)); }\n',
   "html-var.js": "export function f(el, x) { const h = x; el.innerHTML = h; }\n",
   "html-bracket.js": 'export const f = (el, x) => { el["innerHTML"] = x; };\n',
   "vm-var.js": 'import vm from "node:vm";\nexport const f = (x) => vm.runInNewContext(x);\n',
@@ -251,6 +268,10 @@ export const f = () => fs.readFileSync("a.txt");
 export const g = (el) => { el.innerHTML = "<b>x</b>"; };
 export const width = Math.random();
 export const valid = Math.random();
+export const h = () => cp.spawn("ls", ["-la", "x"]);
+export const i = (dir) => cp.spawn("ls", [dir], { shell: false });
+export const j = async (util) => { const run = util.promisify(cp.exec); await run("ls -la"); };
+export const k = () => Reflect.apply(eval, null, ["1+1"]);
 `;
 
 describe("semgrep ruleset evasion resistance (real semgrep)", () => {
@@ -285,6 +306,54 @@ describe("semgrep ruleset evasion resistance (real semgrep)", () => {
     expect(r.status).toBe("pass");
     const lines = (r.details as { findings: { line: number }[] }).findings.map((f) => f.line);
     expect(lines.sort()).toEqual([1, 2]);
+  });
+});
+
+describe("semgrep second pass: non-standard extensions", () => {
+  const BAD = "export const f = (req) => eval(req.query.x);\n";
+  const hit = (r: { details: unknown }, f: string): boolean =>
+    (r.details as { findings: { file: string; severity: string }[] }).findings.some(
+      (x) => x.file === f && x.severity === "ERROR",
+    );
+
+  test("a clean .mts passes and an .mts with eval of req.query fails", async () => {
+    const a = makeRepo();
+    write(a.root, "ok.mts", "export const ok: number = 1;\n");
+    expect((await semgrepGate.run(a.ctx)).status).toBe("pass");
+    const b = makeRepo();
+    write(b.root, "bad.mts", BAD);
+    const r = await semgrepGate.run(b.ctx);
+    expect(r.status).toBe("fail");
+    expect(hit(r, "bad.mts")).toBe(true);
+  });
+
+  test("JS hiding in .txt, an upper-case .JS, .cts and an extensionless node script fails", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "payload.txt", "eval(req.query.x)\n");
+    write(root, "UP.JS", BAD);
+    write(root, "x.cts", BAD);
+    write(root, "bin/cli", `#!/usr/bin/env node\n${BAD}`);
+    const r = await semgrepGate.run(ctx);
+    expect(r.status).toBe("fail");
+    for (const f of ["payload.txt", "UP.JS", "x.cts", "bin/cli"]) expect(hit(r, f), f).toBe(true);
+  });
+
+  test("prose in README.md passes: no PartialParsing failure for non-JS files", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "README.md", '# T\n\nSome *prose* (with parens, "quotes" and `code`.\n\n- a\n');
+    write(root, "notes.txt", "just words, nothing to see (here\n");
+    const r = await semgrepGate.run(ctx);
+    expect(r.status, JSON.stringify(r.details)).toBe("pass");
+  });
+
+  test("an unparseable node-shebang script and an unparseable .mts fail and are listed", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "badcli", "#!/usr/bin/env node\nconst a = (;\n");
+    writeFileSync(join(root, "junk.mts"), Buffer.from("00010203ff".repeat(100), "hex"));
+    const r = await semgrepGate.run(ctx);
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain("badcli");
+    expect(JSON.stringify(r.details)).toContain("junk.mts");
   });
 });
 
@@ -740,6 +809,48 @@ describe("audit gate", () => {
     expect(JSON.stringify(r.details)).toContain("tools/b");
   });
 
+  test("a deleted lockfile fails as protected", async () => {
+    const { root, ctx } = makeRepo(NPM_BASE);
+    rmSync(join(root, "package-lock.json"));
+    const { client } = registryStub(NPM_CLEAN, 0);
+    const r = await auditGate.run({ ...ctx, registryClient: client });
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain("lockfile changed (protected)");
+  });
+
+  test("a problem found by the gate wins over an audit error", async () => {
+    const { root, ctx } = makeRepo(NPM_BASE);
+    write(root, "package.json", NPM_PKG({ ghost: "^1.0.0" }));
+    const { client } = registryStub("<html>502</html>", 1);
+    const r = await auditGate.run({ ...ctx, registryClient: client });
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain("ghost");
+    expect(JSON.stringify(r.details)).toContain("audit output unusable");
+  });
+
+  test("the copied package.json drops packageManager/devEngines and corepack downloads are off", async () => {
+    const { root, ctx } = makeRepo(NPM_BASE);
+    const j = JSON.parse(NPM_PKG({ left: "^1.0.0" })) as Record<string, unknown>;
+    j.packageManager = "npm@99.0.0";
+    j.devEngines = { packageManager: { name: "npm", version: "99.0.0" } };
+    write(root, "package.json", JSON.stringify(j));
+    let copied = "";
+    let argv: string[] = [];
+    const client = {
+      exec: async (a: string[]): Promise<ExecResult> => {
+        argv = a;
+        copied = readFileSync(join(a[a.indexOf("--prefix") + 1] as string, "package.json"), "utf8");
+        return { exitCode: 0, stdout: NPM_CLEAN, stderr: "", timedOut: false };
+      },
+    } as unknown as SandboxClient;
+    const r = await auditGate.run({ ...ctx, registryClient: client });
+    expect(r.status).toBe("pass");
+    expect(copied).not.toContain("packageManager");
+    expect(copied).not.toContain("devEngines");
+    expect(copied).toContain("left");
+    expect(argv).toContain("npm_config_manage_package_manager_versions=false");
+  });
+
   test("a corepack shim for the package manager is refused", async () => {
     const { root, ctx } = makeRepo(NPM_BASE);
     write(root, "package.json", NPM_PKG({ left: "^1.0.0" }));
@@ -792,10 +903,22 @@ describe("policy protects scanner config", () => {
       "**/.pnpmfile.mjs",
       "**/.pnpmfile.js",
       "**/.yarn/**",
+      "**/.tool-versions",
+      "**/mise.toml",
     ]) {
       expect(DEFAULT_POLICY.protectedGlobs).toContain(g);
     }
     expect(DEFAULT_POLICY.credentialDenyGlobs).toContain("~/.npmrc");
+  });
+  test("volta changes are config drift", async () => {
+    const { root, ctx } = makeRepo({ "package.json": NPM_PKG() });
+    const j = JSON.parse(NPM_PKG()) as Record<string, unknown>;
+    j.volta = { node: "99.0.0" };
+    write(root, "package.json", JSON.stringify(j));
+    const { configDrift } = await import("../src/gates/drift.js");
+    const { GateExec } = await import("../src/gates/shared.js");
+    const d = await configDrift(ctx, new GateExec(ctx));
+    expect(d.map((x) => x.path)).toContain("package.json");
   });
   test("packageManager and devEngines changes are config drift", async () => {
     const { root, ctx } = makeRepo({ "package.json": NPM_PKG() });

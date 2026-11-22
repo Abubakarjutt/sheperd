@@ -1,14 +1,4 @@
-import {
-  copyFile,
-  lstat,
-  mkdir,
-  mkdtemp,
-  readFile,
-  realpath,
-  rm,
-  stat,
-  writeFile,
-} from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, posix } from "node:path";
 import { z } from "zod";
 import type { Gate, GateContext, GateOutput } from "../types.js";
@@ -282,6 +272,7 @@ async function baseLockFor(
   g: GateExec,
   baseFiles: Set<string>,
   dir: string,
+  cache: Map<string, BaseLock> = new Map(),
 ): Promise<(BaseLock & { dir: string }) | undefined> {
   for (let d = dir; ; d = dirOf(d)) {
     const found = Object.entries(LOCKFILES)
@@ -289,14 +280,19 @@ async function baseLockFor(
       .filter((f) => baseFiles.has(f.path));
     const pick = found.find((f) => f.kind === ctx.pack.packageManager) ?? found[0];
     if (pick) {
-      const text = await baseText(ctx, g, pick.path);
-      const info =
-        pick.kind === "pnpm"
-          ? parsePnpm(text)
-          : pick.kind === "npm"
-            ? parseNpmLock(text)
-            : parseYarn(text);
-      return { path: pick.path, info, dir: d };
+      let hit = cache.get(pick.path);
+      if (!hit) {
+        const text = await baseText(ctx, g, pick.path);
+        const info =
+          pick.kind === "pnpm"
+            ? parsePnpm(text)
+            : pick.kind === "npm"
+              ? parseNpmLock(text)
+              : parseYarn(text);
+        hit = { path: pick.path, info };
+        cache.set(pick.path, hit);
+      }
+      return { ...hit, dir: d };
     }
     if (d === "") return undefined;
   }
@@ -307,6 +303,21 @@ type Missing = { manifest: string; dependency: string; reason: string };
 function peerNames(text: string): Set<string> {
   const j = JSON.parse(text) as { peerDependencies?: Record<string, unknown> };
   return new Set(Object.keys(j.peerDependencies ?? {}));
+}
+
+/**
+ * `packageManager` / `devEngines` make npm, pnpm and corepack download and run another package
+ * manager version: drop them from the isolated copy so only the pinned binary runs.
+ */
+function stripPmFields(text: string): string {
+  try {
+    const j = JSON.parse(text) as Record<string, unknown>;
+    delete j.packageManager;
+    delete j.devEngines;
+    return JSON.stringify(j);
+  } catch {
+    return text;
+  }
 }
 
 /** Corepack shims download and run whatever `packageManager` names: refuse them. */
@@ -364,13 +375,17 @@ async function auditGroup(
       try {
         const st = await lstat(join(root, rel));
         if (st.isFile()) {
-          await copyFile(join(root, rel), dest);
+          await writeFile(dest, stripPmFields(await readFile(join(root, rel), "utf8")), {
+            mode: 0o600,
+          });
           copied = true;
         }
       } catch {
         // deleted in the worktree
       }
-      if (!copied && baseFiles.has(rel)) await writeFile(dest, await baseText(ctx, g, rel));
+      if (!copied && baseFiles.has(rel)) {
+        await writeFile(dest, stripPmFields(await baseText(ctx, g, rel)), { mode: 0o600 });
+      }
     }
     const home = join(work, "home");
     const sub = ["", ".config", ".cache", ".local/share", ".local/state", "tmp", "store"];
@@ -398,6 +413,7 @@ async function auditGroup(
       "COREPACK_ENABLE_NETWORK=0",
       "COREPACK_ENABLE_STRICT=0",
       "npm_config_ignore_scripts=true",
+      "npm_config_manage_package_manager_versions=false",
       "YARN_IGNORE_SCRIPTS=true",
       `npm_config_registry=${REGISTRY}`,
       `YARN_REGISTRY=${REGISTRY}`,
@@ -473,8 +489,9 @@ export const auditGate: Gate = {
     try {
       root = await realRootOf(ctx);
       baseFiles = new Set(await baseFileList(ctx, g));
+      const lockCache = new Map<string, BaseLock>();
       const notePkgDir = async (dir: string): Promise<(BaseLock & { dir: string }) | undefined> =>
-        baseLockFor(ctx, g, baseFiles, dir);
+        baseLockFor(ctx, g, baseFiles, dir, lockCache);
       const touch = async (dir: string, memberDir?: string) => {
         const lock = await notePkgDir(dir);
         if (!lock) return undefined;
@@ -599,14 +616,6 @@ export const auditGate: Gate = {
       missingFromLockfile: missing.slice(0, MAX_LIST),
       audits,
     };
-    const errored = results.filter((r) => r.error);
-    if (errored.length > 0) {
-      return {
-        status: "error",
-        summary: `audit ${errored[0]?.dir || "."}: ${errored[0]?.error}`,
-        details,
-      };
-    }
     for (const r of results) {
       const v = r.verdict;
       if (v && v.high + v.critical > 0) {
@@ -615,8 +624,21 @@ export const auditGate: Gate = {
         );
       }
     }
+    const errored = results.filter((r) => r.error);
     if (problems.length > 0) {
-      return { status: "fail", summary: `audit: ${problems.join("; ")}`, details };
+      // a problem the gate itself found wins over an audit that could not run: fail, note the error
+      return {
+        status: "fail",
+        summary: `audit: ${problems.join("; ")}`,
+        details: { ...details, auditErrors: errored.map((r) => `${r.dir || "."}: ${r.error}`) },
+      };
+    }
+    if (errored.length > 0) {
+      return {
+        status: "error",
+        summary: `audit ${errored[0]?.dir || "."}: ${errored[0]?.error}`,
+        details,
+      };
     }
     return { status: "pass", summary: "audit clean", details };
   },

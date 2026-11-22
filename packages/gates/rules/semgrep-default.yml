@@ -32,6 +32,10 @@ rules:
           - pattern: self.eval($X)
           - pattern: global.eval($X)
           - pattern: $G["eval"]($X)
+          - pattern: Reflect.apply(eval, $T, $ARGS)
+          - pattern: Reflect.apply($G.eval, $T, $ARGS)
+          - pattern: eval.call($T, $X)
+          - pattern: eval.apply($T, $ARGS)
           - pattern: new Function(...)
           - pattern: Function(...)
           - pattern: $G.Function(...)
@@ -40,6 +44,8 @@ rules:
       - pattern-not: eval("...")
       - pattern-not: new Function("...")
       - pattern-not: Function("...")
+      - pattern-not: Reflect.apply(eval, $T, ["..."])
+      - pattern-not: eval.call($T, "...")
 
   - id: rewire.js.child-process-exec-dynamic
     languages: [javascript, typescript]
@@ -49,6 +55,8 @@ rules:
       category: security
       cwe: "CWE-78"
     mode: taint
+    options:
+      symbolic_propagation: true
     pattern-sources:
       - pattern: |
           `...${$X}...`
@@ -64,6 +72,11 @@ rules:
               metavariable: $REQ
               regex: ^(req|request)$
       - pattern: process.argv
+    pattern-propagators:
+      # a value that flows into a promise flows into the .then callback parameter
+      - pattern: $P.then(($X) => ...)
+        from: $P
+        to: $X
     pattern-sanitizers:
       - pattern: $F.quote(...)
     pattern-sinks:
@@ -75,6 +88,21 @@ rules:
               - pattern: $CP.execSync($S, ...)
               - pattern: $CP["exec"]($S, ...)
               - pattern: $CP["execSync"]($S, ...)
+              - pattern: promisify(exec)($S, ...)
+              - pattern: promisify($CP.exec)($S, ...)
+              - pattern: $U.promisify(exec)($S, ...)
+              - pattern: $U.promisify($CP.exec)($S, ...)
+          - focus-metavariable: $S
+      # spawn/execFile run through a shell when {shell: true}
+      - patterns:
+          - pattern-either:
+              - pattern: "$F($S, {..., shell: true, ...}, ...)"
+              - pattern: "$F($S, $ARGS, {..., shell: true, ...}, ...)"
+              - pattern: "$CP.$F($S, {..., shell: true, ...}, ...)"
+              - pattern: "$CP.$F($S, $ARGS, {..., shell: true, ...}, ...)"
+          - metavariable-regex:
+              metavariable: $F
+              regex: ^(spawn|spawnSync|execFile|execFileSync)$
           - focus-metavariable: $S
 
   - id: rewire.js.dom-html-sink-nonliteral
