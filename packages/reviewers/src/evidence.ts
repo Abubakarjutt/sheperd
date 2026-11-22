@@ -48,19 +48,14 @@ const isMissing = (e: unknown): boolean => {
 };
 
 /**
- * Read `rel` (worktree-relative) only if its real path is a regular file inside the real
- * worktree and not under any `.git` segment. Absolute paths, `..` traversal and symlinks leading
- * out are "outside". Reads go through the review sandbox client when given. Only a missing path
- * (ENOENT/ENOTDIR/path_protected) is "missing"; every other I/O or sandbox error is rethrown so
- * the review fails closed instead of treating infrastructure trouble as "no evidence". The
- * check-then-read gap (a swap after realpath) is not closed on the host path; the sandbox read
- * re-checks containment itself.
+ * Resolve `rel` (worktree-relative) to its real path only if that is a regular file inside the
+ * real worktree and not under any `.git` segment. Absolute paths, `..` traversal and symlinks
+ * leading out are "outside"; a non-regular file is "missing".
  */
-export async function readInsideWorktree(
+export async function resolveInsideWorktree(
   worktree: string,
   rel: string,
-  client?: Pick<SandboxClient, "read">,
-): Promise<SafeRead> {
+): Promise<{ kind: "ok"; path: string; size: number } | { kind: "outside" } | { kind: "missing" }> {
   if (rel === "" || rel.length > MAX_PATH_CHARS || rel.includes("\0") || isAbsolute(rel)) {
     return { kind: "outside" };
   }
@@ -79,10 +74,33 @@ export async function readInsideWorktree(
   try {
     const st = await stat(real);
     if (!st.isFile()) return { kind: "missing" };
-    if (st.size > MAX_FILE_BYTES) return { kind: "too_large" };
-    const text = client ? await client.read(real) : await readFile(real, "utf8");
+    return { kind: "ok", path: real, size: st.size };
+  } catch (e) {
+    if (isMissing(e)) return { kind: "missing" };
+    throw e;
+  }
+}
+
+/**
+ * Read `rel` (worktree-relative) only if resolveInsideWorktree accepts it. Reads go through the
+ * review sandbox client when given. "missing" covers a path that is not there or not a regular
+ * file (ENOENT, ENOTDIR, ENAMETOOLONG, ELOOP, EINVAL, or a sandbox `path_protected` denial); every
+ * other I/O or sandbox error is rethrown so the review fails closed instead of treating
+ * infrastructure trouble as "no evidence". The check-then-read gap (a swap after realpath) is not
+ * closed on the host path; the sandbox read re-checks containment itself.
+ */
+export async function readInsideWorktree(
+  worktree: string,
+  rel: string,
+  client?: Pick<SandboxClient, "read">,
+): Promise<SafeRead> {
+  const r = await resolveInsideWorktree(worktree, rel);
+  if (r.kind !== "ok") return r;
+  if (r.size > MAX_FILE_BYTES) return { kind: "too_large" };
+  try {
+    const text = client ? await client.read(r.path) : await readFile(r.path, "utf8");
     if (Buffer.byteLength(text, "utf8") > MAX_FILE_BYTES) return { kind: "too_large" };
-    return { kind: "ok", path: real, text };
+    return { kind: "ok", path: r.path, text };
   } catch (e) {
     if (isMissing(e)) return { kind: "missing" };
     throw e;

@@ -195,15 +195,16 @@ test("buildDiffSummary parses hunks: multiple hunks, omitted count, d=0", async 
   expect(d.patch).toContain("@@");
 });
 
-test("untracked non-ignored files count as all-added; ignored are listed too", async () => {
+test("untracked non-ignored files count as all-added; ignored are never read (R22)", async () => {
   const root = makeRepo({ "a.ts": A, ".gitignore": "ignored.txt\n" });
   put(root, "new.ts", "one\ntwo\nthree\n");
   put(root, "ignored.txt", "x\ny\n");
   writeFileSync(join(root, "bin.dat"), Buffer.from([0, 1, 2, 0, 3]));
   const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
   expect(d.files.find((x) => x.path === "new.ts")?.addedLines).toEqual([1, 2, 3]);
-  // Worktree ignore rules must not hide files from review.
-  expect(d.files.find((x) => x.path === "ignored.txt")?.addedLines).toEqual([1, 2]);
+  // R22: ignored non-source files are neither read nor escalated.
+  expect(d.files.some((x) => x.path === "ignored.txt")).toBe(false);
+  expect(d.omitted.some((o) => o.startsWith("ignored.txt"))).toBe(false);
   expect(d.files.find((x) => x.path === "bin.dat")?.addedLines).toEqual([1]);
   expect(d.forced.some((f) => f.file === "bin.dat")).toBe(true);
   expect(d.patch).toContain("+three");
@@ -476,8 +477,11 @@ test("a new .gitignore cannot hide a file from review and is itself flagged", as
   put(root, "evil.ts", "const evil = 1;\n");
   put(root, "node_modules/x/index.js", "x\n");
   const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
-  expect(d.files.find((f) => f.path === "evil.ts")?.addedLines).toEqual([1]);
+  // R22: the ignored source file is listed by name (escalation), never read.
+  expect(d.omitted).toContain("evil.ts (ignored source file)");
+  expect(d.patch).not.toContain("const evil");
   expect(d.files.some((f) => f.path.startsWith("node_modules/"))).toBe(false);
+  expect(d.omitted.some((o) => o.startsWith("node_modules"))).toBe(false);
   expect(d.forced.some((f) => f.file === ".gitignore")).toBe(true);
   expect(d.omitted.some((o) => o.includes(".gitignore changed (protected)"))).toBe(true);
 });
@@ -491,4 +495,121 @@ test("a modified nested .GITIGNORE is flagged", async () => {
   put(root2, "x/.GITATTRIBUTES", "* text\n");
   const d2 = await buildDiffSummary(root2, "HEAD", { client: hostClient() });
   expect(d2.forced.some((f) => f.file === "x/.GITATTRIBUTES")).toBe(true);
+});
+
+// ---- fix round 4 (R22, R21b) ----
+const recordingClient = () => {
+  const base = hostClient();
+  const reads: string[] = [];
+  const execs: string[][] = [];
+  const client = {
+    ...base,
+    read: async (p: string) => {
+      reads.push(p);
+      return base.read(p);
+    },
+    exec: (argv: string[], o: { timeoutMs: number; cwd?: string }) => {
+      execs.push(argv);
+      return base.exec(argv, o);
+    },
+  } as typeof base;
+  return { client, reads, execs };
+};
+
+test("R22: ignored secret.pem and secrets.json are never read nor sent", async () => {
+  const root = makeRepo({ "a.ts": A, ".gitignore": "*.pem\nsecrets.json\n" });
+  put(root, "secret.pem", "-----BEGIN PRIVATE KEY-----TOPSECRET\n");
+  put(root, "secrets.json", '{"token":"HUNTER2HUNTER2"}\n');
+  put(root, "new.ts", "const x = 1;\n");
+  const { client, reads, execs } = recordingClient();
+  const d = await buildDiffSummary(root, "HEAD", { client });
+  expect(reads.some((p) => p.endsWith("secret.pem") || p.endsWith("secrets.json"))).toBe(false);
+  const touched = execs.filter((a) => a.some((x) => /secret\.pem|secrets\.json/.test(x)));
+  expect(touched.filter((a) => !/git$/.test(a[0] ?? ""))).toEqual([]);
+  expect(d.patch).not.toContain("TOPSECRET");
+  expect(d.patch).not.toContain("HUNTER2");
+  expect(d.files.some((f) => f.path === "secret.pem" || f.path === "secrets.json")).toBe(false);
+  expect(d.forced).toEqual([]);
+  expect(d.omitted).toEqual([]);
+  expect(reads.some((p) => p.endsWith("new.ts"))).toBe(true);
+});
+
+test("R22: cache-dir .gitignore and .DS_Store are silent", async () => {
+  const root = makeRepo({ "a.ts": A, ".gitignore": ".DS_Store\n" });
+  put(root, ".pytest_cache/.gitignore", "*\n");
+  put(root, ".pytest_cache/v/cache/x.py", "x = 1\n");
+  put(root, ".DS_Store", "junk");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.forced).toEqual([]);
+  expect(d.omitted).toEqual([]);
+});
+
+test("R22: self-ignoring src/.gitignore is forced; hidden evil.ts escalates by name", async () => {
+  const root = makeRepo({ "a.ts": A });
+  put(root, "src/.gitignore", "*\n");
+  put(root, "src/evil.ts", "const evil = 1;\n");
+  const { client, reads } = recordingClient();
+  const d = await buildDiffSummary(root, "HEAD", { client });
+  expect(d.forced.some((f) => f.file === "src/.gitignore")).toBe(true);
+  expect(d.omitted).toContain("src/evil.ts (ignored source file)");
+  expect(reads.some((p) => p.endsWith("evil.ts"))).toBe(false);
+  expect(d.patch).not.toContain("const evil");
+});
+
+test("R22: dist/ ignored at baseRef does not escalate; newly ignored dist/ does", async () => {
+  const root = makeRepo({ "a.ts": A, ".gitignore": "dist/\n" });
+  put(root, "dist/index.js", "built();\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.omitted).toEqual([]);
+  expect(d.forced).toEqual([]);
+  const root2 = makeRepo({ "a.ts": A });
+  put(root2, ".gitignore", "dist/\n");
+  put(root2, "dist/index.js", "evil();\n");
+  const d2 = await buildDiffSummary(root2, "HEAD", { client: hostClient() });
+  expect(d2.omitted).toContain("dist/index.js (ignored source file)");
+});
+
+test("R22: ignored listing beyond 10,000 entries is truncated and noted", async () => {
+  const root = makeRepo({ "a.ts": A, ".gitignore": "*.log\n" });
+  for (let i = 0; i < 10_001; i++) writeFileSync(join(root, `f${i}.log`), "");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.omitted).toContain("ignored-file listing truncated");
+}, 60_000);
+
+test("content change plus mode change also gets a (mode change) entry", async () => {
+  const root = makeRepo({ "run.sh": "echo hi\n" });
+  writeFileSync(join(root, "run.sh"), "echo hi\necho there\n");
+  chmodSync(join(root, "run.sh"), 0o755);
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.files.find((f) => f.path === "run.sh")?.addedLines).toEqual([2]);
+  expect(d.omitted).toContain("run.sh (mode change)");
+});
+
+test("R21b: tracked x.png containing JS is reviewed as text", async () => {
+  const root = makeRepo({ "a.ts": A, "x.png": "ok\n" });
+  put(root, "x.png", "ok\nrequire('child_process').exec('rm -rf /');\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.files.find((f) => f.path === "x.png")?.addedLines).toEqual([2]);
+  expect(d.patch).toContain("child_process");
+  expect(d.omitted.some((o) => o.startsWith("x.png"))).toBe(false);
+});
+
+test("R21b: tracked real PNG replaced by JS is reviewed as text", async () => {
+  const root = makeRepo({ "a.ts": A });
+  writeFileSync(join(root, "x.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 1]));
+  git(root, "add", "x.png");
+  git(root, "commit", "-q", "-m", "png");
+  put(root, "x.png", "evilPayload();\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.files.find((f) => f.path === "x.png")?.addedLines).toEqual([1]);
+  expect(d.patch).toContain("evilPayload");
+});
+
+test("R21b: untracked y.woff2 containing JS is reviewed as text", async () => {
+  const root = makeRepo({ "a.ts": A });
+  put(root, "y.woff2", "fetch('https://x');\nmore();\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.files.find((f) => f.path === "y.woff2")?.addedLines).toEqual([1, 2]);
+  expect(d.patch).toContain("fetch('https://x')");
+  expect(d.omitted.some((o) => o.startsWith("y.woff2"))).toBe(false);
 });
