@@ -21,6 +21,33 @@ importers:
         specifier: ^5.1.1
         version: 5.1.1(@opentelemetry/api@1.10.0)(@types/node@26.6.6)(vite@8.3.8(@types/node@26.6.6))
 
+  packages/cli:
+    dependencies:
+      '@rewire/core':
+        specifier: workspace:*
+        version: link:../core
+      '@rewire/gates':
+        specifier: workspace:*
+        version: link:../gates
+      '@rewire/pipeline':
+        specifier: workspace:*
+        version: link:../pipeline
+      '@rewire/policy':
+        specifier: workspace:*
+        version: link:../policy
+      '@rewire/providers':
+        specifier: workspace:*
+        version: link:../providers
+      '@rewire/reviewers':
+        specifier: workspace:*
+        version: link:../reviewers
+      '@rewire/sandbox':
+        specifier: workspace:*
+        version: link:../sandbox
+      zod:
+        specifier: ^4.6.7
+        version: 4.6.7
+
   packages/core:
     dependencies:
       zod:
