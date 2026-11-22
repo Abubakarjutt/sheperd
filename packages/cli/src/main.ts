@@ -3,6 +3,7 @@ import { parseArgs } from "node:util";
 import { runDoctor } from "./doctor.js";
 import { effectivePlatform, isSupported, PLATFORM_MESSAGE } from "./platform.js";
 import { formatError, runCommand } from "./run.js";
+import { oneLine } from "./sanitize.js";
 import { installSigint } from "./sigint.js";
 
 const USAGE = `usage:
@@ -77,8 +78,13 @@ async function main(argv: string[]): Promise<number> {
         cwd: process.cwd(),
       },
       ac.signal,
+      () => ac.abort(),
     );
   } catch (e) {
+    if (e instanceof Error && (e as NodeJS.ErrnoException).code?.startsWith("ERR_PARSE_ARGS")) {
+      process.stderr.write(`${oneLine(e.message, 300)}\n${USAGE}`);
+      return 1;
+    }
     process.stderr.write(`${formatError(e)}\n`);
     return 1;
   }

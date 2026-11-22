@@ -2,8 +2,23 @@ import { RewireError } from "@rewire/core";
 import { type ModelRef, normalizeOllamaHost } from "@rewire/providers";
 import { z } from "zod";
 
-export const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-5";
+/** The one place default model names live. Override with REWIRE_ANTHROPIC_MODEL / REWIRE_OPENAI_MODEL. */
+export const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-5-5";
 export const DEFAULT_OPENAI_MODEL = "gpt-5";
+const MODEL_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$/;
+
+function modelFor(env: NodeJS.ProcessEnv, name: string, fallback: string): string {
+  const v = env[name];
+  if (v === undefined || v === "") return fallback;
+  if (!MODEL_TOKEN.test(v)) {
+    throw new RewireError(
+      "model_override_invalid",
+      `${name} is not a valid model name`,
+      "use letters, digits and . _ : / - only",
+    );
+  }
+  return v;
+}
 export const OLLAMA_PROBE_TIMEOUT_MS = 2000;
 
 export type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
@@ -24,8 +39,16 @@ export async function discoverModels(
   fetchFn: FetchLike = fetch,
 ): Promise<ModelRef[]> {
   const found: ModelRef[] = [];
-  if (env.ANTHROPIC_API_KEY) found.push({ provider: "anthropic", model: DEFAULT_ANTHROPIC_MODEL });
-  if (env.OPENAI_API_KEY) found.push({ provider: "openai", model: DEFAULT_OPENAI_MODEL });
+  if (env.ANTHROPIC_API_KEY)
+    found.push({
+      provider: "anthropic",
+      model: modelFor(env, "REWIRE_ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL),
+    });
+  if (env.OPENAI_API_KEY)
+    found.push({
+      provider: "openai",
+      model: modelFor(env, "REWIRE_OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+    });
   try {
     const res = await fetchFn(`${ollamaBase(env)}/api/tags`, {
       signal: AbortSignal.timeout(OLLAMA_PROBE_TIMEOUT_MS),

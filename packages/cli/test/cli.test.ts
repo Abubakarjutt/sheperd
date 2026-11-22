@@ -15,11 +15,17 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RunEvent } from "@rewire/core";
 import { findSandboxBinary } from "@rewire/sandbox";
-import { afterAll, describe, expect, test } from "vitest";
+import { afterAll, afterEach, describe, expect, test } from "vitest";
 import { exitCodeFor } from "../src/exit.js";
 import { loadFauxScript } from "../src/faux.js";
 import { discoverModels } from "../src/models.js";
-import { escalationHint, finalLine, renderEvent } from "../src/render-interactive.js";
+import {
+  escalationDetail,
+  escalationHint,
+  finalLine,
+  renderEvent,
+} from "../src/render-interactive.js";
+import { markFauxReport, providerFactory } from "../src/run.js";
 import { sanitize } from "../src/sanitize.js";
 import { installSigint } from "../src/sigint.js";
 
@@ -69,8 +75,18 @@ function cleanEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   delete env.NODE_ENV;
   delete env.REWIRE_PLATFORM_OVERRIDE;
   delete env.REWIRE_FAUX_SCRIPT;
-  return { ...env, ...extra };
+  delete env.REWIRE_ANTHROPIC_MODEL;
+  delete env.REWIRE_OPENAI_MODEL;
+  delete env.ANTHROPIC_API_KEY;
+  delete env.OPENAI_API_KEY;
+  const home = tmp();
+  return { ...env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), ...extra };
 }
+
+const children: ChildProcess[] = [];
+afterEach(() => {
+  for (const c of children.splice(0)) if (c.exitCode === null) c.kill("SIGKILL");
+});
 
 type Done = { code: number | null; stdout: string; stderr: string };
 function start(
@@ -91,6 +107,7 @@ function start(
   child.stderr?.on("data", (d) => {
     stderr += d;
   });
+  children.push(child);
   const done = new Promise<Done>((res) =>
     child.on("close", (code) => res({ code, stdout, stderr })),
   );
@@ -127,6 +144,73 @@ describe("sanitize (#23)", () => {
     expect(out).not.toContain("\x9b");
     expect(out).not.toContain(SECRET);
     expect(out).toContain("\n");
+  });
+});
+
+describe("sanitize bidi", () => {
+  test("strips bidi and zero-width characters", () => {
+    expect(sanitize("a\u202eb\u200bc\u2066d\ufeffe\u200f")).toBe("abcde");
+  });
+});
+
+describe("escalation hints use the orchestrator's real strings", () => {
+  const out = (details: string[], unresolved: unknown[] = []) =>
+    ({
+      runId: "r",
+      status: "escalated",
+      branch: "",
+      worktree: "",
+      reportPath: "",
+      escalation: {
+        reason: "stage_error",
+        tried: [],
+        unresolved,
+        hypothesis: "",
+        question: "",
+        details,
+      },
+    }) as never;
+  // orchestrator.ts: `node_modules is in the index before the final commit: <paths>`
+  test("tracked node_modules", () => {
+    const h = escalationHint(
+      out(["node_modules is in the index before the final commit: node_modules/a.js"]),
+    );
+    expect(h).toMatch(/repos that commit node_modules are unsupported in v0\.1/);
+  });
+  // orchestrator.ts: TAMPERED = "node_modules link tampered" (also `${TAMPERED} before the final commit`)
+  test("tampered node_modules", () => {
+    const h = escalationHint(out(["node_modules link tampered before the final commit"]));
+    expect(h).toMatch(/the agent modified node_modules; the run was rejected/);
+    const g = escalationHint(
+      out(
+        [],
+        [{ gate: "tsc", status: "error", category: "x", summary: "node_modules link tampered" }],
+      ),
+    );
+    expect(g).toMatch(/agent modified node_modules/);
+  });
+  test("unrelated text gets no hint", () => {
+    expect(escalationHint(out(["tracked file changed"]))).toBeUndefined();
+  });
+  test("details are capped at 10 with a remainder line", () => {
+    const lines = escalationDetail(out(Array.from({ length: 13 }, (_, i) => `d${i}`)));
+    expect(lines.filter((l) => l.startsWith("  d"))).toHaveLength(10);
+    expect(lines.join("\n")).toContain("… 3 more");
+  });
+});
+
+describe("faux mode is exclusive", () => {
+  test("provider factory never reaches a real provider", () => {
+    const f = providerFactory({ ANTHROPIC_API_KEY: "x" }, { scripts: { m: [] } });
+    expect(() => f({ provider: "anthropic", model: "m" })).toThrow(/faux/);
+    expect(f({ provider: "faux", model: "m" })).toBeDefined();
+  });
+  test("markFauxReport surfaces append failures", async () => {
+    await expect(
+      markFauxReport("/x/report.md", async () => {
+        throw new Error("disk full");
+      }),
+    ).rejects.toThrow(/disk full/);
   });
 });
 
@@ -219,26 +303,6 @@ describe("interactive rendering", () => {
       }),
     ).toBe("verified → branch rewire/x, report /r.md");
   });
-  test("node_modules hint", () => {
-    const esc = {
-      reason: "stage_error" as const,
-      tried: [],
-      unresolved: [],
-      hypothesis: "",
-      question: "",
-      details: ["index guard: tracked node_modules/foo/index.js changed"],
-    };
-    const hint = escalationHint({
-      runId: "r",
-      status: "escalated",
-      branch: "",
-      worktree: "",
-      reportPath: "",
-      escalation: esc,
-    });
-    expect(hint).toMatch(/node_modules/);
-    expect(hint).toMatch(/unsupported in v0\.1/);
-  });
 });
 
 describe("exit codes", () => {
@@ -295,6 +359,24 @@ describe("model discovery", () => {
     expect(r.map((m) => m.provider)).toEqual(["anthropic", "openai"]);
     expect(JSON.stringify(r)).not.toContain(SECRET);
   });
+  test("defaults and env overrides", async () => {
+    const down = async () => {
+      throw new Error("down");
+    };
+    const d = await discoverModels({ ANTHROPIC_API_KEY: "k", OPENAI_API_KEY: "k" }, down);
+    expect(d).toEqual([
+      { provider: "anthropic", model: "claude-sonnet-5-5" },
+      { provider: "openai", model: "gpt-5" },
+    ]);
+    const o = await discoverModels(
+      { ANTHROPIC_API_KEY: "k", REWIRE_ANTHROPIC_MODEL: "claude-x-1" },
+      down,
+    );
+    expect(o[0]?.model).toBe("claude-x-1");
+    await expect(
+      discoverModels({ ANTHROPIC_API_KEY: "k", REWIRE_ANTHROPIC_MODEL: "bad\x1b[2J model" }, down),
+    ).rejects.toMatchObject({ code: "model_override_invalid" });
+  });
   test("falls back to the first tagged ollama model", async () => {
     const urls: string[] = [];
     const r = await discoverModels({}, async (url) => {
@@ -332,8 +414,7 @@ describe("process", () => {
   test("doctor reports missing semgrep with hint", async () => {
     const bin = tmp();
     for (const b of ["git", "rg", "gitleaks"]) {
-      const p = execFileSync("which", [b], { encoding: "utf8" }).trim();
-      symlinkSync(p, join(bin, b));
+      writeFileSync(join(bin, b), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     }
     const r = await exec(["doctor"], cleanEnv({ PATH: bin }));
     expect(r.code).toBe(1);
@@ -341,6 +422,65 @@ describe("process", () => {
     expect(r.stdout).toMatch(/✓ git/);
     expect(r.stdout).toMatch(/✓ rg/);
   });
+
+  test("unknown flag prints usage and message without a stack", async () => {
+    const r = await exec(["run", "--bogus", "x"], cleanEnv());
+    expect(r.code).toBe(1);
+    expect(r.stderr).toMatch(/usage:/);
+    expect(r.stderr).not.toMatch(/\n\s+at /);
+  });
+
+  test("task-file must be a regular file and is size-capped", async () => {
+    const d = tmp();
+    const dirRun = await exec(["run", "--task-file", d], cleanEnv());
+    expect(dirRun.code).toBe(1);
+    expect(dirRun.stderr).toMatch(/task_file_unreadable/);
+    const big = join(d, "big.txt");
+    writeFileSync(big, "x".repeat(1024 * 1024 + 1));
+    const bigRun = await exec(["run", "--task-file", big], cleanEnv());
+    expect(bigRun.code).toBe(1);
+    expect(bigRun.stderr).toMatch(/task_file_too_large/);
+  });
+
+  test("doctor sanitizes model names", async () => {
+    const d = tmp();
+    const f = join(d, "models.toml");
+    writeFileSync(f, 'available = ["ollama:a\\u001b[2Jb"]\n');
+    const r = await exec(["doctor", "--models", f], cleanEnv({ PATH: d }));
+    expect(r.stdout).not.toContain("\x1b");
+  });
+
+  test("faux with --models is refused", async () => {
+    const r = await exec(
+      ["run", "--headless", "--models", "/nonexistent.toml", "x"],
+      cleanEnv({ REWIRE_FAUX_SCRIPT: writeScript({ m: [] }) }),
+    );
+    expect(r.code).toBe(1);
+    expect(r.stderr).toMatch(/--models cannot be combined with REWIRE_FAUX_SCRIPT/);
+  });
+
+  test.skipIf(!sandboxAvailable)(
+    "faux ignores a decoy default models.toml and the report is marked",
+    async () => {
+      const repo = makeRepo();
+      const env = cleanEnv({ REWIRE_FAUX_SCRIPT: writeScript({ m: [] }) });
+      const cfg = join(env.XDG_CONFIG_HOME as string, "rewire");
+      mkdirSync(cfg, { recursive: true });
+      writeFileSync(join(cfg, "models.toml"), 'available = ["ollama:decoy"]\n');
+      const r = await exec(["run", "--headless", "--repo", repo, "x"], env);
+      expect(r.code).toBe(2);
+      expect(r.stderr).toContain("faux_script_exhausted");
+      expect(r.stdout).not.toContain("decoy");
+      const end = r.stdout
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as RunEvent)
+        .find((e) => e.type === "run_end");
+      const path = end?.type === "run_end" ? end.reportPath : "";
+      expect(readFileSync(path, "utf8")).toMatch(/faux provider/i);
+    },
+    60_000,
+  );
 
   test("run without a task is a usage error", async () => {
     const r = await exec(["run"], cleanEnv());
@@ -407,7 +547,6 @@ describe("process", () => {
       const runs = join(repo, ".rewire", "runs");
       const id = readdirSync(runs)[0] as string;
       expect(readFileSync(join(runs, id, "report.md"), "utf8")).toMatch(/interrupted/);
-      mkdirSync(runs, { recursive: true });
     },
     60_000,
   );

@@ -1,4 +1,4 @@
-import { appendFile, readFile, stat } from "node:fs/promises";
+import { appendFile, type FileHandle, open, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -18,7 +18,7 @@ import { type FauxScript, loadFauxScript } from "./faux.js";
 import { discoverModels } from "./models.js";
 import { headlessLine } from "./render-headless.js";
 import { escalationDetail, escalationHint, finalLine, renderEvent } from "./render-interactive.js";
-import { oneLine, sanitize } from "./sanitize.js";
+import { oneLine } from "./sanitize.js";
 
 export type RunOptions = {
   task?: string | undefined;
@@ -39,22 +39,35 @@ export type RunIo = {
 const TASK_MAX_BYTES = 1024 * 1024;
 export const FAUX_WARNING = "warning: faux provider in use (REWIRE_FAUX_SCRIPT)";
 
+/** Regular files only; reads at most TASK_MAX_BYTES + 1 bytes through an fd, never trusting stat. */
+async function readCapped(p: string): Promise<string> {
+  let fh: FileHandle | undefined;
+  try {
+    fh = await open(p, "r");
+    if (!(await fh.stat()).isFile()) {
+      throw new RewireError("task_file_unreadable", `${p} is not a regular file`);
+    }
+    const buf = Buffer.alloc(TASK_MAX_BYTES + 1);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    if (bytesRead > TASK_MAX_BYTES) {
+      throw new RewireError("task_file_too_large", `${p} is larger than ${TASK_MAX_BYTES} bytes`);
+    }
+    return buf.subarray(0, bytesRead).toString("utf8");
+  } catch (e) {
+    if (e instanceof RewireError) throw e;
+    throw new RewireError("task_file_unreadable", `cannot read ${p}: ${(e as Error).message}`);
+  } finally {
+    await fh?.close();
+  }
+}
+
 async function readTask(o: RunOptions, cwd: string): Promise<string> {
   if (o.task !== undefined && o.taskFile !== undefined) {
     throw new RewireError("usage", "give either a task or --task-file, not both");
   }
   if (o.taskFile !== undefined) {
     const p = resolve(cwd, o.taskFile);
-    let size: number;
-    try {
-      size = (await stat(p)).size;
-    } catch (e) {
-      throw new RewireError("task_file_unreadable", `cannot read ${p}: ${(e as Error).message}`);
-    }
-    if (size > TASK_MAX_BYTES) {
-      throw new RewireError("task_file_too_large", `${p} is larger than ${TASK_MAX_BYTES} bytes`);
-    }
-    const text = (await readFile(p, "utf8")).trim();
+    const text = (await readCapped(p)).trim();
     if (text === "") throw new RewireError("usage", `${p} is empty`);
     return text;
   }
@@ -86,10 +99,11 @@ export async function resolveModels(
   env: NodeJS.ProcessEnv,
   faux: FauxScript | undefined,
 ): Promise<ModelsFile> {
-  if (modelsPath !== undefined) return loadModelsFile(resolve(cwd, modelsPath));
-  const fromFile = await defaultModelsFile(env);
-  if (fromFile !== undefined) return loadModelsFile(fromFile);
+  // Faux mode is exclusive: no models file, default or explicit, is ever consulted.
   if (faux !== undefined) {
+    if (modelsPath !== undefined) {
+      throw new RewireError("usage", "--models cannot be combined with REWIRE_FAUX_SCRIPT");
+    }
     const names = Object.keys(faux.scripts);
     if (names.length === 0) {
       throw new RewireError("faux_script_invalid", "faux script defines no models");
@@ -99,10 +113,13 @@ export async function resolveModels(
       overrides: {},
     };
   }
+  if (modelsPath !== undefined) return loadModelsFile(resolve(cwd, modelsPath));
+  const fromFile = await defaultModelsFile(env);
+  if (fromFile !== undefined) return loadModelsFile(fromFile);
   return { available: await discoverModels(env), overrides: {} };
 }
 
-function providerFactory(env: NodeJS.ProcessEnv, faux: FauxScript | undefined) {
+export function providerFactory(env: NodeJS.ProcessEnv, faux: FauxScript | undefined) {
   const fauxByModel = new Map<string, FauxProvider>();
   return (ref: ModelRef): Provider => {
     if (ref.provider === "faux" && faux !== undefined) {
@@ -113,6 +130,12 @@ function providerFactory(env: NodeJS.ProcessEnv, faux: FauxScript | undefined) {
       }
       return p;
     }
+    if (faux !== undefined) {
+      throw new RewireError(
+        "faux_mode_violation",
+        `faux mode never uses a real provider (asked for ${ref.provider})`,
+      );
+    }
     return createProvider(ref, env);
   };
 }
@@ -121,12 +144,15 @@ async function askInteractive(
   questions: string[],
   io: RunIo,
   signal: AbortSignal,
+  onInterrupt: () => void,
 ): Promise<string[] | null> {
   const rl = createInterface({ input: io.stdin, output: io.stdout });
+  // On a TTY readline owns Ctrl-C: turn it into the run's abort so the report says interrupted.
+  rl.on("SIGINT", () => onInterrupt());
   try {
     const answers: string[] = [];
     for (const q of questions) {
-      io.stdout.write(`? ${sanitize(q)}\n`);
+      io.stdout.write(`? ${oneLine(q, 500)}\n`);
       const a = await new Promise<string | null>((res) => {
         const onClose = () => res(null);
         rl.once("close", onClose);
@@ -148,7 +174,12 @@ async function askInteractive(
 }
 
 /** Runs the pipeline; returns the process exit code. Throws RewireError for setup problems. */
-export async function runCommand(o: RunOptions, io: RunIo, signal: AbortSignal): Promise<number> {
+export async function runCommand(
+  o: RunOptions,
+  io: RunIo,
+  signal: AbortSignal,
+  onInterrupt: () => void = () => {},
+): Promise<number> {
   const task = await readTask(o, io.cwd);
   const repo = resolve(io.cwd, o.repo ?? ".");
   const policy = await loadPolicy(repo);
@@ -177,20 +208,18 @@ export async function runCommand(o: RunOptions, io: RunIo, signal: AbortSignal):
     routing,
     providers: providerFactory(io.env, faux),
     policy,
-    ask: o.headless ? async () => null : (qs) => askInteractive(qs, io, signal),
+    ask: o.headless ? async () => null : (qs) => askInteractive(qs, io, signal, onInterrupt),
     emit,
     signal,
   });
 
   // runPipeline has no provenance flag: the CLI appends the faux note to the report it wrote.
+  let markFailure: string | undefined;
   if (faux && outcome.reportPath !== "") {
     try {
-      await appendFile(
-        outcome.reportPath,
-        "\n## Provider note\n\nThis run used the faux provider (REWIRE_FAUX_SCRIPT), not real models. It is a harness self-test, not evidence of model-checked code.\n",
-      );
-    } catch {
-      io.stderr.write("warning: could not add the faux-provider note to the report\n");
+      await markFauxReport(outcome.reportPath);
+    } catch (e) {
+      markFailure = oneLine(e instanceof Error ? e.message : String(e), 300);
     }
   }
 
@@ -199,7 +228,21 @@ export async function runCommand(o: RunOptions, io: RunIo, signal: AbortSignal):
   if (hint) summary.push(hint);
   // Headless keeps stdout for events only; the human summary goes to stderr.
   (o.headless ? io.stderr : io.stdout).write(`${summary.join("\n")}\n`);
+  if (markFailure !== undefined) {
+    io.stderr.write(`error: could not mark report as faux-provider run: ${markFailure}\n`);
+    return 1; // an unmarked faux report must never look like a normal result
+  }
   return exitCodeFor(outcome);
+}
+
+export const FAUX_NOTE =
+  "\n## Provider note\n\nThis run used the faux provider (REWIRE_FAUX_SCRIPT), not real models. It is a harness self-test, not evidence of model-checked code.\n";
+
+export async function markFauxReport(
+  path: string,
+  append: (p: string, text: string) => Promise<void> = appendFile,
+): Promise<void> {
+  await append(path, FAUX_NOTE);
 }
 
 /** `<code>: <message>` plus the hint, sanitized: messages can carry model or file text. */

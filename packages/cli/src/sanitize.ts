@@ -5,6 +5,7 @@ import { redact } from "@rewire/reviewers";
 const OSC = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/g;
 const CSI = /\u001b\[[0-?]*[ -/]*[@-~]?/g;
 const ESC_PAIR = /\u001b[@-Z\\-_]?/g;
+const INVISIBLE = /[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
 const CONTROLS = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g;
 
 /**
@@ -13,7 +14,14 @@ const CONTROLS = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g;
  * rejoined before the redaction sees it.
  */
 export function sanitize(s: string): string {
-  return redact(s.replace(OSC, "").replace(CSI, "").replace(ESC_PAIR, "").replace(CONTROLS, ""));
+  return redact(
+    s
+      .replace(OSC, "")
+      .replace(CSI, "")
+      .replace(ESC_PAIR, "")
+      .replace(CONTROLS, "")
+      .replace(INVISIBLE, ""),
+  );
 }
 
 /** Sanitized, collapsed to one line, clipped to `max` characters. */

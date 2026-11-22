@@ -80,7 +80,7 @@ export async function runDoctor(
     const file =
       modelsPath !== undefined ? resolve(io.cwd, modelsPath) : await defaultModelsFile(io.env);
     const available = file ? (await loadModelsFile(file)).available : await discoverModels(io.env);
-    ok("models", available.map((m) => `${m.provider}:${m.model}`).join(", "));
+    ok("models", oneLine(available.map((m) => `${m.provider}:${m.model}`).join(", "), 300));
     if (available.some((m) => m.provider === "ollama")) {
       const base = ollamaBase(io.env);
       try {
