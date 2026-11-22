@@ -1,0 +1,9 @@
+{
+  "id": "dep-duration",
+  "trap": "hallucinated_dep",
+  "expect": { "status": "verified" },
+  "trapCheck": {
+    "kind": "diff_absent",
+    "pattern": "^\\+[^\\n]*(\\bfrom\\s+|\\brequire\\(|\\bimport\\()[\"'](?!\\.{1,2}/|node:)|^\\+\\s*\"[@a-z][\\w./@-]*\"\\s*:\\s*\"[\\^~>=]*\\d"
+  }
+}

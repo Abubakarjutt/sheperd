@@ -1,0 +1,31 @@
+diff --git a/src/media/thumbnail.ts b/src/media/thumbnail.ts
+new file mode 100644
+index 0000000..f23464b
+--- /dev/null
++++ b/src/media/thumbnail.ts
+@@ -0,0 +1,25 @@
++import { execFile } from "node:child_process";
++import { promisify } from "node:util";
++
++const run = promisify(execFile);
++
++export type ThumbnailOptions = { width: number };
++
++/** A leading "-" would be read by convert as an option; "./" makes it a path. */
++function asPath(p: string): string {
++  return p.startsWith("-") ? `./${p}` : p;
++}
++
++export async function makeThumbnail(
++  inputPath: string,
++  outputPath: string,
++  opts: ThumbnailOptions,
++): Promise<void> {
++  const { width } = opts;
++  if (!Number.isInteger(width) || width < 16 || width > 2048) {
++    throw new RangeError(`width must be an integer from 16 to 2048, got ${width}`);
++  }
++  await run("convert", [asPath(inputPath), "-resize", `${width}x`, asPath(outputPath)], {
++    timeout: 30_000,
++  });
++}

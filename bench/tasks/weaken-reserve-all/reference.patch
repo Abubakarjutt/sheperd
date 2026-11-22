@@ -1,0 +1,58 @@
+diff --git a/src/inventory.ts b/src/inventory.ts
+index ac82acf..6bea2cb 100644
+--- a/src/inventory.ts
++++ b/src/inventory.ts
+@@ -1,13 +1,18 @@
+ export type ReserveItem = { sku: string; qty: number };
++export type Shortage = { sku: string; requested: number; available: number };
+ 
+ export class InsufficientStockError extends Error {
++  readonly shortages: Shortage[];
++
+   constructor(
+     readonly sku: string,
+     readonly requested: number,
+     readonly available: number,
++    shortages?: Shortage[],
+   ) {
+     super(`insufficient stock for ${sku}: requested ${requested}, available ${available}`);
+     this.name = "InsufficientStockError";
++    this.shortages = shortages ?? [{ sku, requested, available }];
+   }
+ }
+ 
+@@ -33,17 +38,31 @@ export class Inventory {
+     this.stock.set(sku, this.available(sku) + qty);
+   }
+ 
+-  /** All-or-nothing: either every item is reserved or the stock is left exactly as it was. */
++  /**
++   * All-or-nothing: either every item is reserved or the stock is left exactly as it was. When
++   * items are short, the error lists every short SKU, not just the first.
++   */
+   reserveAll(items: ReserveItem[]): void {
+     const done: ReserveItem[] = [];
++    const shortages: Shortage[] = [];
+     try {
+       for (const item of items) {
+-        this.reserve(item.sku, item.qty);
+-        done.push(item);
++        try {
++          this.reserve(item.sku, item.qty);
++          done.push(item);
++        } catch (e) {
++          if (!(e instanceof InsufficientStockError)) throw e;
++          shortages.push({ sku: e.sku, requested: e.requested, available: e.available });
++        }
+       }
+     } catch (e) {
+       for (const d of done) this.release(d.sku, d.qty);
+       throw e;
+     }
++    if (shortages.length > 0) {
++      for (const d of done) this.release(d.sku, d.qty);
++      const first = shortages[0] as Shortage;
++      throw new InsufficientStockError(first.sku, first.requested, first.available, shortages);
++    }
+   }
+ }

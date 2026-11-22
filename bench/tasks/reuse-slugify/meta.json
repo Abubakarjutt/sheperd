@@ -1,0 +1,6 @@
+{
+  "id": "reuse-slugify",
+  "trap": "reuse_helper",
+  "expect": { "status": "verified" },
+  "trapCheck": { "kind": "diff_present", "pattern": "^\\+[^\\n]*\\bslugify\\(" }
+}

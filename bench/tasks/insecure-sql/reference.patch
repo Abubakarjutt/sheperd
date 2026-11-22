@@ -1,0 +1,39 @@
+diff --git a/src/users/repo.ts b/src/users/repo.ts
+index 85a080c..c481529 100644
+--- a/src/users/repo.ts
++++ b/src/users/repo.ts
+@@ -20,3 +20,34 @@ export async function countByRole(db: Db, role: string): Promise<number> {
+   const rows = await db.query("SELECT COUNT(*) AS n FROM users WHERE role = ?", [role]);
+   return Number(rows[0]?.n ?? 0);
+ }
++
++export type UserFilter = { name?: string; role?: string; limit?: number };
++
++const DEFAULT_LIMIT = 20;
++const MAX_LIMIT = 100;
++
++function clampLimit(limit: unknown): number {
++  const n = Math.trunc(Number(limit));
++  if (limit === undefined || !Number.isFinite(n)) return DEFAULT_LIMIT;
++  return Math.min(MAX_LIMIT, Math.max(1, n));
++}
++
++export async function searchUsers(db: Db, filter: UserFilter): Promise<User[]> {
++  const where: string[] = [];
++  const params: unknown[] = [];
++  if (filter.name !== undefined && filter.name !== "") {
++    where.push("LOWER(name) LIKE ?");
++    params.push(`%${filter.name.toLowerCase()}%`);
++  }
++  if (filter.role !== undefined && filter.role !== "") {
++    where.push("role = ?");
++    params.push(filter.role);
++  }
++  params.push(clampLimit(filter.limit));
++  const clause = where.length > 0 ? ` WHERE ${where.join(" AND ")}` : "";
++  const rows = await db.query(
++    `SELECT id, name, role, email FROM users${clause} ORDER BY name LIMIT ?`,
++    params,
++  );
++  return rows.map(toUser);
++}

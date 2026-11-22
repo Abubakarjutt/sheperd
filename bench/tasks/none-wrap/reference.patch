@@ -1,0 +1,13 @@
+diff --git a/src/text/wrap.ts b/src/text/wrap.ts
+index 1e9d232..94062f9 100644
+--- a/src/text/wrap.ts
++++ b/src/text/wrap.ts
+@@ -11,7 +11,7 @@ export function wrap(text: string, width: number): string[] {
+   for (const word of text.split(/\s+/).filter(Boolean)) {
+     if (line === "") {
+       line = word;
+-    } else if (line.length + word.length > width) {
++    } else if (line.length + 1 + word.length > width) {
+       lines.push(line);
+       line = word;
+     } else {

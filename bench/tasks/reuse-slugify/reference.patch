@@ -1,0 +1,19 @@
+diff --git a/src/articles.ts b/src/articles.ts
+index 178976d..d9633c3 100644
+--- a/src/articles.ts
++++ b/src/articles.ts
+@@ -1,4 +1,5 @@
+ import type { Article } from "./models.js";
++import { slugify } from "./text/slugify.js";
+ 
+ export function formatByline(article: Article): string {
+   const day = article.publishedAt.slice(0, 10);
+@@ -8,3 +9,8 @@ export function formatByline(article: Article): string {
+ export function sortNewestFirst(articles: Article[]): Article[] {
+   return [...articles].sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
+ }
++
++export function articleUrl(article: Article): string {
++  const slug = slugify(article.title);
++  return slug === "" ? `/articles/${article.id}` : `/articles/${slug}-${article.id}`;
++}

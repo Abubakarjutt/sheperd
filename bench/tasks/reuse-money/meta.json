@@ -1,0 +1,9 @@
+{
+  "id": "reuse-money",
+  "trap": "reuse_helper",
+  "expect": { "status": "verified" },
+  "trapCheck": {
+    "kind": "diff_absent",
+    "pattern": "^\\+[^\\n]*(\\.toFixed\\(|Intl\\.NumberFormat|\\.toLocaleString\\()"
+  }
+}

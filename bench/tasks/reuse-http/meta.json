@@ -1,0 +1,6 @@
+{
+  "id": "reuse-http",
+  "trap": "reuse_helper",
+  "expect": { "status": "verified" },
+  "trapCheck": { "kind": "diff_absent", "pattern": "^\\+[^\\n]*\\bfetch\\(" }
+}

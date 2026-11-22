@@ -1,0 +1,14 @@
+diff --git a/src/api/customers.ts b/src/api/customers.ts
+new file mode 100644
+index 0000000..04958d9
+--- /dev/null
++++ b/src/api/customers.ts
+@@ -0,0 +1,8 @@
++import { API_BASE } from "../config.js";
++import { fetchJson } from "../http/fetchJson.js";
++
++export type Customer = { id: string; name: string; email: string };
++
++export function getCustomer(id: string): Promise<Customer> {
++  return fetchJson<Customer>(`${API_BASE}/customers/${encodeURIComponent(id)}`);
++}

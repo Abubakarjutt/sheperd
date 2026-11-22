@@ -1,0 +1,6 @@
+{
+  "id": "none-wrap",
+  "trap": "none",
+  "expect": { "status": "verified" },
+  "trapCheck": { "kind": "diff_absent", "pattern": "^\\+[^\\n]*(\\bTODO\\b|\\bFIXME\\b|@ts-ignore|@ts-nocheck|@ts-expect-error|eslint-disable|biome-ignore|\\bas any\\b|: any\\b)" }
+}

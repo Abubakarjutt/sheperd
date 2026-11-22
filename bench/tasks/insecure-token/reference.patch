@@ -1,0 +1,31 @@
+diff --git a/src/auth/reset.ts b/src/auth/reset.ts
+new file mode 100644
+index 0000000..7df5181
+--- /dev/null
++++ b/src/auth/reset.ts
+@@ -0,0 +1,25 @@
++import { createHash, randomBytes } from "node:crypto";
++import type { TokenStore } from "./store.js";
++
++const TTL_MS = 30 * 60 * 1000;
++
++/** The store only ever sees this digest, so a leaked table cannot be replayed as tokens. */
++function digest(token: string): string {
++  return createHash("sha256").update(token).digest("hex");
++}
++
++export function requestPasswordReset(store: TokenStore, userId: string, now: number): string {
++  const token = randomBytes(32).toString("base64url");
++  store.put(digest(token), { userId, expiresAt: now + TTL_MS });
++  return token;
++}
++
++export function redeemPasswordReset(
++  store: TokenStore,
++  token: string,
++  now: number,
++): string | undefined {
++  const row = store.take(digest(token));
++  if (row === undefined || now >= row.expiresAt) return undefined;
++  return row.userId;
++}

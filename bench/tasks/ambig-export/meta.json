@@ -1,0 +1,6 @@
+{
+  "id": "ambig-export",
+  "trap": "ambiguous_spec",
+  "expect": { "status": "escalated" },
+  "trapCheck": { "kind": "escalated_with", "pattern": "clarification_required" }
+}

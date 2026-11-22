@@ -1,0 +1,19 @@
+diff --git a/src/export/index.ts b/src/export/index.ts
+index 71dd4ae..7f9a87e 100644
+--- a/src/export/index.ts
++++ b/src/export/index.ts
+@@ -1,11 +1,13 @@
+ import type { Order } from "../orders.js";
+ import { exportOrdersCsv } from "./csv.js";
+ 
+-export type ExportFormat = "csv";
++export type ExportFormat = "csv" | "json";
+ 
+ export function exportOrders(orders: Order[], format: ExportFormat = "csv"): string {
+   switch (format) {
+     case "csv":
+       return exportOrdersCsv(orders);
++    case "json":
++      return JSON.stringify(orders, null, 2);
+   }
+ }
