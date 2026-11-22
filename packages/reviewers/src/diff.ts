@@ -63,38 +63,72 @@ const isBinaryAsset = (p: string): boolean => {
 
 /** git's own binary heuristic: a NUL in the first 8000 bytes. */
 export const SNIFF_BYTES = 8000;
-const HEAD_BIN = "/usr/bin/head";
+const OD_BIN = "/usr/bin/od";
+
+/** R21c: magic numbers per asset extension (`null` = any byte). Others fall back to NUL. */
+const MAGIC: Record<string, (number | null)[][]> = (() => {
+  const a = (s: string): number[] => [...Buffer.from(s, "latin1")];
+  const any4 = [null, null, null, null];
+  const png = [[0x89, 0x50, 0x4e, 0x47]];
+  const jpg = [[0xff, 0xd8, 0xff]];
+  const gz = [[0x1f, 0x8b]];
+  return {
+    png,
+    jpg,
+    jpeg: jpg,
+    gif: [a("GIF8")],
+    webp: [[...a("RIFF"), ...any4, ...a("WEBP")]],
+    ico: [[0x00, 0x00, 0x01, 0x00]],
+    woff: [a("wOFF")],
+    woff2: [a("wOF2")],
+    ttf: [[0x00, 0x01, 0x00, 0x00], a("true")],
+    otf: [a("OTTO")],
+    wasm: [[0x00, 0x61, 0x73, 0x6d]],
+    pdf: [a("%PDF")],
+    zip: [[0x50, 0x4b, 0x03, 0x04]],
+    gz,
+    tgz: gz,
+    mp4: [[...any4, ...a("ftyp")]],
+    ogg: [a("OggS")],
+    wav: [[...a("RIFF"), ...any4, ...a("WAVE")]],
+  };
+})();
+
+export type Sniff = { asset: boolean; nulLine?: number };
 
 /**
- * R21b: is the worktree (new-side) content of `rel` really binary? Only the first SNIFF_BYTES
- * bytes are read, inside the review sandbox, after realpath containment. Anything that cannot be
- * proven binary (missing, outside, a symlink out) is "not binary" and is reviewed as text.
+ * R21b/R21c: is the worktree (new-side) content of `rel` really a binary asset? Only the first
+ * SNIFF_BYTES bytes are read (`od`, hex, inside the review sandbox) after realpath containment.
+ * An extension with a known magic number is an asset only if the bytes start with it; other asset
+ * extensions need a NUL (git's heuristic). Anything unprovable (missing, outside, a symlink out)
+ * is not an asset and is reviewed as text. `nulLine` is the line of the first NUL, if any, so a
+ * non-asset with a NUL gets the forced NUL finding.
  */
-async function isBinaryContent(worktree: string, rel: string, g: GateExec): Promise<boolean> {
+async function sniffAsset(worktree: string, rel: string, g: GateExec): Promise<Sniff> {
   const r = await resolveInsideWorktree(worktree, rel);
-  if (r.kind !== "ok") return false;
-  const out = await g.exec([HEAD_BIN, "-c", String(SNIFF_BYTES), "--", r.path]);
+  if (r.kind !== "ok") return { asset: false };
+  const out = await g.exec([OD_BIN, "-An", "-v", "-tx1", `-N${SNIFF_BYTES}`, "--", r.path]);
   if (out.timedOut || out.exitCode !== 0) {
     throw new Error(`binary sniff of ${rel} failed (exit ${out.exitCode}): ${out.stderr.trim()}`);
   }
-  return out.stdout.includes("\0");
+  const bytes = (out.stdout.match(/[0-9a-f]{2}/gi) ?? []).map((h) => Number.parseInt(h, 16));
+  const nul = bytes.indexOf(0);
+  const nulLine = nul < 0 ? undefined : bytes.slice(0, nul).filter((b) => b === 0x0a).length + 1;
+  const ext = /\.([^./]+)$/.exec(rel)?.[1]?.toLowerCase() ?? "";
+  const magics = MAGIC[ext];
+  const asset = magics
+    ? magics.some((m) => m.every((b, i) => b === null || bytes[i] === b))
+    : nul >= 0;
+  return nulLine === undefined ? { asset } : { asset, nulLine };
 }
 
 /** R22: ignored-file listing cap. */
 export const IGNORED_CAP = 10_000;
-/** Self-ignoring tool caches: everything under them is ignored silently (R22). */
-const CACHE_DIRS = new Set([
-  ".pytest_cache",
-  ".mypy_cache",
-  ".ruff_cache",
-  "__pycache__",
-  ".venv",
-  "venv",
-  ".tox",
-  ".cache",
-  ".turbo",
-  ".parcel-cache",
-]);
+/** Source-free, self-ignoring tool caches: silent wherever they are (R22, round 5). */
+const SOURCE_FREE_CACHES = new Set([".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__"]);
+/** Other cache-named dirs: silent only when already ignored at baseRef (round 5). */
+const OTHER_CACHES = new Set([".venv", "venv", ".tox", ".cache", ".turbo", ".parcel-cache"]);
+const MANIFESTS = ["package.json", "Cargo.toml", "pyproject.toml"];
 /** Conventional build output: silent when the directory was already ignored at baseRef (R22). */
 const BUILD_DIRS = new Set(["dist", "build", "out", "coverage", ".next", "target", "lib"]);
 /** Ignored files with these extensions escalate by name, never by content (R22). */
@@ -121,7 +155,6 @@ const isSource = (p: string): boolean => {
   return ext !== undefined && SOURCE_EXTS.includes(ext);
 };
 const segments = (p: string): string[] => p.split("/").filter((s) => s !== "");
-const inCacheDir = (p: string): boolean => segments(p).some((s) => CACHE_DIRS.has(s));
 /** Files that steer git itself; any change (or new ignored copy) is a forced finding. */
 const PROTECTED_NAMES = new Set([".gitattributes", ".gitignore"]);
 const protectedBase = (p: string): string | undefined => {
@@ -316,10 +349,19 @@ export async function buildDiffSummary(
   // whose new side is text are re-diffed as text; only real binary content stays an asset.
   const binaryAssets = new Set<string>();
   const textAssets: string[] = [];
+  const assetNul = new Map<string, number>();
   for (const c of changed) {
     if (!isBinaryAsset(c.path)) continue;
-    if (c.status === "D" || (await isBinaryContent(worktree, c.path, g))) binaryAssets.add(c.path);
-    else textAssets.push(c.path);
+    if (c.status === "D") {
+      binaryAssets.add(c.path);
+      continue;
+    }
+    const sn = await sniffAsset(worktree, c.path, g);
+    if (sn.asset) binaryAssets.add(c.path);
+    else {
+      textAssets.push(c.path);
+      if (sn.nulLine !== undefined) assetNul.set(c.path, sn.nulLine);
+    }
   }
   if (textAssets.length > 0) raw += await textDiff(textAssets.map((p) => `:(literal)${p}`));
   const parsed = parseDiff(raw);
@@ -350,6 +392,11 @@ export async function buildDiffSummary(
     files.push({ path: f.path, addedLines: f.addedLines });
     if (f.nulLine !== undefined) nulFinding(f.path, f.nulLine);
   }
+  // R21c: an asset-named file that is not a real asset but holds a NUL is always forced, even
+  // when the NUL is on a line this diff did not add.
+  for (const [path, line] of assetNul) {
+    if (!forced.some((x) => x.file === path)) nulFinding(path, line);
+  }
   // A changed path with no parsed hunks is never dropped silently.
   const seen = new Set(files.map((f) => f.path));
   for (const c of changed) {
@@ -374,7 +421,7 @@ export async function buildDiffSummary(
   }
   let patch = tracked;
   for (const path of others.sort()) {
-    if (isBinaryAsset(path) && (await isBinaryContent(worktree, path, g))) {
+    if (isBinaryAsset(path) && (await sniffAsset(worktree, path, g)).asset) {
       files.push({ path, addedLines: [] });
       omitted.push(`${path} (binary asset)`);
       continue;
@@ -438,12 +485,17 @@ export async function buildDiffSummary(
 
 /**
  * R22: ignored untracked files, by NAME only (never read, never sent to the provider).
- * `--directory` keeps huge ignored trees as one entry. Each entry is classified from its path:
- * cache dirs are silent; an ignored `.gitignore`/`.gitattributes` is a protected path (forced
- * finding); an ignored source file escalates as `"<path> (ignored source file)"`; everything
- * else is silent. A directory entry is silent when it is conventional build output that was
- * already ignored at baseRef; any other directory entry is expanded by a second name-only listing
- * restricted to source and protected names. The listing is capped at IGNORED_CAP entries.
+ * `--directory` keeps huge ignored trees as one entry; capped at IGNORED_CAP entries. Each path is
+ * classified by its first exempt ancestor directory (round 5):
+ *   - a source-free tool cache (.pytest_cache, .mypy_cache, .ruff_cache, __pycache__): silent,
+ *     except a protected file other than the cache's own top-level `.gitignore` (forced);
+ *   - another cache name (.venv, venv, .tox, .cache, .turbo, .parcel-cache) ignored at baseRef,
+ *     or a build dir (dist, build, out, coverage, .next, target, lib) ignored at baseRef that sits
+ *     at the repo root or beside a baseRef package.json/Cargo.toml/pyproject.toml: silent;
+ *   - otherwise: an ignored `.gitignore`/`.gitattributes` is a protected path (forced finding), an
+ *     ignored source file escalates as `"<path> (ignored source file)"`, the rest is silent.
+ * Non-exempt directory entries (and source-free caches, for protected names only) are expanded
+ * by a second name-only listing restricted to source extensions and protected names.
  */
 async function listIgnored(
   g: GateExec,
@@ -455,45 +507,92 @@ async function listIgnored(
   const omitted: string[] = [];
   const protectedPaths: string[] = [];
   let truncated = false;
-  const capped = (list: string[]): string[] => {
-    if (list.length <= IGNORED_CAP) return list;
-    truncated = true;
-    return list.slice(0, IGNORED_CAP);
-  };
   const ls = (extra: string[], specs: string[]) =>
     g.git(["ls-files", "--others", "--ignored", "--exclude-standard", ...extra, "-z", ...specs]);
-  const entries = capped(
-    (await ls(["--directory"], scope)).split("\0").filter((p) => keep(p) && !inCacheDir(p)),
-  );
-  const files: string[] = [];
-  const dirs: string[] = [];
-  for (const e of entries) (e.endsWith("/") ? dirs : files).push(e);
+  let entries = (await ls(["--directory"], scope)).split("\0").filter(keep);
+  if (entries.length > IGNORED_CAP) {
+    truncated = true;
+    entries = entries.slice(0, IGNORED_CAP);
+  }
 
   const changedSet = new Set(changed.map((c) => c.path));
+  const memo = new Map<string, Promise<boolean>>();
+  const once = (key: string, f: () => Promise<boolean>): Promise<boolean> => {
+    let v = memo.get(key);
+    if (v === undefined) {
+      v = f();
+      memo.set(key, v);
+    }
+    return v;
+  };
+  const baseIgnored = (dir: string) =>
+    once(`i:${dir}`, () => ignoredAtBase(g, baseRef, dir, changedSet));
+  const besideManifest = (dir: string) =>
+    once(`m:${dir}`, async () => {
+      const parent = segments(dir).slice(0, -1).join("/");
+      if (parent === "") return true;
+      const paths = MANIFESTS.map((m) => `${parent}/${m}`);
+      const out = await g.git(["ls-tree", "-r", "-z", "--name-only", baseRef, "--", ...paths]);
+      return out.split("\0").some((x) => paths.includes(x));
+    });
+  type Exempt = { kind: "sourceFree" | "base"; dir: string } | undefined;
+  const exemptRoot = async (p: string): Promise<Exempt> => {
+    const segs = segments(p);
+    const limit = p.endsWith("/") ? segs.length : segs.length - 1;
+    for (let i = 0; i < limit; i++) {
+      const name = segs[i] ?? "";
+      const dir = `${segs.slice(0, i + 1).join("/")}/`;
+      if (SOURCE_FREE_CACHES.has(name)) return { kind: "sourceFree", dir };
+      if (OTHER_CACHES.has(name) && (await baseIgnored(dir))) return { kind: "base", dir };
+      if (BUILD_DIRS.has(name) && (await baseIgnored(dir)) && (await besideManifest(dir))) {
+        return { kind: "base", dir };
+      }
+    }
+    return undefined;
+  };
+  const classify = (p: string, ex: Exempt): void => {
+    if (ex?.kind === "base") return;
+    if (protectedBase(p) !== undefined) {
+      if (ex?.kind === "sourceFree" && p === `${ex.dir}.gitignore`) return;
+      protectedPaths.push(p);
+    } else if (ex === undefined && isSource(p)) {
+      omitted.push(`${p} (ignored source file)`);
+    }
+  };
+
+  const seen = new Set<string>();
   const expand: string[] = [];
-  for (const d of dirs) {
-    const name = segments(d).pop() ?? "";
-    if (BUILD_DIRS.has(name) && (await ignoredAtBase(g, baseRef, d, changedSet))) continue;
-    expand.push(d);
+  const sourceFree: string[] = [];
+  const skip: string[] = [];
+  for (const e of entries) {
+    const ex = await exemptRoot(e);
+    if (!e.endsWith("/")) {
+      seen.add(e);
+      classify(e, ex);
+    } else if (ex === undefined) expand.push(e);
+    else if (ex.kind === "sourceFree") sourceFree.push(e);
+    else skip.push(e);
   }
-  if (expand.length > 0) {
+  if (expand.length > 0 || sourceFree.length > 0) {
     const specs = [
       ...SOURCE_EXTS.map((x) => `:(glob,icase)**/*.${x}`),
       ...[...PROTECTED_NAMES].map((n) => `:(glob,icase)**/${n}`),
       ":(exclude,glob)**/node_modules/**",
       ":(exclude,glob).git/**",
-      ...[...CACHE_DIRS].map((c) => `:(exclude,glob)**/${c}/**`),
+      ...skip.map((d) => `:(exclude,literal)${d.replace(/\/$/, "")}`),
     ];
+    const under = (p: string, dirs: string[]) => dirs.some((d) => p.startsWith(d));
     const inner = (await ls([], ["--", ...specs]))
       .split("\0")
-      .filter((p) => keep(p) && !inCacheDir(p) && expand.some((d) => p.startsWith(d)));
+      .filter(
+        (p) =>
+          keep(p) &&
+          !seen.has(p) &&
+          (under(p, expand) || (protectedBase(p) !== undefined && under(p, sourceFree))),
+      );
     const room = Math.max(0, IGNORED_CAP - entries.length);
     if (inner.length > room) truncated = true;
-    files.push(...inner.slice(0, room));
-  }
-  for (const p of new Set(files)) {
-    if (protectedBase(p) !== undefined) protectedPaths.push(p);
-    else if (isSource(p)) omitted.push(`${p} (ignored source file)`);
+    for (const p of inner.slice(0, room)) classify(p, await exemptRoot(p));
   }
   if (truncated) omitted.push("ignored-file listing truncated");
   return { omitted, protectedPaths };

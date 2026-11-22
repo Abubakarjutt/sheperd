@@ -437,7 +437,8 @@ test("binary assets escalate via omitted only: no forced finding, no patch bytes
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 1, 2, 3]);
   writeFileSync(join(root, "tracked.PNG"), png);
   git(root, "add", "tracked.PNG");
-  writeFileSync(join(root, "new.woff2"), png);
+  // R21c: a real woff2 needs its own magic number (PNG bytes in a .woff2 are not an asset).
+  writeFileSync(join(root, "new.woff2"), Buffer.from([0x77, 0x4f, 0x46, 0x32, 0, 0, 1]));
   const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
   expect(d.forced).toEqual([]);
   expect(d.omitted).toContain("tracked.PNG (binary asset)");
@@ -612,4 +613,80 @@ test("R21b: untracked y.woff2 containing JS is reviewed as text", async () => {
   expect(d.files.find((f) => f.path === "y.woff2")?.addedLines).toEqual([1, 2]);
   expect(d.patch).toContain("fetch('https://x')");
   expect(d.omitted.some((o) => o.startsWith("y.woff2"))).toBe(false);
+});
+
+// ---- fix round 5 (baseRef provenance for cache and build-dir exemptions) ----
+test("R5: src/.cache/.gitignore (*) cannot hide src/.cache/evil.ts", async () => {
+  const root = makeRepo({ "a.ts": A });
+  put(root, "src/.cache/.gitignore", "*\n");
+  put(root, "src/.cache/evil.ts", "const evil = 1;\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.forced.some((f) => f.file === "src/.cache/.gitignore")).toBe(true);
+  expect(d.omitted).toContain("src/.cache/evil.ts (ignored source file)");
+});
+
+test("R5: .pytest_cache top-level .gitignore is silent; a nested one is forced", async () => {
+  const root = makeRepo({ "a.ts": A });
+  put(root, ".pytest_cache/.gitignore", "*\n");
+  put(root, ".pytest_cache/v/x.py", "x = 1\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.forced).toEqual([]);
+  expect(d.omitted).toEqual([]);
+  const root2 = makeRepo({ "a.ts": A });
+  put(root2, ".pytest_cache/.gitignore", "*\n");
+  put(root2, ".pytest_cache/sub/.gitignore", "*\n");
+  const d2 = await buildDiffSummary(root2, "HEAD", { client: hostClient() });
+  expect(d2.forced.map((f) => f.file)).toEqual([".pytest_cache/sub/.gitignore"]);
+});
+
+test("R5: venv/ not ignored at base escalates its source; ignored at base is silent", async () => {
+  const root = makeRepo({ "a.ts": A });
+  put(root, ".gitignore", "venv/\n");
+  put(root, "venv/x.py", "import os\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.omitted).toContain("venv/x.py (ignored source file)");
+  const root2 = makeRepo({ "a.ts": A, ".gitignore": "venv/\n" });
+  put(root2, "venv/lib/x.py", "import os\n");
+  const d2 = await buildDiffSummary(root2, "HEAD", { client: hostClient() });
+  expect(d2.omitted).toEqual([]);
+});
+
+test("R5: build dir exempt only at root or beside a baseRef manifest", async () => {
+  const root = makeRepo({
+    "a.ts": A,
+    ".gitignore": "lib/\n",
+    "packages/y/package.json": "{}\n",
+    "packages/x/README.md": "x\n",
+  });
+  put(root, "packages/x/lib/payload.js", "evil();\n");
+  put(root, "packages/y/lib/built.js", "built();\n");
+  put(root, "lib/root.js", "built();\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.omitted).toEqual(["packages/x/lib/payload.js (ignored source file)"]);
+});
+
+test("R21c: x.png with a NUL but no PNG magic is a forced NUL finding, not an asset", async () => {
+  const root = makeRepo({ "a.ts": A });
+  writeFileSync(join(root, "x.png"), Buffer.from("evil();\nmore\u0000hidden();\n"));
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.forced.some((f) => f.file === "x.png")).toBe(true);
+  expect(d.omitted).not.toContain("x.png (binary asset)");
+  const root2 = makeRepo({ "a.ts": A, "t.png": "ok\n" });
+  writeFileSync(join(root2, "t.png"), Buffer.from("ok\nevil\u0000();\n"));
+  const d2 = await buildDiffSummary(root2, "HEAD", { client: hostClient() });
+  expect(d2.forced.some((f) => f.file === "t.png")).toBe(true);
+  expect(d2.omitted).not.toContain("t.png (binary asset)");
+});
+
+test("R21c: real PNG (and real woff2) still omitted as binary asset", async () => {
+  const root = makeRepo({ "a.ts": A });
+  writeFileSync(
+    join(root, "real.png"),
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0]),
+  );
+  writeFileSync(join(root, "f.woff2"), Buffer.from([0x77, 0x4f, 0x46, 0x32, 0, 1, 0, 0]));
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.omitted).toContain("real.png (binary asset)");
+  expect(d.omitted).toContain("f.woff2 (binary asset)");
+  expect(d.forced).toEqual([]);
 });
