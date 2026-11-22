@@ -1,18 +1,30 @@
 import { type Finding, RewireError } from "@rewire/core";
 import type { DiffSummary } from "./diff.js";
 import type { Dropped } from "./evidence.js";
-import { type ReviewerDef, type ReviewerInput, runReviewer } from "./framework.js";
+import {
+  type ReviewerDef,
+  type ReviewerInput,
+  type ReviewResult,
+  runReviewer,
+} from "./framework.js";
 
 /** An added line that suggests error-handling or fallback code worth a silent-failure review. */
 export const SILENT_FAILURE_PATTERN =
-  /\bcatch\b|\?\?|\|\||TODO|FIXME|console\.(error|warn)|\.catch\(|Promise\.allSettled/;
+  /\bcatch\b|\?\?|\|\||TODO|FIXME|console\.(error|warn)|\.catch\(|Promise\.allSettled|\bexcept\b|\brescue\b|\bfinally\b|\.then\(|unwrap_or|_ = err|if err != nil/;
 
-/** Text of every line the patch adds (`+` lines, not the `+++` file header). */
+/**
+ * Text of every line the patch adds. Hunk-aware: inside a hunk (after `@@`) every `+` line is
+ * added, including ones that start `++`; outside a hunk the `--- `/`+++ ` headers are skipped.
+ */
 function addedText(patch: string): string[] {
-  return patch
-    .split("\n")
-    .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
-    .map((l) => l.slice(1));
+  const out: string[] = [];
+  let inHunk = false;
+  for (const l of patch.split("\n")) {
+    if (l.startsWith("diff --git ")) inHunk = false;
+    else if (l.startsWith("@@")) inHunk = true;
+    else if (inHunk && l.startsWith("+")) out.push(l.slice(1));
+  }
+  return out;
 }
 
 export const REVIEWERS: ReviewerDef[] = [
@@ -64,7 +76,7 @@ export async function runPanel(input: ReviewerInput): Promise<PanelResult> {
   const selected = selectReviewers(input.diff);
   const settled = await Promise.allSettled(selected.map((def) => runReviewer(def, input)));
 
-  const results = [];
+  const results: ReviewResult[] = [];
   for (const [i, s] of settled.entries()) {
     if (s.status === "rejected") {
       const reviewer = selected[i]?.name ?? "unknown";

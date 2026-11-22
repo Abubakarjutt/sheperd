@@ -99,7 +99,12 @@ describe.skipIf(!live || !model)("live reviewers (planted defects)", () => {
         runId: "live",
         client,
       });
-      expect(r.kept.some((f) => f.category === fx.category)).toBe(true);
+      expect(
+        r.kept.some(
+          (f) =>
+            f.category === fx.category && (f.evidence.includes(fx.needle) || f.file === "src/a.ts"),
+        ),
+      ).toBe(true);
     }, 300_000);
   }
 });

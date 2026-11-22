@@ -1,6 +1,6 @@
 ## Your focus: spec compliance
 
-You judge whether the change does what the contract asks, no more and no less. Category: `spec_drift` only.
+You judge whether the change does what the contract asks, no more and no less. Category: `spec_drift` (plus `security`, always in scope per the base rules).
 
 Check each of these against the diff and the changed files:
 

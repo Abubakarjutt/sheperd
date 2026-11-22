@@ -1,5 +1,5 @@
 import { DEFAULT_POLICY } from "@rewire/policy";
-import { FauxProvider, text } from "@rewire/providers";
+import { FauxProvider, type ScriptEntry, text } from "@rewire/providers";
 import { expect, test } from "vitest";
 import { type DiffSummary, REVIEWERS, runPanel, selectReviewers } from "../src/index.js";
 import { hostClient, makeRepo, put } from "./helpers.js";
@@ -65,12 +65,55 @@ test("silent-failure ignores removed and context lines, and plain code", () => {
   expect(names(removedOnly)).not.toContain("silent-failure");
 });
 
+test("hunk-aware scanning: an added line starting with ++ still counts (I1)", () => {
+  expect(names(diffOf(["++n; try { f() } catch {}"]))).toContain("silent-failure");
+});
+
+test("a +++ file header alone does not select silent-failure (I1)", () => {
+  const d: DiffSummary = {
+    ...diffOf(["const a = 1;"]),
+    patch:
+      "diff --git a/catch.ts b/catch.ts\n--- a/catch.ts\n+++ b/catch.ts\n@@ -1,0 +1,1 @@\n+const a = 1;\n",
+  };
+  expect(names(d)).not.toContain("silent-failure");
+  const headerOnly: DiffSummary = { ...d, patch: "--- a/x\n+++ b/x || y ?? catch\n" };
+  expect(names(headerOnly)).not.toContain("silent-failure");
+});
+
+test("a new file's header after a hunk is not treated as hunk content", () => {
+  const d: DiffSummary = {
+    ...diffOf(["x"]),
+    patch:
+      "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -0,0 +1 @@\n+x\ndiff --git a/b b/b\n--- a/b\n+++ b/b catch\n@@ -0,0 +1 @@\n+y\n",
+  };
+  expect(names(d)).not.toContain("silent-failure");
+});
+
+test.each([
+  "except ValueError:",
+  "rescue StandardError => e",
+  "} finally {",
+  "fetch(u).then(r => r.json())",
+  "let n = x.unwrap_or(0);",
+  "_ = err",
+  "if err != nil {",
+])("silent-failure triggers on non-JS token %s", (line) => {
+  expect(names(diffOf([line]))).toContain("silent-failure");
+});
+
+test.each(["const catchment = 1;", "a?.b", "const x = c ? 1 : 2;", "exceptional()", "rescued = 1"])(
+  "silent-failure negative: %s",
+  (line) => {
+    expect(names(diffOf([line]))).not.toContain("silent-failure");
+  },
+);
+
 test("silent-failure is selected when the patch was truncated (cannot prove absence)", () => {
   expect(names(diffOf(["const a = 1;"], { truncated: true }))).toContain("silent-failure");
 });
 
 async function panelSetup(
-  script: string[],
+  script: (string | ScriptEntry)[],
   over: Partial<DiffSummary> = {},
   added = ["const a = b ?? 0;"],
 ) {
@@ -80,7 +123,7 @@ async function panelSetup(
   const client = hostClient();
   const built = await buildDiffSummary(root, "HEAD", { client });
   const diff = { ...built, ...over };
-  const provider = new FauxProvider(script.map((s) => text(s)));
+  const provider = new FauxProvider(script.map((s) => (typeof s === "string" ? text(s) : s)));
   const run = (d: DiffSummary = diff) =>
     runPanel({
       diff: d,
@@ -104,23 +147,40 @@ const forcedOne = {
   failureScenario: "binary content hidden",
 };
 
-test("panel rejects if one reviewer fails, naming it", async () => {
-  // Faux provider hands out scripted replies in call order; make the 3rd call garbage.
-  const { run } = await panelSetup([none, none, "garbage", "garbage"]);
-  await expect(run()).rejects.toThrow(/silent-failure|security|spec-compliance/);
-  await expect(
-    (async () => {
-      const s = await panelSetup([
-        "garbage",
-        "garbage",
-        "garbage",
-        "garbage",
-        "garbage",
-        "garbage",
-      ]);
-      return s.run();
-    })(),
-  ).rejects.toMatchObject({ message: expect.stringMatching(/^reviewer "[a-z-]+" failed/) });
+test("panel rejection names the failing reviewer, keeps code and cause (I2)", async () => {
+  const bySystem: ScriptEntry = (req) => ({
+    text: req.system?.includes("## Your focus: silent failure") ? "garbage" : none,
+  });
+  const { run } = await panelSetup(Array.from({ length: 12 }, () => bySystem));
+  const err = await run().then(
+    () => undefined,
+    (e: unknown) => e,
+  );
+  expect(err).toBeInstanceOf(Error);
+  expect((err as Error).message).toContain('reviewer "silent-failure"');
+  expect((err as { code?: string }).code).toBe("structured_output_invalid");
+  expect((err as { cause?: unknown }).cause).toBeInstanceOf(Error);
+});
+
+test("dropped findings are deduped by (id, reason); reviewer omissions are unioned", async () => {
+  const bad = {
+    category: "security",
+    severity: 2,
+    file: "a.ts",
+    lineStart: 2,
+    lineEnd: 2,
+    evidence: "const hallucinated = true;",
+    failureScenario: "x then y",
+    confidence: 0.9,
+    suggestedFix: "f",
+  };
+  const twice = JSON.stringify({ findings: [bad, bad] });
+  const { run, diff } = await panelSetup([twice, twice, twice]);
+  const r = await run({ ...diff, files: [...diff.files, { path: "ghost.ts", addedLines: [1] }] });
+  // 3 reviewers x 2 identical drops collapse to one (id, reason)
+  expect(r.dropped).toHaveLength(1);
+  expect(r.omitted.some((o) => o.startsWith("ghost.ts"))).toBe(true);
+  expect(r.escalate).toBe(true);
 });
 
 test("clean panel does not escalate", async () => {
