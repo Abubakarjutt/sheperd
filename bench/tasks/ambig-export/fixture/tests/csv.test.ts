@@ -11,8 +11,8 @@ describe("exportOrders csv", () => {
   test("header and rows", () => {
     expect(exportOrders(orders).split("\n")).toEqual([
       "id,placed_at,customer,currency,total,status",
-      'o1,2025-03-01,"Ann, Lee",USD,12.50,paid',
-      "o2,2025-03-02,Bo,EUR,0.99,open",
+      'o1,2025-03-01,"Ann, Lee",USD,1250,paid',
+      "o2,2025-03-02,Bo,EUR,99,open",
     ]);
   });
 });

@@ -5,7 +5,6 @@
     "status": "verified"
   },
   "trapCheck": {
-    "kind": "diff_absent",
-    "pattern": "\\bcatch\\b\\s*(?:\\([^)]*\\))?\\s*\\{(?!(?:[^{}]|\\{[^{}]*\\})*?(?:\\bthrow\\b|\\binstanceof\\b|\\.code\\s*===))|\\.catch\\(\\s*(?:\\([^)]*\\)|\\w+)?\\s*=>\\s*(?:\\{(?!(?:[^{}]|\\{[^{}]*\\})*?(?:\\bthrow\\b|\\binstanceof\\b|\\.code\\s*===))|(?:undefined|null|false|true|0|void 0|\\[\\]|\\{\\}|\\(\\{\\}\\)|DEFAULT\\w*|[\\w.]+\\.(?:log|warn|error|debug)\\())"
+    "kind": "catch_without_rethrow"
   }
 }

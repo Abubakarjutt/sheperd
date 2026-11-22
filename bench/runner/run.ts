@@ -14,7 +14,14 @@ import {
   type Task,
   tokensFromReport,
 } from "./lib.js";
-import { isClean, type Outcome, type Score, scoreTask } from "./score.js";
+import {
+  escalationOf,
+  isClean,
+  isInfraReason,
+  type Outcome,
+  type Score,
+  scoreTask,
+} from "./score.js";
 
 export type TaskResult = {
   id: string;
@@ -107,6 +114,20 @@ async function runTask(task: Task, o: BenchOptions): Promise<TaskResult> {
         : `exit ${c.code}${end ? "" : ", no run_end event"}: ${c.stderr.trim().split("\n").pop() ?? ""}`;
       return { ...base, exitCode: c.code, status: "crashed", error: why, score: null };
     }
+    // stage_error / interrupted mean the pipeline or tooling failed, not that the model chose to
+    // stop: such a run is crashed (no score), never clean and never a trap result.
+    const infra = end.status === "escalated" ? escalationOf(c.events) : undefined;
+    if (infra && isInfraReason(infra.reason)) {
+      return {
+        ...base,
+        exitCode: c.code,
+        status: "crashed",
+        error: `escalated with ${infra.reason} (infrastructure): ${infra.question.trim().split("\n")[0] ?? ""}`,
+        score: null,
+        escalationReason: infra.reason,
+        escalationDetail: infra.question,
+      };
+    }
     const runId = end.runId;
     const branch = `rewire/${runId}`;
     const hasBranch = git(repo, "branch", "--list", branch).trim() !== "";
@@ -178,10 +199,17 @@ export function markdownTable(
   ].join("\n");
 }
 
-/** Local time, minute resolution: runs never overwrite each other within a minute of each other. */
+/** Local time with seconds: `YYYY-MM-DDTHHmmss`. */
 export function fileStem(now: Date = new Date()): string {
   const p = (n: number): string => String(n).padStart(2, "0");
-  return `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}T${p(now.getHours())}${p(now.getMinutes())}`;
+  return `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}T${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`;
+}
+
+/** `stem`, or `stem-2`, `stem-3`... when `<stem>.json` already exists: a run never overwrites one. */
+export function uniqueStem(dir: string, stem: string): string {
+  let out = stem;
+  for (let n = 2; existsSync(join(dir, `${out}.json`)); n++) out = `${stem}-${n}`;
+  return out;
 }
 
 /** Errors that make every later task fail the same way: stop and keep what we have. */
@@ -199,9 +227,9 @@ export async function runBench(
   }
   const tasks = loadTasks(o.filter);
   const results: TaskResult[] = [];
-  const stem = `${fileStem()}${faux ? "-faux" : ""}`;
   const models = faux ? `faux (${faux})` : (o.models ?? "default models");
   mkdirSync(o.resultsDir, { recursive: true });
+  const stem = uniqueStem(o.resultsDir, `${fileStem()}${faux ? "-faux" : ""}`);
   const jsonPath = join(o.resultsDir, `${stem}.json`);
   let aborted = false;
   const persist = (): void => {
@@ -211,6 +239,7 @@ export async function runBench(
     );
     writeFileSync(join(o.resultsDir, `${stem}.md`), markdownTable(stem, models, results, aborted));
   };
+  persist(); // claims the file name straight away
   const onSigint = (): void => {
     aborted = true;
     persist();

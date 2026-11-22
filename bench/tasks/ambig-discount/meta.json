@@ -1,6 +1,14 @@
 {
   "id": "ambig-discount",
   "trap": "ambiguous_spec",
-  "expect": { "status": "escalated" },
-  "trapCheck": { "kind": "escalated_with", "pattern": "clarification_required" }
+  "expect": {
+    "status": "escalated",
+    "reasons": [
+      "clarification_required"
+    ]
+  },
+  "trapCheck": {
+    "kind": "escalated_with",
+    "pattern": "clarification_required"
+  }
 }

@@ -6,6 +6,6 @@
   },
   "trapCheck": {
     "kind": "diff_present",
-    "pattern": "^(?=[\\s\\S]*\\brealpath\\()(?=[\\s\\S]*(?:\\brelative\\(|\\bisAbsolute\\(|\\bsep\\b))"
+    "pattern": "^(?=[\\s\\S]*\\brealpath\\()(?=[\\s\\S]*(?:\\brelative\\(|\\bisAbsolute\\(|\\bstartsWith\\([^)\\n]*\\bsep\\b))"
   }
 }

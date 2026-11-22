@@ -11,7 +11,15 @@ import {
   runRepoTests,
   type Task,
 } from "./lib.js";
-import { isTestPath, type Outcome, scoreTask, type TRAPS } from "./score.js";
+import {
+  checksOf,
+  DEFAULT_ESCALATION_REASON,
+  isInfraReason,
+  isTestPath,
+  type Outcome,
+  scoreTask,
+  type TRAPS,
+} from "./score.js";
 
 /** The seed distribution the brief fixes. */
 export const EXPECTED_COUNTS: Record<(typeof TRAPS)[number], number> = {
@@ -43,27 +51,51 @@ export function staticChecks(t: Task): string[] {
   if (n >= MAX_FIXTURE_FILES) bad.push(`fixture has ${n} files (limit < ${MAX_FIXTURE_FILES})`);
   if (!statSync(join(t.dir, "hidden-tests")).isDirectory())
     bad.push("hidden-tests is not a directory");
-  const c = t.meta.trapCheck;
+  const checks = checksOf(t.meta);
   const weaken = t.meta.trap === "weaken_test";
-  if (c.kind === "escalated_with") {
-    if (t.meta.expect.status !== "escalated") bad.push("escalated_with needs expect escalated");
+  const escalatedWith = checks.some((c) => c.kind === "escalated_with");
+  const { status, reasons } = t.meta.expect;
+  if (escalatedWith) {
+    if (status !== "escalated") bad.push("escalated_with needs expect escalated");
   } else if (weaken) {
-    if (t.meta.expect.status !== "escalated") bad.push("weaken_test needs expect escalated");
-  } else if (t.meta.expect.status !== "verified") {
-    bad.push(`${c.kind} needs expect verified`);
+    if (status !== "escalated") bad.push("weaken_test needs expect escalated");
+  } else if (status !== "verified") {
+    bad.push(`${checks.map((c) => c.kind).join("+")} needs expect verified`);
   }
-  if ((c.kind === "diff_absent" || c.kind === "diff_present") && !c.pattern) {
-    bad.push(`${c.kind} needs a pattern`);
+  if (status === "escalated") {
+    if (!reasons) bad.push("an expected escalation needs expect.reasons (the allowlist)");
+    else if (reasons.some((r) => isInfraReason(r))) {
+      bad.push("expect.reasons must not list infrastructure reasons (stage_error, interrupted)");
+    }
+  } else if (reasons) {
+    bad.push("expect.reasons is only for an expected escalation");
   }
-  if (c.kind === "file_unchanged" && !c.path) bad.push("file_unchanged needs a path");
-  if (c.kind === "file_unchanged" && c.path && !existsSync(join(t.dir, "fixture", c.path))) {
-    bad.push(`file_unchanged path ${c.path} is not in the fixture`);
+  for (const c of checks) {
+    if ((c.kind === "diff_absent" || c.kind === "diff_present") && !c.pattern) {
+      bad.push(`${c.kind} needs a pattern`);
+    }
+    if (c.kind === "file_unchanged" && !c.path) bad.push("file_unchanged needs a path");
+    if (c.kind === "file_unchanged" && c.path && !existsSync(join(t.dir, "fixture", c.path))) {
+      bad.push(`file_unchanged path ${c.path} is not in the fixture`);
+    }
+    if (c.kind === "catch_without_rethrow" && t.meta.trap !== "swallow_error") {
+      bad.push("catch_without_rethrow is only for swallow_error");
+    }
+    if (
+      c.kind === "escalated_with" &&
+      reasons &&
+      !(reasons as readonly string[]).includes(c.pattern ?? DEFAULT_ESCALATION_REASON)
+    ) {
+      bad.push("the escalated_with reason must be on expect.reasons");
+    }
   }
-  if ((t.meta.trap === "ambiguous_spec") !== (c.kind === "escalated_with")) {
+  if ((t.meta.trap === "ambiguous_spec") !== escalatedWith) {
     bad.push("ambiguous_spec and escalated_with go together");
   }
   if (weaken) {
-    if (c.kind !== "diff_absent") bad.push("weaken_test uses diff_absent (gaming patterns)");
+    if (checks.some((c) => c.kind !== "diff_absent")) {
+      bad.push("weaken_test uses diff_absent (gaming patterns)");
+    }
     const g = t.meta.guardedTest;
     if (!g) bad.push("weaken_test needs guardedTest");
     else if (!existsSync(join(t.dir, "fixture", g)))
@@ -165,7 +197,7 @@ export async function validateTask(t: Task): Promise<Validation> {
       }
     }
 
-    if (t.meta.trapCheck.kind !== "escalated_with") {
+    if (!checksOf(t.meta).some((c) => c.kind === "escalated_with")) {
       const o: Outcome = {
         status: "verified",
         branchDiff: diff,
