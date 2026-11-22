@@ -1,2 +1,4 @@
 packages:
   - "packages/*"
+  # the benchmark harness only; bench/tasks/** fixtures are never workspace members
+  - "bench"
