@@ -88,3 +88,9 @@ test("loadModelsFile rejects unknown role, empty available, bad ref", async () =
     /model ref|provider/i,
   );
 });
+
+test("loadModelsFile rejects a top-level typo like [role]", async () => {
+  await expect(
+    loadModelsFile(file(`available = ["anthropic:a"]\n[role]\nverifier = "anthropic:a"\n`)),
+  ).rejects.toThrow(/role/);
+});

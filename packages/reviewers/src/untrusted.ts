@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-const CLOSER = /<\s*\/\s*(diff|file|contract)/gi;
+const CLOSER = /<\s*\/\s*(diff|file|contract|findings)/gi;
 const ATTR_NAME = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 
 const escAttr = (v: string): string =>
@@ -12,7 +12,7 @@ const escAttr = (v: string): string =>
  * a random per-call `id` so a forged closer cannot match. Attribute values are escaped.
  */
 export function wrapUntrusted(
-  tag: "diff" | "file" | "contract",
+  tag: "diff" | "file" | "contract" | "findings",
   content: string,
   attrs: Record<string, string> = {},
 ): string {

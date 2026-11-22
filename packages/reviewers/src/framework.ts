@@ -158,6 +158,11 @@ const cleanFinding = (f: Finding): Finding => ({
 
 /** Mandatory `security` findings decided by code (NUL bytes, protected git files). */
 function forcedFindings(def: ReviewerDef, diff: DiffSummary): Finding[] {
+  return forcedFindingsFor(def.name, diff);
+}
+
+/** Forced findings as reviewer `reviewer` would emit them (ids depend on the reviewer name). */
+export function forcedFindingsFor(reviewer: string, diff: DiffSummary): Finding[] {
   return diff.forced.map((f) => {
     const full = {
       ...f,
@@ -166,7 +171,7 @@ function forcedFindings(def: ReviewerDef, diff: DiffSummary): Finding[] {
       confidence: 1,
       suggestedFix: "",
       id: "",
-      reviewer: def.name,
+      reviewer,
     };
     return { ...full, id: fingerprintFinding(full).slice(0, 16) };
   });

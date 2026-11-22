@@ -75,7 +75,7 @@ const RefString = z.string().transform((s, ctx) => {
   }
 });
 
-const ModelsToml = z.object({
+const ModelsToml = z.strictObject({
   available: z.array(RefString).min(1, "available must list at least one model"),
   roles: z
     .object(Object.fromEntries(ROLES.map((r) => [r, RefString.optional()])))
