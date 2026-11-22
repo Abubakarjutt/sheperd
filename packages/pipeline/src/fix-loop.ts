@@ -1,4 +1,4 @@
-import type { Finding, GateResult } from "@rewire/core";
+import { type Finding, type GateResult, RewireError } from "@rewire/core";
 import type { Policy } from "@rewire/policy";
 
 /**
@@ -9,6 +9,11 @@ import type { Policy } from "@rewire/policy";
 
 export type RoundState = {
   round: number;
+  /**
+   * Callers may pass all gate results. Only entries with `status !== "pass"`
+   * count (both `fail` and `error`); `pass` entries are ignored, so an errored
+   * gate can never read as clean.
+   */
   gateFailures: GateResult[];
   blocking: Finding[];
   /** Reasons the review was incomplete (truncated diff, omitted files, forced findings, verifier error). */
@@ -50,9 +55,19 @@ const GATE_SUMMARY_CAP = 1000;
 const FIELD_CAP = 1500;
 const TOP_KEYS = 3;
 
+const failing = (s: RoundState): GateResult[] => s.gateFailures.filter((g) => g.status !== "pass");
+
 export function score(s: RoundState): number {
-  let total = GATE_WEIGHT * s.gateFailures.length;
-  for (const f of s.blocking) total += SEVERITY_WEIGHT[f.severity];
+  let total = GATE_WEIGHT * failing(s).length;
+  for (const f of s.blocking) {
+    if (!Number.isInteger(f.severity) || f.severity < 0 || f.severity > 3) {
+      throw new RewireError(
+        "invalid_severity",
+        `finding ${f.id} has invalid severity ${String(f.severity)}`,
+      );
+    }
+    total += SEVERITY_WEIGHT[f.severity];
+  }
   return total;
 }
 
@@ -60,11 +75,28 @@ export function score(s: RoundState): number {
 // does not depend on reviewers, so it is duplicated here. Keep in sync.
 const SECRET = /(sk-|ghp_|AKIA)[A-Za-z0-9_-]+/g;
 const redact = (s: string): string => s.replace(SECRET, "[redacted]");
-const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n)}…` : s);
+// Code-point-safe clip (never splits a surrogate pair).
+const clip = (s: string, n: number): string => {
+  const cps = Array.from(s);
+  return cps.length > n ? `${cps.slice(0, n).join("")}…` : s;
+};
+/** Clip to at most `bytes` UTF-8 bytes on a code-point boundary. */
+const clipBytes = (s: string, bytes: number): string => {
+  let used = 0;
+  let out = "";
+  for (const ch of s) {
+    const b = Buffer.byteLength(ch);
+    if (used + b > bytes) break;
+    out += ch;
+    used += b;
+  }
+  return out;
+};
+const NAME_CAP = 100;
 
 const gateKey = (g: GateResult): string => `gate:${g.gate}`;
 const roundKeys = (s: RoundState): Set<string> =>
-  new Set([...s.gateFailures.map(gateKey), ...s.blocking.map((f) => f.id)]);
+  new Set([...failing(s).map(gateKey), ...s.blocking.map((f) => f.id)]);
 
 const bySeverity = (a: Finding, b: Finding): number =>
   b.severity - a.severity ||
@@ -74,7 +106,7 @@ const bySeverity = (a: Finding, b: Finding): number =>
 
 function findingBlock(f: Finding): string {
   return [
-    `- ${f.file}:${f.lineStart} [${f.category}] severity ${f.severity}`,
+    `- ${redact(clip(f.file, FIELD_CAP))}:${f.lineStart} [${redact(clip(f.category, NAME_CAP))}] severity ${f.severity}`,
     `  scenario: ${redact(clip(f.failureScenario, FIELD_CAP))}`,
     `  fix: ${redact(clip(f.suggestedFix, FIELD_CAP))}`,
   ].join("\n");
@@ -82,9 +114,19 @@ function findingBlock(f: Finding): string {
 
 function buildFeedback(s: RoundState): string {
   const parts: string[] = [];
-  for (const g of s.gateFailures) {
-    parts.push(`Gate ${g.gate}: ${redact(clip(g.summary, GATE_SUMMARY_CAP))}`);
+  const gates = failing(s).map((g) => ({
+    prefix: `Gate ${redact(clip(g.gate, NAME_CAP))}: `,
+    summary: redact(clip(g.summary, GATE_SUMMARY_CAP)),
+  }));
+  const gateBytes = (): number =>
+    gates.reduce((n, g) => n + Buffer.byteLength(g.prefix) + Buffer.byteLength(g.summary) + 1, 0);
+  if (gates.length > 0 && gateBytes() > FEEDBACK_CAP_BYTES) {
+    // Shrink every summary proportionally; gates are never dropped.
+    const fixed = gates.reduce((n, g) => n + Buffer.byteLength(g.prefix) + 1, 0);
+    const per = Math.max(0, Math.floor((FEEDBACK_CAP_BYTES - fixed) / gates.length));
+    for (const g of gates) g.summary = clipBytes(g.summary, per);
   }
+  for (const g of gates) parts.push(`${g.prefix}${g.summary}`);
   let used = Buffer.byteLength(parts.join("\n"));
   const sorted = [...s.blocking].sort(bySeverity);
   const omittedLine = (n: number): string => `… ${n} more findings omitted`;
@@ -101,14 +143,12 @@ function buildFeedback(s: RoundState): string {
   if (shown < sorted.length) parts.push(omittedLine(sorted.length - shown));
   const out = parts.join("\n");
   // Gate lines are individually capped, but an absurd number of gates could still overflow.
-  return Buffer.byteLength(out) > FEEDBACK_CAP_BYTES
-    ? Buffer.from(out).subarray(0, FEEDBACK_CAP_BYTES).toString("utf8")
-    : out;
+  return Buffer.byteLength(out) > FEEDBACK_CAP_BYTES ? clipBytes(out, FEEDBACK_CAP_BYTES) : out;
 }
 
 function summarize(s: RoundState): string {
   const keys = [
-    ...s.gateFailures.map(gateKey),
+    ...failing(s).map(gateKey),
     ...[...s.blocking].sort(bySeverity).map((f) => f.id.slice(0, 12)),
   ].slice(0, TOP_KEYS);
   return `round ${s.round}: score ${score(s)}; top: ${keys.join(", ") || "none"}`;
@@ -173,7 +213,7 @@ export class FixLoopController {
     return {
       kind: "escalate",
       reason: trigger,
-      unresolved: [...s.gateFailures, ...s.blocking],
+      unresolved: [...failing(s), ...s.blocking],
       ...(reasons.length > 0 ? { details: [...reasons] } : {}),
     };
   }

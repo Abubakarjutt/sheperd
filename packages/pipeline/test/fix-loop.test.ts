@@ -1,4 +1,4 @@
-import type { Finding, GateResult } from "@rewire/core";
+import { type Finding, type GateResult, RewireError } from "@rewire/core";
 import { DEFAULT_POLICY } from "@rewire/policy";
 import { expect, test } from "vitest";
 import { FixLoopController, type RoundState, score } from "../src/fix-loop.js";
@@ -56,13 +56,44 @@ test("flat rounds trigger replan once then escalate no_progress", () => {
   expect(d).toMatchObject({ kind: "escalate", reason: "no_progress" });
 });
 
-test("reappearing fingerprint is oscillation", () => {
-  const c = new FixLoopController(wide);
+test("reappearing fingerprint is oscillation (no_progress disabled)", () => {
+  const c = new FixLoopController({ ...wide, noProgressRounds: 99 });
   const A = finding("A");
   expect(c.record(st(1, [], [A])).kind).toBe("fix");
   expect(c.record(st(2, [gate("g1")], [])).kind).toBe("fix");
-  const d = c.record(st(3, [], [A]));
-  expect(d.kind).toBe("replan");
+  expect(c.record(st(3, [], [A])).kind).toBe("replan");
+});
+
+test("oscillation fires even when every round strictly improves", () => {
+  const c = new FixLoopController(wide);
+  expect(c.record(st(1, [gate("g")], [finding("A", 3)])).kind).toBe("fix"); // 18
+  expect(c.record(st(2, [], [finding("B", 2)])).kind).toBe("fix"); // 5
+  expect(c.record(st(3, [], [finding("A", 0)])).kind).toBe("replan"); // 1
+});
+
+test("errored gate is never clean; pass-only gate is done", () => {
+  const err = { ...gate("e"), status: "error" as const };
+  const d = new FixLoopController(DEFAULT_POLICY).record(st(1, [err]));
+  expect(d.kind).toBe("fix");
+  expect(score(st(1, [err]))).toBe(10);
+  const ok = { ...gate("p"), status: "pass" as const };
+  expect(new FixLoopController(DEFAULT_POLICY).record(st(1, [ok])).kind).toBe("done");
+});
+
+test("invalid severity throws RewireError naming the finding", () => {
+  const bad = finding("badone", 2, {}) as Finding;
+  (bad as { severity: number }).severity = 7;
+  expect(() => score(st(1, [], [bad]))).toThrow(RewireError);
+  expect(() => new FixLoopController(DEFAULT_POLICY).record(st(1, [], [bad]))).toThrow(/badone/);
+});
+
+test("feedback cap shrinks gate summaries, keeps all gates, no U+FFFD", () => {
+  const gates = Array.from({ length: 40 }, (_, i) => gate(`gate${i}`, "日本語🙂".repeat(250)));
+  const d = new FixLoopController(DEFAULT_POLICY).record(st(1, gates, [finding("A", 3)]));
+  if (d.kind !== "fix") throw new Error("expected fix");
+  expect(Buffer.byteLength(d.feedback)).toBeLessThanOrEqual(16 * 1024);
+  expect(d.feedback).not.toContain("\uFFFD");
+  for (let i = 0; i < 40; i++) expect(d.feedback).toContain(`Gate gate${i}:`);
 });
 
 test("reappearing gate failure is oscillation, and escalates after replan", () => {
