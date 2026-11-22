@@ -1,5 +1,6 @@
 import { type Finding, type GateResult, RewireError } from "@rewire/core";
 import type { Policy } from "@rewire/policy";
+import { redact } from "@rewire/reviewers";
 
 /**
  * Fix-loop controller: a pure, deterministic state machine. No I/O, no model
@@ -29,11 +30,14 @@ export type EscalationReport = {
     | "clarification_required"
     | "interrupted"
     | "stage_error"
-    | "review_incomplete";
+    | "review_incomplete"
+    | "implementer_truncated";
   tried: string[];
   unresolved: Array<GateResult | Finding>;
   hypothesis: string;
   question: string;
+  /** Extra context: review-incomplete reasons, the failing stage's error code and message. */
+  details?: string[];
 };
 
 export type Decision =
@@ -71,10 +75,6 @@ export function score(s: RoundState): number {
   return total;
 }
 
-// Same pattern as `SECRET`/`redact` in @rewire/reviewers (framework.ts); pipeline
-// does not depend on reviewers, so it is duplicated here. Keep in sync.
-const SECRET = /(sk-|ghp_|AKIA)[A-Za-z0-9_-]+/g;
-const redact = (s: string): string => s.replace(SECRET, "[redacted]");
 // Code-point-safe clip (never splits a surrogate pair).
 const clip = (s: string, n: number): string => {
   const cps = Array.from(s);

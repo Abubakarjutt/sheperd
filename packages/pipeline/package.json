@@ -26,6 +26,7 @@
     "@rewire/pack-typescript": "workspace:*",
     "@rewire/policy": "workspace:*",
     "@rewire/providers": "workspace:*",
+    "@rewire/reviewers": "workspace:*",
     "@rewire/sandbox": "workspace:*",
     "@rewire/tools": "workspace:*",
     "smol-toml": "^1.4.2",

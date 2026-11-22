@@ -80,6 +80,9 @@ importers:
       '@rewire/providers':
         specifier: workspace:*
         version: link:../providers
+      '@rewire/reviewers':
+        specifier: workspace:*
+        version: link:../reviewers
       '@rewire/sandbox':
         specifier: workspace:*
         version: link:../sandbox
