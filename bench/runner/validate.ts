@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -12,6 +12,7 @@ import {
   type Task,
 } from "./lib.js";
 import {
+  checkResults,
   checksOf,
   DEFAULT_ESCALATION_REASON,
   isInfraReason,
@@ -36,6 +37,18 @@ const MAX_FIXTURE_FILES = 30;
 /** Traps whose tasks must ship a `slop.patch`: everything that has a diff-based or file check. */
 export const needsSlop = (t: Task): boolean =>
   t.meta.trap !== "none" && t.meta.trap !== "ambiguous_spec";
+
+/** slop.patch first, then slop-2.patch, slop-3.patch ... (each must trip the trapCheck). */
+export const slopPatches = (t: Task): string[] =>
+  readdirSync(t.dir)
+    .filter((f) => /^slop(?:-\d+)?\.patch$/.test(f))
+    .sort((a, b) =>
+      a === "slop.patch"
+        ? -1
+        : b === "slop.patch"
+          ? 1
+          : a.localeCompare(b, "en", { numeric: true }),
+    );
 
 /** Static checks that need no sandbox. Returns the problems found. */
 export function staticChecks(t: Task): string[] {
@@ -210,16 +223,20 @@ export async function validateTask(t: Task): Promise<Validation> {
     }
 
     if (needsSlop(t)) {
-      let slopDiff: string | undefined;
-      try {
-        slopDiff = applyOnBranch(repo, "slop", join(t.dir, "slop.patch"));
-      } catch (e) {
-        problems.push(`slop.patch does not apply: ${(e as Error).message.split("\n")[0]}`);
-      }
-      if (slopDiff !== undefined) {
+      const checks = checksOf(t.meta);
+      const tripped = checks.map(() => false);
+      const patches = slopPatches(t);
+      for (const [n, name] of patches.entries()) {
+        let slopDiff: string | undefined;
+        try {
+          slopDiff = applyOnBranch(repo, `slop${n}`, join(t.dir, name));
+        } catch (e) {
+          problems.push(`${name} does not apply: ${(e as Error).message.split("\n")[0]}`);
+        }
+        if (slopDiff === undefined) continue;
         const slopTests = testFilesIn(slopDiff);
         if (slopTests.length > 0) {
-          problems.push(`slop.patch touches test files: ${slopTests.join(", ")}`);
+          problems.push(`${name} touches test files: ${slopTests.join(", ")}`);
         }
         const hidden = await runHiddenTests(repo, t);
         const o: Outcome = {
@@ -229,16 +246,28 @@ export async function validateTask(t: Task): Promise<Validation> {
           events: [],
         };
         const s = scoreTask(t.meta, o);
-        slop = { trips: s.trapAvoided === false, hiddenCatches: !hidden.passed };
+        const per = checkResults(t.meta, o);
+        per.forEach((r, i) => {
+          if (r === false) tripped[i] = true;
+        });
+        const result = { trips: s.trapAvoided === false, hiddenCatches: !hidden.passed };
+        if (n === 0) slop = result;
         notes.push(
-          `slop: trapCheck ${slop.trips ? "trips" : "MISSES"}, hidden tests ${slop.hiddenCatches ? "catch" : "miss"} it`,
+          `${name}: trapCheck ${result.trips ? "trips" : "MISSES"}${per.length > 1 ? ` (${per.map((r) => (r === false ? "x" : "-")).join("")})` : ""}, hidden tests ${result.hiddenCatches ? "catch" : "miss"} it`,
         );
-        if (!slop.trips) problems.push("slop.patch does not trip the trapCheck (check is vacuous)");
+        if (!result.trips) problems.push(`${name} does not trip the trapCheck (check is vacuous)`);
         if (guarded) {
           const g = await runRepoTests(repo, [guarded]);
-          if (!g.passed) problems.push("slop.patch does not make the guarded test pass");
+          if (!g.passed) problems.push(`${name} does not make the guarded test pass`);
         }
       }
+      tripped.forEach((ok, i) => {
+        if (!ok) {
+          problems.push(
+            `check ${i + 1} (${checks[i]?.kind}) is not tripped by any slop patch (add slop-N.patch)`,
+          );
+        }
+      });
     }
     return done();
   } finally {

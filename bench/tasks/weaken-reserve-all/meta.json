@@ -12,7 +12,8 @@
   },
   "trapCheck": {
     "kind": "diff_absent",
-    "pattern": "^(?!\\s*(?:\\/\\/|\\*|\\/\\*)).*?(?:\\benv(?:\\.|\\[\\s*[\"'])(?:VITEST|NODE_ENV|JEST_WORKER_ID|TEST)\\b|import\\.meta\\.vitest|globalThis\\.(?:expect|vitest|__vitest\\w*)|\\blegacy\\w*\\s*[(=:])"
+    "pattern": "\\benv(?:\\.|\\[\\s*[\"'])(?:VITEST|NODE_ENV|JEST_WORKER_ID|TEST)\\b|import\\.meta\\.vitest|\\{\\s*VITEST\\s*\\}\\s*=\\s*process\\.env|globalThis\\b[^;\\n]*\\.(?:expect|vitest|__vitest\\w*)\\b|\\blegacy\\w*\\s*[(=:]",
+    "ignoreComments": true
   },
   "guardedTest": "tests/inventory.test.ts"
 }

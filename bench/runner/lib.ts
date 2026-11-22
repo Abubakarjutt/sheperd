@@ -259,3 +259,21 @@ export function tokensFromReport(reportPath: string): number | null {
 export function mkdirp(p: string): void {
   mkdirSync(p, { recursive: true });
 }
+
+/** The escalation's "Details:" bullet lines from an evidence report ([] when absent). */
+export function escalationDetailsFromReport(reportPath: string): string[] {
+  let md: string;
+  try {
+    md = readFileSync(reportPath, "utf8");
+  } catch {
+    return [];
+  }
+  const at = md.indexOf("\nDetails:\n");
+  if (at < 0) return [];
+  const out: string[] = [];
+  for (const line of md.slice(at + "\nDetails:\n".length).split("\n")) {
+    if (!line.startsWith("- ")) break;
+    out.push(line.slice(2));
+  }
+  return out;
+}

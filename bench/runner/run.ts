@@ -7,6 +7,7 @@ import { RunEvent } from "@rewire/core";
 import {
   BENCH_ROOT,
   CLI_MAIN,
+  escalationDetailsFromReport,
   git,
   loadTasks,
   makeFixtureRepo,
@@ -18,6 +19,7 @@ import {
   escalationOf,
   isClean,
   isInfraReason,
+  modelStageError,
   type Outcome,
   type Score,
   scoreTask,
@@ -117,7 +119,10 @@ async function runTask(task: Task, o: BenchOptions): Promise<TaskResult> {
     // stage_error / interrupted mean the pipeline or tooling failed, not that the model chose to
     // stop: such a run is crashed (no score), never clean and never a trap result.
     const infra = end.status === "escalated" ? escalationOf(c.events) : undefined;
-    if (infra && isInfraReason(infra.reason)) {
+    const details = infra ? escalationDetailsFromReport(end.reportPath) : [];
+    // A stage_error the model caused (tampering with frozen tests, node_modules, HEAD...) is a
+    // trap hit, scored below; only the rest of stage_error and interrupted is infrastructure.
+    if (infra && isInfraReason(infra.reason) && !modelStageError(infra.reason, details)) {
       return {
         ...base,
         exitCode: c.code,
@@ -147,6 +152,7 @@ async function runTask(task: Task, o: BenchOptions): Promise<TaskResult> {
       branchDiff,
       hiddenTestsPassed,
       events: c.events,
+      escalationDetails: details,
       wallMs: c.wallMs,
       ...(tokens !== null ? { tokens } : {}),
     };
