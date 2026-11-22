@@ -267,13 +267,20 @@ fn walk_read_only(p: &Profile, start: &Path, m: &mut Masks, budget: &mut usize) 
     Ok(())
 }
 
-/// A write-denied symlink needs no ro-bind (which would refuse it anyway) when
-/// its canonical target lies outside every writable root: the target is
-/// already read-only, and the link node itself is verified by the
-/// orchestrator (R33, e.g. the worktree's node_modules link). Unresolvable
-/// targets and targets inside a writable root keep the fail-closed mask.
-fn symlink_mask_skippable(target: Option<&Path>, writable: &[PathBuf]) -> bool {
-    target.is_some_and(|t| !writable.iter().any(|w| t.starts_with(w)))
+/// The worktree's `<root>/node_modules` link (and only that path) needs no
+/// ro-bind (which would refuse a symlink) when its canonical target lies
+/// outside every writable root: the target is already read-only, and the link
+/// node itself is verified by the orchestrator before every tool run (R33).
+/// Every other protected symlink, an unresolvable target, or a target inside
+/// a writable root keeps the fail-closed mask.
+fn symlink_mask_skippable(
+    path: &Path,
+    root: &Path,
+    target: Option<&Path>,
+    writable: &[PathBuf],
+) -> bool {
+    path == root.join("node_modules")
+        && target.is_some_and(|t| !writable.iter().any(|w| t.starts_with(w)))
 }
 
 /// Record a mask for `path` if a rule hits it; true = handled.
@@ -290,7 +297,7 @@ fn classify(p: &Profile, path: &Path, writable: &[PathBuf], m: &mut Masks) -> Re
         let is_link = fs::symlink_metadata(path).is_ok_and(|md| md.file_type().is_symlink());
         if is_link {
             let target = fs::canonicalize(path).ok();
-            if symlink_mask_skippable(target.as_deref(), writable) {
+            if symlink_mask_skippable(path, p.root(), target.as_deref(), writable) {
                 return Ok(true);
             }
         }
@@ -618,16 +625,39 @@ mod tests {
     }
 
     #[test]
-    fn symlink_mask_skippable_only_for_targets_outside_writable_roots() {
+    fn symlink_mask_skippable_only_for_root_node_modules_outside_writable_roots() {
+        let root = Path::new("/r");
+        let nm = Path::new("/r/node_modules");
         let w = vec![PathBuf::from("/r/src"), PathBuf::from("/scratch")];
-        assert!(symlink_mask_skippable(
-            Some(Path::new("/elsewhere/node_modules")),
+        let out = Some(Path::new("/elsewhere/node_modules"));
+        assert!(symlink_mask_skippable(nm, root, out, &w));
+        assert!(!symlink_mask_skippable(
+            nm,
+            root,
+            Some(Path::new("/r/src/inner")),
             &w
         ));
-        assert!(!symlink_mask_skippable(Some(Path::new("/r/src/inner")), &w));
-        assert!(!symlink_mask_skippable(Some(Path::new("/scratch")), &w));
+        assert!(!symlink_mask_skippable(
+            nm,
+            root,
+            Some(Path::new("/scratch")),
+            &w
+        ));
         // dangling or unresolvable: keep the fail-closed mask
-        assert!(!symlink_mask_skippable(None, &w));
+        assert!(!symlink_mask_skippable(nm, root, None, &w));
+        // any other protected symlink keeps the mask, wherever it points
+        assert!(!symlink_mask_skippable(
+            Path::new("/r/vendor"),
+            root,
+            out,
+            &w
+        ));
+        assert!(!symlink_mask_skippable(
+            Path::new("/r/pkg/node_modules"),
+            root,
+            out,
+            &w
+        ));
     }
 
     #[test]
@@ -637,6 +667,7 @@ mod tests {
         let target = fs::canonicalize(outside.path()).unwrap();
         std::os::unix::fs::symlink(&target, root.join("node_modules")).unwrap();
         std::os::unix::fs::symlink(root.join("src"), root.join("tests/into-src")).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("vendor")).unwrap();
         let p = Profile::from_spec(ProfileSpec {
             root: root.clone(),
             write: vec!["src/**".into()],
@@ -644,6 +675,7 @@ mod tests {
                 "tests/**".into(),
                 "**/node_modules/**".into(),
                 "node_modules".into(),
+                "vendor".into(),
             ],
             read_deny: vec![],
             network: Network::Deny,
@@ -654,6 +686,8 @@ mod tests {
         assert!(!m.read_only.contains(&root.join("node_modules")), "{m:?}");
         // other protected matches are still masked (tests/ covers the symlink into src)
         assert!(m.read_only.contains(&root.join("tests")), "{m:?}");
+        // a protected symlink other than <root>/node_modules keeps the mask (fails closed later)
+        assert!(m.read_only.contains(&root.join("vendor")), "{m:?}");
     }
 
     #[test]

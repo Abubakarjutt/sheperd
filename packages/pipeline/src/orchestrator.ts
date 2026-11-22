@@ -1,15 +1,4 @@
-import {
-  appendFile,
-  lstat,
-  mkdir,
-  mkdtemp,
-  readlink,
-  realpath,
-  rm,
-  stat,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -65,6 +54,11 @@ import {
 } from "@rewire/sandbox";
 import { z } from "zod";
 import { type EscalationReport, FixLoopController, type RoundState, score } from "./fix-loop.js";
+import {
+  linkNodeModules,
+  type NodeModulesState,
+  nodeModulesTampered,
+} from "./node-modules-guard.js";
 import { type ReportData, type ReviewData, renderReport } from "./report.js";
 import { ROLES, type Role, type RoleRouting } from "./routing.js";
 import { runImplementerStage } from "./stages/implementer.js";
@@ -122,7 +116,7 @@ export const KNOWN_LIMITATIONS: readonly string[] = [
   "rules cover JS/TS only (the semgrep rules and the TypeScript pack)",
   "gitignored untracked files are not scanned by semgrep/gitleaks",
   "host PATH passed through the sandbox",
-  "dependency installs are not harness-mediated in v0.1: the gates run against the dependencies already present (the repo's gitignored node_modules is shared into the worktree by a symlink); a change to a manifest's dependencies fails the drift and lockfile checks instead of being installed",
+  "dependency installs are not harness-mediated in v0.1: the gates run against the dependencies already present (the repo's node_modules is shared into the worktree by a symlink, never committed); a change to a manifest's dependencies fails the drift and lockfile checks instead of being installed",
   "tests run in the same process as the code under test: implementer code imported by a frozen test can tamper with the assertion library or the reporter in-process; only cheap forgery is detected",
   "the test runner config is owned by the harness: projects that need setupFiles, plugins, aliases or tsconfig paths fail closed",
   "jest support is covered by unit tests only (no real jest run in the harness test suite)",
@@ -227,8 +221,8 @@ type State = {
   review?: ReviewData;
   rounds: Array<{ round: number; score: number }>;
   tried: string[];
-  /** The exact target of the node_modules link the orchestrator created, if any (R33). */
-  link?: string;
+  /** `<wt>/node_modules` as set up by the orchestrator; every tool run re-checks it (R33). */
+  nm?: NodeModulesState;
 };
 
 type Ctx = {
@@ -394,6 +388,14 @@ const Hypothesis = z.object({ hypothesis: z.string().min(1), question: z.string(
 
 async function finishEscalation(esc: Escalation, ctx: Ctx): Promise<EscalationReport> {
   let hq = esc.preset;
+  if (hq === undefined && ctx.st.stage === "preflight") {
+    // Nothing model-made to explain yet (dirty tree, unfit model, provider down): fixed text.
+    hq = {
+      hypothesis:
+        "The run stopped in preflight, before any stage ran: the repository or the model routing is not ready (see details).",
+      question: "Fix the preflight problem in the details, then re-run the task?",
+    };
+  }
   if (hq === undefined && esc.reason === "interrupted") {
     hq = {
       hypothesis: "The run was interrupted before it finished.",
@@ -484,48 +486,15 @@ async function identity(wt: string): Promise<string[]> {
     : ["-c", "user.name=rewire", "-c", "user.email=rewire@localhost"];
 }
 
-/**
- * Share the repo's node_modules with the worktree (no install, #26) whenever the repo has a
- * node_modules directory, whatever .gitignore says: the final commit excludes it explicitly.
- * Returns the exact link target, which every later gate run and the final commit re-verify
- * (R33); undefined when nothing was linked (none in the repo, or the worktree already has one).
- */
-async function linkNodeModules(repo: string, wt: string): Promise<string | undefined> {
-  let target: string;
-  try {
-    target = await realpath(join(repo, "node_modules"));
-    if (!(await stat(target)).isDirectory()) return undefined;
-  } catch {
-    return undefined;
-  }
-  const dst = join(wt, "node_modules");
-  try {
-    await lstat(dst);
-    return undefined; // tracked in the repo: not ours to link or verify
-  } catch {
-    // absent: link it
-  }
-  await symlink(target, dst, "dir");
-  return target;
-}
-
 const TAMPERED = "node_modules link tampered";
 
-/**
- * Trusted check (R33): gates run `<wt>/node_modules/.bin` tools, so a link swapped for an
- * implementer-written tree could forge a pass. True when the link we created is gone, is no
- * longer a symlink, or points elsewhere. Platform independent: never relies on the sandbox.
- */
-async function linkTampered(wt: string, expected: string | undefined): Promise<boolean> {
-  if (expected === undefined) return false;
-  const dst = join(wt, "node_modules");
-  try {
-    if (!(await lstat(dst)).isSymbolicLink()) return true;
-    return (await readlink(dst)) !== expected;
-  } catch {
-    return true;
-  }
-}
+/** R33: true when `<wt>/node_modules` no longer matches what was recorded at setup. */
+const nmTampered = async (wt: string, st: State): Promise<boolean> =>
+  st.nm !== undefined && (await nodeModulesTampered(wt, st.nm));
+
+/** Gate-guard form of {@link nmTampered}: the failure summary, or undefined to run. */
+const nmGuard = (wt: string, st: State) => async (): Promise<string | undefined> =>
+  (await nmTampered(wt, st)) ? TAMPERED : undefined;
 
 const tamperedResults = (gates: Gate[]): GateResult[] =>
   gates.map((g) => ({
@@ -560,7 +529,7 @@ async function execute(ctx: Ctx): Promise<void> {
   st.worktree = wt.path;
   st.branch = wt.branch;
   const worktree = wt.path;
-  st.link = await linkNodeModules(repo, worktree);
+  st.nm = await linkNodeModules(repo, worktree);
   const pack = await detectTsPack(worktree);
   const ident = await identity(worktree);
   checkAbort(ctx);
@@ -593,6 +562,7 @@ async function execute(ctx: Ctx): Promise<void> {
     emit: log.emit,
     runId,
     policy,
+    gateGuard: nmGuard(worktree, st),
     ...sig,
     ...clientFactory,
   });
@@ -637,7 +607,7 @@ async function execute(ctx: Ctx): Promise<void> {
       policy,
       ...(feedback !== undefined ? { feedback } : {}),
       ...(input.seams?.implementerMaxTurns ? { maxTurns: input.seams.implementerMaxTurns } : {}),
-      gateGuard: async () => ((await linkTampered(worktree, st.link)) ? TAMPERED : undefined),
+      gateGuard: nmGuard(worktree, st),
       ...sig,
       ...clientFactory,
     });
@@ -683,7 +653,7 @@ async function execute(ctx: Ctx): Promise<void> {
       continue;
     }
     st.stage = "replan";
-    st.link = await resetToFrozen(repo, worktree, frozenCommit, sig);
+    st.nm = await resetToFrozen(repo, worktree, frozenCommit, sig);
     st.tried.push(`replan after round ${round}: worktree reset to the frozen-tests commit`);
     feedback = `Previous approach failed:\n${decision.history}\nTake a different approach.`;
   }
@@ -698,7 +668,7 @@ async function execute(ctx: Ctx): Promise<void> {
       frozen.mismatches.map((m) => `frozen test ${m.path}: ${m.reason} before the final commit`),
     );
   }
-  if (await linkTampered(worktree, st.link)) {
+  if (await nmTampered(worktree, st)) {
     throw new Escalation("stage_error", [], [`${TAMPERED} before the final commit`]);
   }
   const before = (await trustedGitOk(worktree, ["rev-parse", "HEAD"], sig)).trim();
@@ -721,14 +691,26 @@ async function execute(ctx: Ctx): Promise<void> {
   );
   const nm = await trustedGitOk(
     worktree,
-    ["ls-files", "-z", "--cached", "--", ":(top,literal)node_modules"],
+    [
+      "ls-files",
+      "-z",
+      "--cached",
+      "--",
+      ":(top,literal)node_modules",
+      ":(top,glob)**/node_modules",
+      ":(top,glob)**/node_modules/**",
+    ],
     sig,
   );
   if (nm !== "") {
     throw new Escalation(
       "stage_error",
       [],
-      ["node_modules is in the index before the final commit"],
+      [
+        `node_modules is in the index before the final commit: ${redact(
+          nm.split("\0").filter(Boolean).slice(0, 5).join(", "),
+        )}`,
+      ],
     );
   }
   await trustedGitOk(
@@ -762,7 +744,7 @@ async function resetToFrozen(
   worktree: string,
   frozenCommit: string,
   sig: { signal?: AbortSignal },
-): Promise<string | undefined> {
+): Promise<NodeModulesState> {
   await trustedGitOk(worktree, ["reset", "-q", "--hard", frozenCommit], sig);
   await trustedGitOk(worktree, ["clean", "-q", "-ffdx", "-e", ".rewire"], sig);
   return linkNodeModules(repo, worktree);
@@ -803,7 +785,7 @@ async function runAllGates(
       },
     ];
   }
-  if (await linkTampered(a.worktree, ctx.st.link)) {
+  if (await nmTampered(a.worktree, ctx.st)) {
     const results = tamperedResults(gates);
     for (const result of results) {
       ctx.log.emit({

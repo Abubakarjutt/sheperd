@@ -52,7 +52,7 @@ afterAll(() => {
 const git = (cwd: string, ...args: string[]): string =>
   execFileSync("git", args, { cwd, encoding: "utf8" });
 
-function makeRepo(opts: { gitignore?: string } = {}): string {
+function makeRepo(opts: { gitignore?: string; noModules?: boolean } = {}): string {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "rewire-e2e-")));
   dirs.push(root);
   cpSync(FIXTURE, root, { recursive: true });
@@ -63,7 +63,7 @@ function makeRepo(opts: { gitignore?: string } = {}): string {
     for (const entry of readdirSync(WORKSPACE_MODULES)) {
       symlinkSync(join(WORKSPACE_MODULES, entry), join(root, "node_modules", entry));
     }
-  } else {
+  } else if (!opts.noModules) {
     symlinkSync(WORKSPACE_MODULES, join(root, "node_modules"));
   }
   git(root, "init", "-q", "-b", "main");
@@ -630,11 +630,72 @@ describe.skipIf(!sandboxAvailable)(
     test("a preflight failure escalates without creating a run dir", async () => {
       const repo = makeRepo();
       writeFileSync(join(repo, "src", "index.ts"), "// dirty\n");
-      const { outcome } = await run({ impl: implementer(() => []) }, { repo });
+      let modelCalls = 0;
+      const impl: Provider = {
+        async chat() {
+          modelCalls++;
+          return text(JSON.stringify({ hypothesis: "model", question: "model?" }));
+        },
+      };
+      const { outcome } = await run({ impl }, { repo });
       expect(outcome.status).toBe("escalated");
       expect(outcome.escalation?.reason).toBe("stage_error");
       expect(outcome.reportPath).toBe("");
       expect(existsSync(join(repo, ".rewire", "runs"))).toBe(false);
+      // Preflight escalations get fixed text: no hypothesis model call (fix round 2, M2).
+      expect(modelCalls).toBe(0);
+      expect(outcome.escalation?.hypothesis).toContain("preflight");
+    });
+
+    test("a node_modules planted in a repo that has none fails the run closed", async () => {
+      // No node_modules in the repo: the recorded state is "absent". A host-side plant of
+      // working tools during the test-writer stands in for a forged .bin; the red check's
+      // guard must catch it before any .bin tool runs.
+      const repo = makeRepo({ noModules: true });
+      const plant = () => {
+        const nm = join(worktreeOf(repo), "node_modules");
+        if (!existsSync(nm)) symlinkSync(WORKSPACE_MODULES, nm);
+      };
+      const tw = new FauxProvider([
+        () => {
+          plant();
+          return call("write", { path: TEST_FILE, content: TEST_SRC });
+        },
+        text("done"),
+      ]);
+      const { outcome, events } = await run(
+        { tw, impl: implementer(() => [["src/sum.ts", GOOD_SUM]]) },
+        { repo },
+      );
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.reason).toBe("stage_error");
+      expect(outcome.escalation?.details?.join("\n")).toContain("node_modules");
+      expect(events.some((e) => e.type === "gate_result" && e.result.status === "pass")).toBe(
+        false,
+      );
+    });
+
+    test("a nested node_modules staged for the final commit escalates", async () => {
+      const repo = makeRepo({ gitignore: "/node_modules\n*.log\n" });
+      const gates = passAll();
+      const last = DEFAULT_POLICY.gates[DEFAULT_POLICY.gates.length - 1] ?? "audit";
+      gates[last] = {
+        name: last,
+        category: "broken",
+        async run(ctx: GateContext) {
+          mkdirSync(join(ctx.worktree, "src", "node_modules"), { recursive: true });
+          writeFileSync(join(ctx.worktree, "src", "node_modules", "x.js"), "module.exports = 1;\n");
+          return { status: "pass", summary: "stubbed", details: null };
+        },
+      };
+      const { outcome } = await run(
+        { impl: implementer(() => [["src/sum.ts", GOOD_SUM]]) },
+        { repo, seams: { gates } },
+      );
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.reason).toBe("stage_error");
+      expect(outcome.escalation?.details?.join("\n")).toContain("node_modules");
+      expect(commitsAfterBase(repo, outcome.branch)).toEqual(["rewire: frozen acceptance tests"]);
     });
   },
 );

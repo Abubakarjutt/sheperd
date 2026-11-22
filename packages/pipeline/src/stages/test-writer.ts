@@ -65,6 +65,11 @@ export type TestWriterInput = {
   client?: SandboxClient;
   /** Test seam: builds the client for a profile (test-writer and verify). The stage disposes what it builds. */
   clientFactory?: (profile: CapabilityProfile) => SandboxClient;
+  /**
+   * Trusted check run before the red check's test runner (R33): returns a failure summary when
+   * no `.bin` tool may run (e.g. a tampered node_modules); the stage then fails closed.
+   */
+  gateGuard?: () => Promise<string | undefined>;
 };
 
 let promptCache: string | undefined;
@@ -221,7 +226,7 @@ async function execute(
     if (result.endedBy === "aborted" || input.signal?.aborted) {
       throw new RewireError("aborted", "test-writer was aborted");
     }
-    return analyze(ctx, root, baseline);
+    return analyze(ctx, root, baseline, input.gateGuard);
   };
 
   let analysis = await attempt(basePrompt);
@@ -268,6 +273,7 @@ async function analyze(
   ctx: GateContext,
   root: string,
   baseline: Map<string, Entry>,
+  gateGuard?: () => Promise<string | undefined>,
 ): Promise<Analysis> {
   const after = await worktreeState(new GateExec(ctx), root, ctx.policy.testGlobs);
   const changed = new Set<string>();
@@ -283,7 +289,7 @@ async function analyze(
   }
 
   const runnable = paths.filter(isRunnable);
-  const problems = await redCheck(ctx, root, runnable);
+  const problems = await redCheck(ctx, root, runnable, gateGuard);
   return {
     newFiles: paths,
     problems: problems.problems,
@@ -295,6 +301,7 @@ async function redCheck(
   ctx: GateContext,
   root: string,
   runnable: string[],
+  gateGuard?: () => Promise<string | undefined>,
 ): Promise<{ problems: Problem[]; run?: ParsedRun }> {
   if (runnable.length === 0) {
     return {
@@ -321,6 +328,10 @@ async function redCheck(
   }
   if (static_.length > 0) return { problems: static_ };
 
+  const blocked = gateGuard ? await gateGuard() : undefined;
+  if (blocked !== undefined) {
+    throw new RewireError("node_modules_tampered", `${blocked} before the red check`);
+  }
   let run: ParsedRun;
   try {
     run = await runTestFiles(ctx, runnable);
