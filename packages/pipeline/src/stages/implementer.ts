@@ -58,6 +58,11 @@ export type ImplementerInput = {
   clientFactory?: (profile: CapabilityProfile) => SandboxClient;
   /** Test seam: replaces the fast gates. */
   gates?: Gate[];
+  /**
+   * Trusted pre-gate check (R33): returns a failure summary when the gates must not run (e.g. a
+   * tampered node_modules link); every fast gate then fails closed with that summary.
+   */
+  gateGuard?: () => Promise<string | undefined>;
 };
 
 export type ImplementerResult = {
@@ -241,7 +246,6 @@ async function run(
       worktree,
       baseRef: input.baseRef,
       client: verifyClient,
-      registryClient: verifyClient,
       pack: input.pack,
       policy,
       manifest: input.manifest,
@@ -334,7 +338,18 @@ async function execute(
         inject: "No changes since the last failing gate run — fix the failures above.",
       };
     }
-    fastGates = await runGates(gates, ctx, safeEmit);
+    const blocked = input.gateGuard ? await input.gateGuard() : undefined;
+    fastGates =
+      blocked === undefined
+        ? await runGates(gates, ctx, safeEmit)
+        : gates.map((g) => ({
+            gate: g.name,
+            category: g.category,
+            status: "error" as const,
+            summary: blocked,
+            details: null,
+            durationMs: 0,
+          }));
     lastFailed = fastGates.some((r) => r.status !== "pass");
     lastHash = await changeHash(ctx).catch(() => undefined);
     if (!lastFailed) {

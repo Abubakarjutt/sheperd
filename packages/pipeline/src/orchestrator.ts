@@ -3,8 +3,10 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readlink,
   realpath,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -153,6 +155,9 @@ class Escalation extends Error {
  */
 class EventLog {
   incomplete = false;
+  /** Lines are buffered until `start` (the run dir exists only after preflight, M8). */
+  started = false;
+  private buffered: string[] = [];
   private chain: Promise<void> = Promise.resolve();
   private warnedWrite = false;
   private warnedObserver = false;
@@ -172,9 +177,8 @@ class EventLog {
       this.writeFailed();
       return;
     }
-    this.chain = this.chain
-      .then(() => appendFile(this.file, `${line}\n`))
-      .catch(() => this.writeFailed());
+    if (this.started) this.append(`${line}\n`);
+    else this.buffered.push(`${line}\n`);
     try {
       const r: unknown = this.observer(clean);
       Promise.resolve(r).catch(() => this.observerFailed());
@@ -183,8 +187,20 @@ class EventLog {
     }
   };
 
+  /** The run dir exists: write what was buffered and every later event. */
+  start(): void {
+    this.started = true;
+    const pending = this.buffered.join("");
+    this.buffered = [];
+    if (pending !== "") this.append(pending);
+  }
+
   flush(): Promise<void> {
     return this.chain;
+  }
+
+  private append(text: string): void {
+    this.chain = this.chain.then(() => appendFile(this.file, text)).catch(() => this.writeFailed());
   }
 
   private writeFailed(): void {
@@ -211,6 +227,8 @@ type State = {
   review?: ReviewData;
   rounds: Array<{ round: number; score: number }>;
   tried: string[];
+  /** The exact target of the node_modules link the orchestrator created, if any (R33). */
+  link?: string;
 };
 
 type Ctx = {
@@ -227,6 +245,10 @@ type Ctx = {
 
 const errCode = (e: unknown): string => (e instanceof RewireError ? e.code : "internal_error");
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+const ERR_CLIP = 200;
+/** Redacted, single-line, at most 200 chars: safe inside an escalation reason. */
+const errClip = (e: unknown): string =>
+  redact(errText(e)).replace(/\s+/g, " ").trim().slice(0, ERR_CLIP);
 
 /**
  * Run one task end to end: contract, frozen tests, implement, gate, review, fix loop, commit,
@@ -238,7 +260,6 @@ export async function runPipeline(input: RunPipelineInput): Promise<RunOutcome> 
   const runId = newRunId();
   const repo = await realpath(input.repo);
   const runDir = join(repo, ".rewire", "runs", runId);
-  await mkdir(runDir, { recursive: true });
   const reportPath = join(runDir, "report.md");
   const log = new EventLog(join(runDir, "events.jsonl"), input.emit);
   const usage: Partial<Record<Role, Usage>> = {};
@@ -287,6 +308,18 @@ export async function runPipeline(input: RunPipelineInput): Promise<RunOutcome> 
       reason: escalation.reason,
       question: escalation.question,
     });
+  }
+
+  if (!log.started) {
+    // Preflight failed before the run dir existed: no report, no events on disk (M8).
+    return {
+      runId,
+      status: "escalated",
+      branch: "",
+      worktree: "",
+      reportPath: "",
+      ...(escalation ? { escalation } : {}),
+    };
   }
 
   const status = escalation ? "escalated" : "verified";
@@ -370,11 +403,13 @@ async function finishEscalation(esc: Escalation, ctx: Ctx): Promise<EscalationRe
   hq ??= await hypothesize(esc, ctx);
   return {
     reason: esc.reason,
-    tried: [...ctx.st.tried],
-    unresolved: esc.unresolved,
-    hypothesis: hq.hypothesis,
-    question: hq.question,
-    ...(esc.details.length > 0 ? { details: esc.details } : {}),
+    tried: ctx.st.tried.map(redact),
+    unresolved: JSON.parse(
+      redact(JSON.stringify(esc.unresolved)),
+    ) as EscalationReport["unresolved"],
+    hypothesis: redact(hq.hypothesis),
+    question: redact(hq.question),
+    ...(esc.details.length > 0 ? { details: esc.details.map(redact) } : {}),
   };
 }
 
@@ -385,7 +420,11 @@ async function hypothesize(
 ): Promise<{ hypothesis: string; question: string }> {
   const fallback = { hypothesis: FALLBACK_HYPOTHESIS, question: FALLBACK_QUESTION };
   const ms = ctx.input.seams?.hypothesisTimeoutMs ?? HYPOTHESIS_TIMEOUT_MS;
+  const outer = ctx.input.signal;
+  if (outer?.aborted) return fallback;
   const ac = new AbortController();
+  const onAbort = (): void => ac.abort();
+  outer?.addEventListener("abort", onAbort, { once: true });
   let timer: NodeJS.Timeout | undefined;
   try {
     const payload = JSON.stringify(
@@ -393,6 +432,18 @@ async function hypothesize(
       null,
       2,
     ).slice(0, HYPOTHESIS_INPUT_CAP);
+    // Settles on the 60 s timeout or the run's abort, even if the provider ignores the signal.
+    // Armed before the call: a provider may run (and the run abort) synchronously inside it.
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        ac.abort();
+        reject(new Error("hypothesis timed out"));
+      }, ms);
+      ac.signal.addEventListener("abort", () => reject(new Error("hypothesis aborted")), {
+        once: true,
+      });
+    });
+    timeout.catch(() => {});
     const call = structured(
       ctx.providerFor("implementer"),
       ctx.input.routing.implementer,
@@ -406,13 +457,6 @@ async function hypothesize(
       },
     );
     call.catch(() => {});
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        ac.abort();
-        reject(new Error("hypothesis timed out"));
-      }, ms);
-    });
-    timeout.catch(() => {});
     const out = await Promise.race([call, timeout]);
     return {
       hypothesis: out.hypothesis.slice(0, HYPOTHESIS_FIELD_CAP),
@@ -422,6 +466,7 @@ async function hypothesize(
     return fallback;
   } finally {
     clearTimeout(timer);
+    outer?.removeEventListener("abort", onAbort);
     ac.abort();
   }
 }
@@ -440,26 +485,57 @@ async function identity(wt: string): Promise<string[]> {
 }
 
 /**
- * Share the repo's node_modules with the worktree (no install, #26): only when the repo has one
- * and git ignores it, so it can never be committed or reviewed.
+ * Share the repo's node_modules with the worktree (no install, #26) whenever the repo has a
+ * node_modules directory, whatever .gitignore says: the final commit excludes it explicitly.
+ * Returns the exact link target, which every later gate run and the final commit re-verify
+ * (R33); undefined when nothing was linked (none in the repo, or the worktree already has one).
  */
-async function linkNodeModules(repo: string, wt: string): Promise<void> {
-  const src = join(repo, "node_modules");
+async function linkNodeModules(repo: string, wt: string): Promise<string | undefined> {
+  let target: string;
   try {
-    await lstat(src);
+    target = await realpath(join(repo, "node_modules"));
+    if (!(await stat(target)).isDirectory()) return undefined;
   } catch {
-    return;
+    return undefined;
   }
-  const ignored = await trustedGit(wt, ["check-ignore", "-q", "--no-index", "node_modules"]);
-  if (ignored.code !== 0) return;
+  const dst = join(wt, "node_modules");
   try {
-    await lstat(join(wt, "node_modules"));
-    return;
+    await lstat(dst);
+    return undefined; // tracked in the repo: not ours to link or verify
   } catch {
     // absent: link it
   }
-  await symlink(await realpath(src), join(wt, "node_modules"), "dir");
+  await symlink(target, dst, "dir");
+  return target;
 }
+
+const TAMPERED = "node_modules link tampered";
+
+/**
+ * Trusted check (R33): gates run `<wt>/node_modules/.bin` tools, so a link swapped for an
+ * implementer-written tree could forge a pass. True when the link we created is gone, is no
+ * longer a symlink, or points elsewhere. Platform independent: never relies on the sandbox.
+ */
+async function linkTampered(wt: string, expected: string | undefined): Promise<boolean> {
+  if (expected === undefined) return false;
+  const dst = join(wt, "node_modules");
+  try {
+    if (!(await lstat(dst)).isSymbolicLink()) return true;
+    return (await readlink(dst)) !== expected;
+  } catch {
+    return true;
+  }
+}
+
+const tamperedResults = (gates: Gate[]): GateResult[] =>
+  gates.map((g) => ({
+    gate: g.name,
+    category: g.category,
+    status: "error" as const,
+    summary: TAMPERED,
+    details: null,
+    durationMs: 0,
+  }));
 
 async function execute(ctx: Ctx): Promise<void> {
   const { input, runId, repo, st, log } = ctx;
@@ -471,6 +547,8 @@ async function execute(ctx: Ctx): Promise<void> {
 
   checkAbort(ctx);
   const { head } = await assertCleanRepo(repo);
+  await mkdir(ctx.runDir, { recursive: true });
+  log.start();
   for (const role of ROLES) {
     await assertRoleFit(routing[role], role, join(repo, ".rewire", "cache"));
   }
@@ -482,7 +560,7 @@ async function execute(ctx: Ctx): Promise<void> {
   st.worktree = wt.path;
   st.branch = wt.branch;
   const worktree = wt.path;
-  await linkNodeModules(repo, worktree);
+  st.link = await linkNodeModules(repo, worktree);
   const pack = await detectTsPack(worktree);
   const ident = await identity(worktree);
   checkAbort(ctx);
@@ -519,7 +597,7 @@ async function execute(ctx: Ctx): Promise<void> {
     ...clientFactory,
   });
   st.manifest = manifest;
-  await writeFile(join(ctx.runDir, "manifest.json"), JSON.stringify(manifest, null, 2));
+  await writeFile(join(ctx.runDir, "manifest.json"), redact(JSON.stringify(manifest, null, 2)));
   checkAbort(ctx);
 
   st.stage = "freeze";
@@ -559,6 +637,7 @@ async function execute(ctx: Ctx): Promise<void> {
       policy,
       ...(feedback !== undefined ? { feedback } : {}),
       ...(input.seams?.implementerMaxTurns ? { maxTurns: input.seams.implementerMaxTurns } : {}),
+      gateGuard: async () => ((await linkTampered(worktree, st.link)) ? TAMPERED : undefined),
       ...sig,
       ...clientFactory,
     });
@@ -604,7 +683,7 @@ async function execute(ctx: Ctx): Promise<void> {
       continue;
     }
     st.stage = "replan";
-    await resetToFrozen(repo, worktree, frozenCommit, sig);
+    st.link = await resetToFrozen(repo, worktree, frozenCommit, sig);
     st.tried.push(`replan after round ${round}: worktree reset to the frozen-tests commit`);
     feedback = `Previous approach failed:\n${decision.history}\nTake a different approach.`;
   }
@@ -619,8 +698,39 @@ async function execute(ctx: Ctx): Promise<void> {
       frozen.mismatches.map((m) => `frozen test ${m.path}: ${m.reason} before the final commit`),
     );
   }
+  if (await linkTampered(worktree, st.link)) {
+    throw new Escalation("stage_error", [], [`${TAMPERED} before the final commit`]);
+  }
+  const before = (await trustedGitOk(worktree, ["rev-parse", "HEAD"], sig)).trim();
+  if (before !== frozenCommit) {
+    throw new Escalation(
+      "stage_error",
+      [],
+      [`HEAD ${before} is not the frozen-tests commit ${frozenCommit} before the final commit`],
+    );
+  }
   const title = redact(contract.title).replace(/\s+/g, " ").trim().slice(0, TITLE_CAP);
-  await trustedGitOk(worktree, ["add", "-A"], sig);
+  // Never stage node_modules, whatever .gitignore says. git rejects an exclude pathspec that
+  // names an ignored path, so an ignored one relies on the ignore rule instead; either way the
+  // index check below is the guarantee.
+  const nmIgnored = (await trustedGit(worktree, ["check-ignore", "-q", "node_modules"], sig)).code;
+  await trustedGitOk(
+    worktree,
+    nmIgnored === 0 ? ["add", "-A"] : ["add", "-A", "--", ".", ":(exclude,top)node_modules"],
+    sig,
+  );
+  const nm = await trustedGitOk(
+    worktree,
+    ["ls-files", "-z", "--cached", "--", ":(top,literal)node_modules"],
+    sig,
+  );
+  if (nm !== "") {
+    throw new Escalation(
+      "stage_error",
+      [],
+      ["node_modules is in the index before the final commit"],
+    );
+  }
   await trustedGitOk(
     worktree,
     [
@@ -636,6 +746,14 @@ async function execute(ctx: Ctx): Promise<void> {
     ],
     sig,
   );
+  const parent = (await trustedGitOk(worktree, ["rev-parse", "HEAD^"], sig)).trim();
+  if (parent !== frozenCommit) {
+    throw new Escalation(
+      "stage_error",
+      [],
+      [`the final commit's parent ${parent} is not the frozen-tests commit ${frozenCommit}`],
+    );
+  }
 }
 
 /** Implementer leftovers go too: tracked changes, untracked and ignored files. */
@@ -644,10 +762,10 @@ async function resetToFrozen(
   worktree: string,
   frozenCommit: string,
   sig: { signal?: AbortSignal },
-): Promise<void> {
+): Promise<string | undefined> {
   await trustedGitOk(worktree, ["reset", "-q", "--hard", frozenCommit], sig);
   await trustedGitOk(worktree, ["clean", "-q", "-ffdx", "-e", ".rewire"], sig);
-  await linkNodeModules(repo, worktree);
+  return linkNodeModules(repo, worktree);
 }
 
 function unknownGate(name: string): Gate {
@@ -684,6 +802,19 @@ async function runAllGates(
         durationMs: 0,
       },
     ];
+  }
+  if (await linkTampered(a.worktree, ctx.st.link)) {
+    const results = tamperedResults(gates);
+    for (const result of results) {
+      ctx.log.emit({
+        type: "gate_result",
+        runId: ctx.runId,
+        ts: new Date().toISOString(),
+        stage: "gates",
+        result,
+      });
+    }
+    return results;
   }
   const scratch = await realpath(await mkdtemp(join(tmpdir(), "rewire-gates-")));
   const owned: SandboxClient[] = [];
@@ -765,7 +896,7 @@ async function review(
       });
     } catch (e) {
       if (signal?.aborted) throw e;
-      escalationReasons.push(`review panel error: ${errCode(e)}`);
+      escalationReasons.push(`review panel error: ${errCode(e)}: ${errClip(e)}`);
       return {
         data: { ran: true, kept: [], verdicts: [], dropped: [], escalationReasons },
         blocking: [],
@@ -789,7 +920,7 @@ async function review(
       if (signal?.aborted) throw e;
       // No verdicts: blockingFindings treats every kept finding as upheld.
       verdicts = [];
-      escalationReasons.push(`verifier error: ${errCode(e)}`);
+      escalationReasons.push(`verifier error: ${errCode(e)}: ${errClip(e)}`);
     }
     return {
       data: { ran: true, kept: panel.kept, verdicts, dropped: panel.dropped, escalationReasons },

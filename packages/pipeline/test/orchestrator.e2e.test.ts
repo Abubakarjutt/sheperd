@@ -3,12 +3,14 @@ import { createHash } from "node:crypto";
 import {
   cpSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -50,16 +52,27 @@ afterAll(() => {
 const git = (cwd: string, ...args: string[]): string =>
   execFileSync("git", args, { cwd, encoding: "utf8" });
 
-function makeRepo(): string {
+function makeRepo(opts: { gitignore?: string } = {}): string {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "rewire-e2e-")));
   dirs.push(root);
   cpSync(FIXTURE, root, { recursive: true });
-  symlinkSync(WORKSPACE_MODULES, join(root, "node_modules"));
+  if (opts.gitignore !== undefined) {
+    writeFileSync(join(root, ".gitignore"), opts.gitignore);
+    // A real node_modules directory (what a dir-only `node_modules/` rule matches).
+    mkdirSync(join(root, "node_modules"));
+    for (const entry of readdirSync(WORKSPACE_MODULES)) {
+      symlinkSync(join(WORKSPACE_MODULES, entry), join(root, "node_modules", entry));
+    }
+  } else {
+    symlinkSync(WORKSPACE_MODULES, join(root, "node_modules"));
+  }
   git(root, "init", "-q", "-b", "main");
   git(root, "config", "user.email", "t@example.com");
   git(root, "config", "user.name", "t");
   git(root, "config", "commit.gpgsign", "false");
+  // Never commit the shared node_modules link (a dir-only ignore does not match a symlink).
   git(root, "add", "-A");
+  git(root, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "node_modules");
   git(root, "commit", "-q", "-m", "base");
   return root;
 }
@@ -219,245 +232,409 @@ const worktreeOf = (repo: string): string => {
 };
 const BUDGET_0: Policy = { ...DEFAULT_POLICY, maxFixRounds: 0 };
 
-describe.skipIf(!sandboxAvailable)("orchestrator e2e (real sandbox, fixture sum-lib)", () => {
-  test("happy path produces verified branch and report", async () => {
-    const { outcome, repo, events } = await run({
-      impl: implementer(() => [["src/sum.ts", GOOD_SUM]]),
-    });
-    expect(outcome.escalation).toBeUndefined();
-    expect(outcome.status).toBe("verified");
-    const report = readFileSync(outcome.reportPath, "utf8");
-    expect(report).toMatch(/## Gates[\s\S]*\| tsc \| broken \| pass/);
-    expect(commitsAfterBase(repo, outcome.branch)).toEqual([
-      "rewire: add sum",
-      "rewire: frozen acceptance tests",
-    ]);
-    expect(git(repo, "log", "-1", "--format=%B", outcome.branch)).toContain(
-      `Rewire-Run: ${outcome.runId}`,
-    );
-    expect(git(repo, "show", `${outcome.branch}:src/sum.ts`)).toBe(GOOD_SUM);
-    // worktree removed, branch kept; run dir holds the artifacts
-    expect(existsSync(outcome.worktree)).toBe(false);
-    const runDir = dirname(outcome.reportPath);
-    expect(runDir).toBe(join(repo, ".rewire", "runs", outcome.runId));
-    for (const f of ["events.jsonl", "contract.json", "manifest.json", "report.md"]) {
-      expect(existsSync(join(runDir, f))).toBe(true);
-    }
-    const logged = readFileSync(join(runDir, "events.jsonl"), "utf8").trim().split("\n");
-    expect(logged.length).toBe(events.length);
-    for (const l of logged) RunEvent.parse(JSON.parse(l));
-    expect(events[0]?.type).toBe("run_start");
-    expect(events.at(-1)).toMatchObject({ type: "run_end", status: "verified" });
-    // the user's repo is still clean for the next run
-    expect(git(repo, "status", "--porcelain", "--", ".", ":(exclude).rewire")).toBe("");
-  });
-
-  test("implementer editing a frozen test cannot get verified", async () => {
-    const { outcome, repo } = await run(
-      {
-        impl: implementer(() => [
-          [
-            TEST_FILE,
-            `import { test } from "vitest";\ntest("AC-1: adds two numbers", () => {});\n`,
-          ],
-        ]),
-      },
-      { policy: BUDGET_0 },
-    );
-    expect(outcome.status).toBe("escalated");
-    const m = manifestOf(outcome);
-    const frozen = m.files.find((f) => f.path === TEST_FILE);
-    expect(frozen?.sha256).toBe(sha(TEST_SRC));
-    expect(sha(git(repo, "show", `${outcome.branch}:${TEST_FILE}`))).toBe(frozen?.sha256);
-    expect(sha(readFileSync(join(outcome.worktree, TEST_FILE)))).toBe(frozen?.sha256);
-    expect(commitsAfterBase(repo, outcome.branch)).toEqual(["rewire: frozen acceptance tests"]);
-    expect(existsSync(outcome.worktree)).toBe(true);
-  });
-
-  test("upheld security finding blocks and is fed back", async () => {
-    const impl = implementer((req) => [
-      ["src/sum.ts", firstUser(req).includes("Required fixes") ? GOOD_SUM : MARKED_SUM],
-    ]);
-    const { outcome } = await run({
-      impl,
-      rev: markReviewer("SCENARIO-7: a caller passes strings and gets concatenation"),
-    });
-    expect(outcome.status).toBe("verified");
-    const fed = (impl as FauxProvider).requests.filter((r) =>
-      firstUser(r).includes("SCENARIO-7: a caller passes strings"),
-    );
-    expect(fed.length).toBeGreaterThan(0);
-    const report = readFileSync(outcome.reportPath, "utf8");
-    expect(report).toMatch(/\| 1 \| 8 \|/); // round 1 scored one critical finding
-    expect(report).toMatch(/\| 2 \| 0 \|/);
-  });
-
-  test("clarification with no human escalates with questions; a second run is not blocked by .rewire/runs", async () => {
-    const asking = () =>
-      new FauxProvider([text("x"), text(contractJson({ openQuestions: ["Which number type?"] }))]);
-    const task = `add sum(a,b) using key ${SECRET}`;
-    const first = await run({ spec: asking(), impl: implementer(() => []) }, { task });
-    expect(first.outcome.status).toBe("escalated");
-    expect(first.outcome.escalation?.reason).toBe("clarification_required");
-    expect(first.outcome.escalation?.question).toContain("Which number type?");
-    const report = readFileSync(first.outcome.reportPath, "utf8");
-    expect(report).toContain("## Escalation");
-    expect(report).toContain("Which number type?");
-    expect(existsSync(first.outcome.worktree)).toBe(true);
-    // secret-shaped text never reaches the report or the event log
-    const log = readFileSync(join(dirname(first.outcome.reportPath), "events.jsonl"), "utf8");
-    expect(report).not.toContain(SECRET);
-    expect(log).not.toContain(SECRET);
-    expect(first.events.map((e) => JSON.stringify(e)).join("\n")).not.toContain(SECRET);
-
-    const second = await run(
-      { spec: asking(), impl: implementer(() => []) },
-      { repo: first.repo, task },
-    );
-    expect(second.outcome.escalation?.reason).toBe("clarification_required");
-    expect(second.outcome.runId).not.toBe(first.outcome.runId);
-  });
-
-  test("abort writes partial report with interrupted", async () => {
-    const ac = new AbortController();
-    const impl = responder(() => {
-      ac.abort();
-      return call("write", { path: "src/sum.ts", content: GOOD_SUM });
-    });
-    const { outcome, events } = await run({ impl }, { signal: ac.signal });
-    expect(outcome.status).toBe("escalated");
-    expect(outcome.escalation?.reason).toBe("interrupted");
-    expect(existsSync(outcome.worktree)).toBe(true);
-    const report = readFileSync(outcome.reportPath, "utf8");
-    expect(report).toContain("## Status");
-    expect(report).toContain("interrupted");
-    expect(events.at(-1)).toMatchObject({ type: "run_end", status: "escalated" });
-  });
-
-  test("a verifier error is never done: kept findings stay upheld and the review is incomplete", async () => {
-    const ver = responder(() => {
-      throw new RewireError("verifier_down", "boom");
-    });
-    const { outcome } = await run(
-      { impl: implementer(() => [["src/sum.ts", MARKED_SUM]]), rev: markReviewer(EVIL), ver },
-      { policy: BUDGET_0 },
-    );
-    expect(outcome.status).toBe("escalated");
-    expect(outcome.escalation?.details?.join("\n")).toContain("verifier error:");
-    const report = readFileSync(outcome.reportPath, "utf8");
-    expect(report).toContain("verifier error:");
-    // the finding's scenario is in the report, inert and redacted
-    expect(report).toContain("failure scenario: [x](http://evil)");
-    expect(report).not.toContain(SECRET);
-    const outside = report.replace(/^(`{3,})text\n[\s\S]*?\n\1$/gm, "");
-    expect(outside).not.toContain("](http");
-    expect([...outside.matchAll(/^## Status$/gm)].length).toBe(1);
-    const log = readFileSync(join(dirname(outcome.reportPath), "events.jsonl"), "utf8");
-    expect(log).not.toContain(SECRET);
-  });
-
-  test("panel escalation (binary asset) with a clean score escalates review_incomplete", async () => {
-    const { outcome } = await run({
-      impl: implementer(() => [
-        ["src/sum.ts", GOOD_SUM],
-        ["docs/spec.pdf", "%PDF-1.4\nbinary asset by magic number\n"],
-      ]),
-    });
-    expect(outcome.status).toBe("escalated");
-    expect(outcome.escalation?.reason).toBe("review_incomplete");
-    expect(outcome.escalation?.details?.join("\n")).toContain("spec.pdf");
-  });
-
-  test("a panel rejection is never done", async () => {
-    const rev = responder(() => {
-      throw new RewireError("reviewer_down", "boom");
-    });
-    const { outcome } = await run({ impl: implementer(() => [["src/sum.ts", GOOD_SUM]]), rev });
-    expect(outcome.status).toBe("escalated");
-    expect(outcome.escalation?.reason).toBe("review_incomplete");
-    expect(outcome.escalation?.details?.join("\n")).toContain("review panel error: reviewer_down");
-  });
-
-  test("replan resets to the frozen commit: implementer leftovers are gone, frozen tests identical", async () => {
-    const seen: Array<{ junk: boolean; log: boolean }> = [];
-    let repoDir = "";
-    const impl = implementer((req) => {
-      if (firstUser(req).includes("Previous approach failed")) {
-        const wt = worktreeOf(repoDir);
-        seen.push({
-          junk: existsSync(join(wt, "src/junk.ts")),
-          log: existsSync(join(wt, "debug.log")),
-        });
-        return [["src/sum.ts", GOOD_SUM]];
-      }
-      return [
-        ["src/sum.ts", "export function sum(a: number, b: number): number {\n  return a - b;\n}\n"],
-        ["src/junk.ts", "export const junk = 1;\n"],
-        ["debug.log", "ignored leftover\n"],
-      ];
-    });
-    repoDir = makeRepo();
-    const { outcome, repo } = await run({ impl }, { repo: repoDir, policy: BUDGET_0 });
-    expect(seen).toEqual([{ junk: false, log: false }]);
-    expect(outcome.status).toBe("verified");
-    const frozen = manifestOf(outcome).files.find((f) => f.path === TEST_FILE);
-    expect(sha(git(repo, "show", `${outcome.branch}:${TEST_FILE}`))).toBe(frozen?.sha256);
-    expect(git(repo, "show", `${outcome.branch}:src/sum.ts`)).toBe(GOOD_SUM);
-    expect(git(repo, "ls-tree", "-r", "--name-only", outcome.branch)).not.toContain("junk.ts");
-  });
-
-  test("frozen tests are re-verified before the final commit", async () => {
-    // A sandbox hole for the test only: the implementer may write test paths, and every gate
-    // passes, so only the pre-commit re-check stands between the edit and a verified branch.
-    const clientFactory = (p: CapabilityProfile): SandboxClient =>
-      new SandboxClient(
-        p.write.includes("**")
-          ? { ...p, writeDeny: p.writeDeny.filter((g) => !DEFAULT_POLICY.testGlobs.includes(g)) }
-          : p,
+describe.skipIf(!sandboxAvailable)(
+  "orchestrator e2e (real sandbox, fixture sum-lib)",
+  { timeout: 120_000 },
+  () => {
+    test("happy path produces verified branch and report", async () => {
+      const { outcome, repo, events } = await run({
+        impl: implementer(() => [["src/sum.ts", GOOD_SUM]]),
+      });
+      expect(outcome.escalation).toBeUndefined();
+      expect(outcome.status).toBe("verified");
+      const report = readFileSync(outcome.reportPath, "utf8");
+      expect(report).toMatch(/## Gates[\s\S]*\| tsc \| broken \| pass/);
+      expect(commitsAfterBase(repo, outcome.branch)).toEqual([
+        "rewire: add sum",
+        "rewire: frozen acceptance tests",
+      ]);
+      expect(git(repo, "log", "-1", "--format=%B", outcome.branch)).toContain(
+        `Rewire-Run: ${outcome.runId}`,
       );
-    const pass: Gate = {
-      name: "stub",
-      category: "broken",
-      run: async () => ({ status: "pass", summary: "stubbed", details: null }),
-    };
-    const gates = Object.fromEntries(DEFAULT_POLICY.gates.map((n) => [n, { ...pass, name: n }]));
-    const edited = `import { test } from "vitest";\ntest("AC-1: adds two numbers", () => {});\n`;
-    const { outcome, repo } = await run(
-      {
+      expect(git(repo, "show", `${outcome.branch}:src/sum.ts`)).toBe(GOOD_SUM);
+      // worktree removed, branch kept; run dir holds the artifacts
+      expect(existsSync(outcome.worktree)).toBe(false);
+      const runDir = dirname(outcome.reportPath);
+      expect(runDir).toBe(join(repo, ".rewire", "runs", outcome.runId));
+      for (const f of ["events.jsonl", "contract.json", "manifest.json", "report.md"]) {
+        expect(existsSync(join(runDir, f))).toBe(true);
+      }
+      const logged = readFileSync(join(runDir, "events.jsonl"), "utf8").trim().split("\n");
+      expect(logged.length).toBe(events.length);
+      for (const l of logged) RunEvent.parse(JSON.parse(l));
+      expect(events[0]?.type).toBe("run_start");
+      expect(events.at(-1)).toMatchObject({ type: "run_end", status: "verified" });
+      // the user's repo is still clean for the next run
+      expect(git(repo, "status", "--porcelain", "--", ".", ":(exclude).rewire")).toBe("");
+    });
+
+    test("implementer editing a frozen test cannot get verified", async () => {
+      const { outcome, repo } = await run(
+        {
+          impl: implementer(() => [
+            [
+              TEST_FILE,
+              `import { test } from "vitest";\ntest("AC-1: adds two numbers", () => {});\n`,
+            ],
+          ]),
+        },
+        { policy: BUDGET_0 },
+      );
+      expect(outcome.status).toBe("escalated");
+      const m = manifestOf(outcome);
+      const frozen = m.files.find((f) => f.path === TEST_FILE);
+      expect(frozen?.sha256).toBe(sha(TEST_SRC));
+      expect(sha(git(repo, "show", `${outcome.branch}:${TEST_FILE}`))).toBe(frozen?.sha256);
+      expect(sha(readFileSync(join(outcome.worktree, TEST_FILE)))).toBe(frozen?.sha256);
+      expect(commitsAfterBase(repo, outcome.branch)).toEqual(["rewire: frozen acceptance tests"]);
+      expect(existsSync(outcome.worktree)).toBe(true);
+    });
+
+    test("upheld security finding blocks and is fed back", async () => {
+      const impl = implementer((req) => [
+        ["src/sum.ts", firstUser(req).includes("Required fixes") ? GOOD_SUM : MARKED_SUM],
+      ]);
+      const { outcome } = await run({
+        impl,
+        rev: markReviewer("SCENARIO-7: a caller passes strings and gets concatenation"),
+      });
+      expect(outcome.status).toBe("verified");
+      const fed = (impl as FauxProvider).requests.filter((r) =>
+        firstUser(r).includes("SCENARIO-7: a caller passes strings"),
+      );
+      expect(fed.length).toBeGreaterThan(0);
+      const report = readFileSync(outcome.reportPath, "utf8");
+      expect(report).toMatch(/\| 1 \| 8 \|/); // round 1 scored one critical finding
+      expect(report).toMatch(/\| 2 \| 0 \|/);
+    });
+
+    test("clarification with no human escalates with questions; a second run is not blocked by .rewire/runs", async () => {
+      const asking = () =>
+        new FauxProvider([
+          text("x"),
+          text(contractJson({ openQuestions: ["Which number type?"] })),
+        ]);
+      const task = `add sum(a,b) using key ${SECRET}`;
+      const first = await run({ spec: asking(), impl: implementer(() => []) }, { task });
+      expect(first.outcome.status).toBe("escalated");
+      expect(first.outcome.escalation?.reason).toBe("clarification_required");
+      expect(first.outcome.escalation?.question).toContain("Which number type?");
+      const report = readFileSync(first.outcome.reportPath, "utf8");
+      expect(report).toContain("## Escalation");
+      expect(report).toContain("Which number type?");
+      expect(existsSync(first.outcome.worktree)).toBe(true);
+      // secret-shaped text never reaches the report or the event log
+      const log = readFileSync(join(dirname(first.outcome.reportPath), "events.jsonl"), "utf8");
+      expect(report).not.toContain(SECRET);
+      expect(log).not.toContain(SECRET);
+      expect(first.events.map((e) => JSON.stringify(e)).join("\n")).not.toContain(SECRET);
+
+      const second = await run(
+        { spec: asking(), impl: implementer(() => []) },
+        { repo: first.repo, task },
+      );
+      expect(second.outcome.escalation?.reason).toBe("clarification_required");
+      expect(second.outcome.runId).not.toBe(first.outcome.runId);
+    });
+
+    test("abort writes partial report with interrupted", async () => {
+      const ac = new AbortController();
+      const impl = responder(() => {
+        ac.abort();
+        return call("write", { path: "src/sum.ts", content: GOOD_SUM });
+      });
+      const { outcome, events } = await run({ impl }, { signal: ac.signal });
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.reason).toBe("interrupted");
+      expect(existsSync(outcome.worktree)).toBe(true);
+      const report = readFileSync(outcome.reportPath, "utf8");
+      expect(report).toContain("## Status");
+      expect(report).toContain("interrupted");
+      expect(events.at(-1)).toMatchObject({ type: "run_end", status: "escalated" });
+    });
+
+    test("a verifier error is never done: kept findings stay upheld and the review is incomplete", async () => {
+      const ver = responder(() => {
+        throw new RewireError("verifier_down", "boom");
+      });
+      const { outcome } = await run(
+        { impl: implementer(() => [["src/sum.ts", MARKED_SUM]]), rev: markReviewer(EVIL), ver },
+        { policy: BUDGET_0 },
+      );
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.details?.join("\n")).toContain("verifier error:");
+      const report = readFileSync(outcome.reportPath, "utf8");
+      expect(report).toContain("verifier error:");
+      // the finding's scenario is in the report, inert and redacted
+      expect(report).toContain("failure scenario: [x](http://evil)");
+      expect(report).not.toContain(SECRET);
+      const outside = report.replace(/^(`{3,})text\n[\s\S]*?\n\1$/gm, "");
+      expect(outside).not.toContain("](http");
+      expect([...outside.matchAll(/^## Status$/gm)].length).toBe(1);
+      const log = readFileSync(join(dirname(outcome.reportPath), "events.jsonl"), "utf8");
+      expect(log).not.toContain(SECRET);
+    });
+
+    test("panel escalation (binary asset) with a clean score escalates review_incomplete", async () => {
+      const { outcome } = await run({
         impl: implementer(() => [
           ["src/sum.ts", GOOD_SUM],
-          [TEST_FILE, edited],
+          ["docs/spec.pdf", "%PDF-1.4\nbinary asset by magic number\n"],
         ]),
-      },
-      { seams: { clientFactory, gates } },
-    );
-    expect(readFileSync(join(outcome.worktree, TEST_FILE), "utf8")).toBe(edited);
-    expect(outcome.status).toBe("escalated");
-    expect(outcome.escalation?.reason).toBe("stage_error");
-    expect(outcome.escalation?.details?.join("\n")).toContain(`frozen test ${TEST_FILE}: modified`);
-    expect(commitsAfterBase(repo, outcome.branch)).toEqual(["rewire: frozen acceptance tests"]);
-    expect(sha(git(repo, "show", `${outcome.branch}:${TEST_FILE}`))).toBe(sha(TEST_SRC));
-  });
+      });
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.reason).toBe("review_incomplete");
+      expect(outcome.escalation?.details?.join("\n")).toContain("spec.pdf");
+    });
 
-  test("the audit gate gets a registry-profile client, the other gates a network-deny one", async () => {
-    const seen: Array<{ client: string; registry: string | undefined }> = [];
-    const network = (c: SandboxClient | undefined): string | undefined =>
-      c
-        ? (JSON.parse(readFileSync(c.profilePath, "utf8")) as CapabilityProfile).network
-        : undefined;
-    const audit: Gate = {
-      name: "audit",
-      category: "security",
-      async run(ctx: GateContext) {
-        seen.push({ client: network(ctx.client) ?? "", registry: network(ctx.registryClient) });
-        return { status: "pass", summary: "stubbed", details: null };
-      },
-    };
-    const { outcome } = await run(
-      { impl: implementer(() => [["src/sum.ts", GOOD_SUM]]) },
-      { seams: { gates: { audit } } },
-    );
-    expect(outcome.status).toBe("verified");
-    expect(seen).toEqual([{ client: "deny", registry: "registry" }]);
-  });
-});
+    test("a panel rejection is never done", async () => {
+      const rev = responder(() => {
+        throw new RewireError("reviewer_down", "boom");
+      });
+      const { outcome } = await run({ impl: implementer(() => [["src/sum.ts", GOOD_SUM]]), rev });
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.reason).toBe("review_incomplete");
+      expect(outcome.escalation?.details?.join("\n")).toMatch(
+        /review panel error: reviewer_down: [^\n]*boom/,
+      );
+    });
+
+    test("replan resets to the frozen commit: implementer leftovers are gone, frozen tests identical", async () => {
+      const seen: Array<{ junk: boolean; log: boolean }> = [];
+      let repoDir = "";
+      const impl = implementer((req) => {
+        if (firstUser(req).includes("Previous approach failed")) {
+          const wt = worktreeOf(repoDir);
+          seen.push({
+            junk: existsSync(join(wt, "src/junk.ts")),
+            log: existsSync(join(wt, "debug.log")),
+          });
+          return [["src/sum.ts", GOOD_SUM]];
+        }
+        return [
+          [
+            "src/sum.ts",
+            "export function sum(a: number, b: number): number {\n  return a - b;\n}\n",
+          ],
+          ["src/junk.ts", "export const junk = 1;\n"],
+          ["debug.log", "ignored leftover\n"],
+        ];
+      });
+      repoDir = makeRepo();
+      const { outcome, repo } = await run({ impl }, { repo: repoDir, policy: BUDGET_0 });
+      expect(seen).toEqual([{ junk: false, log: false }]);
+      expect(outcome.status).toBe("verified");
+      const frozen = manifestOf(outcome).files.find((f) => f.path === TEST_FILE);
+      expect(sha(git(repo, "show", `${outcome.branch}:${TEST_FILE}`))).toBe(frozen?.sha256);
+      expect(git(repo, "show", `${outcome.branch}:src/sum.ts`)).toBe(GOOD_SUM);
+      expect(git(repo, "ls-tree", "-r", "--name-only", outcome.branch)).not.toContain("junk.ts");
+    });
+
+    test("frozen tests are re-verified before the final commit", async () => {
+      // A sandbox hole for the test only: the implementer may write test paths, and every gate
+      // passes, so only the pre-commit re-check stands between the edit and a verified branch.
+      const clientFactory = (p: CapabilityProfile): SandboxClient =>
+        new SandboxClient(
+          p.write.includes("**")
+            ? { ...p, writeDeny: p.writeDeny.filter((g) => !DEFAULT_POLICY.testGlobs.includes(g)) }
+            : p,
+        );
+      const pass: Gate = {
+        name: "stub",
+        category: "broken",
+        run: async () => ({ status: "pass", summary: "stubbed", details: null }),
+      };
+      const gates = Object.fromEntries(DEFAULT_POLICY.gates.map((n) => [n, { ...pass, name: n }]));
+      const edited = `import { test } from "vitest";\ntest("AC-1: adds two numbers", () => {});\n`;
+      const { outcome, repo } = await run(
+        {
+          impl: implementer(() => [
+            ["src/sum.ts", GOOD_SUM],
+            [TEST_FILE, edited],
+          ]),
+        },
+        { seams: { clientFactory, gates } },
+      );
+      expect(readFileSync(join(outcome.worktree, TEST_FILE), "utf8")).toBe(edited);
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.reason).toBe("stage_error");
+      expect(outcome.escalation?.details?.join("\n")).toContain(
+        `frozen test ${TEST_FILE}: modified`,
+      );
+      expect(commitsAfterBase(repo, outcome.branch)).toEqual(["rewire: frozen acceptance tests"]);
+      expect(sha(git(repo, "show", `${outcome.branch}:${TEST_FILE}`))).toBe(sha(TEST_SRC));
+    });
+
+    test("the audit gate gets a registry-profile client, the other gates a network-deny one", async () => {
+      const seen: Array<{ client: string; registry: string | undefined }> = [];
+      const network = (c: SandboxClient | undefined): string | undefined =>
+        c
+          ? (JSON.parse(readFileSync(c.profilePath, "utf8")) as CapabilityProfile).network
+          : undefined;
+      const audit: Gate = {
+        name: "audit",
+        category: "security",
+        async run(ctx: GateContext) {
+          seen.push({ client: network(ctx.client) ?? "", registry: network(ctx.registryClient) });
+          return { status: "pass", summary: "stubbed", details: null };
+        },
+      };
+      const { outcome } = await run(
+        { impl: implementer(() => [["src/sum.ts", GOOD_SUM]]) },
+        { seams: { gates: { audit } } },
+      );
+      expect(outcome.status).toBe("verified");
+      expect(seen).toEqual([{ client: "deny", registry: "registry" }]);
+    });
+
+    const passAll = (): Record<string, Gate> =>
+      Object.fromEntries(
+        DEFAULT_POLICY.gates.map((n) => [
+          n,
+          {
+            name: n,
+            category: "broken" as const,
+            run: async () => ({ status: "pass" as const, summary: "stubbed", details: null }),
+          },
+        ]),
+      );
+
+    test("a dir-only node_modules/ ignore still links node_modules; the commit never holds it", async () => {
+      const repo = makeRepo({ gitignore: "node_modules/\n*.log\n" });
+      const { outcome } = await run(
+        { impl: implementer(() => [["src/sum.ts", GOOD_SUM]]) },
+        { repo },
+      );
+      expect(outcome.escalation).toBeUndefined();
+      expect(outcome.status).toBe("verified");
+      const report = readFileSync(outcome.reportPath, "utf8");
+      expect(report).toMatch(/\| tsc \| broken \| pass/);
+      const tree = git(repo, "ls-tree", "-r", "--name-only", outcome.branch).split("\n");
+      expect(tree.filter((f) => f === "node_modules" || f.startsWith("node_modules/"))).toEqual([]);
+    });
+
+    test("a tampered node_modules link fails every gate closed", async () => {
+      // Host-side stand-in for an implementer that swaps the link for its own tools, on every
+      // implementer run (a replan resets the worktree and relinks).
+      const impl = implementer(() => {
+        const nm = join(worktreeOf(repo), "node_modules");
+        rmSync(nm, { recursive: true, force: true }); // removes the link itself, never its target
+        mkdirSync(join(nm, ".bin"), { recursive: true });
+        return [["src/sum.ts", GOOD_SUM]];
+      });
+      const repo = makeRepo();
+      const { outcome, events } = await run({ impl }, { repo, policy: BUDGET_0 });
+      expect(outcome.status).toBe("escalated");
+      const gateEnds = events.filter((e) => e.type === "gate_result") as Array<
+        Extract<RunEvent, { type: "gate_result" }>
+      >;
+      const report = readFileSync(outcome.reportPath, "utf8");
+      expect(report).toContain("node\\_modules link tampered"); // the report escapes markdown
+      expect(gateEnds.some((e) => e.result.summary === "node_modules link tampered")).toBe(true);
+      expect(gateEnds.every((e) => e.result.status !== "pass")).toBe(true);
+    });
+
+    test("a node_modules link tampered after the gates blocks the final commit", async () => {
+      const gates = passAll();
+      const last = DEFAULT_POLICY.gates[DEFAULT_POLICY.gates.length - 1] ?? "audit";
+      gates[last] = {
+        name: last,
+        category: "broken",
+        async run(ctx: GateContext) {
+          const nm = join(ctx.worktree, "node_modules");
+          rmSync(nm, { force: true });
+          symlinkSync(tmpdir(), nm);
+          return { status: "pass", summary: "stubbed", details: null };
+        },
+      };
+      const { outcome, repo } = await run(
+        { impl: implementer(() => [["src/sum.ts", GOOD_SUM]]) },
+        { seams: { gates } },
+      );
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.reason).toBe("stage_error");
+      expect(outcome.escalation?.details?.join("\n")).toContain("node_modules link tampered");
+      expect(commitsAfterBase(repo, outcome.branch)).toEqual(["rewire: frozen acceptance tests"]);
+    });
+
+    test("HEAD must still be the frozen commit before the final commit", async () => {
+      const gates = passAll();
+      const last = DEFAULT_POLICY.gates[DEFAULT_POLICY.gates.length - 1] ?? "audit";
+      gates[last] = {
+        name: last,
+        category: "broken",
+        async run(ctx: GateContext) {
+          git(ctx.worktree, "commit", "-q", "--allow-empty", "--no-verify", "-m", "sneaky");
+          return { status: "pass", summary: "stubbed", details: null };
+        },
+      };
+      const { outcome } = await run(
+        { impl: implementer(() => [["src/sum.ts", GOOD_SUM]]) },
+        { seams: { gates } },
+      );
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.reason).toBe("stage_error");
+      expect(outcome.escalation?.details?.join("\n")).toContain("HEAD");
+    });
+
+    test("escalation text and manifest.json are redacted", async () => {
+      const tw = new FauxProvider([
+        call("write", {
+          path: TEST_FILE,
+          content: TEST_SRC.replace("adds two numbers", `adds ${SECRET}`),
+        }),
+        text("done"),
+      ]);
+      const impl = responder((req) => {
+        if (req.system.includes("stopped and needs a human")) {
+          return text(JSON.stringify({ hypothesis: `leak ${SECRET}`, question: `ask ${SECRET}?` }));
+        }
+        if (lastIsTool(req)) return text("done");
+        return call("write", { path: "src/sum.ts", content: "export const nope = 1;\n" });
+      });
+      const { outcome } = await run({ impl, tw }, { policy: BUDGET_0 });
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.hypothesis).toContain("leak");
+      expect(JSON.stringify(outcome.escalation)).not.toContain(SECRET);
+      const manifest = readFileSync(join(dirname(outcome.reportPath), "manifest.json"), "utf8");
+      expect(manifest).toContain("AC-1: adds");
+      expect(manifest).not.toContain(SECRET);
+    });
+
+    test("the hypothesis call honours the run's abort signal", async () => {
+      const ac = new AbortController();
+      const fail = implementer(() => [["src/sum.ts", "export const nope = 1;\n"]]);
+      let askedAt = 0;
+      const impl: Provider = {
+        chat(req) {
+          if (req.system.includes("stopped and needs a human")) {
+            askedAt = Date.now();
+            ac.abort();
+            // A provider that never answers: only the abort can settle the call in time.
+            return new Promise(() => {});
+          }
+          return fail.chat(req);
+        },
+      };
+      const { outcome } = await run(
+        { impl },
+        { policy: BUDGET_0, signal: ac.signal, seams: { hypothesisTimeoutMs: 60_000 } },
+      );
+      expect(askedAt).toBeGreaterThan(0);
+      // The 60 s hypothesis timeout never fires: the run's abort settles the call at once.
+      expect(Date.now() - askedAt).toBeLessThan(10_000);
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.hypothesis).toContain("Unable to generate hypothesis");
+    }, 180_000);
+
+    test("a preflight failure escalates without creating a run dir", async () => {
+      const repo = makeRepo();
+      writeFileSync(join(repo, "src", "index.ts"), "// dirty\n");
+      const { outcome } = await run({ impl: implementer(() => []) }, { repo });
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.reason).toBe("stage_error");
+      expect(outcome.reportPath).toBe("");
+      expect(existsSync(join(repo, ".rewire", "runs"))).toBe(false);
+    });
+  },
+);

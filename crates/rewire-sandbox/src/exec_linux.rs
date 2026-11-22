@@ -203,8 +203,12 @@ fn collect_masks(p: &Profile) -> Result<Masks> {
     }
     let mut bases = vec![p.root().to_path_buf()];
     bases.extend(p.extra_write().iter().filter(|d| d.is_dir()).cloned());
+    let mut writable = write_binds(p)?;
+    for d in p.extra_write().iter().filter(|d| d.is_dir()) {
+        writable.push(fs::canonicalize(d).unwrap_or_else(|_| d.clone()));
+    }
     for b in &bases {
-        walk(p, b, &mut m, &mut budget)?;
+        walk(p, b, &writable, &mut m, &mut budget)?;
     }
     // Absolute readDeny globs outside the walked trees: mask what exists.
     for (anchor, glob) in p.read_deny_sources() {
@@ -226,16 +230,22 @@ fn collect_masks(p: &Profile) -> Result<Masks> {
 
 /// Walk `dir` without following symlinks. A deny match is recorded and not
 /// descended into (the mount covers its subtree).
-fn walk(p: &Profile, dir: &Path, m: &mut Masks, budget: &mut usize) -> Result<()> {
+fn walk(
+    p: &Profile,
+    dir: &Path,
+    writable: &[PathBuf],
+    m: &mut Masks,
+    budget: &mut usize,
+) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let path = entry?.path();
         *budget = budget.checked_sub(1).context("tree too large to sandbox")?;
-        if classify(p, &path, m)? {
+        if classify(p, &path, writable, m)? {
             continue;
         }
         let meta = fs::symlink_metadata(&path)?;
         if meta.is_dir() {
-            walk(p, &path, m, budget)?;
+            walk(p, &path, writable, m, budget)?;
         }
     }
     Ok(())
@@ -257,8 +267,17 @@ fn walk_read_only(p: &Profile, start: &Path, m: &mut Masks, budget: &mut usize) 
     Ok(())
 }
 
+/// A write-denied symlink needs no ro-bind (which would refuse it anyway) when
+/// its canonical target lies outside every writable root: the target is
+/// already read-only, and the link node itself is verified by the
+/// orchestrator (R33, e.g. the worktree's node_modules link). Unresolvable
+/// targets and targets inside a writable root keep the fail-closed mask.
+fn symlink_mask_skippable(target: Option<&Path>, writable: &[PathBuf]) -> bool {
+    target.is_some_and(|t| !writable.iter().any(|w| t.starts_with(w)))
+}
+
 /// Record a mask for `path` if a rule hits it; true = handled.
-fn classify(p: &Profile, path: &Path, m: &mut Masks) -> Result<bool> {
+fn classify(p: &Profile, path: &Path, writable: &[PathBuf], m: &mut Masks) -> Result<bool> {
     // Secrecy first: a hidden path is also not writable on the host.
     if hide_if_read_denied(p, path, m)? {
         return Ok(true);
@@ -268,6 +287,13 @@ fn classify(p: &Profile, path: &Path, m: &mut Masks) -> Result<bool> {
         .with_context(|| format!("resolving {}", path.display()))?;
     let spellings: Vec<&Path> = r.spellings.iter().map(PathBuf::as_path).collect();
     if p.write_denial(&spellings).is_some() {
+        let is_link = fs::symlink_metadata(path).is_ok_and(|md| md.file_type().is_symlink());
+        if is_link {
+            let target = fs::canonicalize(path).ok();
+            if symlink_mask_skippable(target.as_deref(), writable) {
+                return Ok(true);
+            }
+        }
         m.read_only.push(path.to_path_buf());
         return Ok(true);
     }
@@ -589,6 +615,62 @@ mod tests {
         argv.windows(seq.len())
             .position(|w| w == seq)
             .unwrap_or_else(|| panic!("{seq:?} not in {argv:?}"))
+    }
+
+    #[test]
+    fn symlink_mask_skippable_only_for_targets_outside_writable_roots() {
+        let w = vec![PathBuf::from("/r/src"), PathBuf::from("/scratch")];
+        assert!(symlink_mask_skippable(
+            Some(Path::new("/elsewhere/node_modules")),
+            &w
+        ));
+        assert!(!symlink_mask_skippable(Some(Path::new("/r/src/inner")), &w));
+        assert!(!symlink_mask_skippable(Some(Path::new("/scratch")), &w));
+        // dangling or unresolvable: keep the fail-closed mask
+        assert!(!symlink_mask_skippable(None, &w));
+    }
+
+    #[test]
+    fn protected_symlink_out_of_writable_roots_is_not_masked() {
+        let (_t, root, _) = fixture(Network::Deny);
+        let outside = TempDir::new().unwrap();
+        let target = fs::canonicalize(outside.path()).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(root.join("src"), root.join("tests/into-src")).unwrap();
+        let p = Profile::from_spec(ProfileSpec {
+            root: root.clone(),
+            write: vec!["src/**".into()],
+            write_deny: vec![
+                "tests/**".into(),
+                "**/node_modules/**".into(),
+                "node_modules".into(),
+            ],
+            read_deny: vec![],
+            network: Network::Deny,
+            extra_write: vec![],
+        })
+        .unwrap();
+        let m = collect_masks(&p).unwrap();
+        assert!(!m.read_only.contains(&root.join("node_modules")), "{m:?}");
+        // other protected matches are still masked (tests/ covers the symlink into src)
+        assert!(m.read_only.contains(&root.join("tests")), "{m:?}");
+    }
+
+    #[test]
+    fn protected_symlink_into_a_writable_root_stays_masked() {
+        let (_t, root, _) = fixture(Network::Deny);
+        std::os::unix::fs::symlink(root.join("src"), root.join("node_modules")).unwrap();
+        let p = Profile::from_spec(ProfileSpec {
+            root: root.clone(),
+            write: vec!["src/**".into()],
+            write_deny: vec!["node_modules".into()],
+            read_deny: vec![],
+            network: Network::Deny,
+            extra_write: vec![],
+        })
+        .unwrap();
+        let m = collect_masks(&p).unwrap();
+        assert!(m.read_only.contains(&root.join("node_modules")), "{m:?}");
     }
 
     #[test]

@@ -163,7 +163,6 @@ async function run(
       worktree,
       baseRef: input.baseRef,
       client: verifyClient,
-      registryClient: verifyClient,
       pack: input.pack,
       policy,
       scratch,
