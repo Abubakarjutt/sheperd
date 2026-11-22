@@ -20,3 +20,4 @@ export {
   selectReviewers,
 } from "./routing.js";
 export { wrapUntrusted } from "./untrusted.js";
+export { blockingFindings, type VerifyContext, verifyFindings } from "./verifier.js";

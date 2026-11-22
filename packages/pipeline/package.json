@@ -28,6 +28,7 @@
     "@rewire/providers": "workspace:*",
     "@rewire/sandbox": "workspace:*",
     "@rewire/tools": "workspace:*",
+    "smol-toml": "^1.4.2",
     "zod": "^4.6.7"
   }
 }
