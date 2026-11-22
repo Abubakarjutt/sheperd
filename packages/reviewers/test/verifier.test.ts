@@ -311,3 +311,56 @@ test("hunk match is exact: a.ts does not pull in data/a.ts", async () => {
   await verifyFindings([mk("a")], ctx(root, diff, p));
   expect(p.requests[0]?.messages[0]?.content).not.toContain("SECRETHUNK");
 });
+
+test("contract over budget: every finding auto-upheld, no model call", async () => {
+  const { root, diff } = await setup();
+  const big = { ...contract, title: "t".repeat(70 * 1024) };
+  const p = new FauxProvider([]);
+  const out = await verifyFindings([mk("a"), mk("b")], { ...ctx(root, diff, p), contract: big });
+  expect(out.map((v) => v.reasoning)).toEqual([
+    "verifier budget exceeded (contract)",
+    "verifier budget exceeded (contract)",
+  ]);
+  expect(out.every((v) => v.verdict === "upheld")).toBe(true);
+  expect(p.callCount).toBe(0);
+});
+
+test("first finding alone over budget is auto-upheld; the next still goes to the model", async () => {
+  const { root, diff } = await setup();
+  const p = new FauxProvider([reply([{ findingId: "ok", verdict: "refuted" }])]);
+  const out = await verifyFindings(
+    [mk("huge", { failureScenario: "z".repeat(70 * 1024) }), mk("ok")],
+    ctx(root, diff, p),
+  );
+  expect(out[0]).toMatchObject({ verdict: "upheld", reasoning: "verifier budget exceeded" });
+  expect(out[1]?.verdict).toBe("refuted");
+  expect((p.requests[0]?.messages[0]?.content ?? "").length).toBeLessThanOrEqual(64 * 1024);
+});
+
+test("hunks match renamed and quoted paths", async () => {
+  const { root, diff } = await setup();
+  const patch = [
+    'diff --git "a/d\\303\\251.ts" "b/d\\303\\251.ts"',
+    "--- a/x",
+    '+++ "b/d\\303\\251.ts"',
+    "+QUOTEDHUNK",
+    "diff --git a/old.ts b/a.ts",
+    "similarity index 90%",
+    "rename from old.ts",
+    "rename to a.ts",
+    "+RENAMEDHUNK",
+    "",
+  ].join("\n");
+  put(root, "dé.ts", "q1\nconst total = items.length;\n");
+  const d: DiffSummary = { ...diff, patch };
+  const p = new FauxProvider([
+    reply([
+      { findingId: "q", verdict: "upheld" },
+      { findingId: "r", verdict: "upheld" },
+    ]),
+  ]);
+  await verifyFindings([mk("r"), mk("q", { file: "dé.ts" })], ctx(root, d, p));
+  const sent = p.requests.at(0)?.messages[0]?.content ?? "";
+  expect(sent).toContain("RENAMEDHUNK");
+  expect(sent).toContain("QUOTEDHUNK");
+});

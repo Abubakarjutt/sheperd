@@ -10,17 +10,18 @@ import {
 import { type ModelRef, type Provider, structured } from "@rewire/providers";
 import type { SandboxClient } from "@rewire/sandbox";
 import { z } from "zod";
-import type { DiffSummary } from "./diff.js";
+import { type DiffSummary, unquote } from "./diff.js";
 import { readInsideWorktree } from "./evidence.js";
-import { forcedFindingsFor } from "./framework.js";
+import { forcedFindingsFor, redact } from "./framework.js";
 import { wrapUntrusted } from "./untrusted.js";
 
 const CONTEXT_LINES = 20;
 const HUNK_BUDGET = 8 * 1024;
 const EXCERPT_CAP = 4 * 1024;
-/** Leaves headroom under the 64 KiB cap for the contract, fences and instructions. */
-const PROMPT_BUDGET = 48 * 1024;
-const SECRET = /(sk-|ghp_|AKIA)[A-Za-z0-9_-]+/g;
+/** Cap on the whole user prompt. The contract and findings JSON are counted, never truncated. */
+const PROMPT_BUDGET = 64 * 1024;
+/** Fences, headings and the closing instruction. */
+const PROMPT_OVERHEAD = 2 * 1024;
 const BUDGET_REASONING = "verifier budget exceeded";
 const FORCED_REASONING = "harness-forced finding; not subject to model refutation";
 const UNREADABLE_REASONING = "verifier could not read the code";
@@ -55,8 +56,6 @@ const prompt = (): string => {
   return promptText;
 };
 
-const redact = (t: string): string => t.replace(SECRET, "[redacted]");
-
 /**
  * Forced by id (the id the framework derives for the finding's own reviewer name) or, as a
  * second route, by content match against diff.forced.
@@ -87,12 +86,23 @@ const numbered = (text: string, from: number, to: number): string =>
     .map(([n, l]) => `${n}| ${l}`)
     .join("\n");
 
-/** The diff sections whose `diff --git a/X b/X` header names exactly `path`, cut at the budget. */
+/**
+ * The diff sections for `path`: the `diff --git` header names it exactly (plain or C-quoted),
+ * or the section's `+++ b/<path>` or `rename to <path>` line does (renames, quoted names).
+ */
 function hunksFor(patch: string, path: string): string {
   const exact = [`diff --git a/${path} b/${path}`, `diff --git "a/${path}" "b/${path}"`];
-  const own = patch
-    .split(/^(?=diff --git )/m)
-    .filter((s) => exact.includes(s.split("\n", 1)[0] ?? ""));
+  const own = patch.split(/^(?=diff --git )/m).filter((sec) => {
+    const lines = sec.split("\n");
+    if (exact.includes(lines[0] ?? "")) return true;
+    return lines.some((l) => {
+      if (l.startsWith("+++ ")) {
+        const n = unquote(l.slice(4));
+        return n === `b/${path}`;
+      }
+      return l.startsWith("rename to ") && unquote(l.slice(10)) === path;
+    });
+  });
   return cap(own.join(""), HUNK_BUDGET);
 }
 
@@ -159,10 +169,15 @@ export async function verifyFindings(findings: Finding[], ctx: VerifyContext): P
     const blocks: string[] = [];
     const asked: object[] = [];
     const seenFiles = new Set<string>();
-    let used = 0;
+    let used = PROMPT_OVERHEAD + (ctx.contract ? JSON.stringify(ctx.contract, null, 2).length : 0);
+    const contractOver = used > PROMPT_BUDGET;
     const overBudget = new Set<string>();
     for (const f of findings) {
       if (auto.has(f.id) || sentIds.has(f.id) || overBudget.has(f.id)) continue;
+      if (contractOver) {
+        overBudget.add(f.id);
+        continue;
+      }
       const from = Math.max(1, f.lineStart - CONTEXT_LINES);
       const to = f.lineEnd + CONTEXT_LINES;
       const body = excerpt.get(f.id + "\0" + f.file + "\0" + f.lineStart + "\0" + f.lineEnd) ?? "";
@@ -188,7 +203,7 @@ export async function verifyFindings(findings: Finding[], ctx: VerifyContext): P
         if (h !== "") mine.push(wrapUntrusted("diff", h, { path: f.file }));
       }
       const cost = JSON.stringify(entry, null, 2).length + mine.reduce((n, b) => n + b.length, 0);
-      if (toSend.length > 0 && used + cost > PROMPT_BUDGET) {
+      if (used + cost > PROMPT_BUDGET) {
         overBudget.add(f.id);
         continue;
       }
@@ -246,7 +261,9 @@ export async function verifyFindings(findings: Finding[], ctx: VerifyContext): P
     const verdicts = findings.map((f): Verdict => {
       const a = auto.get(f.id);
       if (a) return a;
-      if (overBudget.has(f.id)) return harness(f.id, BUDGET_REASONING);
+      if (overBudget.has(f.id)) {
+        return harness(f.id, contractOver ? `${BUDGET_REASONING} (contract)` : BUDGET_REASONING);
+      }
       const v = returned.get(f.id);
       if (!v) throw new RewireError("verifier_mismatch", `no verdict for finding ${f.id}`);
       return { findingId: f.id, verdict: v.verdict, reasoning: v.reasoning, verifierModel };

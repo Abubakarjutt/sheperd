@@ -1,18 +1,21 @@
 import { randomUUID } from "node:crypto";
 
-const CLOSER = /<\s*\/\s*(diff|file|contract|findings)/gi;
+/** Every fence tag. Both the defanging here and the fold in evidence.ts derive from this list. */
+export const FENCE_TAGS = ["diff", "file", "contract", "findings"] as const;
+export type FenceTag = (typeof FENCE_TAGS)[number];
+const CLOSER = new RegExp(`<\\s*\\/\\s*(${FENCE_TAGS.join("|")})`, "gi");
 const ATTR_NAME = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 
 const escAttr = (v: string): string =>
   v.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 /**
- * Fence untrusted content. Any closing tag for diff/file/contract inside the content is
+ * Fence untrusted content. Any closing tag for any FENCE_TAGS tag inside the content is
  * defanged (`</diff`, `</ DIFF`, `</file id="x"` all become `<\/...`), and the real tags carry
  * a random per-call `id` so a forged closer cannot match. Attribute values are escaped.
  */
 export function wrapUntrusted(
-  tag: "diff" | "file" | "contract" | "findings",
+  tag: FenceTag,
   content: string,
   attrs: Record<string, string> = {},
 ): string {

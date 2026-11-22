@@ -19,5 +19,5 @@ export {
   SILENT_FAILURE_PATTERN,
   selectReviewers,
 } from "./routing.js";
-export { wrapUntrusted } from "./untrusted.js";
+export { FENCE_TAGS, wrapUntrusted } from "./untrusted.js";
 export { blockingFindings, type VerifyContext, verifyFindings } from "./verifier.js";

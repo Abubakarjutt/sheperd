@@ -2,7 +2,13 @@ import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Finding } from "@rewire/core";
 import { expect, test } from "vitest";
-import { buildDiffSummary, type DiffSummary, filterEvidence, wrapUntrusted } from "../src/index.js";
+import {
+  buildDiffSummary,
+  type DiffSummary,
+  FENCE_TAGS,
+  filterEvidence,
+  wrapUntrusted,
+} from "../src/index.js";
 import { git, hostClient, makeRepo, put } from "./helpers.js";
 
 const finding = (over: Partial<Finding> = {}): Finding => ({
@@ -689,4 +695,17 @@ test("R21c: real PNG (and real woff2) still omitted as binary asset", async () =
   expect(d.omitted).toContain("real.png (binary asset)");
   expect(d.omitted).toContain("f.woff2 (binary asset)");
   expect(d.forced).toEqual([]);
+});
+
+test.each(FENCE_TAGS)("a defanged </%s> in evidence still matches the real line", async (tag) => {
+  const root = makeRepo({ "a.ts": "line1\nline2\n" });
+  put(root, "a.ts", `line1\nconst x = "</${tag}>"; // bad\n`);
+  const diff = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  const wrapped = wrapUntrusted("file", `const x = "</${tag}>"; // bad`);
+  expect(wrapped).toContain(`<\\/${tag}>`);
+  const defanged = `const x = "<\\/${tag}>"; // bad`;
+  const r = await filterEvidence([finding({ evidence: defanged })], root, diff, 0.5, {
+    client: hostClient(),
+  });
+  expect(r.kept).toHaveLength(1);
 });

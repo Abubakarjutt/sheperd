@@ -3,6 +3,7 @@ import { isAbsolute, posix, relative, resolve, sep } from "node:path";
 import { type Finding, normalizeEvidence, type SlopCategory } from "@rewire/core";
 import type { SandboxClient } from "@rewire/sandbox";
 import type { DiffSummary } from "./diff.js";
+import { FENCE_TAGS } from "./untrusted.js";
 
 /** Largest file the verifier or the prompt builder will read. */
 export const MAX_FILE_BYTES = 2 * 1024 * 1024;
@@ -108,7 +109,7 @@ export async function readInsideWorktree(
 }
 
 /** #23 closers were defanged to `<\/tag` in the prompt; fold both spellings to `</tag`. */
-const CLOSER_FOLD = /<\s*\\?\s*\/\s*(diff|file|contract)/gi;
+const CLOSER_FOLD = new RegExp(`<\\s*\\\\?\\s*\\/\\s*(${FENCE_TAGS.join("|")})`, "gi");
 
 /**
  * Matching-only normaliser (ids use core's normalizeEvidence, unchanged): NFKC, drop format
