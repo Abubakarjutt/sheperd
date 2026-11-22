@@ -310,14 +310,11 @@ function peerNames(text: string): Set<string> {
  * manager version: drop them from the isolated copy so only the pinned binary runs.
  */
 function stripPmFields(text: string): string {
-  try {
-    const j = JSON.parse(text) as Record<string, unknown>;
-    delete j.packageManager;
-    delete j.devEngines;
-    return JSON.stringify(j);
-  } catch {
-    return text;
-  }
+  // fail closed: an unparseable manifest is never copied verbatim (the caller reports an error)
+  const j = JSON.parse(text) as Record<string, unknown>;
+  delete j.packageManager;
+  delete j.devEngines;
+  return JSON.stringify(j);
 }
 
 /** Corepack shims download and run whatever `packageManager` names: refuse them. */

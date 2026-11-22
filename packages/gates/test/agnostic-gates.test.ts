@@ -253,6 +253,19 @@ const EVASION_BAD: Record<string, string> = {
   "reflect-eval.js": "export const f = (x) => Reflect.apply(eval, null, [x]);\n",
   "then-callback.js":
     'import { exec } from "node:child_process";\nexport function f(req) { Promise.resolve(req.query.c).then((c) => exec(c)); }\n',
+  "then-fs.js":
+    'import fs from "node:fs";\nexport function f(req) { Promise.resolve(req.query.p).then((p) => fs.readFileSync(p)); }\n',
+  "then-sql.js":
+    "export function f(req, db) { Promise.resolve(req.query.q).then((q) => db.query(q)); }\n",
+  "shell-var.js":
+    'import cp from "node:child_process";\nexport function f(d, opt) { cp.spawn(`ls \x24{d}`, [], { shell: opt }); }\n',
+  "shell-string.js":
+    'import cp from "node:child_process";\nexport function f(d) { cp.execFile("ls " + d, { shell: "/bin/sh" }, () => 1); }\n',
+  "execfile-args-shell.js":
+    'import { execFile } from "node:child_process";\nexport function f(req) { execFile("ls", [req.query.x], { shell: true }, () => 1); }\n',
+  "settimeout-string.js": 'export const f = () => setTimeout("doit()", 1);\n',
+  "setinterval-template.js": "export const f = (d) => setInterval(`run(\x24{d})`, 1);\n",
+  "ctor-ctor.js": "export const f = (req) => (() => 1).constructor.constructor(req.query.c)();\n",
   "html-var.js": "export function f(el, x) { const h = x; el.innerHTML = h; }\n",
   "html-bracket.js": 'export const f = (el, x) => { el["innerHTML"] = x; };\n',
   "vm-var.js": 'import vm from "node:vm";\nexport const f = (x) => vm.runInNewContext(x);\n',
@@ -272,6 +285,10 @@ export const h = () => cp.spawn("ls", ["-la", "x"]);
 export const i = (dir) => cp.spawn("ls", [dir], { shell: false });
 export const j = async (util) => { const run = util.promisify(cp.exec); await run("ls -la"); };
 export const k = () => Reflect.apply(eval, null, ["1+1"]);
+export const l = (d) => cp.spawn("ls", [d], { shell: false });
+export const m = () => setTimeout(() => 1, 10);
+export const n = (fn) => setInterval(fn, 10);
+export const o = () => cp.execFile("ls", ["-la"], { shell: false }, () => 1);
 `;
 
 describe("semgrep ruleset evasion resistance (real semgrep)", () => {
@@ -357,6 +374,48 @@ describe("semgrep second pass: non-standard extensions", () => {
   });
 });
 
+describe("semgrep pass 2 strictness is decided by whether the file compiles", () => {
+  test("prose and Makefiles that do not compile as JS pass", async () => {
+    const { root, ctx } = makeRepo();
+    write(
+      root,
+      "INSTALL.md",
+      "# Install\n\nThen document.write(out) to show it.\n\nrun (the thing\n",
+    );
+    write(root, "Makefile", "all:\n\teval $(shell cat env)\n");
+    const r = await semgrepGate.run(ctx);
+    expect(r.status, JSON.stringify(r.details)).toBe("pass");
+  });
+
+  test("helper.txt holding valid JS that evals req.query fails", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "helper.txt", "const x = 1;\neval(req.query.x);\n");
+    const r = await semgrepGate.run(ctx);
+    expect(r.status).toBe("fail");
+  });
+
+  test("a BOM before a node shebang, and tsx/bun/deno shebangs, are strict", async () => {
+    for (const sh of [
+      "#!/usr/bin/env node",
+      "#!/usr/bin/env tsx",
+      "#!/usr/bin/env bun",
+      "#!/usr/bin/env -S deno run",
+    ]) {
+      const { root, ctx } = makeRepo();
+      writeFileSync(join(root, "cli"), `\ufeff${sh}\nconst a = (;\n`);
+      const r = await semgrepGate.run(ctx);
+      expect(r.status, sh).toBe("fail");
+      expect(JSON.stringify(r.details), sh).toContain("cli");
+    }
+  });
+
+  test("a module-syntax .txt with eval of req.query fails", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "mod.txt", "import fs from 'fs';\nexport const f = (req) => eval(req.query.x);\n");
+    expect((await semgrepGate.run(ctx)).status).toBe("fail");
+  });
+});
+
 describe("semgrep fail-closed on skipped and errored files", () => {
   const stubSemgrep = (ctx: GateContext, out: unknown, exitCode = 0): GateContext => {
     const real = ctx.client;
@@ -391,7 +450,7 @@ describe("semgrep fail-closed on skipped and errored files", () => {
   test("a changed JS file missing from paths.scanned fails; non-JS files are ignored", async () => {
     const { root, ctx } = makeRepo();
     write(root, "a.ts", "export const a = 1;\n");
-    write(root, "notes.txt", "hello\n");
+    write(root, "notes.txt", "hello there, plain prose (not code\n");
     const out = { results: [], errors: [], paths: { scanned: [] } };
     const r = await semgrepGate.run(stubSemgrep(ctx, out));
     expect(r.status).toBe("fail");
@@ -851,6 +910,14 @@ describe("audit gate", () => {
     expect(argv).toContain("npm_config_manage_package_manager_versions=false");
   });
 
+  test("an unparseable package.json fails closed instead of being copied verbatim", async () => {
+    const { root, ctx } = makeRepo(NPM_BASE);
+    write(root, "package.json", '{"dependencies": {"left": "^1.0.0"}, "packageManager": "npm@99"');
+    const { client } = registryStub(NPM_CLEAN, 0);
+    const r = await auditGate.run({ ...ctx, registryClient: client });
+    expect(r.status).not.toBe("pass");
+  });
+
   test("a corepack shim for the package manager is refused", async () => {
     const { root, ctx } = makeRepo(NPM_BASE);
     write(root, "package.json", NPM_PKG({ left: "^1.0.0" }));
@@ -905,10 +972,38 @@ describe("policy protects scanner config", () => {
       "**/.yarn/**",
       "**/.tool-versions",
       "**/mise.toml",
+      "**/.mise.toml",
+      "**/mise.local.toml",
+      "**/.mise.local.toml",
+      "**/.config/mise.toml",
+      "**/.config/mise/**",
+      "**/.mise/**",
+      "**/.nvmrc",
+      "**/.node-version",
     ]) {
       expect(DEFAULT_POLICY.protectedGlobs).toContain(g);
     }
     expect(DEFAULT_POLICY.credentialDenyGlobs).toContain("~/.npmrc");
+  });
+  test("version-manager files (.nvmrc, .tool-versions, mise.toml) are config drift", async () => {
+    const { configDrift } = await import("../src/gates/drift.js");
+    const { GateExec } = await import("../src/gates/shared.js");
+    for (const f of [
+      ".nvmrc",
+      ".node-version",
+      ".tool-versions",
+      "mise.toml",
+      ".mise.toml",
+      "sub/.mise/config.toml",
+    ]) {
+      const { root, ctx } = makeRepo({ "package.json": NPM_PKG(), [f]: "1\n" });
+      write(root, f, "2\n");
+      const d = await configDrift(ctx, new GateExec(ctx));
+      expect(
+        d.map((x) => x.path),
+        f,
+      ).toContain(f);
+    }
   });
   test("volta changes are config drift", async () => {
     const { root, ctx } = makeRepo({ "package.json": NPM_PKG() });

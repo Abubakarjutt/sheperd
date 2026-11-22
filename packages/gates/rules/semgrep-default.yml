@@ -11,6 +11,9 @@
 # call or destructuring does not hide the flow) and the eval/DOM/vm rules use symbolic
 # propagation (an alias such as `const e = eval; e(x)` is still eval).
 #
+# Known limits (not caught): promisify assigned to a class field, execa and other wrappers,
+# and taint carried through callbacks other than `.then(($X) => ...)`.
+#
 # Scope: a small, high-signal set aimed at injection and unsafe-crypto mistakes that coding
 # agents make. Severity ERROR blocks the `semgrep` gate; WARNING is reported but does not block.
 rules:
@@ -93,16 +96,92 @@ rules:
               - pattern: $U.promisify(exec)($S, ...)
               - pattern: $U.promisify($CP.exec)($S, ...)
           - focus-metavariable: $S
-      # spawn/execFile run through a shell when {shell: true}
+      # spawn/execFile run the command through a shell when `shell` is anything but literal false
       - patterns:
           - pattern-either:
-              - pattern: "$F($S, {..., shell: true, ...}, ...)"
-              - pattern: "$F($S, $ARGS, {..., shell: true, ...}, ...)"
-              - pattern: "$CP.$F($S, {..., shell: true, ...}, ...)"
-              - pattern: "$CP.$F($S, $ARGS, {..., shell: true, ...}, ...)"
+              - pattern: "$F($S, {..., shell: $SH, ...}, ...)"
+              - pattern: "$F($S, $ARGS, {..., shell: $SH, ...}, ...)"
+              - pattern: "$CP.$F($S, {..., shell: $SH, ...}, ...)"
+              - pattern: "$CP.$F($S, $ARGS, {..., shell: $SH, ...}, ...)"
           - metavariable-regex:
               metavariable: $F
               regex: ^(spawn|spawnSync|execFile|execFileSync)$
+          - metavariable-regex:
+              metavariable: $SH
+              regex: ^(?!false$)
+          - focus-metavariable: $S
+      # ... and so do the arguments then (a tainted args array is shell-parsed)
+      - patterns:
+          - pattern-either:
+              - pattern: "$F($C, $ARGS, {..., shell: $SH, ...}, ...)"
+              - pattern: "$CP.$F($C, $ARGS, {..., shell: $SH, ...}, ...)"
+          - metavariable-regex:
+              metavariable: $F
+              regex: ^(spawn|spawnSync|execFile|execFileSync)$
+          - metavariable-regex:
+              metavariable: $SH
+              regex: ^(?!false$)
+          - focus-metavariable: $ARGS
+
+  - id: rewire.js.timer-string-eval
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: setTimeout/setInterval with a string (literal, template or concatenation) first argument evals it; pass a function.
+    metadata:
+      category: security
+      cwe: "CWE-95"
+    patterns:
+      - pattern-either:
+          - pattern: setTimeout("...", ...)
+          - pattern: setInterval("...", ...)
+          - pattern: $G.setTimeout("...", ...)
+          - pattern: $G.setInterval("...", ...)
+          - pattern: |
+              setTimeout(`...`, ...)
+          - pattern: |
+              setInterval(`...`, ...)
+          - pattern: |
+              $G.setTimeout(`...`, ...)
+          - pattern: |
+              $G.setInterval(`...`, ...)
+          - pattern: setTimeout($A + $B, ...)
+          - pattern: setInterval($A + $B, ...)
+          - pattern: $G.setTimeout($A + $B, ...)
+          - pattern: $G.setInterval($A + $B, ...)
+
+  - id: rewire.js.function-constructor-tainted
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Reaching the Function constructor through `.constructor` (or `.constructor.constructor`) with built or request-derived code is eval in disguise.
+    metadata:
+      category: security
+      cwe: "CWE-95"
+    mode: taint
+    options:
+      symbolic_propagation: true
+    pattern-sources:
+      - pattern: |
+          `...${$X}...`
+      - pattern: $A + $B
+      - patterns:
+          - pattern-either:
+              - pattern: $REQ.query
+              - pattern: $REQ.params
+              - pattern: $REQ.body
+              - pattern: $REQ.headers
+          - metavariable-regex:
+              metavariable: $REQ
+              regex: ^(req|request)$
+    pattern-propagators:
+      - pattern: $P.then(($X) => ...)
+        from: $P
+        to: $X
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $F.constructor($S, ...)
+              - pattern: $F.constructor.constructor($S, ...)
+              - pattern: Function.prototype.constructor($S, ...)
           - focus-metavariable: $S
 
   - id: rewire.js.dom-html-sink-nonliteral
@@ -153,6 +232,11 @@ rules:
           - metavariable-regex:
               metavariable: $REQ
               regex: ^(req|request)$
+    pattern-propagators:
+      # a value that flows into a promise flows into the .then callback parameter
+      - pattern: $P.then(($X) => ...)
+        from: $P
+        to: $X
     pattern-sinks:
       - patterns:
           - pattern-either:
@@ -204,6 +288,11 @@ rules:
           - metavariable-regex:
               metavariable: $REQ
               regex: ^(req|request)$
+    pattern-propagators:
+      # a value that flows into a promise flows into the .then callback parameter
+      - pattern: $P.then(($X) => ...)
+        from: $P
+        to: $X
     pattern-sanitizers:
       - pattern: path.basename(...)
     pattern-sinks:

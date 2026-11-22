@@ -66,6 +66,14 @@ export const DEFAULT_POLICY: Policy = {
     "**/.yarn/**",
     "**/.tool-versions",
     "**/mise.toml",
+    "**/.mise.toml",
+    "**/mise.local.toml",
+    "**/.mise.local.toml",
+    "**/.config/mise.toml",
+    "**/.config/mise/**",
+    "**/.mise/**",
+    "**/.nvmrc",
+    "**/.node-version",
   ],
   // `~` is kept unexpanded here; the sandbox layer expands it.
   credentialDenyGlobs: [

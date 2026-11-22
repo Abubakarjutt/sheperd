@@ -1,7 +1,8 @@
-import { closeSync, existsSync, openSync, readSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
 import { z } from "zod";
 import type { Gate, GateOutput } from "../types.js";
 import {
@@ -76,27 +77,46 @@ const BENIGN_WARNING_RE = /deprecat/i;
 const SCANNED_EXT_RE = /\.(js|jsx|mjs|cjs|ts|tsx)$/;
 /**
  * Second pass (`--scan-unknown-extensions`) covers every other changed file, because node will
- * `require()` JS from `.txt` or extensionless files. Parse errors there are tolerated (prose,
- * JSON, binaries) EXCEPT for files that really are JS/TS: `.mts`/`.cts`, case variants such as
- * `.JS`, and extensionless or other files that start with a `#!...node` shebang.
+ * `require()` JS from `.txt` or extensionless files. Whether a parse error there fails depends
+ * on whether the file could be loaded as JS at all: `.mts`/`.cts`, case variants such as `.JS`
+ * and `#!...node|tsx|ts-node|bun|deno` shebang scripts are always strict; any other file is
+ * strict only if its text COMPILES (checked with `vm.Script`, then `vm.SourceTextModule` when
+ * the flag is available, never run). A file that does not compile cannot be `require()`d
+ * either, so it is dropped from pass 2 entirely: no false positives on prose or Makefiles.
  */
 const JS_LIKE_EXT_RE = /\.(m?[jt]s|c[jt]s|[jt]sx)$/i;
-const NODE_SHEBANG_RE = /^#!.*\bnode/;
-const mustParse = (worktree: string, f: string): boolean => {
-  if (JS_LIKE_EXT_RE.test(f)) return true;
+const SHEBANG_RE = /^#!.*\b(node|tsx|ts-node|bun|deno)\b/;
+const ESM_HINT_RE =
+  /^\s*(import\s*[\w{*"']|export\s+(default|const|let|var|function|class|async|\{|\*))/m;
+const MAX_COMPILE_BYTES = 8 * 1024 * 1024;
+
+/** "always" (extension/shebang), "compiles", or "no" (cannot be loaded as JS; skip). */
+function loadability(worktree: string, f: string): "always" | "compiles" | "no" {
+  if (JS_LIKE_EXT_RE.test(f)) return "always";
+  let src: string;
   try {
-    const fd = openSync(join(worktree, f), "r");
-    try {
-      const buf = Buffer.alloc(200);
-      const n = readSync(fd, buf, 0, 200, 0);
-      return NODE_SHEBANG_RE.test(buf.subarray(0, n).toString("latin1").split("\n")[0] ?? "");
-    } finally {
-      closeSync(fd);
-    }
+    const full = join(worktree, f);
+    if (statSync(full).size > MAX_COMPILE_BYTES) return "compiles"; // cannot cheaply tell: scan strictly
+    src = readFileSync(full, "utf8");
   } catch {
-    return false;
+    return "no";
   }
-};
+  if (src.charCodeAt(0) === 0xfeff) src = src.slice(1);
+  const first = src.split("\n", 1)[0] ?? "";
+  if (SHEBANG_RE.test(first)) return "always";
+  if (src.startsWith("#!")) src = `//${src}`;
+  try {
+    new vm.Script(src, { filename: f });
+    return "compiles";
+  } catch {
+    // maybe an ES module: import/export fails as a classic script
+  }
+  if (ESM_HINT_RE.test(src)) {
+    // vm.SourceTextModule needs --experimental-vm-modules; import/export-looking source counts as compiling
+    return "compiles";
+  }
+  return "no";
+}
 const typeText = (t: unknown): string => (typeof t === "string" ? t : JSON.stringify(t ?? ""));
 const norm = (p: string): string => p.replace(/^\.\//, "");
 
@@ -116,7 +136,7 @@ type Finding = { rule: string; file: string; line: number; severity: string; mes
  * or a semgrep error that is not about a changed file is `error`, never `pass`. A syntax/parse
  * error, timeout or out-of-memory on a changed file is `fail` and lists the file, since it was
  * not fully analysed; the implementer can fix it, so it is not a tool error. In pass 2, syntax
- * errors are ignored (prose, JSON, binaries) unless the file must parse (see `mustParse`).
+ * errors never occur for files that cannot compile as JS, because those are not scanned (see `loadability`).
  * Only a warn-level `deprecat*` message is ignored as benign.
  *
  * `paths.skipped` is NOT used: semgrep only fills it under `--verbose`, so it is dead without
@@ -172,8 +192,11 @@ export const semgrepGate: Gate = {
     const warnings: string[] = [];
     try {
       const pass1 = files.filter((f) => SCANNED_EXT_RE.test(f));
-      const pass2 = files.filter((f) => !SCANNED_EXT_RE.test(f));
-      const strict = new Set(pass2.filter((f) => mustParse(ctx.worktree, f)));
+      const load = new Map(
+        files.filter((f) => !SCANNED_EXT_RE.test(f)).map((f) => [f, loadability(ctx.worktree, f)]),
+      );
+      const pass2 = [...load].filter(([, v]) => v !== "no").map(([f]) => f);
+      const strict = new Set(pass2);
       const jobs = [
         ...chunks(pass1, SCAN_CHUNK).map((chunk) => ({ chunk, unknown: false })),
         ...chunks(pass2, SCAN_CHUNK).map((chunk) => ({ chunk, unknown: true })),

@@ -181,11 +181,17 @@ const CONFIG_RE = [
   /^\.semgrepignore$/,
   /^npm-shrinkwrap\.json$/,
   /^\.pnpmfile\.(c|m)?js$/,
+  /^\.tool-versions$/,
+  /^\.?mise(\.local)?\.toml$/,
+  /^\.nvmrc$/,
+  /^\.node-version$/,
 ];
 export const isConfigFile = (p: string): boolean =>
   !inNodeModules(p) &&
   (p.split("/").includes("__mocks__") ||
     p.split("/").includes(".yarn") ||
+    p.split("/").includes(".mise") ||
+    /(^|\/)\.config\/mise(\/|\.toml$)/.test(p) ||
     CONFIG_RE.some((re) => re.test(basename(p))));
 
 /** Pathspecs that list the current config files (node_modules excluded). */
@@ -217,10 +223,19 @@ export const CONFIG_PATHSPECS = [
     ".pnpmfile.cjs",
     ".pnpmfile.mjs",
     ".pnpmfile.js",
+    ".tool-versions",
+    "mise.toml",
+    ".mise.toml",
+    "mise.local.toml",
+    ".mise.local.toml",
+    ".nvmrc",
+    ".node-version",
     "package.json",
   ].map((n) => `:(glob)**/${n}`),
   ":(glob)**/__mocks__/**",
   ":(glob)**/.yarn/**",
+  ":(glob)**/.mise/**",
+  ":(glob)**/.config/mise/**",
   ":(glob,exclude)**/node_modules/**",
 ];
 
