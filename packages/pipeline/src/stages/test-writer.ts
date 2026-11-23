@@ -30,6 +30,7 @@ import type { Policy } from "@rewire/policy";
 import type { ModelRef, Provider } from "@rewire/providers";
 import { type CapabilityProfile, profileFor, SandboxClient } from "@rewire/sandbox";
 import { createTools } from "@rewire/tools";
+import { PACKAGE_ROOT } from "../assets.js";
 
 const STAGE = "test-writer";
 const MAX_TURNS = 40;
@@ -79,8 +80,7 @@ export type TestWriterInput = {
 
 let promptCache: string | undefined;
 function writerPrompt(): string {
-  // Same relative path from src/stages and dist/stages.
-  promptCache ??= readFileSync(new URL("../../prompts/test-writer.md", import.meta.url), "utf8");
+  promptCache ??= readFileSync(join(PACKAGE_ROOT, "prompts", "test-writer.md"), "utf8");
   return promptCache;
 }
 

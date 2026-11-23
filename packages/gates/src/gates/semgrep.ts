@@ -1,9 +1,9 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import vm from "node:vm";
 import { z } from "zod";
+import { PACKAGE_ROOT } from "../assets.js";
 import type { Gate, GateOutput } from "../types.js";
 import {
   changedScanFiles,
@@ -17,13 +17,7 @@ import {
 } from "./shared.js";
 
 /** rewire's own original ruleset (Apache-2.0); never registry rules (licence, ruling R20). */
-export const SEMGREP_RULES_FILE = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "..",
-  "rules",
-  "semgrep-default.yml",
-);
+export const SEMGREP_RULES_FILE = join(PACKAGE_ROOT, "rules", "semgrep-default.yml");
 /**
  * semgrep's OCaml core initialises a CA store at startup even when it never touches the network,
  * and aborts ("empty trust anchors") when the sandbox hides the macOS keychain. Point it at a

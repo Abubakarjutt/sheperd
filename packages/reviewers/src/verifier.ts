@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { posix } from "node:path";
+import { join, posix } from "node:path";
 import {
   type Contract,
   type Finding,
@@ -12,6 +12,7 @@ import {
 import { type ModelRef, type Provider, structured } from "@rewire/providers";
 import type { SandboxClient } from "@rewire/sandbox";
 import { z } from "zod";
+import { PACKAGE_ROOT } from "./assets.js";
 import { type DiffSummary, unquote } from "./diff.js";
 import { readInsideWorktree, removedNear } from "./evidence.js";
 import { forcedFindingsFor } from "./framework.js";
@@ -54,7 +55,7 @@ const VerifierOutput = z.object({
 
 let promptText: string | undefined;
 const prompt = (): string => {
-  promptText ??= readFileSync(new URL("../prompts/verifier.md", import.meta.url), "utf8");
+  promptText ??= readFileSync(join(PACKAGE_ROOT, "prompts", "verifier.md"), "utf8");
   return promptText;
 };
 
