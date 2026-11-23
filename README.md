@@ -45,7 +45,8 @@ rewire doctor
 The package carries the CLI as one bundled file plus a prebuilt `rewire-sandbox` for your
 platform, which npm installs automatically as an optional dependency
 (`sheperd-darwin-arm64`, `sheperd-darwin-x64`, `sheperd-linux-x64` or `sheperd-linux-arm64`).
-Supported platforms: macOS on Apple silicon or Intel, and Linux on x64 or arm64 (glibc).
+Supported platforms: macOS on Apple silicon or Intel, and Linux on x64 or arm64 with glibc 2.35
+or newer (Ubuntu 22.04, Debian 12 or later; musl distributions such as Alpine are not supported).
 Windows is not supported. If your npm install skips optional dependencies
 (`--omit=optional`, `--no-optional`), the sandbox binary is missing and `rewire doctor` says so.
 

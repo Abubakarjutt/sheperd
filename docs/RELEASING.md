@@ -65,9 +65,9 @@ git push origin v0.1.0-beta.1
 The tag push runs `release.yml`:
 
 1. `plan` fails the run if the tag is not `v` + the version in `npm/sheperd/package.json`.
-2. `sandbox` builds `rewire-sandbox --release` on `macos-14` (arm64), `macos-15-intel` (x64),
-   `ubuntu-latest` (x64) and `ubuntu-24.04-arm` (arm64), checks each binary's header matches
-   its target, and uploads it.
+2. `sandbox` builds `rewire-sandbox --release` on `macos-15` (arm64), `macos-15-intel` (x64),
+   `ubuntu-22.04` (x64) and `ubuntu-22.04-arm` (arm64), checks each binary's header matches
+   its target (and, on Linux, that it needs no glibc newer than 2.35), and uploads it.
 3. `package` bundles `sheperd`, checks and packs all five packages, and smoke-tests the
    tarballs (install, `rewire --help`, `rewire doctor` must find the sandbox in the platform
    package).

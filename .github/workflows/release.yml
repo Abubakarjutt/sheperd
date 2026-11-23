@@ -78,15 +78,17 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - runner: macos-14
+          # macos-14 and macos-13 are retired runner images; macos-15 is arm64 and
+          # macos-15-intel is the x64 replacement.
+          - runner: macos-15
             target: darwin-arm64
-          # macos-13 was GitHub's last x64 macOS label until its retirement in late 2025;
-          # macos-15-intel is its replacement.
           - runner: macos-15-intel
             target: darwin-x64
-          - runner: ubuntu-latest
+          # Linux builds run on the oldest supported Ubuntu so the binary links against an old
+          # glibc (a 24.04 build needs glibc 2.39, which excludes Ubuntu 22.04 and Debian 12).
+          - runner: ubuntu-22.04
             target: linux-x64
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-22.04-arm
             target: linux-arm64
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -116,9 +118,14 @@ jobs:
           node scripts/npm/build.mjs platform --target "${{ matrix.target }}" --out dist-npm
           ./dist-npm/sheperd-${{ matrix.target }}/rewire-sandbox --version
           if [ "$RUNNER_OS" = Linux ]; then
-            echo "newest glibc symbol version the binary needs:"
-            objdump -T "dist-npm/sheperd-${{ matrix.target }}/rewire-sandbox" \
-              | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+            need=$(objdump -T "dist-npm/sheperd-${{ matrix.target }}/rewire-sandbox" \
+              | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+            echo "the binary needs glibc $need or newer"
+            # README promises glibc 2.35 (Ubuntu 22.04, Debian 12 has 2.36).
+            if [ "$(printf '%s\n2.35\n' "$need" | sort -V | tail -1)" != 2.35 ]; then
+              echo "::error::rewire-sandbox needs glibc $need, newer than the supported 2.35"
+              exit 1
+            fi
           fi
           # upload-artifact drops the executable bit; a tar keeps it.
           tar -C dist-npm -cf "sheperd-${{ matrix.target }}.tar" "sheperd-${{ matrix.target }}"
