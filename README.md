@@ -195,6 +195,11 @@ Stated in every report (this list is checked against the pipeline's `KNOWN_LIMIT
   report lists them), so the gates see exactly the committed tree; build output the implementer
   creates does not survive between gate runs.
 - Host PATH passed through the sandbox.
+- Credential read-deny is a deny-list, not an allow-list: listed secret files (ssh, cloud and
+  registry credentials, shell rc and history files, ~/.claude*, .env files in the worktree, the
+  run's repo and up to three directories below HOME) are unreadable, but the rest of HOME, other
+  repositories and system files stay readable by every stage, so a secret stored elsewhere can be
+  read and sent to a model provider.
 - Dependency installs are not harness-mediated in v0.1: the gates run against the dependencies
   already present (the repo's node_modules is shared into the worktree by a symlink, never
   committed); a change to a manifest's dependencies fails the drift and lockfile checks instead of

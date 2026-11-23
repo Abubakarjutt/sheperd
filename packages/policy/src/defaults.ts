@@ -120,6 +120,33 @@ export const DEFAULT_POLICY: Policy = deepFreeze({
     "~/.gnupg/**",
     "~/.pypirc",
     "~/.config/rewire/**",
+    // I3: files that commonly hold API keys and tokens. Shell start-up files and histories
+    // (`export ANTHROPIC_API_KEY=...`), Claude Code's own config, and other tool credentials.
+    // This is a deny-list, not an allow-list: secrets elsewhere in HOME stay readable (see
+    // KNOWN_LIMITATIONS).
+    "~/.zshrc",
+    "~/.zprofile",
+    "~/.zshenv",
+    "~/.zlogin",
+    "~/.bashrc",
+    "~/.bash_profile",
+    "~/.bash_login",
+    "~/.profile",
+    "~/.zsh_history",
+    "~/.bash_history",
+    "~/.config/fish/**",
+    "~/.claude.json*",
+    "~/.claude/**",
+    "~/.cargo/credentials*",
+    "~/.pgpass",
+    "~/.terraform.d/**",
+    // `.env` files outside the worktree, up to three directories below HOME (`**/.env*` above
+    // covers the worktree). Depth-limited: on Linux an absolute deny glob is walked on every
+    // exec, and `~/**` would walk all of HOME. The run's own repo is added per profile.
+    "~/.env*",
+    "~/*/.env*",
+    "~/*/*/.env*",
+    "~/*/*/*/.env*",
     // Private-key PEMs by name only: a blanket `**/*.pem` also denies CA bundles such as
     // /etc/ssl/cert.pem, and semgrep (and any TLS client) then fails in every gate.
     "**/*key*.pem",

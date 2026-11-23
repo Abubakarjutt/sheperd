@@ -55,3 +55,13 @@ test("odd ~ pattern is policy_invalid; relative root rejected; dedupes", () => {
   const p = profileFor("spec", "/w", { ...DEFAULT_POLICY, credentialDenyGlobs: ["a", "a"] }, "/s");
   expect(p.readDeny).toEqual(["a"]);
 });
+
+test("a run worktree's own repo .env files are read-denied (I3: outside the worktree)", () => {
+  const p = profileFor("implementer", "/r/repo/.rewire/worktrees/run-1", DEFAULT_POLICY, "/tmp/s");
+  expect(p.readDeny).toEqual(
+    expect.arrayContaining(["/r/repo/.env*", "/r/repo/*/.env*", "/r/repo/*/*/.env*"]),
+  );
+  // Any other root gets no repo-derived entries.
+  const q = profileFor("implementer", "/w", DEFAULT_POLICY, "/tmp/s");
+  expect(q.readDeny.filter((g) => g.startsWith("/r/"))).toEqual([]);
+});

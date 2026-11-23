@@ -211,18 +211,33 @@ fn collect_masks(p: &Profile) -> Result<Masks> {
         walk(p, b, &writable, &mut m, &mut budget)?;
     }
     // Absolute readDeny globs outside the walked trees: mask what exists.
+    // Each literal prefix is walked once, only as deep as a glob below it can
+    // match (`~/*/.env*` lists HOME's children, never all of HOME); `**`
+    // means unbounded.
+    let mut walks: Vec<(PathBuf, Option<usize>)> = Vec::new();
     for (anchor, glob) in p.read_deny_sources() {
         if anchor != Anchor::Abs {
             continue;
         }
-        let Some((prefix, _)) = absolute_prefix(p.root(), anchor, glob) else {
+        let Some((prefix, rest)) = absolute_prefix(p.root(), anchor, glob) else {
             continue;
         };
         if bases.iter().any(|b| prefix.starts_with(b)) || fs::symlink_metadata(&prefix).is_err() {
             continue;
         }
-        walk_read_only(p, &prefix, &mut m, &mut budget)?;
+        let depth = glob_depth(&rest);
+        match walks.iter_mut().find(|(w, _)| *w == prefix) {
+            Some((_, d)) => *d = deeper(*d, depth),
+            None => walks.push((prefix, depth)),
+        }
     }
+    for (prefix, depth) in walks {
+        walk_read_only(p, &prefix, depth, &mut m, &mut budget)?;
+    }
+    m.hide_dirs.sort();
+    m.hide_dirs.dedup();
+    m.hide_files.sort();
+    m.hide_files.dedup();
     m.read_only.sort();
     m.read_only.dedup();
     Ok(m)
@@ -251,18 +266,52 @@ fn walk(
     Ok(())
 }
 
-/// Same as [`walk`] but only for readDeny (outside the writable trees).
-fn walk_read_only(p: &Profile, start: &Path, m: &mut Masks, budget: &mut usize) -> Result<()> {
+/// How many path segments below its literal prefix a glob can match;
+/// `None` when it contains `**` (any depth).
+fn glob_depth(rest: &str) -> Option<usize> {
+    let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.iter().any(|s| s.contains("**")) {
+        None
+    } else {
+        Some(segs.len())
+    }
+}
+
+fn deeper(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        _ => None,
+    }
+}
+
+/// Same as [`walk`] but only for readDeny (outside the writable trees),
+/// descending at most `depth` levels below `start` (`None`: unbounded).
+fn walk_read_only(
+    p: &Profile,
+    start: &Path,
+    depth: Option<usize>,
+    m: &mut Masks,
+    budget: &mut usize,
+) -> Result<()> {
     if hide_if_read_denied(p, start, m)? {
         return Ok(());
     }
-    if !fs::symlink_metadata(start)?.is_dir() {
+    if depth == Some(0) || !fs::symlink_metadata(start)?.is_dir() {
         return Ok(());
     }
-    for entry in fs::read_dir(start).with_context(|| format!("reading {}", start.display()))? {
+    let entries = match fs::read_dir(start) {
+        Ok(e) => e,
+        // A depth-limited walk spans home-wide globs (`~/*/.env*`); one
+        // unlistable dir there (root-owned, 0711) must not make every exec
+        // fail. Residual: a file inside a dir we cannot list but the command
+        // can enter by name stays readable. Unbounded walks fail closed.
+        Err(_) if depth.is_some() => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", start.display())),
+    };
+    for entry in entries {
         let path = entry?.path();
         *budget = budget.checked_sub(1).context("tree too large to sandbox")?;
-        walk_read_only(p, &path, m, budget)?;
+        walk_read_only(p, &path, depth.map(|d| d - 1), m, budget)?;
     }
     Ok(())
 }
@@ -597,6 +646,59 @@ mod tests {
 
     fn s(p: &Path) -> String {
         p.to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn glob_depth_counts_segments_and_star_star_is_unbounded() {
+        assert_eq!(glob_depth(""), Some(0));
+        assert_eq!(glob_depth(".env*"), Some(1));
+        assert_eq!(glob_depth("*/*/.env*"), Some(3));
+        assert_eq!(glob_depth("**"), None);
+        assert_eq!(glob_depth("a/**/b"), None);
+        assert_eq!(deeper(Some(1), Some(3)), Some(3));
+        assert_eq!(deeper(Some(1), None), None);
+    }
+
+    #[test]
+    fn home_wide_readdeny_walks_only_as_deep_as_the_glob() {
+        let t = TempDir::new().unwrap();
+        let base = fs::canonicalize(t.path()).unwrap();
+        let root = base.join("root");
+        let home = base.join("home");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(home.join("proj/sub/deeper")).unwrap();
+        fs::write(home.join(".env"), "").unwrap();
+        fs::write(home.join("proj/.env.local"), "").unwrap();
+        fs::write(home.join("proj/sub/deeper/.env"), "").unwrap();
+        // Many entries below the glob's depth: must never be walked.
+        let wide = home.join("proj/sub/deeper/wide");
+        fs::create_dir_all(&wide).unwrap();
+        for i in 0..50 {
+            fs::write(wide.join(format!("f{i}")), "").unwrap();
+        }
+        let h = s(&home);
+        let p = Profile::from_spec(ProfileSpec {
+            root: root.clone(),
+            write: vec![],
+            write_deny: vec![],
+            read_deny: vec![format!("{h}/.env*"), format!("{h}/*/.env*")],
+            network: Network::Deny,
+            extra_write: vec![],
+        })
+        .unwrap();
+        let m = collect_masks(&p).unwrap();
+        assert!(m.hide_files.contains(&home.join(".env")), "{m:?}");
+        assert!(
+            m.hide_files.contains(&home.join("proj/.env.local")),
+            "{m:?}"
+        );
+        assert!(
+            !m.hide_files.contains(&home.join("proj/sub/deeper/.env")),
+            "{m:?}"
+        );
+        // Walk budget: HOME's entries and proj's, never `wide`'s 50.
+        let mut budget = 10;
+        walk_read_only(&p, &home, Some(2), &mut Masks::default(), &mut budget).unwrap();
     }
 
     fn v(xs: &[&str]) -> Vec<String> {

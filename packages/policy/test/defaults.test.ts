@@ -56,3 +56,39 @@ test("DEFAULT_POLICY is deeply frozen (row 5)", () => {
     (DEFAULT_POLICY.gates as string[]).push("x");
   }).toThrow();
 });
+
+test("credential read-deny covers secret-bearing home files and .env files outside the worktree (I3)", () => {
+  for (const g of [
+    "~/.zshrc",
+    "~/.zprofile",
+    "~/.zshenv",
+    "~/.zlogin",
+    "~/.bashrc",
+    "~/.bash_profile",
+    "~/.bash_login",
+    "~/.profile",
+    "~/.zsh_history",
+    "~/.bash_history",
+    "~/.config/fish/**",
+    "~/.claude.json*",
+    "~/.claude/**",
+    "~/.config/gh/**",
+    "~/.netrc",
+    "~/.npmrc",
+    "~/.pypirc",
+    "~/.docker/config.json",
+    "~/.kube/**",
+    "~/.aws/**",
+    "~/.gnupg/**",
+    "~/.ssh/**",
+    "~/.cargo/credentials*",
+    "~/.pgpass",
+    "~/.terraform.d/**",
+    "~/.env*",
+    "~/*/.env*",
+    "~/*/*/.env*",
+    "~/*/*/*/.env*",
+  ]) {
+    expect(DEFAULT_POLICY.credentialDenyGlobs).toContain(g);
+  }
+});

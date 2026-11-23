@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { isAbsolute } from "node:path";
+import { basename, dirname, isAbsolute } from "node:path";
 import { RewireError } from "@rewire/core";
 import type { Policy } from "@rewire/policy";
 
@@ -31,6 +31,18 @@ export function expandHome(glob: string): string {
     throw new RewireError("policy_invalid", `unsupported ~ pattern in policy glob: ${glob}`);
   }
   return glob;
+}
+
+/**
+ * A run worktree lives at `<repo>/.rewire/worktrees/<id>`, so the repo's own `.env` files sit
+ * outside the sandbox root, where `**\/.env*` does not reach (I3). Depth-limited like the HOME
+ * globs (monorepo packages one or two levels down).
+ */
+function repoEnvDeny(root: string): string[] {
+  const wt = dirname(root);
+  if (basename(wt) !== "worktrees" || basename(dirname(wt)) !== ".rewire") return [];
+  const repo = dirname(dirname(wt));
+  return [`${repo}/.env*`, `${repo}/*/.env*`, `${repo}/*/*/.env*`];
 }
 
 export function profileFor(
@@ -69,7 +81,7 @@ export function profileFor(
     root,
     write: dedupe(write),
     writeDeny: dedupe(writeDeny),
-    readDeny: dedupe(policy.credentialDenyGlobs.map(expandHome)),
+    readDeny: dedupe([...policy.credentialDenyGlobs.map(expandHome), ...repoEnvDeny(root)]),
     network: stage === "verify-registry" ? "registry" : "deny",
     extraWrite: dedupe(extraWrite),
   };
