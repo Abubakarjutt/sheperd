@@ -19,11 +19,14 @@
 //! 4. otherwise pass the command's exit code through (128+signal for a
 //!    signal death).
 //!
-//! The scan cannot miss a live process: after the command is reaped, only
-//! processes that are still alive (or zombies, which are dead and skipped)
-//! appear in /proc, and the namespace holds nothing else. A command that
-//! kills the reaper itself (`kill -9 -1`) ends the run with a signal exit,
-//! never a success, and the namespace teardown still kills everything.
+//! After the command is reaped, only processes that are still alive (or
+//! zombies, which are dead and skipped unless a thread of theirs still
+//! runs) appear in /proc, and the namespace holds nothing else.
+//!
+//! Reporting (not containment) is best-effort: a command that kills the
+//! reaper (`kill -9 -1`: a 137 exit, never success) or ptraces it (Yama
+//! ptrace_scope 0) can avoid the escape label. Either way bwrap's init exits
+//! and the kernel tears the namespace down, so nothing outlives the exec.
 
 use anyhow::{bail, Context, Result};
 use std::ffi::OsString;
@@ -86,12 +89,26 @@ pub fn live_pids(proc: &str, me: i32) -> Result<Vec<i32>> {
         let Ok(stat) = fs::read_to_string(e.path().join("stat")) else {
             continue;
         };
-        if state_of(&stat) != Some('Z') {
+        if state_of(&stat) != Some('Z') || has_live_thread(&e.path()) {
             out.push(pid);
         }
     }
     out.sort_unstable();
     Ok(out)
+}
+
+/// A zombie thread-group leader can still have running threads (its main
+/// thread exited, others did not): that process is alive (NEW-2).
+fn has_live_thread(proc_pid: &std::path::Path) -> bool {
+    let Ok(tasks) = fs::read_dir(proc_pid.join("task")) else {
+        return false;
+    };
+    tasks.flatten().any(|t| {
+        fs::read_to_string(t.path().join("stat"))
+            .ok()
+            .and_then(|st| state_of(&st))
+            .is_some_and(|c| c != 'Z')
+    })
 }
 
 /// The state field of `/proc/<pid>/stat`: the first non-space after the
@@ -128,9 +145,16 @@ mod tests {
             fs::create_dir(p.join(pid)).unwrap();
             fs::write(p.join(pid).join("stat"), stat).unwrap();
         }
+        // A zombie leader whose other thread still runs is alive (NEW-2).
+        fs::create_dir(p.join("11")).unwrap();
+        fs::write(p.join("11/stat"), "11 (thr) Z 1").unwrap();
+        fs::create_dir_all(p.join("11/task/11")).unwrap();
+        fs::write(p.join("11/task/11/stat"), "11 (thr) Z 1").unwrap();
+        fs::create_dir_all(p.join("11/task/12")).unwrap();
+        fs::write(p.join("11/task/12/stat"), "12 (thr) S 1").unwrap();
         fs::create_dir(p.join("self")).unwrap();
         fs::create_dir(p.join("10")).unwrap(); // exited: no stat file
-        assert_eq!(live_pids(p.to_str().unwrap(), 2).unwrap(), vec![7, 9]);
+        assert_eq!(live_pids(p.to_str().unwrap(), 2).unwrap(), vec![7, 9, 11]);
         assert!(live_pids("/nonexistent-proc-dir", 2).is_err());
     }
 }
