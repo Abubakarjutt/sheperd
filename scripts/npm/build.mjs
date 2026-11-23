@@ -10,9 +10,9 @@
 //       Stages the prebuilt rewire-sandbox (default: the `sandbox` output) as
 //       <out>/sheperd-<os>-<arch>/. The target defaults to this host; the binary's own header
 //       must match it.
-//   node scripts/npm/build.mjs pack     [--out dir]
+//   node scripts/npm/build.mjs pack     [--out dir] [--all-platforms]
 //       Checks every staged package's `npm pack --dry-run` file list and contents, then packs
-//       each into <out>/tarballs/.
+//       each into <out>/tarballs/. --all-platforms (release) requires every platform package.
 //
 // <out> defaults to dist-npm/ in the repository root.
 import { execFileSync } from "node:child_process";
@@ -283,7 +283,7 @@ function checkPack(dir) {
   return report;
 }
 
-function pack(out) {
+function pack(out, allPlatforms) {
   const dest = join(out, "tarballs");
   rmSync(dest, { recursive: true, force: true });
   mkdirSync(dest, { recursive: true });
@@ -291,6 +291,10 @@ function pack(out) {
     .filter((d) => d === "sheperd" || d.startsWith("sheperd-"))
     .map((d) => join(out, d));
   if (!dirs.some((d) => d.endsWith(`${sep}sheperd`))) fail(`no staged sheperd in ${out}`);
+  if (allPlatforms) {
+    const missing = Object.keys(TARGETS).filter((t) => !existsSync(join(out, `sheperd-${t}`)));
+    if (missing.length > 0) fail(`platform packages not staged: ${missing.join(", ")}`);
+  }
   for (const d of dirs) {
     checkPack(d);
     npm(["pack", "--ignore-scripts", "--pack-destination", dest], d);
@@ -305,6 +309,7 @@ const { values, positionals } = parseArgs({
     out: { type: "string", default: join(ROOT, "dist-npm") },
     target: { type: "string", default: hostTarget() },
     binary: { type: "string" },
+    "all-platforms": { type: "boolean", default: false },
   },
 });
 const out = resolve(values.out);
@@ -320,7 +325,7 @@ switch (positionals[0]) {
     buildPlatform(out, values.target, values.binary ? resolve(values.binary) : SANDBOX_BINARY);
     break;
   case "pack":
-    pack(out);
+    pack(out, values["all-platforms"]);
     break;
   default:
     fail(

@@ -1,0 +1,213 @@
+name: release
+
+# Publishes sheperd and its four sheperd-<os>-<arch> sandbox packages to npm (docs/RELEASING.md).
+# Publishes only from a v* tag whose version matches npm/sheperd/package.json: on the tag push,
+# or on a manual dispatch from that tag with dry-run unticked. Every other run (a dry-run
+# dispatch, or a pull request that touches the packaging) builds, packs and smoke-tests only.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - npm/**
+      - scripts/npm/**
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Build, pack and smoke-test only; never publish"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - id: plan
+        name: Decide whether this run publishes
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          version=$(node -p 'require("./npm/sheperd/package.json").version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          tag=""
+          if [ "$REF_TYPE" = tag ]; then
+            tag="$REF_NAME"
+            if [ "$tag" != "v$version" ]; then
+              echo "::error::tag $tag does not match npm/sheperd/package.json version $version"
+              exit 1
+            fi
+          fi
+          publish=false
+          if [ "$EVENT" = push ] && [ -n "$tag" ]; then
+            publish=true
+          elif [ "$EVENT" = workflow_dispatch ] && [ "$DRY_RUN" = false ]; then
+            if [ -z "$tag" ]; then
+              echo "::error::publishing needs a v* tag: dispatch this workflow from the tag v$version"
+              exit 1
+            fi
+            publish=true
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "sheperd $version: publish=$publish (event $EVENT, ref ${REF_TYPE}:${REF_NAME})"
+
+  sandbox:
+    name: sandbox (${{ matrix.target }})
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: macos-14
+            target: darwin-arm64
+          # macos-13 was GitHub's last x64 macOS label until its retirement in late 2025;
+          # macos-15-intel is its replacement.
+          - runner: macos-15-intel
+            target: darwin-x64
+          - runner: ubuntu-latest
+            target: linux-x64
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain
+        run: |
+          if command -v rustup >/dev/null; then
+            rustup toolchain install stable --profile minimal && rustup default stable
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      # Release builds are never served from a cache.
+      - name: Build rewire-sandbox --release (local paths remapped)
+        run: node scripts/npm/build.mjs sandbox
+
+      - name: Stage sheperd-${{ matrix.target }}
+        run: |
+          node scripts/npm/build.mjs platform --target "${{ matrix.target }}" --out dist-npm
+          ./dist-npm/sheperd-${{ matrix.target }}/rewire-sandbox --version
+          if [ "$RUNNER_OS" = Linux ]; then
+            echo "newest glibc symbol version the binary needs:"
+            objdump -T "dist-npm/sheperd-${{ matrix.target }}/rewire-sandbox" \
+              | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          fi
+          # upload-artifact drops the executable bit; a tar keeps it.
+          tar -C dist-npm -cf "sheperd-${{ matrix.target }}.tar" "sheperd-${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sandbox-${{ matrix.target }}
+          path: sheperd-${{ matrix.target }}.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    needs: [plan, sandbox]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          version: 12.21.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r build
+      - run: node scripts/npm/build.mjs sheperd --out dist-npm
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: sandbox-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Unpack the platform packages
+        run: for f in artifacts/*.tar; do tar -xf "$f" -C dist-npm; done
+
+      - name: Check and pack all five packages
+        run: node scripts/npm/build.mjs pack --all-platforms --out dist-npm
+
+      - name: Smoke-test the packed tarballs (install, --help, doctor)
+        run: node scripts/npm/smoke.mjs --tarballs dist-npm/tarballs
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-tarballs
+          path: dist-npm/tarballs/*.tgz
+          if-no-files-found: error
+          retention-days: 30
+
+  # Only this job can publish, and it runs no repository code: it publishes the tarballs the
+  # package job checked and smoke-tested.
+  publish:
+    needs: [plan, package]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-tarballs
+          path: tarballs
+
+      - name: npm publish (platform packages first, then sheperd) with --tag next
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          publish() {
+            # A re-run after a partial publish skips what is already on the registry.
+            if npm view "$1@$VERSION" version >/dev/null 2>&1; then
+              echo "$1@$VERSION is already published; skipping"
+            else
+              npm publish "tarballs/$1-$VERSION.tgz" --provenance --access public --tag next
+            fi
+          }
+          for target in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            publish "sheperd-$target"
+          done
+          publish sheperd
