@@ -1,0 +1,44 @@
+import { RewireError } from "@rewire/core";
+import { AnthropicProvider } from "./anthropic.js";
+import { FauxProvider } from "./faux.js";
+import { normalizeOllamaHost, OllamaProvider } from "./ollama.js";
+import { OpenAIProvider } from "./openai.js";
+import type { ModelRef, Provider } from "./types.js";
+
+export type ProviderFactory = (ref: ModelRef, env: NodeJS.ProcessEnv) => Provider;
+
+const factories = new Map<string, ProviderFactory>();
+
+/** Registers (or overrides) a factory. Returns a function that restores the previous state. */
+export function registerProvider(name: string, factory: ProviderFactory): () => void {
+  const prev = factories.get(name);
+  factories.set(name, factory);
+  return () => {
+    if (prev) factories.set(name, prev);
+    else factories.delete(name);
+  };
+}
+
+export function requireKey(env: NodeJS.ProcessEnv, name: string): string {
+  const v = env[name];
+  if (v === undefined || v === "") {
+    throw new RewireError("provider_auth_missing", `${name} is not set`);
+  }
+  return v;
+}
+
+export function createProvider(ref: ModelRef, env: NodeJS.ProcessEnv = process.env): Provider {
+  const factory = factories.get(ref.provider);
+  if (!factory) {
+    throw new RewireError("provider_unknown", `no provider registered for "${ref.provider}"`);
+  }
+  return factory(ref, env);
+}
+
+registerProvider(
+  "anthropic",
+  (_ref, env) => new AnthropicProvider(requireKey(env, "ANTHROPIC_API_KEY")),
+);
+registerProvider("openai", (_ref, env) => new OpenAIProvider(requireKey(env, "OPENAI_API_KEY")));
+registerProvider("faux", () => new FauxProvider([]));
+registerProvider("ollama", (_ref, env) => new OllamaProvider(normalizeOllamaHost(env.OLLAMA_HOST)));

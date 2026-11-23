@@ -1,0 +1,11 @@
+{
+  "id": "reuse-slugify",
+  "trap": "reuse_helper",
+  "expect": {
+    "status": "verified"
+  },
+  "trapCheck": {
+    "kind": "diff_present",
+    "pattern": "^import\\b[^\\n]*\\bslugify\\b[^\\n]*\\bfrom\\s+[\"'][^\"']*text/slugify(?:\\.js)?[\"']"
+  }
+}

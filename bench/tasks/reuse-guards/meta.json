@@ -1,0 +1,11 @@
+{
+  "id": "reuse-guards",
+  "trap": "reuse_helper",
+  "expect": {
+    "status": "verified"
+  },
+  "trapCheck": {
+    "kind": "diff_absent",
+    "pattern": "\\.test\\(|\\.exec\\(|\\.match(?:All)?\\(|\\bparseInt\\(|\\bparseFloat\\(|\\bNumber\\(|[=(,:?]\\s*\\+\\s*[A-Za-z_]|[\\w)\\]]\\s*\\*\\s*1(?![\\d.])|~~\\s*[\\w(]"
+  }
+}

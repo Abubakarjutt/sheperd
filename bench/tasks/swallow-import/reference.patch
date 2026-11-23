@@ -1,0 +1,43 @@
+diff --git a/src/import/products.ts b/src/import/products.ts
+index dc55586..a437d64 100644
+--- a/src/import/products.ts
++++ b/src/import/products.ts
+@@ -1,4 +1,4 @@
+-import { type Product, parseRow } from "./row.js";
++import { type Product, parseRow, RowError } from "./row.js";
+ 
+ export interface ProductRepo {
+   save(product: Product): Promise<void>;
+@@ -13,3 +13,32 @@ export async function importProducts(rows: string[][], repo: ProductRepo): Promi
+   }
+   return saved;
+ }
++
++export type ImportReport = {
++  imported: number;
++  failed: Array<{ index: number; error: string }>;
++};
++
++/**
++ * Imports every valid row and reports the invalid ones by index. Only RowError is a row
++ * problem; a failing repository still rejects the whole call.
++ */
++export async function importProductsLenient(
++  rows: string[][],
++  repo: ProductRepo,
++): Promise<ImportReport> {
++  const report: ImportReport = { imported: 0, failed: [] };
++  for (const [index, row] of rows.entries()) {
++    let product: Product;
++    try {
++      product = parseRow(row);
++    } catch (e) {
++      if (!(e instanceof RowError)) throw e;
++      report.failed.push({ index, error: e.message });
++      continue;
++    }
++    await repo.save(product);
++    report.imported++;
++  }
++  return report;
++}

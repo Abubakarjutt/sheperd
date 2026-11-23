@@ -1,0 +1,22 @@
+[package]
+name = "rewire-sandbox"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "rewire enforcement boundary: sandboxed path decisions, fs operations and exec"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+caseless = "0.2.2"
+clap = { version = "4.6.9", features = ["derive"] }
+globset = "0.4.21"
+libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+unicode-normalization = "0.1.26"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+serde_json = "1.0.154"
+tempfile = "3.27.0"

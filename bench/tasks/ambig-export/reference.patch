@@ -1,0 +1,30 @@
+diff --git a/src/export/index.ts b/src/export/index.ts
+index 71dd4ae..b5799b2 100644
+--- a/src/export/index.ts
++++ b/src/export/index.ts
+@@ -1,11 +1,24 @@
+ import type { Order } from "../orders.js";
+ import { exportOrdersCsv } from "./csv.js";
+ 
+-export type ExportFormat = "csv";
++export type ExportFormat = "csv" | "json";
+ 
+ export function exportOrders(orders: Order[], format: ExportFormat = "csv"): string {
+   switch (format) {
+     case "csv":
+       return exportOrdersCsv(orders);
++    case "json":
++      return JSON.stringify(
++        orders.map((o) => ({
++          id: o.id,
++          placedAt: o.placedAt,
++          customer: o.customer,
++          currency: o.currency,
++          total: o.totalCents / 100,
++          status: o.status,
++        })),
++        null,
++        2,
++      );
+   }
+ }

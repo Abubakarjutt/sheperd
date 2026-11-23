@@ -1,0 +1,18 @@
+diff --git a/src/uploads/store.ts b/src/uploads/store.ts
+index cbd6626..b61bd2e 100644
+--- a/src/uploads/store.ts
++++ b/src/uploads/store.ts
+@@ -1,4 +1,4 @@
+-import { mkdir, readdir, writeFile } from "node:fs/promises";
++import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+ import { join } from "node:path";
+ 
+ export const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+@@ -16,3 +16,7 @@ export async function listUploads(root: string): Promise<string[]> {
+   const names = await readdir(root);
+   return names.sort();
+ }
++
++export async function readUpload(root: string, name: string): Promise<Buffer> {
++  return readFile(join(root, name));
++}

@@ -1,0 +1,34 @@
+diff --git a/src/permissions.ts b/src/permissions.ts
+index 7749fd2..5073730 100644
+--- a/src/permissions.ts
++++ b/src/permissions.ts
+@@ -1,6 +1,8 @@
+ import type { Expense } from "./expenses.js";
+ import type { User } from "./users.js";
+ 
++const MANAGER_LIMIT_CENTS = 50_000;
++
+ /** Who may read an expense. */
+ export function canView(user: User, expense: Expense): boolean {
+   if (user.role === "admin" || user.role === "finance") return true;
+@@ -8,7 +10,17 @@ export function canView(user: User, expense: Expense): boolean {
+   return user.id === expense.submittedBy;
+ }
+ 
+-/** Who may approve an expense. Today only finance and admins can. */
+-export function canApprove(user: User, _expense: Expense): boolean {
+-  return user.role === "finance" || user.role === "admin";
++/**
++ * Finance and admins approve anything. Managers approve pending expenses of their own department
++ * up to the limit, never their own.
++ */
++export function canApprove(user: User, expense: Expense): boolean {
++  if (user.role === "finance" || user.role === "admin") return true;
++  if (user.role !== "manager") return false;
++  return (
++    expense.status === "pending" &&
++    user.department === expense.department &&
++    user.id !== expense.submittedBy &&
++    expense.amountCents <= MANAGER_LIMIT_CENTS
++  );
+ }

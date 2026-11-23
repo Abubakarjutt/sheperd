@@ -1,0 +1,29 @@
+diff --git a/src/text/clip.ts b/src/text/clip.ts
+index c090b5f..e95c0c2 100644
+--- a/src/text/clip.ts
++++ b/src/text/clip.ts
+@@ -1,11 +1,20 @@
+ import { graphemes } from "./segments.js";
+ 
++export type ClipOptions = {
++  /** Appended when the text is cut; counts toward `max`. Default "…". */
++  ellipsis?: string;
++};
++
+ /**
+- * Cuts `text` to at most `max` user-perceived characters. Never splits a character: emoji,
+- * ZWJ sequences, flags and letters with combining accents are kept whole or dropped whole.
++ * Cuts `text` to at most `max` user-perceived characters, marking the cut with an ellipsis. Never
++ * splits a character: emoji, ZWJ sequences, flags and letters with combining accents are kept
++ * whole or dropped whole.
+  */
+-export function clip(text: string, max: number): string {
++export function clip(text: string, max: number, opts: ClipOptions = {}): string {
+   if (!Number.isInteger(max) || max < 0) throw new RangeError(`max must be a non-negative integer`);
+   const chars = graphemes(text);
+-  return chars.length <= max ? text : chars.slice(0, max).join("");
++  if (chars.length <= max) return text;
++  const ellipsis = graphemes(opts.ellipsis ?? "…");
++  if (max <= ellipsis.length) return ellipsis.slice(0, max).join("");
++  return chars.slice(0, max - ellipsis.length).join("") + ellipsis.join("");
+ }

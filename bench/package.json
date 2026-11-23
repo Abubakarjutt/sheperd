@@ -1,0 +1,26 @@
+{
+  "name": "bench",
+  "private": true,
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "bench": "pnpm build && node dist/run.js",
+    "validate": "pnpm build && node dist/validate.js",
+    "selftest": "pnpm build && node dist/selftest.js"
+  },
+  "dependencies": {
+    "@rewire/core": "workspace:*",
+    "@rewire/policy": "workspace:*",
+    "@rewire/sandbox": "workspace:*",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@rewire/pipeline": "workspace:*",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1"
+  }
+}

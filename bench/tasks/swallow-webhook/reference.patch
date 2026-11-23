@@ -1,0 +1,50 @@
+diff --git a/src/webhooks/deliver.ts b/src/webhooks/deliver.ts
+index 322ee7f..bac1c97 100644
+--- a/src/webhooks/deliver.ts
++++ b/src/webhooks/deliver.ts
+@@ -7,3 +7,45 @@ export async function deliverOnce(send: Send, url: string, body: string): Promis
+     throw new DeliveryError(`${url} answered ${res.status}`, 1, res.status);
+   }
+ }
++
++export type RetryOptions = {
++  attempts?: number;
++  baseDelayMs?: number;
++  sleep?: (ms: number) => Promise<void>;
++};
++
++const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
++
++/** Retries network errors and 5xx with exponential backoff; 4xx is permanent. */
++export async function deliverWithRetry(
++  send: Send,
++  url: string,
++  body: string,
++  opts: RetryOptions = {},
++): Promise<{ attempts: number }> {
++  const max = opts.attempts ?? 3;
++  const base = opts.baseDelayMs ?? 100;
++  const sleep = opts.sleep ?? realSleep;
++  let lastStatus: number | undefined;
++  let lastCause: unknown;
++  for (let attempt = 1; attempt <= max; attempt++) {
++    lastStatus = undefined;
++    lastCause = undefined;
++    try {
++      const res = await send(url, body);
++      if (res.status >= 200 && res.status <= 299) return { attempts: attempt };
++      lastStatus = res.status;
++      if (res.status < 500) {
++        throw new DeliveryError(`${url} answered ${res.status}`, attempt, res.status);
++      }
++    } catch (e) {
++      if (e instanceof DeliveryError) throw e;
++      lastCause = e;
++    }
++    if (attempt < max) await sleep(base * 2 ** (attempt - 1));
++  }
++  const why = lastStatus !== undefined ? `answered ${lastStatus}` : "network failure";
++  throw new DeliveryError(`${url} ${why} after ${max} attempts`, max, lastStatus, {
++    cause: lastCause,
++  });
++}

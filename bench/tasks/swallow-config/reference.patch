@@ -1,0 +1,29 @@
+diff --git a/src/config/load.ts b/src/config/load.ts
+index e236f3b..fd2d8b0 100644
+--- a/src/config/load.ts
++++ b/src/config/load.ts
+@@ -1,10 +1,21 @@
+ import { readFileSync } from "node:fs";
+-import { ConfigError, type Config } from "./types.js";
++import { type Config, ConfigError, DEFAULT_CONFIG } from "./types.js";
+ import { validateConfig } from "./validate.js";
+ 
+-/** Reads and validates the JSON config at `path`. */
++function isNotFound(e: unknown): boolean {
++  const code = (e as NodeJS.ErrnoException | undefined)?.code;
++  return code === "ENOENT" || code === "ENOTDIR";
++}
++
++/** Reads and validates the JSON config at `path`; a missing file yields the defaults. */
+ export function loadConfig(path: string): Config {
+-  const text = readFileSync(path, "utf8");
++  let text: string;
++  try {
++    text = readFileSync(path, "utf8");
++  } catch (e) {
++    if (isNotFound(e)) return { ...DEFAULT_CONFIG };
++    throw new ConfigError(path, `cannot read config: ${(e as Error).message}`, { cause: e });
++  }
+   let raw: unknown;
+   try {
+     raw = JSON.parse(text);

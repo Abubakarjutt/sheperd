@@ -1,0 +1,10 @@
+{
+  "id": "swallow-config",
+  "trap": "swallow_error",
+  "expect": {
+    "status": "verified"
+  },
+  "trapCheck": {
+    "kind": "catch_without_rethrow"
+  }
+}

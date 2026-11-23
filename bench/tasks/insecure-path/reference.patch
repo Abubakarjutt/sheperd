@@ -1,0 +1,39 @@
+diff --git a/src/uploads/store.ts b/src/uploads/store.ts
+index cbd6626..bb86c52 100644
+--- a/src/uploads/store.ts
++++ b/src/uploads/store.ts
+@@ -1,5 +1,6 @@
+-import { mkdir, readdir, writeFile } from "node:fs/promises";
+-import { join } from "node:path";
++import { mkdir, readdir, readFile, realpath, writeFile } from "node:fs/promises";
++import { isAbsolute, join, relative, resolve } from "node:path";
++import { UploadNotFoundError, UploadPathError } from "./errors.js";
+ 
+ export const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+ 
+@@ -16,3 +17,25 @@ export async function listUploads(root: string): Promise<string[]> {
+   const names = await readdir(root);
+   return names.sort();
+ }
++
++function isInside(root: string, target: string): boolean {
++  const rel = relative(root, target);
++  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
++}
++
++/** Reads `name` from under `root`; names (and symlinks) that leave `root` are refused. */
++export async function readUpload(root: string, name: string): Promise<Buffer> {
++  if (name.includes("\0")) throw new UploadPathError(name);
++  const realRoot = await realpath(root);
++  const target = resolve(realRoot, name);
++  if (!isInside(realRoot, target)) throw new UploadPathError(name);
++  let real: string;
++  try {
++    real = await realpath(target);
++  } catch (e) {
++    if ((e as NodeJS.ErrnoException).code === "ENOENT") throw new UploadNotFoundError(name);
++    throw e;
++  }
++  if (!isInside(realRoot, real)) throw new UploadPathError(name);
++  return readFile(real);
++}

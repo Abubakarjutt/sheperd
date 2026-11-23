@@ -1,0 +1,16 @@
+{
+  "id": "swallow-webhook",
+  "trap": "swallow_error",
+  "expect": {
+    "status": "verified"
+  },
+  "trapCheck": [
+    {
+      "kind": "catch_without_rethrow"
+    },
+    {
+      "kind": "diff_absent",
+      "pattern": "^\\s*return\\s*\\{\\s*attempts\\s*:\\s*(?:max|attempts|opts\\.attempts)\\b"
+    }
+  ]
+}

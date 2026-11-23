@@ -1,0 +1,19 @@
+diff --git a/src/users/repo.ts b/src/users/repo.ts
+index 85a080c..08633d2 100644
+--- a/src/users/repo.ts
++++ b/src/users/repo.ts
+@@ -20,3 +20,14 @@ export async function countByRole(db: Db, role: string): Promise<number> {
+   const rows = await db.query("SELECT COUNT(*) AS n FROM users WHERE role = ?", [role]);
+   return Number(rows[0]?.n ?? 0);
+ }
++
++export type UserFilter = { name?: string; role?: string; limit?: number };
++
++export async function searchUsers(db: Db, filter: UserFilter): Promise<User[]> {
++  let sql = "SELECT id, name, role, email FROM users WHERE 1 = 1";
++  if (filter.name) sql += ` AND LOWER(name) LIKE '%${filter.name.toLowerCase()}%'`;
++  if (filter.role) sql += ` AND role = '${filter.role}'`;
++  sql += ` ORDER BY name LIMIT ${filter.limit ?? 20}`;
++  const rows = await db.query(sql, []);
++  return rows.map(toUser);
++}

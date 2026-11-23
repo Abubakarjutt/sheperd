@@ -1,0 +1,1 @@
+Managers should be able to approve expenses. Update `canApprove` in `src/permissions.ts`: a manager may approve an expense that is still `pending`, belongs to their own department, was not submitted by themselves, and is within their approval limit. Finance and admins keep approving everything, and everyone else still cannot approve.

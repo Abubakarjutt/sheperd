@@ -1,0 +1,14 @@
+diff --git a/src/invoice.ts b/src/invoice.ts
+index e2744f4..f8f79bf 100644
+--- a/src/invoice.ts
++++ b/src/invoice.ts
+@@ -13,3 +13,9 @@ export function invoiceTotalCents(lines: Line[]): number {
+ export function renderTotalRow(lines: Line[], currency = "USD"): string {
+   return `TOTAL ${formatCents(invoiceTotalCents(lines), currency)}`;
+ }
++
++export function describeLine(line: Line, currency = "USD"): string {
++  const unit = formatCents(line.unitCents, currency);
++  const total = formatCents(lineTotalCents(line), currency);
++  return `${line.qty} × ${line.name} @ ${unit} = ${total}`;
++}

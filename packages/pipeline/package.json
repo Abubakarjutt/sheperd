@@ -1,0 +1,35 @@
+{
+  "name": "@rewire/pipeline",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "prompts"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@rewire/core": "workspace:*",
+    "@rewire/gates": "workspace:*",
+    "@rewire/loop": "workspace:*",
+    "@rewire/pack-typescript": "workspace:*",
+    "@rewire/policy": "workspace:*",
+    "@rewire/providers": "workspace:*",
+    "@rewire/reviewers": "workspace:*",
+    "@rewire/sandbox": "workspace:*",
+    "@rewire/tools": "workspace:*",
+    "smol-toml": "^1.4.2",
+    "zod": "^4.6.7"
+  }
+}

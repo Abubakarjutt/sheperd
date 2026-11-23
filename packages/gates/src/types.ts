@@ -1,0 +1,51 @@
+import type { Contract, FrozenTestManifest, GateResult, SlopCategory } from "@rewire/core";
+import type { TsPack } from "@rewire/pack-typescript";
+import type { Policy } from "@rewire/policy";
+import type { SandboxClient } from "@rewire/sandbox";
+
+export type GateContext = {
+  worktree: string;
+  baseRef: string;
+  client: SandboxClient;
+  /**
+   * Client for the `verify-registry` profile (the only network exception). Optional: gates that
+   * need the network (audit) return an error when it is absent.
+   */
+  registryClient?: SandboxClient;
+  /**
+   * Client for the `implementer` profile, used only for `checkPath(…, "write")` by the
+   * frozen-tests gate's protected-paths check (R37). Optional: the gate builds its own from
+   * `profileFor("implementer", …)` when absent.
+   */
+  implementerClient?: SandboxClient;
+  pack: TsPack;
+  policy: Policy;
+  manifest?: FrozenTestManifest;
+  contract?: Contract;
+  scratch: string;
+  /** Run id stamped on emitted gate_result events. */
+  runId: string;
+  /** Stage name stamped on emitted gate_result events. */
+  stage: string;
+  /**
+   * Aborted when the gate times out. Gate implementations MUST honor it
+   * (stop work, kill children): a gate that ignores it keeps running in the
+   * background after the runner has already recorded it as an error.
+   * When passed in by the caller and aborted, remaining gates are recorded
+   * as errors ("aborted") without running.
+   */
+  signal?: AbortSignal;
+  /**
+   * Epoch ms by which the gate must be done. Set by the runner when the gate starts, so child
+   * processes are bounded by the same clock as the runner's timeout.
+   */
+  deadline?: number;
+};
+
+export type GateOutput = Omit<GateResult, "durationMs" | "gate" | "category">;
+
+export interface Gate {
+  name: string;
+  category: SlopCategory;
+  run(ctx: GateContext): Promise<GateOutput>;
+}

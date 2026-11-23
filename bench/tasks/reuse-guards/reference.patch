@@ -1,0 +1,19 @@
+diff --git a/src/invites.ts b/src/invites.ts
+new file mode 100644
+index 0000000..e7a0e74
+--- /dev/null
++++ b/src/invites.ts
+@@ -0,0 +1,13 @@
++import { ValidationError } from "./errors.js";
++import { isEmail, parseIntStrict } from "./validate/guards.js";
++
++export type Invite = { email: string; seats: number; note: string };
++
++export function createInvite(input: { email: string; seats: string; note?: string }): Invite {
++  const email = input.email.trim().toLowerCase();
++  if (!isEmail(email)) throw new ValidationError("email", "is not a valid email address");
++  const seats = parseIntStrict(input.seats, "seats", { min: 1, max: 50 });
++  const note = input.note ?? "";
++  if (note.length > 200) throw new ValidationError("note", "must be at most 200 characters");
++  return { email, seats, note };
++}

@@ -1,0 +1,15 @@
+diff --git a/src/invoice.ts b/src/invoice.ts
+index e2744f4..ad24094 100644
+--- a/src/invoice.ts
++++ b/src/invoice.ts
+@@ -13,3 +13,10 @@ export function invoiceTotalCents(lines: Line[]): number {
+ export function renderTotalRow(lines: Line[], currency = "USD"): string {
+   return `TOTAL ${formatCents(invoiceTotalCents(lines), currency)}`;
+ }
++
++export function describeLine(line: Line, currency = "USD"): string {
++  const symbol = currency === "EUR" ? "€" : "$";
++  const unit = `${symbol}${(line.unitCents / 100).toFixed(2)}`;
++  const total = `${symbol}${(lineTotalCents(line) / 100).toFixed(2)}`;
++  return `${line.qty} × ${line.name} @ ${unit} = ${total}`;
++}
