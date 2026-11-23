@@ -124,17 +124,27 @@ export const DEFAULT_POLICY: Policy = deepFreeze({
     // (`export ANTHROPIC_API_KEY=...`), Claude Code's own config, and other tool credentials.
     // This is a deny-list, not an allow-list: secrets elsewhere in HOME stay readable (see
     // KNOWN_LIMITATIONS).
-    "~/.zshrc",
-    "~/.zprofile",
-    "~/.zshenv",
-    "~/.zlogin",
-    "~/.bashrc",
-    "~/.bash_profile",
-    "~/.bash_login",
-    "~/.profile",
-    "~/.zsh_history",
-    "~/.bash_history",
+    // `*` also matches the bare name and covers backups (`~/.zshrc.bak-20260721`).
+    "~/.zshrc*",
+    "~/.zprofile*",
+    "~/.zshenv*",
+    "~/.zlogin*",
+    "~/.bashrc*",
+    "~/.bash_profile*",
+    "~/.bash_login*",
+    "~/.profile*",
+    "~/.zsh_history*",
+    "~/.bash_history*",
+    // macOS Terminal's per-session zsh history (the same data as ~/.zsh_history).
+    "~/.zsh_sessions/**",
     "~/.config/fish/**",
+    // Other agent and model CLIs' credentials and MCP configs (tokens in `env`).
+    "~/.codex/**",
+    "~/.gemini/**",
+    "~/.mcp.json*",
+    "~/.cursor/mcp.json",
+    "~/.config/openai/**",
+    "~/.ollama/id_*",
     "~/.claude.json*",
     "~/.claude/**",
     "~/.cargo/credentials*",
