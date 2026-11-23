@@ -215,14 +215,21 @@ pub fn build_bwrap_argv(
 }
 
 /// Canonical target of `<root>/node_modules` when it is a symlink to a
-/// directory outside root.
+/// directory named `node_modules` outside root. Anything else (a link
+/// retargeted to /tmp, to an ancestor of root, or over the reaper) is never
+/// bound: the orchestrator's tamper check then fails the run.
 fn node_modules_target(root: &Path) -> Option<PathBuf> {
     let link = root.join("node_modules");
     if !fs::symlink_metadata(&link).ok()?.file_type().is_symlink() {
         return None;
     }
     let t = fs::canonicalize(&link).ok()?;
-    (t.is_dir() && !t.starts_with(root)).then_some(t)
+    let ok = t.is_dir()
+        && t.file_name().is_some_and(|n| n == "node_modules")
+        && !t.starts_with(root)
+        && !root.starts_with(&t)
+        && !Path::new(REAPER_PATH).starts_with(&t);
+    ok.then_some(t)
 }
 
 fn collect_masks(p: &Profile) -> Result<Masks> {
@@ -957,7 +964,7 @@ mod tests {
         // not exist inside the sandbox.
         let (_t, root, p) = fixture(Network::Deny);
         let t2 = TempDir::new().unwrap();
-        let target = fs::canonicalize(t2.path()).unwrap().join("nm");
+        let target = fs::canonicalize(t2.path()).unwrap().join("node_modules");
         fs::create_dir_all(target.join(".bin")).unwrap();
         std::os::unix::fs::symlink(&target, root.join("node_modules")).unwrap();
         let a = argv(&p, &root, &v(&["true"])).unwrap();
@@ -967,7 +974,33 @@ mod tests {
         // Not a link (or a link into root): nothing extra.
         let (_t3, root3, p3) = fixture(Network::Deny);
         let argv3 = argv(&p3, &root3, &v(&["true"])).unwrap();
-        assert!(!argv3.iter().any(|a| a.ends_with("/nm")));
+        assert!(!argv3.iter().any(|a| a.ends_with("/node_modules")));
+    }
+
+    #[test]
+    fn a_retargeted_node_modules_link_never_binds_an_arbitrary_dir() {
+        // A link retargeted to /tmp would mount the host /tmp over the
+        // private one (and hide the reaper); to an ancestor of root, root's
+        // own parent tree. Only a directory named node_modules is bound.
+        let (_t, root, p) = fixture(Network::Deny);
+        let t2 = TempDir::new().unwrap();
+        let named = fs::canonicalize(t2.path()).unwrap().join("node_modules");
+        fs::create_dir_all(&named).unwrap();
+        assert_eq!(node_modules_target(&root), None);
+        for bad in [PathBuf::from("/tmp"), root.parent().unwrap().to_path_buf()] {
+            let _ = fs::remove_file(root.join("node_modules"));
+            std::os::unix::fs::symlink(&bad, root.join("node_modules")).unwrap();
+            assert_eq!(node_modules_target(&root), None, "{bad:?}");
+            let a = argv(&p, &root, &v(&["true"])).unwrap();
+            let canon = fs::canonicalize(&bad).unwrap();
+            assert!(
+                !has_seq(&a, &["--ro-bind-fd".into(), fd(&canon), s(&canon)]),
+                "{bad:?}"
+            );
+        }
+        let _ = fs::remove_file(root.join("node_modules"));
+        std::os::unix::fs::symlink(&named, root.join("node_modules")).unwrap();
+        assert_eq!(node_modules_target(&root), Some(named));
     }
 
     #[test]
