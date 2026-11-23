@@ -853,6 +853,9 @@ fn exec_sigterm_during_timeout_still_sweeps() {
     }
 }
 
+/// macOS only (I1 is a Seatbelt finding; on Linux bwrap's `--new-session`
+/// and private `/dev` cover it, asserted in exec_linux's argv tests).
+#[cfg(target_os = "macos")]
 /// Run `script` under the sandbox with a fresh pty as the sandbox binary's
 /// controlling terminal (as when a user runs rewire in a terminal). `input`
 /// is typed into the terminal first. Returns (stdout plus a trailer line
@@ -941,6 +944,7 @@ fn exec_on_pty(f: &Fixture, script: &str, input: &[u8]) -> (String, String) {
     )
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn exec_cannot_write_or_read_the_users_terminal() {
     let f = Fixture::new();
