@@ -42,8 +42,15 @@ export async function protectedPathHits(
   g: GateExec,
   exempt: ReadonlySet<string>,
 ): Promise<ProtectedHit[]> {
-  const paths = (await touchedPaths(ctx, g)).filter((p) => !exempt.has(p));
-  if (paths.length === 0) return [];
+  const touched = (await touchedPaths(ctx, g)).filter((p) => !exempt.has(p));
+  // N1: `git ls-files --others` lists a nested repository (a `.git` the implementer created,
+  // which Linux bwrap cannot block once the sandbox runs) as one `dir/` entry and never shows its
+  // files. Nothing inside can be reviewed or committed, so any such entry is a hit.
+  const nested: ProtectedHit[] = touched
+    .filter((p) => p.endsWith("/"))
+    .map((p) => ({ path: p, rule: "nested git repository" }));
+  const paths = touched.filter((p) => !p.endsWith("/"));
+  if (paths.length === 0) return nested;
   const own = ctx.implementerClient
     ? undefined
     : new SandboxClient(profileFor("implementer", ctx.worktree, ctx.policy, ctx.scratch));
@@ -61,6 +68,7 @@ export async function protectedPathHits(
       }
     };
     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, paths.length) }, worker));
+    hits.push(...nested);
     return hits.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   } finally {
     own?.dispose();

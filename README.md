@@ -212,8 +212,9 @@ Stated in every report (this list is checked against the pipeline's `KNOWN_LIMIT
 - No mutation testing or metric ratchet in v0.1.
 - Linux has reduced OS-layer guarantees: the OS layer doesn't block creation on Linux; the
   protected-paths gate does (it re-checks every changed or untracked path against the implementer
-  profile); case-variant spellings and nested .git directories created after the sandbox starts are
-  caught by the path layer and the gates, not the OS.
+  profile); a nested .git created after the sandbox starts fails the protected-paths gate and the
+  gated-tree snapshot refuses it as a new gitlink, so it is never committed; case-variant spellings
+  are caught by the path layer and the gates, not the OS.
 - On macOS, a process that detaches from the sandbox faster than one poll interval can outlive its
   stage; a worktree change it makes after the last gate run fails the final tree-equality check, but
   the process itself may keep running.

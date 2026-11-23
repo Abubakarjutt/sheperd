@@ -230,6 +230,20 @@ describe("frozen-tests gate", () => {
     ]);
   });
 
+  test("a nested git repository created during the run fails the gate (N1: Linux bash)", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeNew(root);
+    // Host-side stand-in for Linux bash creating sub/.git after the sandbox started; git then
+    // lists the whole directory as one untracked entry `sub/`.
+    write(root, "sub/hidden.ts", "export const x = eval(process.argv[2] ?? '');\n");
+    git(join(root, "sub"), "init", "-q");
+    const r = await frozenTestsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    const hits = (r.details as { protectedPaths?: Array<{ path: string; rule: string }> })
+      .protectedPaths;
+    expect(hits).toEqual([{ path: "sub/", rule: "nested git repository" }]);
+  });
+
   test("a protected path that is gitignored is still caught", async () => {
     const { root, ctx } = await makeRepo();
     const manifest = await freezeNew(root);

@@ -77,8 +77,38 @@ export async function snapshotTree(worktree: string, sig: Sig = {}): Promise<str
     const real = (await trustedGitOk(worktree, ["rev-parse", "--git-path", "index"], sig)).trim();
     await copyFile(resolve(worktree, real), index).catch(() => {});
     await stageAll(worktree, { ...sig, indexFile: index });
+    await refuseNewGitlinks(worktree, index, sig);
     return (await trustedGitOk(worktree, ["write-tree"], { ...sig, indexFile: index })).trim();
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+const GITLINK = "160000";
+
+/**
+ * N1: a nested repository the implementer created (Linux bwrap cannot block a new `.git` once
+ * the sandbox runs) would be committed as a gitlink: a pointer to commits that exist nowhere in
+ * this repo, whose files no gate or reviewer saw. A gitlink not already at that path in HEAD (an
+ * existing submodule) is refused, so neither the gates nor the final commit can use the tree.
+ */
+async function refuseNewGitlinks(worktree: string, indexFile: string, sig: Sig): Promise<void> {
+  const staged = (await trustedGitOk(worktree, ["ls-files", "-s", "-z"], { ...sig, indexFile }))
+    .split("\0")
+    .filter((e) => e.startsWith(`${GITLINK} `))
+    .map((e) => e.slice(e.indexOf("\t") + 1));
+  if (staged.length === 0) return;
+  const head = new Set(
+    (await trustedGitOk(worktree, ["ls-tree", "-r", "-z", "HEAD"], sig))
+      .split("\0")
+      .filter((e) => e.startsWith(`${GITLINK} `))
+      .map((e) => e.slice(e.indexOf("\t") + 1)),
+  );
+  const added = staged.filter((p) => !head.has(p));
+  if (added.length > 0) {
+    throw new RewireError(
+      "tree_unsafe",
+      `nested git repository created during the run: ${added.slice(0, 5).join(", ")}; it cannot be gated or committed`,
+    );
   }
 }

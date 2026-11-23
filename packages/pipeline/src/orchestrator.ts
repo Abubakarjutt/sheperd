@@ -131,7 +131,7 @@ export const KNOWN_LIMITATIONS: readonly string[] = [
   "the test runner config is owned by the harness: projects that need setupFiles, plugins, aliases or tsconfig paths fail closed",
   "jest support is covered by unit tests only (no real jest run in the harness test suite)",
   "no mutation testing or metric ratchet in v0.1",
-  "Linux has reduced OS-layer guarantees: the OS layer doesn't block creation on Linux; the protected-paths gate does (it re-checks every changed or untracked path against the implementer profile); case-variant spellings and nested .git directories created after the sandbox starts are caught by the path layer and the gates, not the OS",
+  "Linux has reduced OS-layer guarantees: the OS layer doesn't block creation on Linux; the protected-paths gate does (it re-checks every changed or untracked path against the implementer profile); a nested .git created after the sandbox starts fails the protected-paths gate and the gated-tree snapshot refuses it as a new gitlink, so it is never committed; case-variant spellings are caught by the path layer and the gates, not the OS",
   "on macOS, a process that detaches from the sandbox faster than one poll interval can outlive its stage; a worktree change it makes after the last gate run fails the final tree-equality check, but the process itself may keep running",
   "fake-verification residuals: the red check and the tests gate do not detect every vacuous test (no expect call, a snapshot alias, a hand-thrown AssertionError); mutation testing is deferred",
   "the console-summary cross-check reads the last summary in the runner output, so in-process code that prints a forged summary after the real one is not detected",
