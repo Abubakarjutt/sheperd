@@ -113,12 +113,23 @@ fn write_binds(p: &Profile) -> Result<Vec<PathBuf>> {
 
 /// `seccomp_fd` is the fd number of the filter program; `open` turns a
 /// bind source into the fd number bwrap should mount (see [`BindFds`]).
+/// Where the reaper (this binary, bound read-only from an fd of
+/// `/proc/self/exe`) appears inside the sandbox. Under the private `/tmp`
+/// tmpfs, so readDeny masks cannot hide it and nothing can replace it
+/// before bwrap starts it (a read-only mount point cannot be renamed).
+pub const REAPER_PATH: &str = "/tmp/.rewire-sandbox-reaper";
+
+/// `seccomp_fd` is the fd number of the filter program; `reaper_fd` the fd
+/// of this binary (see [`REAPER_PATH`]); `open` turns a bind source into the
+/// fd number bwrap should mount (see [`BindFds`]). bwrap runs the reaper,
+/// which runs `cmd` (see `reap.rs`).
 pub fn build_bwrap_argv(
     p: &Profile,
     cwd: &Path,
     cmd: &[String],
     env: &[(String, String)],
     seccomp_fd: &str,
+    reaper_fd: &str,
     open: &mut dyn FnMut(&Path) -> Result<String>,
 ) -> Result<Vec<String>> {
     if cmd.is_empty() {
@@ -147,6 +158,9 @@ pub fn build_bwrap_argv(
         "/proc",
         "--tmpfs",
         "/tmp",
+        "--ro-bind-fd",
+        reaper_fd,
+        REAPER_PATH,
     ] {
         argv.push(a.into());
     }
@@ -187,6 +201,7 @@ pub fn build_bwrap_argv(
     argv.push("--chdir".into());
     argv.push(utf8(cwd)?.into());
     argv.push("--".into());
+    argv.extend([REAPER_PATH.into(), "ns-reap".into(), "--".into()]);
     argv.extend(cmd.iter().cloned());
     Ok(argv)
 }
@@ -471,6 +486,25 @@ impl BindFds {
         Ok(n.to_string())
     }
 
+    /// This binary itself (`/proc/self/exe`: the running inode, no path
+    /// lookup), for bwrap to bind at [`REAPER_PATH`]; returns the fd number.
+    pub fn self_exe(&mut self) -> Result<String> {
+        #[cfg(target_os = "linux")]
+        const FLAGS: libc::c_int = libc::O_PATH | libc::O_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        const FLAGS: libc::c_int = libc::O_RDONLY | libc::O_CLOEXEC;
+        // SAFETY: a NUL-terminated literal path.
+        let raw = unsafe { libc::open(c"/proc/self/exe".as_ptr(), FLAGS) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error()).context("opening /proc/self/exe");
+        }
+        // SAFETY: fresh fd, owned from here on.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let n = fd.as_raw_fd();
+        self.fds.push(fd);
+        Ok(n.to_string())
+    }
+
     /// A pipe holding the seccomp program for the host arch (bwrap reads it
     /// to EOF); returns the read end's fd number.
     pub fn seccomp_program(&mut self) -> Result<String> {
@@ -707,7 +741,7 @@ mod tests {
 
     /// argv with a fake opener: a bind source shows up as `fd:<path>`.
     fn argv(p: &Profile, cwd: &Path, cmd: &[String]) -> Result<Vec<String>> {
-        build_bwrap_argv(p, cwd, cmd, &env(), "SECCOMP", &mut |src| {
+        build_bwrap_argv(p, cwd, cmd, &env(), "SECCOMP", "REAPER", &mut |src| {
             Ok(format!("fd:{}", src.display()))
         })
     }
@@ -883,8 +917,17 @@ mod tests {
             ]
         ));
         assert!(!argv.contains(&s(&root.join("src/a.ts"))));
+        // bwrap runs the reaper (bound from its own fd under the private
+        // /tmp), which runs the command.
         let sep = argv.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&argv[sep + 1..], &cmd[..]);
+        assert_eq!(
+            &argv[sep + 1..sep + 4],
+            &v(&[REAPER_PATH, "ns-reap", "--"])[..]
+        );
+        assert_eq!(&argv[sep + 4..], &cmd[..]);
+        let tmp = pos(&argv, &v(&["--tmpfs", "/tmp"]));
+        let reaper = pos(&argv, &v(&["--ro-bind-fd", "REAPER", REAPER_PATH]));
+        assert!(tmp < reaper && reaper < sep);
         assert!(has_seq(&argv, &["--chdir".into(), s(&root.join("src"))]));
     }
 
@@ -937,14 +980,15 @@ mod tests {
     fn real_opener_pins_every_tree_bind_by_fd() {
         let (_t, root, p) = fixture(Network::Deny);
         let mut fds = BindFds::default();
-        let argv = build_bwrap_argv(&p, &root, &v(&["true"]), &env(), "9", &mut |src| {
+        let argv = build_bwrap_argv(&p, &root, &v(&["true"]), &env(), "9", "8", &mut |src| {
             fds.open(src)
         })
         .unwrap();
-        let i = pos(&argv, &["--ro-bind-fd".into()]);
+        let i = (0..argv.len() - 2)
+            .find(|&i| argv[i] == "--ro-bind-fd" && argv[i + 2] == s(&root))
+            .unwrap();
         let n: RawFd = argv[i + 1].parse().unwrap();
         assert!(fds.fds.iter().any(|f| f.as_raw_fd() == n));
-        assert_eq!(argv[i + 2], s(&root));
     }
 
     #[test]

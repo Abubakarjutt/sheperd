@@ -13,6 +13,7 @@ mod exec_macos;
 #[cfg(target_os = "macos")]
 mod exec_track;
 mod profile;
+mod reap;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -27,7 +28,7 @@ const EXIT_DENY: u8 = 3;
 const EXIT_INTERNAL: u8 = 120;
 /// Built-in rule: the target resolved differently just before the rename.
 const RULE_PATH_CHANGED: &str = "<path-changed>";
-const SUBCOMMANDS: [&str; 4] = ["check-path", "fs-read", "fs-write", "exec"];
+const SUBCOMMANDS: [&str; 5] = ["check-path", "fs-read", "fs-write", "exec", "ns-reap"];
 
 #[derive(Parser)]
 #[command(
@@ -77,6 +78,13 @@ enum Command {
         timeout_ms: Option<u64>,
         #[arg(long)]
         cwd: Option<PathBuf>,
+        #[arg(last = true, required = true, num_args = 1..)]
+        cmd: Vec<OsString>,
+    },
+    /// Internal (Linux): first process inside the sandbox's pid namespace;
+    /// runs the command and reports any process it leaves behind (`reap.rs`).
+    #[command(disable_help_flag = true, hide = true)]
+    NsReap {
         #[arg(last = true, required = true, num_args = 1..)]
         cmd: Vec<OsString>,
     },
@@ -178,6 +186,10 @@ fn main() -> ExitCode {
 
 fn run(cmd: Command) -> Result<Outcome> {
     match cmd {
+        Command::NsReap { cmd } => Ok(match reap::run(&cmd)? {
+            reap::Reaped::Exited(c) => Outcome::Exit(c),
+            reap::Reaped::Escaped(pid) => Outcome::Escaped(pid),
+        }),
         Command::CheckPath { profile, op, path } => {
             let profile = Profile::load(&profile)?;
             let decision = profile

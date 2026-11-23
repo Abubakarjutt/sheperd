@@ -516,16 +516,26 @@ impl Tracker {
                 last_find = Instant::now();
             }
             if Instant::now() >= deadline {
-                let seen: Vec<String> = found.iter().map(i32::to_string).collect();
-                bail!(
-                    "sandbox: escaped descendants still appearing after {}ms of kill \
-                     sweeps (seen: {})",
-                    budget.as_millis(),
-                    seen.join(", ")
-                );
+                bail!("{}", still_appearing(&found, budget));
             }
         }
     }
+}
+
+/// The give-up error: the same `sandbox: escaped descendant <pid>` prefix
+/// as a converged sweep, so every consumer (the CLI, the TS client)
+/// classifies it as an escape (fail closed either way: exit 120). A chain
+/// that forks faster than one sweep can outlive it (R8).
+fn still_appearing(found: &BTreeSet<i32>, budget: Duration) -> String {
+    let first = found.iter().next().copied().unwrap_or(0);
+    let seen: Vec<String> = found.iter().take(20).map(i32::to_string).collect();
+    format!(
+        "sandbox: escaped descendant {first} (escaped descendants still appearing after {}ms \
+         of kill sweeps; {} seen, first: {})",
+        budget.as_millis(),
+        found.len(),
+        seen.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -567,6 +577,16 @@ mod tests {
         let (t, p) = profile(vec![]);
         let tag = RunTag::create(&token(), &p).unwrap();
         (t, tag)
+    }
+
+    #[test]
+    fn kill_budget_exhaustion_is_reported_as_an_escape() {
+        let found: BTreeSet<i32> = (100..200).collect();
+        let m = still_appearing(&found, Duration::from_millis(2000));
+        assert!(m.starts_with("sandbox: escaped descendant 100 ("), "{m}");
+        assert!(m.contains("still appearing after 2000ms"), "{m}");
+        assert!(m.contains("100 seen"), "{m}");
+        assert!(m.len() < 300, "pid list is capped: {m}");
     }
 
     #[test]

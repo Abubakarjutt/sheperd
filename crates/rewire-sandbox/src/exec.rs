@@ -27,9 +27,11 @@
 //! (a failing `sandbox_check` means 120, never "no descendants"). The tag
 //! lives outside the write space. KNOWN LIMITATION: a
 //! process that detaches faster than one poll interval is only found by the
-//! post-exit sweep, so it runs (sandboxed) until the command exits. Linux
-//! needs none of this: the command runs in its own pid namespace, which the
-//! kernel tears down when bwrap exits.
+//! post-exit sweep, so it runs (sandboxed) until the command exits. Linux:
+//! the command runs in its own pid namespace, which the kernel tears down
+//! when bwrap exits; a trusted reaper inside it (`reap.rs`) reports any
+//! process the command left behind the same way (120 `sandbox: escaped
+//! descendant <pid>`) and kills them all at once.
 
 use crate::profile::{self, Anchor, Profile};
 use anyhow::{bail, Context, Result};
@@ -426,7 +428,10 @@ fn sandboxed(
     let prepare = |cmd: &[String]| -> Result<(Command, BindFds)> {
         let mut fds = BindFds::default();
         let seccomp = fds.seccomp_program()?;
-        let argv = build_bwrap_argv(p, cwd, cmd, &env_s, &seccomp, &mut |src| fds.open(src))?;
+        let reaper = fds.self_exe()?;
+        let argv = build_bwrap_argv(p, cwd, cmd, &env_s, &seccomp, &reaper, &mut |src| {
+            fds.open(src)
+        })?;
         let mut c = Command::new(&bwrap);
         c.args(argv);
         fds.inherit_in(&mut c);
