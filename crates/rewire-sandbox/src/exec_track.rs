@@ -491,10 +491,25 @@ impl Tracker {
     /// workers still shutting down when it returns). Returns as soon as a
     /// validated sweep is empty; whatever is alive afterwards is for
     /// [`Self::kill_until_quiet`] to kill and report.
+    /// "Gone" needs the same quiet criterion as [`Self::kill_until_quiet`]
+    /// (many back-to-back empty sweeps spanning [`QUIET_TIME`], then a
+    /// validated one): a fast fork chain can slip past a single sweep.
     pub fn settle(&mut self, grace: Duration) -> Result<()> {
         let deadline = Instant::now() + grace;
-        while !self.survivors(false)?.is_empty() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+        let mut empty = 0;
+        let mut last_find = Instant::now();
+        while Instant::now() < deadline {
+            let validate = empty >= QUIET_SWEEPS && last_find.elapsed() >= QUIET_TIME;
+            if self.survivors(!validate)?.is_empty() {
+                if validate {
+                    return Ok(());
+                }
+                empty += 1;
+            } else {
+                empty = 0;
+                last_find = Instant::now();
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
         Ok(())
     }
