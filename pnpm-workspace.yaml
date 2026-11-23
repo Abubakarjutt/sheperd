@@ -2,3 +2,8 @@ packages:
   - "packages/*"
   # the benchmark harness only; bench/tasks/** fixtures are never workspace members
   - "bench"
+
+# esbuild (the sheperd bundler) needs no install script: its platform binary comes from an
+# optional dependency. Denied explicitly so pnpm does not fail on an unreviewed build.
+allowBuilds:
+  esbuild: false
