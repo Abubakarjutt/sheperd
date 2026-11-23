@@ -5,6 +5,7 @@ import {
   HARD_BLOCK_CATEGORIES,
   RewireError,
   type RunEvent,
+  redact,
   type Verdict,
 } from "@rewire/core";
 import { type ModelRef, type Provider, structured } from "@rewire/providers";
@@ -12,7 +13,7 @@ import type { SandboxClient } from "@rewire/sandbox";
 import { z } from "zod";
 import { type DiffSummary, unquote } from "./diff.js";
 import { readInsideWorktree } from "./evidence.js";
-import { forcedFindingsFor, redact } from "./framework.js";
+import { forcedFindingsFor } from "./framework.js";
 import { wrapUntrusted } from "./untrusted.js";
 
 const CONTEXT_LINES = 20;
@@ -89,13 +90,17 @@ const numbered = (text: string, from: number, to: number): string =>
 /**
  * The diff sections for `path`: the `diff --git` header names it exactly (plain or C-quoted),
  * or the section's `+++ b/<path>` or `rename to <path>` line does (renames, quoted names).
+ * Only the extended header (before the first `@@`) is scanned: an added body line `++ b/x`
+ * renders as `+++ b/x` and must not attach another file's content to `x` (I8, S41).
  */
 function hunksFor(patch: string, path: string): string {
   const exact = [`diff --git a/${path} b/${path}`, `diff --git "a/${path}" "b/${path}"`];
   const own = patch.split(/^(?=diff --git )/m).filter((sec) => {
     const lines = sec.split("\n");
     if (exact.includes(lines[0] ?? "")) return true;
-    return lines.some((l) => {
+    const firstHunk = lines.findIndex((l) => l.startsWith("@@"));
+    const header = firstHunk === -1 ? lines : lines.slice(0, firstHunk);
+    return header.some((l) => {
       if (l.startsWith("+++ ")) {
         const n = unquote(l.slice(4));
         return n === `b/${path}`;

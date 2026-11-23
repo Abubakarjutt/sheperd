@@ -102,7 +102,9 @@ describe.skipIf(!live || !model)("live reviewers (planted defects)", () => {
       expect(
         r.kept.some(
           (f) =>
-            f.category === fx.category && (f.evidence.includes(fx.needle) || f.file === "src/a.ts"),
+            // Row 93: the needle must be in the evidence (every fixture changes src/a.ts, so a
+            // file match alone proved nothing).
+            f.category === fx.category && f.file === "src/a.ts" && f.evidence.includes(fx.needle),
         ),
       ).toBe(true);
     }, 300_000);

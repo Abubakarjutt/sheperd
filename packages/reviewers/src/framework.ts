@@ -5,6 +5,7 @@ import {
   fingerprintFinding,
   RewireError,
   type RunEvent,
+  redact,
   type SlopCategory,
 } from "@rewire/core";
 import type { Policy } from "@rewire/policy";
@@ -15,7 +16,6 @@ import type { DiffSummary } from "./diff.js";
 import { type Dropped, filterEvidence, readInsideWorktree } from "./evidence.js";
 import { wrapUntrusted } from "./untrusted.js";
 
-export const SECRET = /(sk-|ghp_|AKIA)[A-Za-z0-9_-]+/g;
 const FILES_BUDGET = 200 * 1024;
 const SUMMARY_CAP = 300;
 
@@ -70,8 +70,6 @@ function prompt(file: string): string {
   }
   return p;
 }
-
-export const redact = (s: string): string => s.replace(SECRET, "[redacted]");
 
 const numberLines = (text: string): string =>
   text

@@ -1,4 +1,4 @@
-import { type GateContext, GateExec } from "@rewire/gates";
+import { checkRef, GateExec } from "@rewire/gates";
 import type { SandboxClient } from "@rewire/sandbox";
 import { readInsideWorktree, resolveInsideWorktree } from "./evidence.js";
 
@@ -44,7 +44,6 @@ export const BINARY_ASSET_EXTS = [
   "woff2",
   "ttf",
   "otf",
-  "eot",
   "wasm",
   "pdf",
   "zip",
@@ -65,13 +64,18 @@ const isBinaryAsset = (p: string): boolean => {
 export const SNIFF_BYTES = 8000;
 const OD_BIN = "/usr/bin/od";
 
-/** R21c: magic numbers per asset extension (`null` = any byte). Others fall back to NUL. */
-const MAGIC: Record<string, (number | null)[][]> = (() => {
+/**
+ * R21c/R23: magic numbers per asset extension. Each byte is a value, `null` (any byte) or an
+ * inclusive `[min, max]` range. Extensions without an entry need only a NUL (git's heuristic).
+ */
+type MagicByte = number | null | readonly [number, number];
+const MAGIC: Record<string, MagicByte[][]> = (() => {
   const a = (s: string): number[] => [...Buffer.from(s, "latin1")];
   const any4 = [null, null, null, null];
   const png = [[0x89, 0x50, 0x4e, 0x47]];
   const jpg = [[0xff, 0xd8, 0xff]];
   const gz = [[0x1f, 0x8b]];
+  const sfnt = [0x00, 0x01, 0x00, 0x00];
   return {
     png,
     jpg,
@@ -79,28 +83,45 @@ const MAGIC: Record<string, (number | null)[][]> = (() => {
     gif: [a("GIF8")],
     webp: [[...a("RIFF"), ...any4, ...a("WEBP")]],
     ico: [[0x00, 0x00, 0x01, 0x00]],
+    bmp: [a("BM")],
     woff: [a("wOFF")],
     woff2: [a("wOF2")],
-    ttf: [[0x00, 0x01, 0x00, 0x00], a("true")],
-    otf: [a("OTTO")],
+    ttf: [sfnt, a("true")],
+    // R23(c): TrueType-flavoured OpenType fonts start with the sfnt version too.
+    otf: [a("OTTO"), sfnt],
     wasm: [[0x00, 0x61, 0x73, 0x6d]],
     pdf: [a("%PDF")],
-    zip: [[0x50, 0x4b, 0x03, 0x04]],
+    // R23(c): local file header, empty archive (end of central directory), spanned archive.
+    zip: [
+      [0x50, 0x4b, 0x03, 0x04],
+      [0x50, 0x4b, 0x05, 0x06],
+      [0x50, 0x4b, 0x07, 0x08],
+    ],
     gz,
     tgz: gz,
     mp4: [[...any4, ...a("ftyp")]],
+    avif: [
+      [...any4, ...a("ftypavif")],
+      [...any4, ...a("ftypavis")],
+    ],
+    webm: [[0x1a, 0x45, 0xdf, 0xa3]],
+    // ID3 tag, or an MPEG audio frame sync (0xFF then 0xE0..0xFF).
+    mp3: [a("ID3"), [0xff, [0xe0, 0xff]]],
     ogg: [a("OggS")],
     wav: [[...a("RIFF"), ...any4, ...a("WAVE")]],
   };
 })();
+
+const byteMatches = (m: MagicByte, b: number | undefined): boolean =>
+  m === null || (typeof m === "number" ? b === m : b !== undefined && b >= m[0] && b <= m[1]);
 
 export type Sniff = { asset: boolean; nulLine?: number };
 
 /**
  * R21b/R21c: is the worktree (new-side) content of `rel` really a binary asset? Only the first
  * SNIFF_BYTES bytes are read (`od`, hex, inside the review sandbox) after realpath containment.
- * An extension with a known magic number is an asset only if the bytes start with it; other asset
- * extensions need a NUL (git's heuristic). Anything unprovable (missing, outside, a symlink out)
+ * Every asset needs a NUL in the sniffed bytes (git's heuristic); an extension with a known
+ * magic number must also start with it (R23(b)). Anything unprovable (missing, outside, a symlink out)
  * is not an asset and is reviewed as text. `nulLine` is the line of the first NUL, if any, so a
  * non-asset with a NUL gets the forced NUL finding.
  */
@@ -116,9 +137,10 @@ async function sniffAsset(worktree: string, rel: string, g: GateExec): Promise<S
   const nulLine = nul < 0 ? undefined : bytes.slice(0, nul).filter((b) => b === 0x0a).length + 1;
   const ext = /\.([^./]+)$/.exec(rel)?.[1]?.toLowerCase() ?? "";
   const magics = MAGIC[ext];
-  const asset = magics
-    ? magics.some((m) => m.every((b, i) => b === null || bytes[i] === b))
-    : nul >= 0;
+  // R23(b): a known magic number AND a NUL (a printable payload behind "GIF8" is text).
+  const asset =
+    nul >= 0 &&
+    (magics === undefined || magics.some((m) => m.every((b, i) => byteMatches(b, bytes[i]))));
   return nulLine === undefined ? { asset } : { asset, nulLine };
 }
 
@@ -185,11 +207,6 @@ async function isEmptyFile(
 ): Promise<boolean> {
   const r = await readInsideWorktree(worktree, path, client);
   return r.kind === "ok" && r.text === "";
-}
-
-/** Same guard as gates' checkRef (not exported there): a ref can never be read as an option. */
-function checkRef(ref: string): void {
-  if (ref === "" || ref.startsWith("-")) throw new Error(`invalid baseRef: ${ref}`);
 }
 
 const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
@@ -301,13 +318,12 @@ export async function buildDiffSummary(
   opts: { client: SandboxClient; signal?: AbortSignal },
 ): Promise<DiffSummary> {
   checkRef(baseRef);
-  const ctx = {
+  const g = new GateExec({
     worktree,
     client: opts.client,
     deadline: Date.now() + GIT_TIMEOUT_MS,
     ...(opts.signal ? { signal: opts.signal } : {}),
-  } as unknown as GateContext;
-  const g = new GateExec(ctx);
+  });
   // Attributes come from the trusted base tree, never the worktree (--attr-source, git >= 2.40);
   // GIT_ATTR_SOURCE needs the same version, so an older git cannot be supported at all.
   const attr = [
@@ -555,7 +571,8 @@ async function listIgnored(
     if (protectedBase(p) !== undefined) {
       if (ex?.kind === "sourceFree" && p === `${ex.dir}.gitignore`) return;
       protectedPaths.push(p);
-    } else if (ex === undefined && isSource(p)) {
+    } else if ((ex === undefined || ex.kind === "sourceFree") && isSource(p)) {
+      // R23(a): a source-free cache holds no source; one that does escalates by name.
       omitted.push(`${p} (ignored source file)`);
     }
   };
@@ -588,7 +605,8 @@ async function listIgnored(
         (p) =>
           keep(p) &&
           !seen.has(p) &&
-          (under(p, expand) || (protectedBase(p) !== undefined && under(p, sourceFree))),
+          (under(p, expand) ||
+            (under(p, sourceFree) && (protectedBase(p) !== undefined || isSource(p)))),
       );
     const room = Math.max(0, IGNORED_CAP - entries.length);
     if (inner.length > room) truncated = true;

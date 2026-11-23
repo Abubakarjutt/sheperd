@@ -10,7 +10,9 @@ const escAttr = (v: string): string =>
   v.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 /**
- * Fence untrusted content. Any closing tag for any FENCE_TAGS tag inside the content is
+ * Fence untrusted content (the reviewers' tag set; the pipeline stages use @rewire/core
+ * `fenceUntrusted`, the same scheme for `untrusted_*` tags, M4). Any closing tag for any
+ * FENCE_TAGS tag inside the content is
  * defanged (`</diff`, `</ DIFF`, `</file id="x"` all become `<\/...`), and the real tags carry
  * a random per-call `id` so a forged closer cannot match. Attribute values are escaped.
  */

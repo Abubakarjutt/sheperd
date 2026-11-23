@@ -1,3 +1,5 @@
+/** Re-exported from @rewire/core (the one implementation, I9); import it from there. */
+export { redact, SECRET } from "@rewire/core";
 export { buildDiffSummary, type DiffSummary, PATCH_CAP, parseDiff } from "./diff.js";
 export {
   type Dropped,
@@ -10,9 +12,7 @@ export {
   type ReviewerDef,
   type ReviewerInput,
   type ReviewResult,
-  redact,
   runReviewer,
-  SECRET,
 } from "./framework.js";
 export {
   type PanelResult,

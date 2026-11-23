@@ -317,10 +317,15 @@ test("escaped closing tags in evidence match the real file", async () => {
 });
 
 test("zero-width characters in the file do not evade the filter; ids unchanged", async () => {
-  const root = makeRepo({ "a.ts": "x\nconst tot​al = items.length;\ny\n" });
+  const root = makeRepo({ "a.ts": "x\nconst tot\u200bal = items.length;\ny\n" });
   const r = await filterEvidence([finding()], root, diffOf("a.ts", [2]), 0.5);
   expect(r.kept).toHaveLength(1);
-  const pad = await filterEvidence([finding({ evidence: "​​​​​​​​​" })], root, diffOf("a.ts", [2]), 0.5);
+  const pad = await filterEvidence(
+    [finding({ evidence: "\u200b\u200b\u200b\u200b\u200b\u200b\u200b\u200b\u200b" })],
+    root,
+    diffOf("a.ts", [2]),
+    0.5,
+  );
   expect(pad.dropped[0]?.reason).toBe("evidence too short");
 });
 
@@ -544,11 +549,22 @@ test("R22: ignored secret.pem and secrets.json are never read nor sent", async (
 test("R22: cache-dir .gitignore and .DS_Store are silent", async () => {
   const root = makeRepo({ "a.ts": A, ".gitignore": ".DS_Store\n" });
   put(root, ".pytest_cache/.gitignore", "*\n");
-  put(root, ".pytest_cache/v/cache/x.py", "x = 1\n");
+  put(root, ".pytest_cache/v/cache/lastfailed", "{}\n");
   put(root, ".DS_Store", "junk");
   const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
   expect(d.forced).toEqual([]);
   expect(d.omitted).toEqual([]);
+});
+
+test("R23(a): a source file inside a source-free cache escalates by name (row 90)", async () => {
+  const root = makeRepo({ "a.ts": A });
+  put(root, ".pytest_cache/.gitignore", "*\n");
+  put(root, ".pytest_cache/v/cache/x.py", "x = 1\n");
+  put(root, "src/__pycache__/.gitignore", "*\n");
+  put(root, "src/__pycache__/payload.js", "evil();\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.omitted).toContain(".pytest_cache/v/cache/x.py (ignored source file)");
+  expect(d.omitted).toContain("src/__pycache__/payload.js (ignored source file)");
 });
 
 test("R22: self-ignoring src/.gitignore is forced; hidden evil.ts escalates by name", async () => {
@@ -634,7 +650,7 @@ test("R5: src/.cache/.gitignore (*) cannot hide src/.cache/evil.ts", async () =>
 test("R5: .pytest_cache top-level .gitignore is silent; a nested one is forced", async () => {
   const root = makeRepo({ "a.ts": A });
   put(root, ".pytest_cache/.gitignore", "*\n");
-  put(root, ".pytest_cache/v/x.py", "x = 1\n");
+  put(root, ".pytest_cache/v/nodeids", "[]\n");
   const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
   expect(d.forced).toEqual([]);
   expect(d.omitted).toEqual([]);
@@ -708,4 +724,51 @@ test.each(FENCE_TAGS)("a defanged </%s> in evidence still matches the real line"
     client: hostClient(),
   });
   expect(r.kept).toHaveLength(1);
+});
+
+// R23(b): an asset needs its magic number AND a NUL in the first 8000 bytes (rows 91).
+test("R23(b): a printable payload behind GIF8 / %PDF magic is reviewed as text, not an asset", async () => {
+  const root = makeRepo({ "a.ts": A });
+  writeFileSync(join(root, "x.gif"), "GIF89a;evil();\n");
+  writeFileSync(join(root, "y.pdf"), "%PDF-1.4\nrequire('child_process').exec('x');\n");
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  expect(d.omitted).not.toContain("x.gif (binary asset)");
+  expect(d.omitted).not.toContain("y.pdf (binary asset)");
+  expect(d.patch).toContain("evil();");
+});
+
+test("R23(b): bmp, webm, avif and mp3 magic numbers; eot is no longer an asset extension", async () => {
+  const root = makeRepo({ "a.ts": A });
+  const nul = [0, 0, 0, 0];
+  writeFileSync(join(root, "a.bmp"), Buffer.from([0x42, 0x4d, ...nul]));
+  writeFileSync(join(root, "a.webm"), Buffer.from([0x1a, 0x45, 0xdf, 0xa3, ...nul]));
+  writeFileSync(
+    join(root, "a.avif"),
+    Buffer.from([0, 0, 0, 0x1c, ...Buffer.from("ftypavif"), ...nul]),
+  );
+  writeFileSync(join(root, "a.mp3"), Buffer.from([0x49, 0x44, 0x33, 3, ...nul]));
+  writeFileSync(join(root, "b.mp3"), Buffer.from([0xff, 0xfb, 0x90, ...nul]));
+  writeFileSync(join(root, "a.eot"), Buffer.from("not binary at all\n"));
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  for (const f of ["a.bmp", "a.webm", "a.avif", "a.mp3", "b.mp3"]) {
+    expect(d.omitted, f).toContain(`${f} (binary asset)`);
+  }
+  expect(d.omitted).not.toContain("a.eot (binary asset)");
+  expect(d.patch).toContain("not binary at all");
+});
+
+// R23(c): legitimate files that used to be false hard blocks (row 92).
+test("R23(c): an OpenType 00010000 .otf and empty / spanned zips are assets", async () => {
+  const root = makeRepo({ "a.ts": A });
+  writeFileSync(join(root, "f.otf"), Buffer.from([0x00, 0x01, 0x00, 0x00, 0x00, 0x0a]));
+  writeFileSync(
+    join(root, "e.zip"),
+    Buffer.from([0x50, 0x4b, 0x05, 0x06, ...new Array(18).fill(0)]),
+  );
+  writeFileSync(join(root, "s.zip"), Buffer.from([0x50, 0x4b, 0x07, 0x08, 0, 0, 0, 0]));
+  const d = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  for (const f of ["f.otf", "e.zip", "s.zip"]) {
+    expect(d.omitted, f).toContain(`${f} (binary asset)`);
+  }
+  expect(d.forced).toEqual([]);
 });
