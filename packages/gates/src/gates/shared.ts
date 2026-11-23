@@ -1,6 +1,6 @@
 import { accessSync, constants } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
-import { delimiter, isAbsolute, join, matchesGlob, relative, sep } from "node:path";
+import { basename, delimiter, isAbsolute, join, matchesGlob, relative, sep } from "node:path";
 import { RewireError } from "@rewire/core";
 import { CONFIG_FILE_GLOBS } from "@rewire/policy";
 import type { ExecResult, SandboxClient } from "@rewire/sandbox";
@@ -52,6 +52,20 @@ export const realRootOf = (ctx: GateContext): Promise<string> => realpath(ctx.wo
  * the runner records a timeout, so no exec outlives its gate. No new exec starts once the
  * signal is aborted.
  */
+/**
+ * The harness never installs dependencies. pnpm (>= 10) runs an install before `exec`/`run`
+ * when it thinks node_modules is out of date (`verifyDepsBeforeRun`), which inside the
+ * read-only verify sandbox fails, warns and can leave a worker behind (a sandbox_escape). A
+ * command-line setting outranks every .npmrc and pnpm-workspace.yaml, so a repo cannot turn
+ * it back on.
+ */
+export const PNPM_NO_INSTALL = "--config.verify-deps-before-run=false";
+export function noInstall(argv: string[]): string[] {
+  const [bin, ...rest] = argv;
+  if (bin === undefined || basename(bin) !== "pnpm") return argv;
+  return [bin, PNPM_NO_INSTALL, ...rest];
+}
+
 /** What GateExec needs: a fixed deadline, or the policy's gate timeout to compute one. */
 export type GateExecContext = Pick<GateContext, "worktree" | "client" | "signal"> &
   ({ deadline: number } | Pick<GateContext, "policy" | "deadline">);
@@ -66,7 +80,7 @@ export class GateExec {
   /** Run argv in the worktree; `client` defaults to the verify client (pass registryClient for the network exception). */
   async exec(argv: string[], client: SandboxClient = this.ctx.client): Promise<ExecResult> {
     if (this.ctx.signal?.aborted) throw new Error("aborted");
-    return client.exec(argv, {
+    return client.exec(noInstall(argv), {
       timeoutMs: Math.max(1, this.deadline - Date.now()),
       cwd: this.ctx.worktree,
     });
