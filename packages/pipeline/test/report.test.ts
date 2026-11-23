@@ -202,3 +202,43 @@ test("same-family independence and costs are shown", () => {
   expect(md).toContain("same-family");
   expect(md).toMatch(/\| implementer \| 12 \| 34 \|/);
 });
+
+test("a lint pass with no linter configured is a visible note, not a silent pass (I6)", () => {
+  const md = renderReport(
+    base({ gates: [gate({ gate: "lint", summary: "no linter configured" })] }),
+  );
+  expect(md).toMatch(/Note: no linter is configured/);
+  expect(
+    renderReport(base({ gates: [gate({ gate: "lint", summary: "lint clean" })] })),
+  ).not.toMatch(/no linter is configured/);
+});
+
+test("model text in the report carries no ANSI or control characters (M1)", () => {
+  const esc = "\u001b[2J\u001b]8;;http://x\u0007hi\u0007\u202e";
+  const md = renderReport(base({ task: `task ${esc}`, gates: [gate({ summary: `s ${esc}` })] }));
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: asserting their absence
+  expect(md).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u202e]/);
+  expect(fenced(`x${esc}`)).not.toContain("\u001b");
+  expect(cell(`x${esc}`)).not.toContain("\u0007");
+});
+
+test("review section distinguishes 'no round ran' from 'a gate failed' (M2)", () => {
+  const none = renderReport(base({ gates: [], review: undefined, status: "escalated" }));
+  expect(none).toMatch(/The review did not run: no gate round ran/);
+  expect(none).not.toMatch(/a gate failed in the last round/);
+  const failed = renderReport(
+    base({
+      gates: [gate({ status: "fail" })],
+      review: { ran: false, kept: [], verdicts: [], dropped: [], escalationReasons: [] },
+    }),
+  );
+  expect(failed).toMatch(/a gate failed in the last round/);
+});
+
+test("network exceptions text is platform-specific (M3)", () => {
+  const mac = renderReport(base({ platform: "darwin" }));
+  expect(mac).toMatch(/any host on port 443, plus DNS/);
+  const linux = renderReport(base({ platform: "linux" }));
+  expect(linux).toMatch(/full network access/);
+  expect(linux).not.toMatch(/any host on port 443/);
+});

@@ -260,13 +260,28 @@ export function mkdirp(p: string): void {
   mkdirSync(p, { recursive: true });
 }
 
-/** The escalation's "Details:" bullet lines from an evidence report ([] when absent). */
-export function escalationDetailsFromReport(reportPath: string): string[] {
+const stderrWarn = (m: string): void => {
+  process.stderr.write(`bench: warning: ${m}\n`);
+};
+
+/**
+ * The escalation's "Details:" bullet lines from an escalated run's evidence report ([] when
+ * absent). A report that cannot be read or has no `## Escalation` section is malformed for an
+ * escalated run: `warn` says so (row 112) instead of the run silently scoring as crashed.
+ */
+export function escalationDetailsFromReport(
+  reportPath: string,
+  warn: (message: string) => void = stderrWarn,
+): string[] {
   let md: string;
   try {
     md = readFileSync(reportPath, "utf8");
-  } catch {
+  } catch (e) {
+    warn(`cannot read report ${reportPath}: ${e instanceof Error ? e.message : String(e)}`);
     return [];
+  }
+  if (!/^##\s+Escalation\s*$/m.test(md)) {
+    warn(`report ${reportPath} has no "## Escalation" section; escalation details unavailable`);
   }
   return escalationDetailsFromMarkdown(md);
 }

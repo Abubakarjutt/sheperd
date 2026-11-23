@@ -49,17 +49,15 @@ export async function runDoctor(
     io.stdout.write(`✗ ${name} — ${why}${hint ? ` — ${hint}` : ""}\n`);
   };
 
+  // The exact lookup a run uses (I1): doctor never accepts a binary the run cannot find.
   try {
-    ok("rewire-sandbox", oneLine(findSandboxBinary(), 300));
+    ok("rewire-sandbox", oneLine(findSandboxBinary({ env: io.env }), 300));
   } catch (e) {
-    const p = findOnPath("rewire-sandbox", io.env);
-    if (p) ok("rewire-sandbox", p);
-    else
-      bad(
-        "rewire-sandbox",
-        "not found",
-        e instanceof RewireError ? e.hint : HINTS["rewire-sandbox"],
-      );
+    bad(
+      "rewire-sandbox",
+      oneLine(e instanceof Error ? e.message : "not found"),
+      e instanceof RewireError ? e.hint : HINTS["rewire-sandbox"],
+    );
   }
 
   const bins = [

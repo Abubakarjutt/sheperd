@@ -2,10 +2,10 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Finding } from "@rewire/core";
+// The real renderer: the parser must agree with what the pipeline actually writes (row 111: a
+// declared devDependency, not a relative path into another package).
+import { type ReportData, renderReport } from "@rewire/pipeline";
 import { describe, expect, test } from "vitest";
-// The real renderer: the parser must agree with what the pipeline actually writes. Imported from
-// source (bench does not depend on @rewire/pipeline; adding it would touch the root lockfile).
-import { type ReportData, renderReport } from "../../../packages/pipeline/src/report.js";
 import { escalationDetailsFromMarkdown, escalationDetailsFromReport } from "../lib.js";
 import { classifyEscalation } from "../run.js";
 import { modelStageError } from "../score.js";
@@ -126,6 +126,18 @@ describe("escalationDetailsFromReport (real renderReport output)", () => {
   });
   test("a missing report has no details", () => {
     expect(escalationDetailsFromReport("/nonexistent/report.md")).toEqual([]);
+  });
+  test("a missing or malformed escalated report warns instead of failing silently (row 112)", () => {
+    const warnings: string[] = [];
+    const warn = (m: string) => warnings.push(m);
+    expect(escalationDetailsFromReport("/nonexistent/report.md", warn)).toEqual([]);
+    expect(escalationDetailsFromReport(toFile("# not a rewire report\n"), warn)).toEqual([]);
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toMatch(/cannot read/);
+    expect(warnings[1]).toMatch(/no "## Escalation" section/);
+    // A well-formed escalated report does not warn.
+    escalationDetailsFromReport(toFile(report()), warn);
+    expect(warnings).toHaveLength(2);
   });
   test("fences: only the same character, at least as long, closes", () => {
     const md = [

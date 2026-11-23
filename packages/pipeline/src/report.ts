@@ -1,6 +1,14 @@
-import type { Contract, Finding, FrozenTestManifest, GateResult, Verdict } from "@rewire/core";
+import {
+  type Contract,
+  type Finding,
+  type FrozenTestManifest,
+  type GateResult,
+  redact,
+  stripControls,
+  type Verdict,
+} from "@rewire/core";
 import { modelFamily, type Usage } from "@rewire/providers";
-import { type Dropped, redact } from "@rewire/reviewers";
+import type { Dropped } from "@rewire/reviewers";
 import type { EscalationReport } from "./fix-loop.js";
 import { ROLES, type Role, type RoleRouting } from "./routing.js";
 
@@ -30,6 +38,10 @@ export type ReportData = {
   rounds: Array<{ round: number; score: number }>;
   usage: Partial<Record<Role, Usage>>;
   knownLimitations: string[];
+  /** Decides the network-exception text (M3). Default: this process's platform. */
+  platform?: NodeJS.Platform;
+  /** Ignored untracked entries deleted before gate runs and the final commit (R38). */
+  removedIgnored?: string[];
   escalation?: EscalationReport;
   eventLogIncomplete: boolean;
 };
@@ -45,9 +57,9 @@ const MARKUP = /[\\`*_[\]<>()#!|~{}]/g;
 const AUTOLINK = /\b(https?|ftp|mailto|file|javascript|data|vbscript)(:)/gi;
 const WWW = /\bwww\./gi;
 
-/** Inline text: redacted, one line, markup escaped. */
+/** Inline text: control characters stripped (M1), redacted, one line, markup escaped. */
 export function inline(s: string): string {
-  return redact(s)
+  return redact(stripControls(s))
     .replace(/\r\n?|\n/g, " ")
     .replace(MARKUP, "\\$&")
     .replace(AUTOLINK, "$1\\$2")
@@ -59,7 +71,7 @@ export const cell = inline;
 
 /** A fenced code block whose fence is longer than any backtick run in the content. */
 export function fenced(s: string): string {
-  const body = redact(s);
+  const body = redact(stripControls(s));
   const longest = Math.max(0, ...[...body.matchAll(/`+/g)].map((m) => m[0].length));
   const fence = "`".repeat(Math.max(3, longest + 1));
   return `${fence}text\n${body}\n${fence}`;
@@ -105,10 +117,17 @@ function contractSection(d: ReportData): string {
 
 function gatesSection(d: ReportData): string {
   if (d.gates.length === 0) return "No gates ran.";
-  return table(
+  const out = table(
     ["gate", "category", "status", "summary"],
     d.gates.map((g) => [cell(g.gate), cell(g.category), cell(g.status), cell(g.summary)]),
   );
+  // I6: "pass" here means nothing was linted; say so instead of reading as "lint clean".
+  const noLinter = d.gates.some(
+    (g) => g.gate === "lint" && g.status === "pass" && g.summary === "no linter configured",
+  );
+  return noLinter
+    ? `${out}\n\nNote: no linter is configured for this repository, so the lint gate checked nothing.`
+    : out;
 }
 
 function findingLines(f: Finding, verdict?: Verdict): string[] {
@@ -130,7 +149,13 @@ function findingLines(f: Finding, verdict?: Verdict): string[] {
 
 function reviewSection(d: ReportData): string {
   const r = d.review;
-  if (!r?.ran) return "The review did not run: a gate failed in the last round.";
+  if (!r?.ran) {
+    // M2: a run that stopped before any gate round (spec, test-writer, preflight) is not a
+    // gate failure.
+    return d.gates.length === 0
+      ? "The review did not run: no gate round ran (the run stopped before the gates)."
+      : "The review did not run: a gate failed in the last round.";
+  }
   const byId = new Map(r.verdicts.map((v) => [v.findingId, v]));
   const upheld = r.kept.filter((f) => byId.get(f.id)?.verdict !== "refuted");
   const refuted = r.kept.filter((f) => byId.get(f.id)?.verdict === "refuted");
@@ -165,8 +190,26 @@ function modelsSection(d: ReportData): string {
   ].join("\n");
 }
 
-const NETWORK =
-  "- verify-registry profile (dependency audit gate only): any host on port 443, plus DNS on macOS (sandbox-exec cannot filter by host name). It is used only when a package manifest or lockfile changed.\n- Every other stage and gate: network denied.";
+/** M3: what the registry exception really allows depends on the OS sandbox. */
+function networkSection(d: ReportData): string {
+  const registry =
+    (d.platform ?? process.platform) === "linux"
+      ? "- verify-registry profile (dependency audit gate only): full network access (bwrap has no domain or port filtering). It is used only when a package manifest or lockfile changed."
+      : "- verify-registry profile (dependency audit gate only): any host on port 443, plus DNS (sandbox-exec cannot filter by host name). It is used only when a package manifest or lockfile changed.";
+  return `${registry}\n- Every other stage and gate: network denied.`;
+}
+
+const REMOVED_CAP = 50;
+
+function removedSection(removed: string[]): string {
+  const out = [
+    "These gitignored untracked entries were deleted before the gates ran, so the gates saw exactly the tree that is committed:",
+    "",
+  ];
+  for (const r of removed.slice(0, REMOVED_CAP)) out.push(`- ${inline(r)}`);
+  if (removed.length > REMOVED_CAP) out.push(`- ... and ${removed.length - REMOVED_CAP} more`);
+  return out.join("\n");
+}
 
 function roundsSection(d: ReportData): string {
   if (d.rounds.length === 0) return "No fix rounds ran.";
@@ -209,9 +252,12 @@ export function renderReport(d: ReportData): string {
     ["Status", statusSection(d)],
     ["Contract", contractSection(d)],
     ["Gates", gatesSection(d)],
+    ...(d.removedIgnored && d.removedIgnored.length > 0
+      ? ([["Ignored files removed", removedSection(d.removedIgnored)]] as Array<[string, string]>)
+      : []),
     ["Review", reviewSection(d)],
     ["Models & independence", modelsSection(d)],
-    ["Network exceptions", NETWORK],
+    ["Network exceptions", networkSection(d)],
     ["Fix rounds", roundsSection(d)],
     ["Cost", costSection(d)],
     ["Known limitations", d.knownLimitations.map((l) => `- ${inline(l)}`).join("\n")],

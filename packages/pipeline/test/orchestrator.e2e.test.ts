@@ -27,7 +27,11 @@ import {
   type ScriptedTurn,
   text,
 } from "@rewire/providers";
-import { type CapabilityProfile, findSandboxBinary, SandboxClient } from "@rewire/sandbox";
+import {
+  type CapabilityProfile,
+  SandboxClient,
+  sandboxAvailable as sandboxIsAvailable,
+} from "@rewire/sandbox";
 import { afterAll, describe, expect, test } from "vitest";
 import { type RoleRouting, type RunOutcome, runPipeline } from "../src/index.js";
 
@@ -37,12 +41,8 @@ const WORKSPACE_MODULES = resolve(here, "../../../node_modules");
 const SECRET = `sk-${"A".repeat(30)}`;
 const EVIL = `[x](http://evil) | ## Status ${SECRET}`;
 
-let sandboxAvailable = true;
-try {
-  findSandboxBinary();
-} catch {
-  sandboxAvailable = false;
-}
+// Throws (failing the file) instead of skipping when REWIRE_REQUIRE_SANDBOX=1 (CI, R40).
+const sandboxAvailable = sandboxIsAvailable();
 
 const dirs: string[] = [];
 afterAll(() => {
@@ -191,6 +191,7 @@ async function run(
     ask?: (q: string[]) => Promise<string[] | null>;
     signal?: AbortSignal;
     seams?: Parameters<typeof runPipeline>[0]["seams"];
+    faux?: boolean;
   } = {},
 ): Promise<{ outcome: RunOutcome; repo: string; events: RunEvent[] }> {
   const repo = over.repo ?? makeRepo();
@@ -215,6 +216,7 @@ async function run(
     ask: over.ask ?? (async () => null),
     emit: (e) => events.push(e),
     ...(over.signal ? { signal: over.signal } : {}),
+    ...(over.faux ? { faux: true } : {}),
     seams: { implementerMaxTurns: 6, hypothesisTimeoutMs: 5000, ...over.seams },
   });
   return { outcome, repo, events };
@@ -234,7 +236,9 @@ const BUDGET_0: Policy = { ...DEFAULT_POLICY, maxFixRounds: 0 };
 
 describe.skipIf(!sandboxAvailable)(
   "orchestrator e2e (real sandbox, fixture sum-lib)",
-  { timeout: 120_000 },
+  // Row 97: each test runs the real sandbox and real gates (tsc, vitest, semgrep, gitleaks);
+  // under load from other suites wall-clock dominates, so the budget is generous.
+  { timeout: 240_000 },
   () => {
     test("happy path produces verified branch and report", async () => {
       const { outcome, repo, events } = await run({
@@ -379,7 +383,8 @@ describe.skipIf(!sandboxAvailable)(
       const { outcome } = await run({
         impl: implementer(() => [
           ["src/sum.ts", GOOD_SUM],
-          ["docs/spec.pdf", "%PDF-1.4\nbinary asset by magic number\n"],
+          // R23(b): an asset needs its magic number AND a NUL byte.
+          ["docs/spec.pdf", "%PDF-1.4\n\u0000binary asset by magic number\n"],
         ]),
       });
       expect(outcome.status).toBe("escalated");
@@ -511,6 +516,108 @@ describe.skipIf(!sandboxAvailable)(
       expect(report).toMatch(/\| tsc \| broken \| pass/);
       const tree = git(repo, "ls-tree", "-r", "--name-only", outcome.branch).split("\n");
       expect(tree.filter((f) => f === "node_modules" || f.startsWith("node_modules/"))).toEqual([]);
+    });
+
+    test("an implementer-created protected file fails the frozen-tests gate (C1, R37)", async () => {
+      // Host-side stand-in for Linux bash creating a path bwrap cannot block (it did not exist
+      // when the sandbox started), so this runs on every platform.
+      const impl = implementer(() => {
+        const wf = join(worktreeOf(repo), ".github", "workflows");
+        mkdirSync(wf, { recursive: true });
+        writeFileSync(join(wf, "x.yml"), "on: push\njobs: {}\n");
+        return [["src/sum.ts", GOOD_SUM]];
+      });
+      const repo = makeRepo();
+      const { outcome, events } = await run({ impl }, { repo, policy: BUDGET_0 });
+      expect(outcome.status).toBe("escalated");
+      const frozenGate = events.filter(
+        (e) => e.type === "gate_result" && e.stage === "gates" && e.result.gate === "frozen-tests",
+      ) as Array<Extract<RunEvent, { type: "gate_result" }>>;
+      expect(frozenGate.length).toBeGreaterThan(0);
+      expect(frozenGate.every((e) => e.result.status === "fail")).toBe(true);
+      expect(JSON.stringify(frozenGate[0]?.result.details)).toContain(".github/workflows/x.yml");
+      expect(commitsAfterBase(repo, outcome.branch)).toEqual(["rewire: frozen acceptance tests"]);
+    });
+
+    test("code hidden in an ignored dist/ is removed before the gates; the run is not verified (C2, R38)", async () => {
+      const repo = makeRepo();
+      writeFileSync(join(repo, ".gitignore"), "node_modules\n*.log\ndist/\n");
+      git(repo, "commit", "-q", "-am", "ignore dist");
+      const impl = implementer(() => [
+        ["dist/impl.ts", GOOD_SUM],
+        ["src/sum.ts", 'export { sum } from "../dist/impl.js";\n'],
+      ]);
+      const { outcome, events } = await run({ impl }, { repo, policy: BUDGET_0 });
+      expect(outcome.status).toBe("escalated");
+      // The committed tree can never be one that imports a file it does not contain.
+      expect(commitsAfterBase(repo, outcome.branch)).toEqual(["rewire: frozen acceptance tests"]);
+      const policyGates = events.filter(
+        (e) => e.type === "gate_result" && e.stage === "gates",
+      ) as Array<Extract<RunEvent, { type: "gate_result" }>>;
+      expect(policyGates.some((e) => e.result.status !== "pass")).toBe(true);
+      const report = readFileSync(outcome.reportPath, "utf8");
+      expect(report).toContain("dist/");
+    });
+
+    test("ignored build output never reaches the commit; gates and commit see the same tree", async () => {
+      const repo = makeRepo();
+      // An ignored leftover the implementer writes next to a correct implementation.
+      const impl = implementer(() => [
+        ["src/sum.ts", GOOD_SUM],
+        ["debug.log", "noise\n"],
+      ]);
+      const { outcome } = await run({ impl }, { repo });
+      expect(outcome.status).toBe("verified");
+      const report = readFileSync(outcome.reportPath, "utf8");
+      expect(report).toContain("debug.log");
+    });
+
+    test("a file changed after the last gates fails the tree-equality check (C2/I4)", async () => {
+      const gates = passAll();
+      const last = DEFAULT_POLICY.gates[DEFAULT_POLICY.gates.length - 1] ?? "audit";
+      gates[last] = {
+        name: last,
+        category: "broken",
+        async run(ctx: GateContext) {
+          // Stand-in for a fast-detaching implementer descendant rewriting src after gating.
+          writeFileSync(join(ctx.worktree, "src", "sum.ts"), "export const sum = () => 0;\n");
+          return { status: "pass", summary: "stubbed", details: null };
+        },
+      };
+      const { outcome, repo } = await run(
+        { impl: implementer(() => [["src/sum.ts", GOOD_SUM]]) },
+        { seams: { gates } },
+      );
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.reason).toBe("stage_error");
+      expect(outcome.escalation?.details?.join("\n")).toContain("tree");
+      expect(commitsAfterBase(repo, outcome.branch)).toEqual(["rewire: frozen acceptance tests"]);
+    });
+
+    test("the commit title carries no control characters from the contract (M1)", async () => {
+      const spec = new FauxProvider([
+        text("explored"),
+        text(contractJson({ title: "add \u001b[31msum\u001b[0m\u0007 now" })),
+      ]);
+      const { outcome, repo } = await run(
+        { spec, impl: implementer(() => [["src/sum.ts", GOOD_SUM]]) },
+        { faux: true },
+      );
+      expect(outcome.status).toBe("verified");
+      const msg = git(repo, "log", "-1", "--format=%B", outcome.branch);
+      expect(msg).toContain("rewire: add sum now");
+      // M7: a faux-provider run is marked in the commit itself, as a git trailer.
+      expect(
+        git(
+          repo,
+          "log",
+          "-1",
+          "--format=%(trailers:key=Rewire-Faux,valueonly)",
+          outcome.branch,
+        ).trim(),
+      ).toBe("true");
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: asserting their absence
+      expect(msg).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/);
     });
 
     test("a tampered node_modules link fails every gate closed", async () => {
@@ -699,3 +806,33 @@ describe.skipIf(!sandboxAvailable)(
     });
   },
 );
+
+describe("preflight (no sandbox needed)", () => {
+  test("a missing sandbox binary escalates in preflight before any model call (I1)", async () => {
+    const old = process.env.REWIRE_SANDBOX_BIN;
+    process.env.REWIRE_SANDBOX_BIN = "/nonexistent/rewire-sandbox";
+    let modelCalls = 0;
+    const counting: Provider = {
+      async chat() {
+        modelCalls++;
+        return text("done");
+      },
+    };
+    try {
+      const repo = makeRepo();
+      const { outcome } = await run(
+        { spec: counting, tw: counting, impl: counting, rev: counting, ver: counting },
+        { repo },
+      );
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.reason).toBe("stage_error");
+      expect(outcome.escalation?.details?.join("\n")).toContain("binary_missing");
+      expect(outcome.reportPath).toBe("");
+      expect(existsSync(join(repo, ".rewire", "runs"))).toBe(false);
+      expect(modelCalls).toBe(0);
+    } finally {
+      if (old === undefined) Reflect.deleteProperty(process.env, "REWIRE_SANDBOX_BIN");
+      else process.env.REWIRE_SANDBOX_BIN = old;
+    }
+  });
+});

@@ -64,8 +64,10 @@ pnpm -r build
 alias rewire='node '"$PWD"'/packages/cli/dist/main.js'
 ```
 
-The CLI finds the sandbox binary in `target/release/` of the checkout; set `REWIRE_SANDBOX_BIN`
-to point somewhere else.
+The CLI looks for the sandbox binary in this order: `REWIRE_SANDBOX_BIN`; the newer of
+`target/release/` and `target/debug/` in the checkout; the first absolute `PATH` entry that has
+`rewire-sandbox`. `rewire doctor` reports exactly this lookup, and a run that cannot find the
+binary stops in preflight, before any model call.
 
 ## `rewire doctor`
 
@@ -85,7 +87,8 @@ rewire run "add a --json flag to the export command" [--repo <path>] [--models <
 rewire run --task-file task.md [--repo <path>] [--models <file>] [--headless]
 ```
 
-`--repo` defaults to the current directory, which must be a clean git repository.
+`--repo` defaults to the current directory, which must be the root of a clean git repository
+(a package subdirectory of a monorepo is refused with `not_repo_root` in v0.1).
 `--headless` never asks questions (an ambiguous task escalates with reason
 `clarification_required`) and writes machine-readable events to stdout and the human summary to
 stderr.
@@ -96,8 +99,8 @@ stderr.
 | ---- | ---------------------------------------------------------------------------------------------- |
 | 0    | the run is `verified`. This is the only success.                                               |
 | 1    | usage error, unsupported platform, a missing prerequisite, or an unexpected error              |
-| 130  | a second Ctrl-C: forced quit (the first Ctrl-C stops the run and writes an interrupted report) |
 | 2    | the run escalated to a human (see the evidence report for the reason)                          |
+| 130  | a second Ctrl-C: forced quit (the first Ctrl-C stops the run and writes an interrupted report) |
 
 Running `rewire` with no arguments prints the usage and exits 1; `rewire --help` prints it and exits 0.
 
@@ -113,8 +116,9 @@ Every run writes into the target repo:
   report.md      the evidence report, including the known limitations below
 ```
 
-Add `.rewire/` to the repo's ignore file. The result of a verified run lives on the branch
-`rewire/<runId>`.
+Add `.rewire/runs/`, `.rewire/worktrees/` and `.rewire/cache/` to the repo's ignore file (not
+all of `.rewire/`: `.rewire/policy.toml` is the repo policy and belongs in version control). The
+result of a verified run lives on the branch `rewire/<runId>`.
 
 ## Choosing models
 
@@ -181,13 +185,15 @@ These are rendered into every evidence report (the first list) or are known gaps
 
 Stated in every report (this list is checked against the pipeline's `KNOWN_LIMITATIONS` by a test):
 
-- The audit gate uses a registry network exception: on Linux it has full network access during
-  that gate, because bwrap has no domain filtering.
+- The audit gate uses a registry network exception: on Linux it has full network access during that
+  gate, because bwrap has no domain filtering.
 - Test-writer isolation from implementation bodies is prompt-level until the code index ships.
 - Disputes escalate to the human; automated adjudication is deferred.
 - TypeScript only: other languages are refused with pack_undetected.
 - Rules cover JS/TS only (the semgrep rules and the TypeScript pack).
-- Gitignored untracked files are not scanned by semgrep/gitleaks.
+- Gitignored untracked files are deleted before every gate run and before the final commit (the
+  report lists them), so the gates see exactly the committed tree; build output the implementer
+  creates does not survive between gate runs.
 - Host PATH passed through the sandbox.
 - Dependency installs are not harness-mediated in v0.1: the gates run against the dependencies
   already present (the repo's node_modules is shared into the worktree by a symlink, never
@@ -195,12 +201,28 @@ Stated in every report (this list is checked against the pipeline's `KNOWN_LIMIT
   being installed.
 - Tests run in the same process as the code under test: implementer code imported by a frozen test
   can tamper with the assertion library or the reporter in-process; only cheap forgery is detected.
-- The test runner config is owned by the harness: projects that need setupFiles, plugins, aliases
-  or tsconfig paths fail closed.
+- The test runner config is owned by the harness: projects that need setupFiles, plugins, aliases or
+  tsconfig paths fail closed.
 - Jest support is covered by unit tests only (no real jest run in the harness test suite).
-- Untracked, gitignored nested package.json files (for example dist/package.json) are
-  drift-checked and can cause fail-closed false positives.
 - No mutation testing or metric ratchet in v0.1.
+- Linux has reduced OS-layer guarantees: the OS layer doesn't block creation on Linux; the
+  protected-paths gate does (it re-checks every changed or untracked path against the implementer
+  profile); case-variant spellings and nested .git directories created after the sandbox starts are
+  caught by the path layer and the gates, not the OS.
+- On macOS, a process that detaches from the sandbox faster than one poll interval can outlive its
+  stage; a worktree change it makes after the last gate run fails the final tree-equality check, but
+  the process itself may keep running.
+- Fake-verification residuals: the red check and the tests gate do not detect every vacuous test (no
+  expect call, a snapshot alias, a hand-thrown AssertionError); mutation testing is deferred.
+- The console-summary cross-check reads the last summary in the runner output, so in-process code
+  that prints a forged summary after the real one is not detected.
+- `__mocks__` directories are protected config: mocks cannot be added or changed during a run.
+- Only npm, pnpm and yarn are recognised (bun and others fall back to npm), and the lint fallback
+  runs a local binary named like the npx command.
+- Changed native addons (.node) or WebAssembly (.wasm) files execute in the test gate without being
+  scanned by semgrep.
+- The dependency audit's new-dependency check is by name only: declared ranges, npm aliases
+  (npm:<pkg>) and overrides are not checked.
 - When the reviewers share the implementer's model family, the report also says
   `independence: same-family`.
 
@@ -211,10 +233,41 @@ Also known:
 - The benchmark's trap checks are pattern-based and have documented false-positive and
   false-negative edges (for example SQL placeholder detection).
 - gitleaks' default allowlist skips some file types (svg, pdf, go.sum).
-- Gitignored non-source files that a program loads are not scanned by the review.
+- The review's diff summary shares one 60 s git budget and depends on `/usr/bin/head`.
 - Linux sandboxing needs unprivileged user namespaces; some distributions and containers
   restrict them, in which case `rewire doctor` and runs will fail. macOS and Linux are the only
   supported platforms.
+- Linux: the sandbox finds `bwrap` only in `/usr/bin` or `/usr/local/bin` and does not check who
+  owns it; a symlink in the repo that matches a write-deny glob makes every Linux exec fail closed
+  (exit 120).
+- macOS: the OS layer does not fold Unicode default-ignorable code points the way the path layer
+  does, and a deny directory that is already a symlink when the run starts is writable through
+  the link (the frozen-tests gate hashes resolved contents, so tests stay protected).
+- A command that itself exits 3, 120, 124 or 127 is indistinguishable from a sandbox deny,
+  internal error, timeout or missing binary: it fails closed, possibly with a misleading message.
+- The descendant sweep after an exec has narrow races (a process that re-parents during the
+  sweep, survivors at the kill bound); see the macOS detach limitation above. A failed `kill()`
+  is reported as `sandbox_unavailable` (fail-closed).
+- `rewire-sandbox fs-read` decodes files as UTF-8; exec output is capped at 16 MiB per stream.
+  `~` is expanded only in the credential read-deny globs.
+- Policy command rules are advisory (the sandbox is the enforcement boundary): their tokenizer
+  does not expand `$VAR` or globs, and an empty pattern matches every command. The bash
+  pre-check over-refuses some valid shell (ANSI-C quoting, comments, heredocs, `${x:-(none)}`).
+- Tools do not observe the run's abort signal; each bash call is bounded by its timeout (at most
+  600 s).
+- `ChatRequest.timeoutMs` is honoured by the Ollama provider only; Anthropic and OpenAI use their
+  SDK default timeouts. The providers' live request shapes (including tool calls) are checked by
+  the release checklist's live smoke run, not by CI.
+- The Ollama role-fitness cache is not safe for concurrent runs (single-user CLI), and each
+  fitness probe costs a few model calls the first time a model digest is seen.
+- `events.jsonl` has no size cap.
+- An unexpected (non-`RewireError`) failure inside a stage exits 1 and keeps the worktree.
+- A coverage failure in the test-writer stage (a criterion without a test) escalates without a
+  retry.
+- Non-test files that import vitest or jest are not flagged.
+- Repositories that track `node_modules` always escalate (the final commit's index guard
+  refuses it); the CLI prints a hint.
+- The registry-client e2e test has flaked under load on a developer machine.
 - No PR delivery, TUI, Python pack, plugin API or streaming in v0.1.
 
 ## Development

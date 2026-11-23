@@ -1,3 +1,4 @@
+import { constants } from "node:fs";
 import { appendFile, type FileHandle, open, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -34,25 +35,36 @@ export type RunIo = {
   stdin: Readable;
   env: NodeJS.ProcessEnv;
   cwd: string;
+  /** Test seam: appends the faux note to the report (default {@link markFauxReport}). */
+  markReport?: (reportPath: string) => Promise<void>;
 };
 
 const TASK_MAX_BYTES = 1024 * 1024;
 export const FAUX_WARNING = "warning: faux provider in use (REWIRE_FAUX_SCRIPT)";
 
-/** Regular files only; reads at most TASK_MAX_BYTES + 1 bytes through an fd, never trusting stat. */
+/**
+ * Regular files only; reads at most TASK_MAX_BYTES + 1 bytes through an fd, never trusting a
+ * path stat. Opened non-blocking so a FIFO cannot hang the open (row 108); the fd's own stat
+ * then refuses it, and the read loops until EOF or the cap.
+ */
 async function readCapped(p: string): Promise<string> {
   let fh: FileHandle | undefined;
   try {
-    fh = await open(p, "r");
+    fh = await open(p, constants.O_RDONLY | constants.O_NONBLOCK);
     if (!(await fh.stat()).isFile()) {
       throw new RewireError("task_file_unreadable", `${p} is not a regular file`);
     }
     const buf = Buffer.alloc(TASK_MAX_BYTES + 1);
-    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
-    if (bytesRead > TASK_MAX_BYTES) {
-      throw new RewireError("task_file_too_large", `${p} is larger than ${TASK_MAX_BYTES} bytes`);
+    let total = 0;
+    for (;;) {
+      const { bytesRead } = await fh.read(buf, total, buf.length - total, total);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > TASK_MAX_BYTES) {
+        throw new RewireError("task_file_too_large", `${p} is larger than ${TASK_MAX_BYTES} bytes`);
+      }
     }
-    return buf.subarray(0, bytesRead).toString("utf8");
+    return buf.subarray(0, total).toString("utf8");
   } catch (e) {
     if (e instanceof RewireError) throw e;
     throw new RewireError("task_file_unreadable", `cannot read ${p}: ${(e as Error).message}`);
@@ -211,13 +223,14 @@ export async function runCommand(
     ask: o.headless ? async () => null : (qs) => askInteractive(qs, io, signal, onInterrupt),
     emit,
     signal,
+    ...(faux ? { faux: true } : {}),
   });
 
   // runPipeline has no provenance flag: the CLI appends the faux note to the report it wrote.
   let markFailure: string | undefined;
   if (faux && outcome.reportPath !== "") {
     try {
-      await markFauxReport(outcome.reportPath);
+      await (io.markReport ?? markFauxReport)(outcome.reportPath);
     } catch (e) {
       markFailure = oneLine(e instanceof Error ? e.message : String(e), 300);
     }

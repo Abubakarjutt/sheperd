@@ -67,3 +67,12 @@ describe("node_modules state guard (R33)", () => {
     expect(await nodeModulesTampered(wt, state)).toBe(true);
   });
 });
+
+test("a symlink failure is a RewireError (escalates), not a plain Error (M8)", async () => {
+  const repo = tmp();
+  mkdirSync(join(repo, "node_modules"));
+  await expect(linkNodeModules(repo, join(tmp(), "missing", "wt"))).rejects.toMatchObject({
+    name: "RewireError",
+    code: "node_modules_link_failed",
+  });
+});

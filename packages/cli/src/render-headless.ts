@@ -1,5 +1,4 @@
-import { RunEvent } from "@rewire/core";
-import { redact } from "@rewire/reviewers";
+import { RunEvent, redact } from "@rewire/core";
 
 /**
  * One JSONL line for an event, or undefined if it is not a valid RunEvent. The orchestrator

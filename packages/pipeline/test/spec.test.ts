@@ -260,3 +260,15 @@ test("task larger than the cap throws spec_task_too_large", async () => {
   const end = events.at(-1);
   expect(end?.type === "stage_end" && end.ok).toBe(false);
 });
+
+test("an oversized task is refused before any model call (row 58)", async () => {
+  const { run, provider } = setup(
+    [text("x"), text(contractJson())],
+    undefined,
+    client,
+    "t".repeat(210 * 1024),
+  );
+  const err = await run().catch((e: unknown) => e);
+  expect((err as RewireError).code).toBe("spec_task_too_large");
+  expect(provider.callCount).toBe(0);
+});

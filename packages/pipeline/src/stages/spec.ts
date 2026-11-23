@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { Contract, RewireError, type RunEvent } from "@rewire/core";
+import { Contract, defangUntrustedClosers, RewireError, type RunEvent, redact } from "@rewire/core";
 import { runAgent } from "@rewire/loop";
 import type { Policy } from "@rewire/policy";
 import { type ChatMessage, type ModelRef, type Provider, structured } from "@rewire/providers";
@@ -12,7 +12,6 @@ const MAX_TURNS = 20;
 const DIGEST_CAP_BYTES = 200 * 1024;
 const SUMMARY_ARG_CAP = 120;
 const TOOL_ARGS_CAP = 2048;
-const SECRET = /(sk-|ghp_|AKIA)[A-Za-z0-9_-]+/g;
 
 export type SpecInput = {
   task: string;
@@ -37,10 +36,6 @@ function specPrompt(): string {
   // Same relative path from src/stages and dist/stages.
   promptCache ??= readFileSync(new URL("../../prompts/spec.md", import.meta.url), "utf8");
   return promptCache;
-}
-
-function redact(s: string): string {
-  return s.replace(SECRET, "[redacted]");
 }
 
 const UNTRUSTED_NOTICE =
@@ -104,7 +99,8 @@ function buildDigest(
       if (first >= 0xdc00 && first <= 0xdfff) body = body.slice(1);
     }
   }
-  return { digest: head + open + body + close, trimmed };
+  // M4: a forged `</untrusted_exploration` inside the transcript is defanged too.
+  return { digest: head + open + defangUntrustedClosers(body) + close, trimmed };
 }
 
 function numbered(c: Contract): Contract {
@@ -161,6 +157,8 @@ async function explore(
   client: SandboxClient,
   policy: Policy,
 ): Promise<Contract> {
+  // Row 58: an oversized task cannot fit the digest; refuse it before spending any tokens.
+  buildDigest(input.task, [], randomUUID());
   const tools = createTools(client, { policy, stage: STAGE, allow: ["read", "grep", "find"] });
   const system = specPrompt();
 

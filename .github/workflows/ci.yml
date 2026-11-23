@@ -102,6 +102,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r build
       - run: pnpm biome check .
-      - run: pnpm -r test
+      - run: pnpm -r --workspace-concurrency=1 test
         env:
           REWIRE_SANDBOX_BIN: ${{ github.workspace }}/target/release/rewire-sandbox
+          # Sandbox suites fail instead of skipping when the binary is missing (R40).
+          REWIRE_REQUIRE_SANDBOX: "1"

@@ -22,7 +22,6 @@
     "@rewire/core": "workspace:*",
     "@rewire/loop": "workspace:*",
     "@rewire/policy": "workspace:*",
-    "@rewire/providers": "workspace:*",
     "@rewire/sandbox": "workspace:*",
     "shell-quote": "^1.8.3"
   },

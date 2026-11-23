@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RunEvent } from "@rewire/core";
-import { findSandboxBinary } from "@rewire/sandbox";
+import { sandboxAvailable as sandboxIsAvailable } from "@rewire/sandbox";
 import { afterAll, afterEach, describe, expect, test } from "vitest";
 import { exitCodeFor } from "../src/exit.js";
 import { loadFauxScript } from "../src/faux.js";
@@ -25,7 +25,7 @@ import {
   finalLine,
   renderEvent,
 } from "../src/render-interactive.js";
-import { markFauxReport, providerFactory } from "../src/run.js";
+import { markFauxReport, providerFactory, runCommand } from "../src/run.js";
 import { sanitize } from "../src/sanitize.js";
 import { installSigint } from "../src/sigint.js";
 
@@ -33,12 +33,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const MAIN = resolve(here, "../dist/main.js");
 const SECRET = `sk-${"A".repeat(30)}`;
 
-let sandboxAvailable = true;
-try {
-  findSandboxBinary();
-} catch {
-  sandboxAvailable = false;
-}
+// Throws (failing the file) instead of skipping when REWIRE_REQUIRE_SANDBOX=1 (CI, R40).
+const sandboxAvailable = sandboxIsAvailable();
 
 const dirs: string[] = [];
 afterAll(() => {
@@ -442,13 +438,26 @@ describe("process", () => {
     expect(bigRun.stderr).toMatch(/task_file_too_large/);
   });
 
-  test("doctor sanitizes model names", async () => {
+  test("doctor sanitizes model names (row 109: the name is printed, minus the escape)", async () => {
     const d = tmp();
     const f = join(d, "models.toml");
     writeFileSync(f, 'available = ["ollama:a\\u001b[2Jb"]\n');
     const r = await exec(["doctor", "--models", f], cleanEnv({ PATH: d }));
+    // The model line really carries the name, so the absence of ESC proves sanitizing.
+    expect(r.stdout).toMatch(/models.*ollama:ab/);
     expect(r.stdout).not.toContain("\x1b");
   });
+
+  test("a FIFO --task-file is refused without blocking (row 108)", async () => {
+    const d = tmp();
+    const fifo = join(d, "task.fifo");
+    execFileSync("mkfifo", [fifo]);
+    const t0 = Date.now();
+    const r = await exec(["run", "--task-file", fifo], cleanEnv());
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toMatch(/task_file_unreadable/);
+  }, 15_000);
 
   test("faux with --models is refused", async () => {
     const r = await exec(
@@ -478,6 +487,40 @@ describe("process", () => {
         .find((e) => e.type === "run_end");
       const path = end?.type === "run_end" ? end.reportPath : "";
       expect(readFileSync(path, "utf8")).toMatch(/faux provider/i);
+    },
+    60_000,
+  );
+
+  test.skipIf(!sandboxAvailable)(
+    "a faux report that cannot be marked exits 1, never a normal result (row 109)",
+    async () => {
+      const repo = makeRepo();
+      const faux = writeScript({ m: [] });
+      const out: string[] = [];
+      const err: string[] = [];
+      const sink = (to: string[]) =>
+        ({
+          write: (s: string) => {
+            to.push(String(s));
+            return true;
+          },
+        }) as unknown as NodeJS.WritableStream;
+      const code = await runCommand(
+        { task: "do thing", repo, headless: true },
+        {
+          stdout: sink(out),
+          stderr: sink(err),
+          stdin: process.stdin,
+          env: cleanEnv({ REWIRE_FAUX_SCRIPT: faux }),
+          cwd: repo,
+          markReport: async () => {
+            throw new Error("disk full");
+          },
+        } as Parameters<typeof runCommand>[1],
+        new AbortController().signal,
+      );
+      expect(code).toBe(1);
+      expect(err.join("")).toContain("could not mark report as faux-provider run: disk full");
     },
     60_000,
   );

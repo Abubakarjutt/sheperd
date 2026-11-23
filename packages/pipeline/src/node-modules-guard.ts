@@ -1,5 +1,6 @@
 import { lstat, readlink, realpath, stat, symlink } from "node:fs/promises";
 import { join } from "node:path";
+import { RewireError } from "@rewire/core";
 
 /**
  * What `<wt>/node_modules` was when the orchestrator set it up (R33). Gates run
@@ -29,7 +30,15 @@ export async function linkNodeModules(repo: string, wt: string): Promise<NodeMod
   } catch {
     return { kind: "absent" };
   }
-  await symlink(target, dst, "dir");
+  try {
+    await symlink(target, dst, "dir");
+  } catch (e) {
+    // M8: an escalation with the worktree kept, never a crash (exit 1).
+    throw new RewireError(
+      "node_modules_link_failed",
+      `cannot link node_modules into the worktree: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
   return { kind: "link", target };
 }
 

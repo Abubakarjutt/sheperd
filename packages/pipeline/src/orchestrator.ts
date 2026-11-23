@@ -9,6 +9,8 @@ import {
   newRunId,
   RewireError,
   type RunEvent,
+  redact,
+  stripControls,
   type Verdict,
 } from "@rewire/core";
 import {
@@ -37,7 +39,6 @@ import {
   blockingFindings,
   buildDiffSummary,
   type DiffSummary,
-  redact,
   runPanel,
   verifyFindings,
   wrapUntrusted,
@@ -46,6 +47,7 @@ import {
   assertCleanRepo,
   type CapabilityProfile,
   createWorktree,
+  findSandboxBinary,
   profileFor,
   removeWorktree,
   SandboxClient,
@@ -64,6 +66,7 @@ import { ROLES, type Role, type RoleRouting } from "./routing.js";
 import { runImplementerStage } from "./stages/implementer.js";
 import { runSpecStage } from "./stages/spec.js";
 import { runTestWriterStage } from "./stages/test-writer.js";
+import { pruneIgnored, snapshotTree, stageAll } from "./tree-guard.js";
 
 /** Test seams. Production callers leave them unset. */
 export type PipelineSeams = {
@@ -86,6 +89,8 @@ export type RunPipelineInput = {
   emit: (e: RunEvent) => void;
   signal?: AbortSignal;
   seams?: PipelineSeams;
+  /** The models are the faux provider (a harness self-test): the commit says so (M7). */
+  faux?: boolean;
 };
 
 export type RunOutcome = {
@@ -118,14 +123,21 @@ export const KNOWN_LIMITATIONS: readonly string[] = [
   "disputes escalate to the human; automated adjudication is deferred",
   "TypeScript only: other languages are refused with pack_undetected",
   "rules cover JS/TS only (the semgrep rules and the TypeScript pack)",
-  "gitignored untracked files are not scanned by semgrep/gitleaks",
+  "gitignored untracked files are deleted before every gate run and before the final commit (the report lists them), so the gates see exactly the committed tree; build output the implementer creates does not survive between gate runs",
   "host PATH passed through the sandbox",
   "dependency installs are not harness-mediated in v0.1: the gates run against the dependencies already present (the repo's node_modules is shared into the worktree by a symlink, never committed); a change to a manifest's dependencies fails the drift and lockfile checks instead of being installed",
   "tests run in the same process as the code under test: implementer code imported by a frozen test can tamper with the assertion library or the reporter in-process; only cheap forgery is detected",
   "the test runner config is owned by the harness: projects that need setupFiles, plugins, aliases or tsconfig paths fail closed",
   "jest support is covered by unit tests only (no real jest run in the harness test suite)",
-  "untracked, gitignored nested package.json files (for example dist/package.json) are drift-checked and can cause fail-closed false positives",
   "no mutation testing or metric ratchet in v0.1",
+  "Linux has reduced OS-layer guarantees: the OS layer doesn't block creation on Linux; the protected-paths gate does (it re-checks every changed or untracked path against the implementer profile); case-variant spellings and nested .git directories created after the sandbox starts are caught by the path layer and the gates, not the OS",
+  "on macOS, a process that detaches from the sandbox faster than one poll interval can outlive its stage; a worktree change it makes after the last gate run fails the final tree-equality check, but the process itself may keep running",
+  "fake-verification residuals: the red check and the tests gate do not detect every vacuous test (no expect call, a snapshot alias, a hand-thrown AssertionError); mutation testing is deferred",
+  "the console-summary cross-check reads the last summary in the runner output, so in-process code that prints a forged summary after the real one is not detected",
+  "`__mocks__` directories are protected config: mocks cannot be added or changed during a run",
+  "only npm, pnpm and yarn are recognised (bun and others fall back to npm), and the lint fallback runs a local binary named like the npx command",
+  "changed native addons (.node) or WebAssembly (.wasm) files execute in the test gate without being scanned by semgrep",
+  "the dependency audit's new-dependency check is by name only: declared ranges, npm aliases (npm:<pkg>) and overrides are not checked",
 ];
 
 const HYPOTHESIS_TIMEOUT_MS = 60_000;
@@ -227,6 +239,10 @@ type State = {
   tried: string[];
   /** `<wt>/node_modules` as set up by the orchestrator; every tool run re-checks it (R33). */
   nm?: NodeModulesState;
+  /** Ignored untracked entries deleted before gate runs and the final commit (R38). */
+  removedIgnored: Set<string>;
+  /** Tree id (as `git add -A` would commit it) the last policy-gate run saw (R38). */
+  gatedTree?: string;
 };
 
 type Ctx = {
@@ -284,6 +300,7 @@ export async function runPipeline(input: RunPipelineInput): Promise<RunOutcome> 
     gates: [],
     rounds: [],
     tried: [],
+    removedIgnored: new Set(),
   };
   const ctx: Ctx = { input, runId, repo, runDir, log, st, usage, providerFor, build };
 
@@ -345,6 +362,7 @@ export async function runPipeline(input: RunPipelineInput): Promise<RunOutcome> 
     routing: input.routing,
     rounds: st.rounds,
     usage,
+    removedIgnored: [...st.removedIgnored].sort(),
     knownLimitations: [
       ...KNOWN_LIMITATIONS,
       ...(input.routing.independence === "same-family" ? ["independence: same-family"] : []),
@@ -496,9 +514,35 @@ const TAMPERED = "node_modules link tampered";
 const nmTampered = async (wt: string, st: State): Promise<boolean> =>
   st.nm !== undefined && (await nodeModulesTampered(wt, st.nm));
 
-/** Gate-guard form of {@link nmTampered}: the failure summary, or undefined to run. */
-const nmGuard = (wt: string, st: State) => async (): Promise<string | undefined> =>
-  (await nmTampered(wt, st)) ? TAMPERED : undefined;
+/**
+ * R38: delete ignored untracked entries (never the top-level node_modules link) so a gate run
+ * sees exactly the tree `git add -A` commits; every removal is recorded for the report.
+ */
+async function pruneForGates(wt: string, st: State, sig: { signal?: AbortSignal }): Promise<void> {
+  const removed = await pruneIgnored(wt, sig);
+  if (removed.length === 0) return;
+  for (const r of removed) st.removedIgnored.add(r);
+  const shown = removed.slice(0, 10).join(", ");
+  st.tried.push(
+    `${st.stage}: removed ${removed.length} ignored untracked entr${removed.length === 1 ? "y" : "ies"} before the gates (not committable): ${shown}${removed.length > 10 ? ", ..." : ""}`,
+  );
+}
+
+/**
+ * The trusted pre-gate step for stage gate runs (red check, fast gates): the R33 node_modules
+ * check, then the R38 prune. Returns the failure summary, or undefined to run.
+ */
+const preGate =
+  (wt: string, st: State, sig: { signal?: AbortSignal }) =>
+  async (): Promise<string | undefined> => {
+    if (await nmTampered(wt, st)) return TAMPERED;
+    try {
+      await pruneForGates(wt, st, sig);
+    } catch (e) {
+      return `cannot remove ignored files before the gates: ${errClip(e)}`;
+    }
+    return undefined;
+  };
 
 const tamperedResults = (gates: Gate[]): GateResult[] =>
   gates.map((g) => ({
@@ -520,6 +564,9 @@ async function execute(ctx: Ctx): Promise<void> {
 
   checkAbort(ctx);
   const { head } = await assertCleanRepo(repo);
+  // I1: every stage needs the sandbox; fail in preflight, before any model call, when it is
+  // missing (a test clientFactory supplies its own clients).
+  if (!input.seams?.clientFactory) findSandboxBinary();
   await mkdir(ctx.runDir, { recursive: true });
   log.start();
   for (const role of ROLES) {
@@ -566,7 +613,7 @@ async function execute(ctx: Ctx): Promise<void> {
     emit: log.emit,
     runId,
     policy,
-    gateGuard: nmGuard(worktree, st),
+    gateGuard: preGate(worktree, st, sig),
     ...sig,
     ...clientFactory,
   });
@@ -611,7 +658,7 @@ async function execute(ctx: Ctx): Promise<void> {
       policy,
       ...(feedback !== undefined ? { feedback } : {}),
       ...(input.seams?.implementerMaxTurns ? { maxTurns: input.seams.implementerMaxTurns } : {}),
-      gateGuard: nmGuard(worktree, st),
+      gateGuard: preGate(worktree, st, sig),
       ...sig,
       ...clientFactory,
     });
@@ -683,16 +730,15 @@ async function execute(ctx: Ctx): Promise<void> {
       [`HEAD ${before} is not the frozen-tests commit ${frozenCommit} before the final commit`],
     );
   }
-  const title = redact(contract.title).replace(/\s+/g, " ").trim().slice(0, TITLE_CAP);
-  // Never stage node_modules, whatever .gitignore says. git rejects an exclude pathspec that
-  // names an ignored path, so an ignored one relies on the ignore rule instead; either way the
-  // index check below is the guarantee.
-  const nmIgnored = (await trustedGit(worktree, ["check-ignore", "-q", "node_modules"], sig)).code;
-  await trustedGitOk(
-    worktree,
-    nmIgnored === 0 ? ["add", "-A"] : ["add", "-A", "--", ".", ":(exclude,top)node_modules"],
-    sig,
-  );
+  // M1: no ANSI/control characters from model text in `git log`.
+  const title = redact(stripControls(contract.title))
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, TITLE_CAP);
+  // R38: ignored leftovers never reach the commit; what was gated is what gets committed.
+  await pruneForGates(worktree, st, sig);
+  // Never stage node_modules, whatever .gitignore says; the index check below is the guarantee.
+  await stageAll(worktree, sig);
   const nm = await trustedGitOk(
     worktree,
     [
@@ -717,6 +763,16 @@ async function execute(ctx: Ctx): Promise<void> {
       ],
     );
   }
+  const tree = (await trustedGitOk(worktree, ["write-tree"], sig)).trim();
+  if (st.gatedTree === undefined || tree !== st.gatedTree) {
+    throw new Escalation(
+      "stage_error",
+      [],
+      [
+        `the tree to commit ${tree} is not the tree the last gates verified ${st.gatedTree ?? "(none)"}: the worktree changed after gating`,
+      ],
+    );
+  }
   await trustedGitOk(
     worktree,
     [
@@ -728,7 +784,7 @@ async function execute(ctx: Ctx): Promise<void> {
       "-m",
       `rewire: ${title}`,
       "-m",
-      `Rewire-Run: ${runId}`,
+      `Rewire-Run: ${runId}${input.faux ? "\nRewire-Faux: true" : ""}`,
     ],
     sig,
   );
@@ -738,6 +794,14 @@ async function execute(ctx: Ctx): Promise<void> {
       "stage_error",
       [],
       [`the final commit's parent ${parent} is not the frozen-tests commit ${frozenCommit}`],
+    );
+  }
+  const committed = (await trustedGitOk(worktree, ["rev-parse", "HEAD^{tree}"], sig)).trim();
+  if (committed !== st.gatedTree) {
+    throw new Escalation(
+      "stage_error",
+      [],
+      [`the committed tree ${committed} is not the tree the last gates verified ${st.gatedTree}`],
     );
   }
 }
@@ -802,10 +866,38 @@ async function runAllGates(
     }
     return results;
   }
+  // R38: the gates must see exactly the tree the final commit will hold.
+  ctx.st.gatedTree = undefined;
+  try {
+    const sig = signal ? { signal } : {};
+    await pruneForGates(a.worktree, ctx.st, sig);
+    ctx.st.gatedTree = await snapshotTree(a.worktree, sig);
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    const summary = `cannot prepare the gated tree: ${errClip(e)}`;
+    const results = gates.map((g) => ({
+      gate: g.name,
+      category: g.category,
+      status: "error" as const,
+      summary,
+      details: null,
+      durationMs: 0,
+    }));
+    for (const result of results) {
+      ctx.log.emit({
+        type: "gate_result",
+        runId: ctx.runId,
+        ts: new Date().toISOString(),
+        stage: "gates",
+        result,
+      });
+    }
+    return results;
+  }
   const scratch = await realpath(await mkdtemp(join(tmpdir(), "rewire-gates-")));
   const owned: SandboxClient[] = [];
   try {
-    const mk = (stage: "verify" | "verify-registry"): SandboxClient => {
+    const mk = (stage: "verify" | "verify-registry" | "implementer"): SandboxClient => {
       const c = ctx.build(profileFor(stage, a.worktree, policy, scratch));
       owned.push(c);
       return c;
@@ -816,6 +908,8 @@ async function runAllGates(
       client: mk("verify"),
       // The audit gate's network exception gets its own client (T15 carry-in).
       registryClient: mk("verify-registry"),
+      // checkPath only (R37): which touched paths the implementer profile denies.
+      implementerClient: mk("implementer"),
       pack: a.pack,
       policy,
       manifest: a.manifest,

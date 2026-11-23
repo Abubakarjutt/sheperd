@@ -36,6 +36,9 @@ importers:
         specifier: ^4.6.7
         version: 4.6.7
     devDependencies:
+      '@rewire/pipeline':
+        specifier: workspace:*
+        version: link:../packages/pipeline
       '@types/node':
         specifier: ^26.6.6
         version: 26.6.6
@@ -223,9 +226,6 @@ importers:
       '@rewire/policy':
         specifier: workspace:*
         version: link:../policy
-      '@rewire/providers':
-        specifier: workspace:*
-        version: link:../providers
       '@rewire/sandbox':
         specifier: workspace:*
         version: link:../sandbox

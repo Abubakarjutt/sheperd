@@ -1,6 +1,5 @@
-import { type Finding, type GateResult, RewireError } from "@rewire/core";
+import { type Finding, type GateResult, RewireError, redact } from "@rewire/core";
 import type { Policy } from "@rewire/policy";
-import { redact } from "@rewire/reviewers";
 
 /**
  * Fix-loop controller: a pure, deterministic state machine. No I/O, no model
