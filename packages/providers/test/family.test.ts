@@ -11,6 +11,15 @@ describe("modelFamily", () => {
     expect(modelFamily({ provider: "openai", model: "gpt-5" })).toBe("gpt");
     expect(modelFamily({ provider: "faux", model: "a" })).toBe("faux-a");
   });
+  test("lineage aliases: code/reasoning variants share their base family (row 96)", () => {
+    const fam = (model: string) => modelFamily({ provider: "ollama", model });
+    expect(fam("codellama:13b")).toBe("llama");
+    expect(fam("llava:7b")).toBe("llama");
+    expect(fam("qwq:32b")).toBe("qwen");
+    expect(fam("codeqwen:7b")).toBe("qwen");
+    expect(fam("codegemma:7b")).toBe("gemma");
+    expect(fam("deepseek-r1:14b")).toBe("deepseek");
+  });
   test("ollama registry/namespace prefixes are stripped", () => {
     expect(
       modelFamily({ provider: "ollama", model: "hf.co/Qwen/Qwen2.5-Coder-7B-GGUF:Q4_K_M" }),

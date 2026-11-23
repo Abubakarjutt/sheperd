@@ -289,6 +289,17 @@ describe("assertRoleFit", () => {
     await fit("implementer");
     expect(chats()).toBe(before);
   });
+  test("an empty model digest is refused, never cached under a shared key (row 39)", async () => {
+    mock.models = [{ name: "tiny:1b", digest: "" }];
+    await expect(fit("reviewer")).rejects.toBeDefined();
+    expect(chats()).toBe(0);
+  });
+  test("the smoke test leaves room for reasoning models: 4096 output tokens (row 42)", async () => {
+    await fit("implementer");
+    expect(chatBodies.length).toBe(2);
+    for (const b of chatBodies) expect(b.max_tokens ?? b.max_completion_tokens).toBe(4096);
+    expect(FITNESS_TEST_VERSION).toBeGreaterThanOrEqual(2);
+  });
   test("different digest re-tests", async () => {
     await fit("reviewer");
     mock.models = [{ name: "tiny:1b", digest: "sha256:new" }];

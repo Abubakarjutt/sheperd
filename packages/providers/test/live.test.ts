@@ -30,6 +30,34 @@ describe.skipIf(!live)("live providers", () => {
     expect(r.message.text.length).toBeGreaterThan(0);
     expect(r.usage.inputTokens).toBeGreaterThan(0);
   });
+  // Row 37: the SDK request shapes are cast through unknown; a live tool call checks them.
+  const ECHO = {
+    name: "echo",
+    description: "Echoes the given value back.",
+    inputSchema: {
+      type: "object",
+      properties: { value: { type: "string" } },
+      required: ["value"],
+    },
+  };
+  for (const [provider, model] of [
+    ["anthropic", anthropicModel],
+    ["openai", openaiModel],
+  ] as const) {
+    test.skipIf(!model)(`${provider} tool call round trip`, async () => {
+      const p = createProvider({ provider, model: model as string }, process.env);
+      const r = await p.chat({
+        model: model as string,
+        system: "You must call the provided tool to answer. Do not answer in prose.",
+        messages: [{ role: "user", content: 'Call the echo tool with value "ping".' }],
+        tools: [ECHO],
+        maxTokens: 512,
+      });
+      expect(r.stopReason).toBe("tool_use");
+      expect(r.message.toolCalls[0]?.name).toBe("echo");
+      expect(r.message.toolCalls[0]?.arguments.value).toBe("ping");
+    });
+  }
 });
 
 const ollamaModel = process.env.REWIRE_LIVE_OLLAMA_MODEL;

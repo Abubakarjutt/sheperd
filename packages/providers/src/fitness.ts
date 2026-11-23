@@ -9,9 +9,14 @@ import type { ModelRef, Provider } from "./types.js";
 export type Role = "spec" | "test-writer" | "implementer" | "reviewer" | "verifier";
 
 /** Bump when the smoke test changes; cached results from other versions are ignored. */
-export const FITNESS_TEST_VERSION = 1;
+export const FITNESS_TEST_VERSION = 2;
 
 const TOOL_ROLES: readonly Role[] = ["test-writer", "implementer"];
+/**
+ * Room for reasoning models (deepseek-r1, qwq) that think before answering; 1024 cut their
+ * tool-call arguments off and cached them as unfit (row 42, test version 2).
+ */
+const SMOKE_MAX_TOKENS = 4096;
 
 const CacheSchema = z.record(
   z.string(),
@@ -63,7 +68,7 @@ async function smokeTest(
     await structured(provider, ref, SmokeSchema, {
       system: "You are a precise assistant that follows output instructions exactly.",
       messages: [{ role: "user", content: "Return ok=true and n=3" }],
-      maxTokens: 1024,
+      maxTokens: SMOKE_MAX_TOKENS,
       ...t,
     });
   } catch (err) {
@@ -78,7 +83,7 @@ async function smokeTest(
     system: "You must call the provided tool to answer. Do not answer in prose.",
     messages: [{ role: "user", content: 'Call the echo tool with value "ping".' }],
     tools: [ECHO_TOOL],
-    maxTokens: 1024,
+    maxTokens: SMOKE_MAX_TOKENS,
     ...t,
   });
   if (resp.stopReason !== "tool_use") {

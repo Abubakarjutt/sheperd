@@ -114,7 +114,9 @@ const ShowSchema = z.object({
   model_info: z.record(z.string(), z.unknown()).optional(),
 });
 const TagsSchema = z.object({
-  models: z.array(z.object({ name: z.string(), model: z.string().optional(), digest: z.string() })),
+  models: z.array(
+    z.object({ name: z.string(), model: z.string().optional(), digest: z.string().min(1) }),
+  ),
 });
 
 export type OllamaModelInfo = {
