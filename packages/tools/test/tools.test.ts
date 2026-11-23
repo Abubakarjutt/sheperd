@@ -159,9 +159,9 @@ test("bash non-zero exit is error with exit code; success includes stdout", asyn
 
 test("bash timeout reports timed out", async () => {
   const { t } = await setup();
-  const r = await t("bash").execute({ command: "sleep 5", timeoutMs: 300 });
+  const r = await t("bash").execute({ command: "sleep 5", timeoutMs: 1000 });
   expect(r.isError).toBe(true);
-  expect(r.content).toContain("timed out after 300ms");
+  expect(r.content).toContain("timed out after 1000ms");
 });
 
 test("bash background process is reported, not success", async () => {
@@ -238,4 +238,30 @@ test("specs mark required keys", async () => {
   const { tools } = await setup();
   const edit = tools.find((x) => x.spec.name === "edit");
   expect(edit?.spec.inputSchema.required).toEqual(["path", "oldString", "newString"]);
+});
+
+/** A client stub that records exec calls (no sandbox needed). */
+function recordingClient() {
+  const calls: Array<{ argv: string[]; timeoutMs: number }> = [];
+  const client = {
+    async exec(argv: string[], opts: { timeoutMs: number }) {
+      calls.push({ argv, timeoutMs: opts.timeoutMs });
+      return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+    },
+  } as unknown as SandboxClient;
+  return { client, calls };
+}
+
+test("bash runs the pinned /bin/sh and clamps timeoutMs to 1 s..600 s (rows 49, 51)", async () => {
+  const { client, calls } = recordingClient();
+  const [bash] = createTools(client, {
+    policy: DEFAULT_POLICY,
+    stage: "implementer",
+    allow: ["bash"],
+  });
+  for (const timeoutMs of [1, 999_999_999, 5000, undefined]) {
+    await bash?.execute({ command: "true", ...(timeoutMs === undefined ? {} : { timeoutMs }) });
+  }
+  expect(calls.map((c) => c.argv[0])).toEqual(["/bin/sh", "/bin/sh", "/bin/sh", "/bin/sh"]);
+  expect(calls.map((c) => c.timeoutMs)).toEqual([1000, 600_000, 5000, 120_000]);
 });

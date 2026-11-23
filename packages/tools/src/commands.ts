@@ -181,7 +181,8 @@ class Ctx {
   /** Called on each unquoted plain character. */
   word(s: string, i: number, p: Prev, inSubst: boolean): void {
     if (!wordStart(p)) return;
-    const end = s[i + 2] === undefined || " \t\n".includes(s[i + 2] as string);
+    // R15: `[[` followed by any bash metacharacter (blank, `|&;()<>`) opens a test command.
+    const end = s[i + 2] === undefined || " \t\n|&;()<>".includes(s[i + 2] as string);
     if (s.startsWith("[[", i) && end) this.dbl = true;
     if (
       inSubst &&
@@ -554,8 +555,46 @@ function justify(rules: CommandRule[], argv: string[]): string {
 }
 
 /** Returns a refusal/forbidden message, or undefined when the command evaluates clean. */
-function check(rules: CommandRule[], command: string, depth: number): string | undefined {
+/**
+ * R15: remove every backslash-newline bash would remove (everywhere except inside single quotes
+ * and `$'...'`) once, before scanning, so `<\⏎<`, `ca\⏎se` and `[\⏎[` read as `<<`, `case`
+ * and `[[`. A continuation on a line that has an unquoted `#` is refused: inside a comment bash
+ * keeps the backslash and ends the comment at the newline, so joining would hide the next line.
+ */
+function joinContinuations(s: string): string {
+  let out = "";
+  let hashOnLine = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i] as string;
+    if (hashOnLine && c !== "\\") {
+      // Possibly a comment: copy verbatim (no quote tracking) up to the newline.
+      if (c === "\n") hashOnLine = false;
+      out += c;
+    } else if (c === "\\") {
+      if (s[i + 1] === "\n") {
+        if (hashOnLine) throw new Unevaluable("line continuation after #");
+        i++;
+        continue;
+      }
+      out += s.slice(i, i + 2);
+      i++;
+    } else if (c === "'") {
+      const ansi = out.endsWith("$") && !out.endsWith("\\$");
+      const end = ansi ? closeAnsiC(s, i) : s.indexOf("'", i + 1);
+      if (end < 0) throw new Unevaluable("unterminated single quote");
+      out += s.slice(i, end + 1);
+      i = end;
+    } else {
+      if (c === "#") hashOnLine = true;
+      out += c;
+    }
+  }
+  return out;
+}
+
+function check(rules: CommandRule[], raw: string, depth: number): string | undefined {
   if (depth > MAX_DEPTH) return cannot("nesting too deep");
+  const command = joinContinuations(raw);
   const { text, refusal } = extractSubstitutions(command, (b) => check(rules, b, depth + 1));
   if (refusal) return refusal;
   for (const seg of segments(text)) {

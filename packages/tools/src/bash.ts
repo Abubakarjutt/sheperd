@@ -6,6 +6,11 @@ import { evaluateBashCommand } from "./commands.js";
 import { capOutput, errorResult, fail, intArg, strArg, type ToolContext } from "./util.js";
 
 export const DEFAULT_BASH_TIMEOUT_MS = 120_000;
+/** Bounds for a model-chosen timeout (row 49): tools ignore the run's abort, so this caps a call. */
+export const MIN_BASH_TIMEOUT_MS = 1_000;
+export const MAX_BASH_TIMEOUT_MS = 600_000;
+/** The shell is pinned to an absolute path (#25), never resolved through PATH. */
+const SHELL = "/bin/sh";
 
 export function bashTool(client: SandboxClient, policy: Policy, ctx: ToolContext): AgentTool {
   return {
@@ -17,7 +22,10 @@ export function bashTool(client: SandboxClient, policy: Policy, ctx: ToolContext
         type: "object",
         properties: {
           command: { type: "string" },
-          timeoutMs: { type: "integer", description: `default ${DEFAULT_BASH_TIMEOUT_MS}` },
+          timeoutMs: {
+            type: "integer",
+            description: `default ${DEFAULT_BASH_TIMEOUT_MS}, clamped to ${MIN_BASH_TIMEOUT_MS}..${MAX_BASH_TIMEOUT_MS}`,
+          },
         },
         required: ["command"],
       },
@@ -25,12 +33,15 @@ export function bashTool(client: SandboxClient, policy: Policy, ctx: ToolContext
     async execute(args) {
       const command = strArg(args, "command");
       if (command === undefined) return fail("command is required");
-      const timeoutMs = intArg(args, "timeoutMs") ?? DEFAULT_BASH_TIMEOUT_MS;
+      const timeoutMs = Math.min(
+        MAX_BASH_TIMEOUT_MS,
+        Math.max(MIN_BASH_TIMEOUT_MS, intArg(args, "timeoutMs") ?? DEFAULT_BASH_TIMEOUT_MS),
+      );
       // Advisory pre-check for a clear message; the sandbox is the boundary (#21).
       const verdict = evaluateBashCommand(policy, command);
       if (verdict.forbidden) return fail(`command not allowed: ${verdict.message}`);
       try {
-        const r = await client.exec(["sh", "-c", command], { timeoutMs });
+        const r = await client.exec([SHELL, "-c", command], { timeoutMs });
         const parts: string[] = [];
         if (r.stdout) parts.push(`stdout:\n${r.stdout.replace(/\n$/, "")}`);
         if (r.stderr) parts.push(`stderr:\n${r.stderr.replace(/\n$/, "")}`);

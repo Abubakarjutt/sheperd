@@ -125,7 +125,7 @@ test.each(["echo $'hello\\n'", "ls # comment with 'quote", 'echo "#notacomment" 
 test.each([
   "echo a #x ; npm i",
   "echo a #x ; npm i",
-  "echo a﻿#x ; npm i",
+  "echo a\ufeff#x ; npm i",
   "echo a #x ; npm i",
   "echo a\r#x ; npm i",
   "echo a\v#x ; npm i",
@@ -234,4 +234,28 @@ test.each([
   "x=$(( 16#ff ))",
 ])("round 5 allowed: %j", (c) => {
   expect(verdict(c)).toEqual({ forbidden: false });
+});
+
+// R15 (row 56): backslash-newline continuation and `[[` followed by a metacharacter must not
+// split the scanner's view of `<<`, `case` and `[[` from bash's.
+test.each([
+  "sh <\\\n<EOF\nnpm i\nEOF",
+  "echo $(ca\\\nse x in x) npm i;; esac)",
+  "echo $(c\\\nase x in x) npm i;; esac)",
+  "[\\\n[ a == #x ]] && npm i",
+  "[[\\\n a == #x ]] && npm i",
+  "[[( a == #x ) ]] && npm i",
+])("continuation / [[ probe is not allowed: %j", (c) => {
+  expect(verdict(c)).toMatchObject({ forbidden: true });
+});
+
+test.each(["echo a \\\n  b", "pnpm \\\n  install", "echo 'a\\\nb'"])(
+  "plain continuation stays allowed: %j",
+  (c) => {
+    expect(verdict(c)).toEqual({ forbidden: false });
+  },
+);
+
+test("a backslash-newline at the end of a comment line does not hide the next line", () => {
+  expect(verdict("echo hi # note \\\nnpm i")).toMatchObject({ forbidden: true });
 });
