@@ -669,7 +669,7 @@ writeFileSync(out, JSON.stringify(j));
 process.exit(r.status ?? 1);
 `,
     );
-    const pack = { ...ctx.pack, testCommand: ["node", shim, ...ctx.pack.testCommand] };
+    const pack = { ...ctx.pack, testCommand: ["node", shim, ...noInstall(ctx.pack.testCommand)] };
     const r = await testsGate.run({ ...ctx, manifest, pack });
     expect(r.status).toBe("error");
     expect(r.summary).toMatch(/disagree|summary/);
@@ -945,7 +945,7 @@ process.stderr.write("\\n Test Files  1 passed (1)\\n      Tests  3 passed (3)\\
 process.exit(r.status ?? 1);
 `,
     );
-    const pack = { ...ctx.pack, testCommand: ["node", shim, ...ctx.pack.testCommand] };
+    const pack = { ...ctx.pack, testCommand: ["node", shim, ...noInstall(ctx.pack.testCommand)] };
     const r = await testsGate.run({ ...ctx, manifest, pack });
     expect(r.status).toBe("error");
     expect(r.summary).toMatch(/disagrees/);
