@@ -13,7 +13,7 @@
 //!    SIGTERM/SIGINT/SIGHUP → the handler SIGKILLs the group at once and
 //!    flags the signal; the wait loop then runs the same full sweep and
 //!    exits 120 `sandbox: terminated by signal <n>` (plus any escaped
-//!    descendant). A second signal `_exit`s from the handler (last resort).
+//!    descendant). A second signal `_exit(120)`s from the handler (last resort).
 //!
 //! Descendants (macOS): a child can leave the process group (`setsid`,
 //! `detached: true`) and outlive us. While the command runs we poll its
@@ -194,13 +194,30 @@ pub fn scrubbed_env(
         if is_secret_var(k) {
             return false;
         }
+        if k == "PATH" {
+            return true; // filtered to absolute entries below (row 13)
+        }
         if k == "TMPDIR" {
             return crate::canonical::canonicalize_maybe_missing(Path::new(v))
                 .is_ok_and(|t| p.extra_write().iter().any(|d| t.starts_with(d)));
         }
         ENV_ALLOW.contains(&k) || k.starts_with("LC_")
     })
+    .map(|(k, v)| {
+        if k == "PATH" {
+            (k, absolute_path_entries(&v))
+        } else {
+            (k, v)
+        }
+    })
     .collect()
+}
+
+/// PATH without empty or relative entries: those resolve against the child's
+/// cwd (inside the worktree), where a planted binary could shadow a tool.
+fn absolute_path_entries(v: &OsString) -> OsString {
+    let kept: Vec<PathBuf> = std::env::split_paths(v).filter(|p| p.is_absolute()).collect();
+    std::env::join_paths(kept).unwrap_or_default()
 }
 
 /// Never passed, whatever the allowlist says.
@@ -465,7 +482,7 @@ const TERM_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHU
 /// First SIGTERM/SIGINT/SIGHUP: SIGKILL the command's group at once and
 /// record the signal; the main loop then runs the full descendant sweep
 /// and exits 120. A second signal (main thread stuck) is the last resort:
-/// kill the group again and `_exit` immediately.
+/// kill the group again and `_exit(120)` immediately.
 extern "C" fn on_fatal_signal(sig: libc::c_int) {
     let pg = CHILD_PGID.load(Ordering::SeqCst);
     let first = PENDING_SIGNAL
@@ -477,7 +494,8 @@ extern "C" fn on_fatal_signal(sig: libc::c_int) {
             libc::kill(-pg, libc::SIGKILL);
         }
         if !first {
-            libc::_exit(128 + sig);
+            // Row 22: the sandbox's own failure code, never a child-looking 128+sig.
+            libc::_exit(120); // EXIT_INTERNAL in main.rs
         }
     }
 }
@@ -755,5 +773,18 @@ mod tests {
         let tmp = [(OsString::from("TMPDIR"), scratch.join("t").into_os_string())];
         assert_eq!(scrubbed_env(tmp.into_iter(), &p).len(), 1);
         assert!(is_secret_var("lc_api_key"));
+    }
+
+    #[test]
+    fn child_path_keeps_only_absolute_entries() {
+        // Row 13: a relative PATH entry (".", "", "node_modules/.bin") resolves against the
+        // child's cwd inside the worktree, so a planted binary could shadow a gate tool.
+        let (_t, p) = profile_with_extra(vec![]);
+        let vars = [(
+            OsString::from("PATH"),
+            OsString::from("node_modules/.bin:/usr/bin::.:/bin:rel/dir"),
+        )];
+        let out = scrubbed_env(vars.into_iter(), &p);
+        assert_eq!(out, [(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]);
     }
 }

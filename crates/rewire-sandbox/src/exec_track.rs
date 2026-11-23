@@ -339,19 +339,28 @@ fn children(pid: i32) -> Vec<i32> {
     }
 }
 
-fn all_pids() -> Vec<i32> {
+/// Every pid on the system. A failed listing is an error (row 18): an empty
+/// list would read as "no survivors" and let an escaped descendant live.
+fn all_pids() -> Result<Vec<i32>> {
+    collect_pids(|buf| {
+        let bytes = std::mem::size_of_val(buf) as libc::c_int;
+        // SAFETY: the buffer holds `bytes` bytes.
+        unsafe { libc::proc_listallpids(buf.as_mut_ptr().cast(), bytes) }
+    })
+}
+
+/// Grow the buffer until the listing fits; `list` returns the pid count or <= 0 on failure.
+fn collect_pids(mut list: impl FnMut(&mut [i32]) -> libc::c_int) -> Result<Vec<i32>> {
     let mut buf = vec![0i32; 8192];
     loop {
-        let bytes = (buf.len() * std::mem::size_of::<i32>()) as libc::c_int;
-        // SAFETY: the buffer holds `bytes` bytes.
-        let n = unsafe { libc::proc_listallpids(buf.as_mut_ptr().cast(), bytes) };
+        let n = list(&mut buf);
         if n <= 0 {
-            return Vec::new();
+            bail!("sandbox: cannot list processes (proc_listallpids returned {n})");
         }
         let n = n as usize;
         if n < buf.len() {
             buf.truncate(n);
-            return buf.into_iter().filter(|&p| p > 0).collect();
+            return Ok(buf.into_iter().filter(|&p| p > 0).collect());
         }
         buf.resize(buf.len() * 2, 0);
     }
@@ -421,7 +430,7 @@ impl Tracker {
             .collect();
         // SAFETY: getuid/getpid cannot fail.
         let (uid, me) = unsafe { (libc::getuid(), libc::getpid()) };
-        let mut pids = all_pids();
+        let mut pids = all_pids()?;
         // Newest first: a hopping chain's current link is the newest pid.
         pids.sort_unstable_by(|a, b| b.cmp(a));
         for pid in pids {
@@ -558,6 +567,21 @@ mod tests {
         let (t, p) = profile(vec![]);
         let tag = RunTag::create(&token(), &p).unwrap();
         (t, tag)
+    }
+
+    #[test]
+    fn a_failing_process_listing_is_an_error_not_an_empty_list() {
+        // Row 18: "no pids" from a failed proc_listallpids would read as "no survivors".
+        assert!(collect_pids(|_| -1).is_err());
+        assert!(collect_pids(|_| 0).is_err());
+        let ok = collect_pids(|buf| {
+            buf[0] = 7;
+            buf[1] = 0;
+            buf[2] = 9;
+            3
+        })
+        .unwrap();
+        assert_eq!(ok, [7, 9]);
     }
 
     #[test]
