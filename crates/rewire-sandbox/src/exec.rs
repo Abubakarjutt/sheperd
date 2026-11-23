@@ -20,7 +20,7 @@
 //! process tree every [`POLL_INTERVAL`] and remember every descendant (pid +
 //! start time); after it exits we also sweep for any process inside this
 //! run's Seatbelt sandbox (per-run tag rule, see `exec_track`). Any
-//! descendant still alive is SIGKILLed (with its own group), sweeps repeat
+//! descendant still alive after [`SETTLE_GRACE`] is SIGKILLed (with its own group), sweeps repeat
 //! until several in a row are empty (bounded, see `exec_track`), and exec
 //! fails with 120 `sandbox: escaped descendant <pid>`. Before the command
 //! runs, the detector is self-tested against a probe in the same sandbox
@@ -46,6 +46,11 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub const EXIT_TIMEOUT: u8 = 124;
+
+/// How long a process the command leaves behind may take to exit on its
+/// own before it counts as an escaped descendant (a test runner's workers
+/// still shutting down when it returns). It stays sandboxed meanwhile.
+pub const SETTLE_GRACE: Duration = Duration::from_millis(300);
 pub const EXIT_NOT_FOUND: u8 = 127;
 
 /// Descendant-tracking poll interval.
@@ -641,8 +646,11 @@ fn spawn_and_wait(
     .context("waiting for sandboxed command")?;
     // Leftover background processes must not outlive the command: sweep
     // and kill until quiet (bounded; still finding them is an error).
-    // Sweep before killing the group, so group members count as escaped.
-    let escaped = tracker.kill_until_quiet();
+    // Leftovers get SETTLE_GRACE to exit on their own; then sweep before
+    // killing the group, so group members still alive count as escaped.
+    let escaped = tracker
+        .settle(SETTLE_GRACE)
+        .and_then(|()| tracker.kill_until_quiet());
     kill_group();
     CHILD_PGID.store(0, Ordering::SeqCst);
     let escaped = escaped?;
@@ -686,6 +694,9 @@ impl Tracker {
     fn poll(&mut self) {}
     fn interval(&self) -> Duration {
         Duration::from_secs(3600)
+    }
+    fn settle(&mut self, _grace: Duration) -> Result<()> {
+        Ok(())
     }
     fn kill_until_quiet(&mut self) -> Result<Vec<i32>> {
         Ok(Vec::new())

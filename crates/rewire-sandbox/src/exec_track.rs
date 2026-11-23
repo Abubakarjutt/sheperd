@@ -487,6 +487,18 @@ impl Tracker {
         }
     }
 
+    /// Wait up to `grace` for leftovers to exit on their own (a runner's
+    /// workers still shutting down when it returns). Returns as soon as a
+    /// validated sweep is empty; whatever is alive afterwards is for
+    /// [`Self::kill_until_quiet`] to kill and report.
+    pub fn settle(&mut self, grace: Duration) -> Result<()> {
+        let deadline = Instant::now() + grace;
+        while !self.survivors(false)?.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
     /// Sweep and SIGKILL until [`QUIET_SWEEPS`] consecutive sweeps (the
     /// last one uncached) find nothing. Returns every pid found. Errors if
     /// processes are still being found after [`KILL_BUDGET`].

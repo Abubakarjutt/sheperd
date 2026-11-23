@@ -496,6 +496,18 @@ fn exec_background_process_is_reported() {
     );
 }
 
+/// A child still finishing when the command returns (a test runner's worker
+/// shutting down) is not an escape: leftovers get a short settle grace to
+/// exit on their own. Anything alive after it is still reported (above).
+#[test]
+fn exec_child_exiting_just_after_the_command_is_not_an_escape() {
+    let f = Fixture::new();
+    for _ in 0..5 {
+        let a = f.sh("(sleep 0.1; :) & exit 0");
+        assert_eq!(code(&a), 0, "{}", stderr(&a));
+    }
+}
+
 /// Exit codes still pass through when nothing is left behind, a signal
 /// death is 128+signal, and a command killing its own process group does
 /// not take the Linux reaper down with it.

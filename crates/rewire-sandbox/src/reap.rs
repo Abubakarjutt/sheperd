@@ -8,7 +8,8 @@
 //!
 //! 1. run the command in its own process group (a `kill(0, …)` from the
 //!    command never reaches the reaper) and wait for it;
-//! 2. list the namespace's `/proc` (bwrap mounts a fresh procfs for it):
+//! 2. after a short settle grace (`exec::SETTLE_GRACE`, for workers still
+//!    shutting down), list the namespace's `/proc` (bwrap mounts a fresh procfs for it):
 //!    any live process other than pid 1 (bwrap's init) and the reaper is a
 //!    descendant that outlived the command;
 //! 3. if there is one: `kill(-1, SIGKILL)` (every process in the namespace
@@ -29,6 +30,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 pub enum Reaped {
     Exited(u8),
@@ -50,7 +52,13 @@ pub fn run(cmd: &[OsString]) -> Result<Reaped> {
         (None, None) => bail!("ns-reap: command ended without status"),
     };
     let me = i32::try_from(std::process::id()).context("pid out of range")?;
-    let left = live_pids("/proc", me)?;
+    // Leftovers get the same settle grace as on macOS to exit on their own.
+    let deadline = Instant::now() + crate::exec::SETTLE_GRACE;
+    let mut left = live_pids("/proc", me)?;
+    while !left.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        left = live_pids("/proc", me)?;
+    }
     if let Some(&first) = left.first() {
         // SAFETY: plain syscall. -1: every process we may signal in this pid
         // namespace except its init and ourselves.
