@@ -216,7 +216,9 @@ pub fn scrubbed_env(
 /// PATH without empty or relative entries: those resolve against the child's
 /// cwd (inside the worktree), where a planted binary could shadow a tool.
 fn absolute_path_entries(v: &OsString) -> OsString {
-    let kept: Vec<PathBuf> = std::env::split_paths(v).filter(|p| p.is_absolute()).collect();
+    let kept: Vec<PathBuf> = std::env::split_paths(v)
+        .filter(|p| p.is_absolute())
+        .collect();
     std::env::join_paths(kept).unwrap_or_default()
 }
 
@@ -534,8 +536,20 @@ fn spawn_and_wait(
         }
     }
     mask_term_signals(libc::SIG_BLOCK);
+    // SAFETY: setsid is async-signal-safe. A new session (I1): the command
+    // has no controlling terminal, so it cannot open /dev/tty, and it leads
+    // a new process group whose pgid is its pid, exactly as
+    // `process_group(0)` gave before (the kill and tracking code relies on
+    // pgid == child pid).
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let spawned = command
-        .process_group(0)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -785,6 +799,9 @@ mod tests {
             OsString::from("node_modules/.bin:/usr/bin::.:/bin:rel/dir"),
         )];
         let out = scrubbed_env(vars.into_iter(), &p);
-        assert_eq!(out, [(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]);
+        assert_eq!(
+            out,
+            [(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]
+        );
     }
 }

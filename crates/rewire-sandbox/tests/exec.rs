@@ -16,6 +16,10 @@ const TIMEOUT: i32 = 124;
 const NOT_FOUND: i32 = 127;
 const INTERNAL: i32 = 120;
 
+/// Serialises tests that briefly hold inheritable fds with the test that
+/// counts the fds a command inherits.
+static FD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Fixture {
     _tmp: TempDir,
     /// Canonical temp dir (macOS: /private/var/...).
@@ -651,6 +655,7 @@ int main(int argc, char **argv) {
 /// for the listing itself) may be open.
 #[test]
 fn exec_command_inherits_no_extra_fds() {
+    let _g = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let f = Fixture::new();
     let dir = if cfg!(target_os = "linux") {
         "/proc/self/fd"
@@ -846,4 +851,140 @@ fn exec_sigterm_during_timeout_still_sweeps() {
             assert!(!alive, "{delay_ms}ms: descendant survived");
         }
     }
+}
+
+/// Run `script` under the sandbox with a fresh pty as the sandbox binary's
+/// controlling terminal (as when a user runs rewire in a terminal). `input`
+/// is typed into the terminal first. Returns (stdout, everything the
+/// terminal displayed).
+fn exec_on_pty(f: &Fixture, script: &str, input: &[u8]) -> (String, String) {
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    use std::os::unix::process::CommandExt;
+    let (mut master, mut slave) = (0, 0);
+    {
+        // openpty fds are inheritable until CLOEXEC is set; hold the lock so
+        // a concurrently spawned test command never sees them.
+        let _g = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: openpty fills two fds; null name/termios/winsize are allowed.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty");
+        for fd in [master, slave] {
+            // SAFETY: plain fcntl on fds we own. The slave still reaches the
+            // pre_exec hook below (CLOEXEC only acts at exec).
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+    }
+    // SAFETY: ttyname returns a static NUL-terminated buffer or null.
+    let name = unsafe { std::ffi::CStr::from_ptr(libc::ttyname(slave)) }
+        .to_string_lossy()
+        .into_owned();
+    let script = script.replace("{TTY}", &name);
+    // SAFETY: we own `master`.
+    let mut term = unsafe { fs::File::from_raw_fd(master) };
+    term.write_all(input).unwrap();
+    let _ = Write::flush(&mut term);
+    let mut c = std::process::Command::new(assert_cmd::cargo::cargo_bin("rewire-sandbox"));
+    c.current_dir(&f.root)
+        .args(["exec", "--timeout-ms", "15000", "--profile"])
+        .arg(&f.profile)
+        .args(["--", "/bin/sh", "-c", &script])
+        .stdin(std::process::Stdio::null());
+    // SAFETY: only async-signal-safe calls between fork and exec.
+    unsafe {
+        c.pre_exec(move || {
+            if libc::setsid() < 0 || libc::ioctl(slave, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = c
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // SAFETY: closing our copy of the slave; the child holds its own.
+    unsafe { libc::close(slave) };
+    // Drain the terminal while the command runs: an exiting session leader
+    // waits for its terminal's output to drain.
+    let reader = std::thread::spawn(move || {
+        let mut shown = Vec::new();
+        let mut buf = [0u8; 4096];
+        // Ends with EOF/EIO once no process holds the slave side.
+        while let Ok(n) = term.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            shown.extend_from_slice(&buf[..n]);
+        }
+        shown
+    });
+    let out = child.wait_with_output().unwrap();
+    let shown = reader.join().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&shown).into_owned(),
+    )
+}
+
+#[test]
+fn exec_cannot_write_or_read_the_users_terminal() {
+    let f = Fixture::new();
+    let (stdout, shown) = exec_on_pty(
+        &f,
+        "printf 'TTY-MARK\\033]0;pwned\\007' > /dev/tty && echo W-OK; \
+         head -c 6 < /dev/tty && echo R-OK; \
+         printf 'NAMED-MARK' > {TTY} && echo N-OK; \
+         head -c 6 < {TTY} && echo NR-OK; echo done",
+        b"typed\n",
+    );
+    assert!(stdout.contains("done"), "command did not run: {stdout:?}");
+    assert!(!shown.contains("TTY-MARK"), "terminal showed: {shown:?}");
+    assert!(
+        !stdout.lines().any(|l| l == "W-OK"),
+        "write to /dev/tty succeeded: {stdout:?}"
+    );
+    assert!(
+        !stdout.lines().any(|l| l == "R-OK"),
+        "read from /dev/tty succeeded: {stdout:?}"
+    );
+    // The same terminal opened by its device name, not as the ctty.
+    assert!(!shown.contains("NAMED-MARK"), "terminal showed: {shown:?}");
+    assert!(
+        !stdout.lines().any(|l| l == "N-OK"),
+        "write to the tty by name succeeded: {stdout:?}"
+    );
+    assert!(
+        !stdout.lines().any(|l| l == "NR-OK"),
+        "read from the tty by name succeeded: {stdout:?}"
+    );
+}
+
+#[test]
+fn exec_command_leads_its_own_session() {
+    let f = Fixture::new();
+    let a = f
+        .exec(
+            &[],
+            &[
+                "python3",
+                "-c",
+                "import os; print(os.getsid(0) == os.getpid())",
+            ],
+        )
+        .assert();
+    assert_eq!(code(&a), 0, "{}", stderr(&a));
+    assert_eq!(
+        String::from_utf8_lossy(&a.get_output().stdout).trim(),
+        "True"
+    );
 }

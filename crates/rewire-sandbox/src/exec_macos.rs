@@ -50,7 +50,16 @@ const BASE_POLICY: &str = r#"(version 1)
 
 /// Character devices every program writes to. `/dev/fd/N` are fds the
 /// process already holds (incl. /dev/stdout, /dev/stderr).
-const DEVICE_WRITES: &str = r#"(allow file-write* (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/fd/[0-9]+$"))
+const DEVICE_WRITES: &str = r#"(allow file-write* (literal "/dev/null") (regex #"^/dev/fd/[0-9]+$"))
+"#;
+
+/// Terminals are never reachable (#23): writing one bypasses the CLI's
+/// control-character stripping (escape sequences, fake status lines, OSC 52
+/// clipboard writes), reading one captures what the user types. Covers the
+/// controlling terminal `/dev/tty` and every terminal by name (`/dev/ttys003`
+/// is owned by the user, so Unix permissions alone would allow it). The
+/// command also runs in its own session, without a controlling terminal.
+const TERMINAL_DENY: &str = r#"(deny file-read* file-write* file-ioctl (regex #"^/dev/(tty|pty|cu\.)"))
 "#;
 
 pub fn build_sbpl(p: &Profile) -> Result<String> {
@@ -131,6 +140,8 @@ pub fn build_sbpl(p: &Profile) -> Result<String> {
         deny.push(regex_filter(&format!("^{}$", escape_re(utf8(&a)?, true)))?);
     }
     emit(&mut out, "deny file-write*", &deny);
+    // Last file rule: later SBPL rules win, so no allow above can re-open it.
+    out.push_str(TERMINAL_DENY);
 
     match p.network() {
         Network::Deny => out.push_str("(deny network*)\n"),
@@ -501,6 +512,20 @@ mod tests {
         let read_deny = sbpl.find("(deny file-read*").unwrap();
         assert!(read_deny > read_allow);
         assert!(sbpl.contains("(deny network*)"));
+    }
+
+    #[test]
+    fn terminals_are_denied_for_read_and_write() {
+        let (_t, p) = profile(&["**"], &[], &[]);
+        let sbpl = build_sbpl(&p).unwrap();
+        assert!(!sbpl.contains(r#"(literal "/dev/tty")"#), "{sbpl}");
+        let deny = sbpl
+            .lines()
+            .find(|l| l.contains("^/dev/(tty|pty"))
+            .expect("terminal deny rule");
+        assert!(deny.starts_with("(deny file-read* file-write*"), "{deny}");
+        // After every file allow, so nothing re-opens it (last match wins).
+        assert!(sbpl.find(deny).unwrap() > sbpl.rfind("(allow file-").unwrap());
     }
 
     #[test]
