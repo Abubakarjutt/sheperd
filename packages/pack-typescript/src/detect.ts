@@ -26,11 +26,18 @@ const LOCKFILES: ReadonlyArray<[string, PM]> = [
   ["package-lock.json", "npm"],
 ];
 
-const ESLINT_CONFIGS = [
+/**
+ * Root-level linter config files the pack detects. Single list: the lint gate's baseRef
+ * detection uses it too, and every name is a protected config file (gates config-patterns test).
+ */
+export const BIOME_CONFIGS: readonly string[] = ["biome.json", "biome.jsonc"];
+export const ESLINT_CONFIGS: readonly string[] = [
   "eslint.config.js",
   "eslint.config.mjs",
   "eslint.config.cjs",
   "eslint.config.ts",
+  "eslint.config.mts",
+  "eslint.config.cts",
   ".eslintrc",
   ".eslintrc.js",
   ".eslintrc.cjs",
@@ -138,6 +145,11 @@ function execPrefix(pm: PM): string[] {
   return pm === "yarn" ? ["yarn"] : [pm, "exec"];
 }
 
+async function anyExists(root: string, names: readonly string[]): Promise<boolean> {
+  for (const n of names) if (await exists(join(root, n))) return true;
+  return false;
+}
+
 export async function detectTsPack(root: string): Promise<TsPack> {
   root = resolve(root);
   const pkg = await readPackageJson(root);
@@ -158,7 +170,7 @@ export async function detectTsPack(root: string): Promise<TsPack> {
   let lintCommand: string[] | null = null;
   if (pkg.scripts && typeof pkg.scripts.lint === "string") {
     lintCommand = [packageManager, "run", "lint"];
-  } else if (await exists(join(root, "biome.json"))) {
+  } else if (await anyExists(root, BIOME_CONFIGS)) {
     lintCommand = ["npx", "biome", "check", "."];
   } else {
     for (const c of ESLINT_CONFIGS) {

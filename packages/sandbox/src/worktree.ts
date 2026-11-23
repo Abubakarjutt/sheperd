@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { accessSync, constants } from "node:fs";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, realpath } from "node:fs/promises";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { RewireError } from "@rewire/core";
 
@@ -41,12 +41,16 @@ export function pinnedGit(): string {
   throw new RewireError("binary_missing", "command not found: git");
 }
 
-/** The host environment without any GIT_* variable (GIT_DIR, GIT_CONFIG_*, GIT_EXEC_PATH, ...). */
-function gitEnv(): NodeJS.ProcessEnv {
+/**
+ * The host environment without any GIT_* variable (GIT_DIR, GIT_CONFIG_*, GIT_EXEC_PATH, ...),
+ * plus GIT_INDEX_FILE when the caller asks for a scratch index.
+ */
+function gitEnv(indexFile?: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (!k.toUpperCase().startsWith("GIT_")) env[k] = v;
   }
+  if (indexFile !== undefined) env.GIT_INDEX_FILE = indexFile;
   return env;
 }
 
@@ -57,7 +61,7 @@ function gitEnv(): NodeJS.ProcessEnv {
 export function trustedGit(
   cwd: string,
   args: string[],
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; indexFile?: string } = {},
 ): Promise<GitResult> {
   return new Promise((res, rej) => {
     let bin: string;
@@ -74,7 +78,7 @@ export function trustedGit(
         cwd,
         encoding: "utf8",
         maxBuffer: 64 * 1024 * 1024,
-        env: gitEnv(),
+        env: gitEnv(opts.indexFile),
         ...(opts.signal ? { signal: opts.signal } : {}),
       },
       (err, stdout, stderr) => {
@@ -96,7 +100,7 @@ export function trustedGit(
 export async function trustedGitOk(
   cwd: string,
   args: string[],
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; indexFile?: string } = {},
 ): Promise<string> {
   const r = await trustedGit(cwd, args, opts);
   if (r.code !== 0) {
@@ -116,6 +120,17 @@ const RUN_ARTIFACTS = [".rewire/runs", ".rewire/worktrees", ".rewire/cache"].map
 export async function assertCleanRepo(repo: string): Promise<{ head: string; branch: string }> {
   const top = await git(repo, ["rev-parse", "--show-toplevel"]);
   if (top.code !== 0) throw new RewireError("not_a_repo", `${repo} is not a git repository`);
+  // I7: the worktree is a checkout of the whole repository, so the pipeline's root must be the
+  // repository root; package subdirectories (monorepos) are not supported in v0.1.
+  const toplevel = await realpath(top.stdout.trim()).catch(() => top.stdout.trim());
+  const given = await realpath(repo).catch(() => repo);
+  if (toplevel !== given) {
+    throw new RewireError(
+      "not_repo_root",
+      `${repo} is not the root of its git repository`,
+      `run rewire with --repo ${toplevel} (monorepo package subdirectories are not supported in v0.1)`,
+    );
+  }
   const sym = await git(repo, ["symbolic-ref", "-q", "HEAD"]);
   if (sym.code !== 0) {
     throw new RewireError("detached_head", "HEAD is detached", "check out a branch first");

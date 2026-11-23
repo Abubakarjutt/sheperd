@@ -3,6 +3,7 @@ import { join, normalize, relative } from "node:path";
 import { verifyFrozen } from "../frozen.js";
 import type { Gate } from "../types.js";
 import { configDrift } from "./drift.js";
+import { type ProtectedHit, protectedPathHits } from "./protected.js";
 import { changedTestFiles, GateExec, realRootOf, testGlobFiles } from "./shared.js";
 
 export const frozenTestsGate: Gate = {
@@ -22,10 +23,13 @@ export const frozenTestsGate: Gate = {
     let changed: string[];
     let inGlobs: string[];
     let drift: Awaited<ReturnType<typeof configDrift>>;
+    let protectedHits: ProtectedHit[];
+    const frozenPaths = new Set(manifest.files.map((f) => normalize(f.path)));
     try {
       changed = await changedTestFiles(ctx, g);
       inGlobs = await testGlobFiles(ctx, g);
       drift = await configDrift(ctx, g);
+      protectedHits = await protectedPathHits(ctx, g, frozenPaths);
     } catch (e) {
       return {
         status: "error",
@@ -34,7 +38,6 @@ export const frozenTestsGate: Gate = {
       };
     }
 
-    const frozenPaths = new Set(manifest.files.map((f) => normalize(f.path)));
     const preexisting = changed.filter((p) => !frozenPaths.has(normalize(p)));
     if (preexisting.length > 0) problems.modifiedPreexistingTests = preexisting;
 
@@ -66,6 +69,8 @@ export const frozenTestsGate: Gate = {
     if (escaping.length > 0) problems.symlinksOutsideTests = escaping;
 
     if (drift.length > 0) problems.configDrift = drift;
+    // R37: a write the implementer profile denies, whatever the OS layer let through.
+    if (protectedHits.length > 0) problems.protectedPaths = protectedHits;
 
     if (Object.keys(problems).length > 0) {
       const parts = Object.keys(problems).map((k) => k.replace(/([A-Z])/g, " $1").toLowerCase());

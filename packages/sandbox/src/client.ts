@@ -1,7 +1,16 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  constants,
+  existsSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RewireError } from "@rewire/core";
 import type { CapabilityProfile } from "./profiles.js";
@@ -32,28 +41,82 @@ function rewireRepoRoot(): string | undefined {
   }
 }
 
-export function findSandboxBinary(): string {
-  const env = process.env.REWIRE_SANDBOX_BIN;
-  if (env) {
-    if (existsSync(env)) return env;
+function executableFile(p: string): { mtimeMs: number } | undefined {
+  try {
+    const st = statSync(p);
+    if (!st.isFile()) return undefined;
+    accessSync(p, constants.X_OK);
+    return st;
+  } catch {
+    return undefined;
+  }
+}
+
+export type FindBinaryOptions = {
+  /** Default `process.env` (REWIRE_SANDBOX_BIN, PATH). */
+  env?: NodeJS.ProcessEnv;
+  /** The rewire source checkout to look in; `null` skips it. Default: found from this module. */
+  sourceRoot?: string | null;
+};
+
+/**
+ * The rewire-sandbox binary, in this order: `REWIRE_SANDBOX_BIN` (a missing file is an error,
+ * never a fall-through); the newer of `target/release` and `target/debug` in the rewire source
+ * checkout; the first absolute PATH entry that has it (relative entries are skipped, #25).
+ * `rewire doctor` reports exactly this lookup, and the pipeline calls it in preflight (I1).
+ */
+export function findSandboxBinary(opts: FindBinaryOptions = {}): string {
+  const env = opts.env ?? process.env;
+  const override = env.REWIRE_SANDBOX_BIN;
+  if (override) {
+    if (existsSync(override)) return override;
     throw new RewireError(
       "binary_missing",
-      `REWIRE_SANDBOX_BIN points at a missing file: ${env}`,
+      `REWIRE_SANDBOX_BIN points at a missing file: ${override}`,
       "unset it or run cargo build -p rewire-sandbox",
     );
   }
-  const root = rewireRepoRoot();
+  const root = opts.sourceRoot === undefined ? rewireRepoRoot() : opts.sourceRoot;
   if (root) {
+    let best: { p: string; mtimeMs: number } | undefined;
     for (const profile of ["release", "debug"]) {
       const p = join(root, "target", profile, "rewire-sandbox");
-      if (existsSync(p)) return p;
+      const st = executableFile(p);
+      if (st && (best === undefined || st.mtimeMs > best.mtimeMs))
+        best = { p, mtimeMs: st.mtimeMs };
     }
+    if (best) return best.p;
+  }
+  for (const dir of (env.PATH ?? "").split(delimiter)) {
+    if (!dir || !isAbsolute(dir)) continue;
+    const p = join(dir, "rewire-sandbox");
+    if (executableFile(p)) return p;
   }
   throw new RewireError(
     "binary_missing",
     "rewire-sandbox binary not found",
-    "run cargo build -p rewire-sandbox",
+    "run cargo build -p rewire-sandbox, put rewire-sandbox on PATH, or set REWIRE_SANDBOX_BIN",
   );
+}
+
+/**
+ * Whether the sandbox binary can be found, for suites that need it. With
+ * `REWIRE_REQUIRE_SANDBOX=1` (CI) a missing binary throws instead, so a suite can never go green
+ * by skipping (I2, R40).
+ */
+export function sandboxAvailable(opts: FindBinaryOptions = {}): boolean {
+  const env = opts.env ?? process.env;
+  try {
+    findSandboxBinary(opts);
+    return true;
+  } catch (e) {
+    if (env.REWIRE_REQUIRE_SANDBOX === "1") {
+      throw new Error(
+        `REWIRE_REQUIRE_SANDBOX=1 but the sandbox binary is unavailable: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+    return false;
+  }
 }
 
 const profileDirs = new Set<string>();

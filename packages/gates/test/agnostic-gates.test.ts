@@ -765,6 +765,16 @@ function shimDir(name: string, body: string): string {
 }
 
 describe("audit gate", () => {
+  test("a package.json that is JSON null is a pack_invalid error, not a raw TypeError (row 72)", async () => {
+    const { root, ctx } = makeRepo(NPM_BASE);
+    write(root, "package.json", "null\n");
+    const { client } = registryStub(NPM_CLEAN);
+    const r = await auditGate.run({ ...ctx, registryClient: client });
+    expect(r.status).toBe("error");
+    expect(r.summary).toContain("package.json is not a JSON object");
+    expect(r.summary).not.toMatch(/TypeError|Cannot read prop/);
+  });
+
   test("is skipped when no manifest changed", async () => {
     const { root, ctx } = makeRepo(NPM_BASE);
     write(root, "src/a.ts", "export {};\n");

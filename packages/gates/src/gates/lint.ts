@@ -1,10 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { BIOME_CONFIGS, ESLINT_CONFIGS } from "@rewire/pack-typescript";
 import type { Gate, GateContext, GateOutput } from "../types.js";
 import { baseFileList, baseText, GateExec, localBin } from "./shared.js";
 
 const MAX_LINES = 50;
-const ESLINT_RE = /^(eslint\.config\.(js|mjs|cjs|ts)|\.eslintrc(\.(js|cjs|mjs|json|yaml|yml))?)$/;
 
 const err = (summary: string): GateOutput => ({ status: "error", summary, details: null });
 const fail = (summary: string, details: unknown = null): GateOutput => ({
@@ -32,8 +32,8 @@ async function baselineLint(
     const script = lintScript(await baseText(ctx, g, "package.json"));
     if (script !== undefined) return { cmd: [ctx.pack.packageManager, "run", "lint"], script };
   }
-  if (files.includes("biome.json")) return { cmd: ["npx", "biome", "check", "."] };
-  if (files.some((f) => !f.includes("/") && ESLINT_RE.test(f))) {
+  if (files.some((f) => BIOME_CONFIGS.includes(f))) return { cmd: ["npx", "biome", "check", "."] };
+  if (files.some((f) => ESLINT_CONFIGS.includes(f))) {
     return { cmd: ["npx", "eslint", "."] };
   }
   return { cmd: null };

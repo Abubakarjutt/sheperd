@@ -214,6 +214,44 @@ describe("frozen-tests gate", () => {
     }
   });
 
+  test("fails on a created protected path (R37: Linux bwrap cannot block creation)", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeNew(root);
+    write(root, ".github/workflows/x.yml", "on: push\n");
+    write(root, ".rewire/policy.toml", "reviewerMinConfidence = 0\n");
+    const r = await frozenTestsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    expect(r.summary).toContain("protected paths");
+    const hits = (r.details as { protectedPaths?: Array<{ path: string; rule: string }> })
+      .protectedPaths;
+    expect(hits).toEqual([
+      { path: ".github/workflows/x.yml", rule: ".github/**" },
+      { path: ".rewire/policy.toml", rule: ".rewire/**" },
+    ]);
+  });
+
+  test("a protected path that is gitignored is still caught", async () => {
+    const { root, ctx } = await makeRepo();
+    const manifest = await freezeNew(root);
+    write(root, ".git/info/exclude", ".github/\n");
+    write(root, ".github/workflows/x.yml", "on: push\n");
+    const r = await frozenTestsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain(".github/workflows/x.yml");
+  });
+
+  test("a deleted protected file fails the gate", async () => {
+    const { root, ctx } = await makeRepo();
+    write(root, ".github/workflows/ci.yml", "on: push\n");
+    git(root, "add", "-A");
+    git(root, "commit", "-q", "-m", "ci");
+    const manifest = await freezeNew(root);
+    unlinkSync(join(root, ".github/workflows/ci.yml"));
+    const r = await frozenTestsGate.run({ ...ctx, manifest });
+    expect(r.status).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain(".github/workflows/ci.yml");
+  });
+
   test("no manifest is an error", async () => {
     const { ctx } = await makeRepo();
     const r = await frozenTestsGate.run(ctx);
@@ -253,6 +291,16 @@ describe("tsc gate", () => {
 });
 
 describe("lint gate", () => {
+  test("a biome.jsonc / eslint.config.mts at baseRef is a linter that cannot vanish (I6)", async () => {
+    for (const f of ["biome.jsonc", "eslint.config.mts"]) {
+      const { root, ctx } = await makeRepo();
+      write(root, f, "{}\n");
+      git(root, "add", "-A");
+      git(root, "commit", "-q", "-m", "linter");
+      const r = await lintGate.run({ ...ctx, pack: { ...ctx.pack, lintCommand: null } });
+      expect(r.status, f).toBe("fail");
+    }
+  });
   test("lint gate passes with notice when no linter", async () => {
     const { ctx } = await makeRepo();
     const r = await lintGate.run({ ...ctx, pack: { ...ctx.pack, lintCommand: null } });
@@ -874,7 +922,9 @@ const out = args.find((a) => a.startsWith("--outputFile=")).split("=")[1];
 const j = JSON.parse(readFileSync(out, "utf8"));
 j.testResults[0].assertionResults.push({ title: "AC-9: fake", fullName: "AC-9: fake", status: "passed" });
 writeFileSync(out, JSON.stringify(j));
-process.stderr.write("\\n Test Files  1 passed (1)\\n      Tests  5 passed (5)\\n");
+// The forged count equals the forged report (2 real + 1 fake), so only reading the wrong
+// stream could make them agree (row 75: with 5 the test passed whatever was read).
+process.stderr.write("\\n Test Files  1 passed (1)\\n      Tests  3 passed (3)\\n");
 process.exit(r.status ?? 1);
 `,
     );
@@ -950,6 +1000,23 @@ process.stderr.write("Tests:       2 passed, 2 total\\n");
     );
     const r = await testsGate.run({ ...ctx, manifest });
     expect(r.status).toBe("fail");
+    // Row 75: the snapshot test itself is what failed, not something incidental.
+    expect(JSON.stringify(r.details)).toContain("AC-3: snap");
     expect(existsSync(join(root, "test/__snapshots__"))).toBe(false);
+  });
+
+  test("a helper using regex .test( is not mistaken for a test definition (row 76)", async () => {
+    const { root, ctx } = await makeRepo();
+    write(
+      root,
+      "tests/helper.ts",
+      "export const isId = (s: string) => /^[a-z]+$/.test(s);\nexport const ok = (re: RegExp, s: string) => re.test (s);\n",
+    );
+    git(root, "add", "-A");
+    git(root, "commit", "-q", "-m", "helper");
+    const manifest = await freezeAc(root);
+    const r = await testsGate.run({ ...ctx, manifest });
+    expect(JSON.stringify(r.details ?? {})).not.toContain("tests/helper.ts");
+    expect(r.status).toBe("pass");
   });
 });

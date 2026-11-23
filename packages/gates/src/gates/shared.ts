@@ -52,10 +52,15 @@ export const realRootOf = (ctx: GateContext): Promise<string> => realpath(ctx.wo
  * the runner records a timeout, so no exec outlives its gate. No new exec starts once the
  * signal is aborted.
  */
+/** What GateExec needs: a fixed deadline, or the policy's gate timeout to compute one. */
+export type GateExecContext = Pick<GateContext, "worktree" | "client" | "signal"> &
+  ({ deadline: number } | Pick<GateContext, "policy" | "deadline">);
+
 export class GateExec {
   private readonly deadline: number;
-  constructor(private readonly ctx: GateContext) {
-    this.deadline = ctx.deadline ?? Date.now() + ctx.policy.gateTimeoutMs;
+  constructor(private readonly ctx: GateExecContext) {
+    this.deadline =
+      ctx.deadline ?? Date.now() + (ctx as Pick<GateContext, "policy">).policy.gateTimeoutMs;
   }
 
   /** Run argv in the worktree; `client` defaults to the verify client (pass registryClient for the network exception). */

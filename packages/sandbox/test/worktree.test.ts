@@ -20,6 +20,18 @@ test("refuses_detached_head", async () => {
   await expect(assertCleanRepo(dir)).rejects.toMatchObject({ code: "detached_head" });
 });
 
+test("a subdirectory of a repo is refused with not_repo_root (I7)", async () => {
+  const dir = makeRepo();
+  mkdirSync(join(dir, "packages", "a"), { recursive: true });
+  writeFileSync(join(dir, "packages", "a", "x.ts"), "export {};\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-q", "-m", "pkg");
+  await expect(assertCleanRepo(join(dir, "packages", "a"))).rejects.toMatchObject({
+    code: "not_repo_root",
+    hint: expect.stringContaining(dir),
+  });
+});
+
 test("clean repo returns head and branch", async () => {
   const dir = makeRepo();
   const r = await assertCleanRepo(dir);

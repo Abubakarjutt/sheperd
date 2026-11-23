@@ -90,6 +90,26 @@ describe("detectTsPack", () => {
     expect((await detectTsPack(fixture(base))).lintCommand).toBeNull();
   });
 
+  test("biome.jsonc and eslint.config.mts/.cts are detected (I6)", async () => {
+    const base = {
+      "package.json": pkg({ devDependencies: { vitest: "1" } }),
+      "tsconfig.json": "{}",
+    };
+    expect((await detectTsPack(fixture({ ...base, "biome.jsonc": "{}" }))).lintCommand).toEqual([
+      "npx",
+      "biome",
+      "check",
+      ".",
+    ]);
+    for (const f of ["eslint.config.mts", "eslint.config.cts"]) {
+      expect((await detectTsPack(fixture({ ...base, [f]: "" }))).lintCommand).toEqual([
+        "npx",
+        "eslint",
+        ".",
+      ]);
+    }
+  });
+
   test("no lockfile: packageManager field, else npm", async () => {
     const mk = (extra: object) =>
       fixture({

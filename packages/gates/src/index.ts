@@ -4,7 +4,14 @@ export { frozenTestsGate } from "./gates/frozen.js";
 export { gitleaksGate } from "./gates/gitleaks.js";
 export { lintGate } from "./gates/lint.js";
 export { SEMGREP_RULES_FILE, semgrepGate } from "./gates/semgrep.js";
-export { GateExec, inNodeModules, matchesAnyGlob, pathspecs } from "./gates/shared.js";
+export {
+  checkRef,
+  GateExec,
+  type GateExecContext,
+  inNodeModules,
+  matchesAnyGlob,
+  pathspecs,
+} from "./gates/shared.js";
 export {
   isRunnable,
   ONLY_PATTERNS,

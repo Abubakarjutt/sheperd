@@ -1,5 +1,6 @@
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, posix } from "node:path";
+import { RewireError } from "@rewire/core";
 import { z } from "zod";
 import type { Gate, GateContext, GateOutput } from "../types.js";
 import {
@@ -133,8 +134,17 @@ async function changedManifests(ctx: GateContext, g: GateExec): Promise<string[]
 
 // ---- dependency names -------------------------------------------------------------------------
 
+/** A manifest as a plain object; JSON `null`, arrays and scalars are `pack_invalid` (row 72). */
+function manifestObject(text: string): Record<string, unknown> {
+  const j: unknown = JSON.parse(text);
+  if (typeof j !== "object" || j === null || Array.isArray(j)) {
+    throw new RewireError("pack_invalid", "package.json is not a JSON object");
+  }
+  return j as Record<string, unknown>;
+}
+
 function depNames(text: string): Set<string> {
-  const j = JSON.parse(text) as Record<string, unknown>;
+  const j = manifestObject(text);
   const names = new Set<string>();
   for (const f of DEP_FIELDS) {
     const v = j[f];
@@ -301,8 +311,8 @@ async function baseLockFor(
 type Missing = { manifest: string; dependency: string; reason: string };
 
 function peerNames(text: string): Set<string> {
-  const j = JSON.parse(text) as { peerDependencies?: Record<string, unknown> };
-  return new Set(Object.keys(j.peerDependencies ?? {}));
+  const peers = manifestObject(text).peerDependencies;
+  return new Set(typeof peers === "object" && peers !== null ? Object.keys(peers) : []);
 }
 
 /**
@@ -311,7 +321,7 @@ function peerNames(text: string): Set<string> {
  */
 function stripPmFields(text: string): string {
   // fail closed: an unparseable manifest is never copied verbatim (the caller reports an error)
-  const j = JSON.parse(text) as Record<string, unknown>;
+  const j = manifestObject(text);
   delete j.packageManager;
   delete j.devEngines;
   return JSON.stringify(j);

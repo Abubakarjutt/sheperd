@@ -12,6 +12,12 @@ export type GateContext = {
    * need the network (audit) return an error when it is absent.
    */
   registryClient?: SandboxClient;
+  /**
+   * Client for the `implementer` profile, used only for `checkPath(…, "write")` by the
+   * frozen-tests gate's protected-paths check (R37). Optional: the gate builds its own from
+   * `profileFor("implementer", …)` when absent.
+   */
+  implementerClient?: SandboxClient;
   pack: TsPack;
   policy: Policy;
   manifest?: FrozenTestManifest;

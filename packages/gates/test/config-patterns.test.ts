@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { BIOME_CONFIGS, ESLINT_CONFIGS } from "@rewire/pack-typescript";
 import { CONFIG_FILE_GLOBS, DEFAULT_POLICY } from "@rewire/policy";
 import { afterAll, describe, expect, test } from "vitest";
 import { CONFIG_PATHSPECS, isConfigFile, matchesAnyGlob } from "../src/gates/shared.js";
@@ -102,4 +103,11 @@ describe("one canonical list of config file patterns (S40)", () => {
     }
     expect(CONFIG_FILE_GLOBS).not.toContain("**/mise/**");
   });
+});
+
+test("every linter config the pack detects is a protected config file (I6)", () => {
+  for (const name of [...BIOME_CONFIGS, ...ESLINT_CONFIGS]) {
+    expect(isConfigFile(name), name).toBe(true);
+    expect(isConfigFile(`sub/${name}`), name).toBe(true);
+  }
 });

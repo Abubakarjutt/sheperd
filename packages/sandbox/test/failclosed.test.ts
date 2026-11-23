@@ -1,9 +1,15 @@
-import { chmodSync, existsSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_POLICY } from "@rewire/policy";
 import { expect, test } from "vitest";
-import { expandHome, findSandboxBinary, profileFor, SandboxClient } from "../src/index.js";
+import {
+  expandHome,
+  findSandboxBinary,
+  profileFor,
+  SandboxClient,
+  sandboxAvailable,
+} from "../src/index.js";
 import { tmp } from "./helpers.js";
 
 function fake(script: string): string {
@@ -121,6 +127,37 @@ test("REWIRE_SANDBOX_BIN override is used", () => {
   }
 });
 
+// I1: the run must find every binary `rewire doctor` reports.
+test("findSandboxBinary searches absolute PATH entries after the source checkout", () => {
+  const p = fake("exit 0");
+  const dir = join(p, "..");
+  const named = join(dir, "rewire-sandbox");
+  writeFileSync(named, "#!/bin/sh\nexit 0\n");
+  chmodSync(named, 0o755);
+  expect(findSandboxBinary({ env: { PATH: `/nonexistent:${dir}` }, sourceRoot: null })).toBe(named);
+  // Relative PATH entries are never searched (#25).
+  expect(() => findSandboxBinary({ env: { PATH: "relative/dir" }, sourceRoot: null })).toThrow(
+    expect.objectContaining({ code: "binary_missing" }),
+  );
+});
+
+test("findSandboxBinary prefers the newer of target/release and target/debug", () => {
+  const root = tmp("rewire-src-");
+  const mk = (profile: string, mtime: number): string => {
+    mkdirSync(join(root, "target", profile), { recursive: true });
+    const p = join(root, "target", profile, "rewire-sandbox");
+    writeFileSync(p, "#!/bin/sh\nexit 0\n");
+    chmodSync(p, 0o755);
+    utimesSync(p, mtime, mtime);
+    return p;
+  };
+  mk("release", 1_000_000);
+  const debug = mk("debug", 2_000_000);
+  expect(findSandboxBinary({ env: {}, sourceRoot: root })).toBe(debug);
+  const release = mk("release", 3_000_000);
+  expect(findSandboxBinary({ env: {}, sourceRoot: root })).toBe(release);
+});
+
 test("expandHome handles bare ~", () => {
   expect(expandHome("~")).toBe(homedir());
 });
@@ -147,4 +184,14 @@ test("fake binary ignoring SIGTERM is SIGKILLed after the grace", { timeout: 800
   expect((err as Error).message).toContain("SIGKILLed");
   expect(Date.now() - t0).toBeGreaterThanOrEqual(1850);
   expect(existsSync(mark)).toBe(true);
+});
+
+// I2/R40: CI sets REWIRE_REQUIRE_SANDBOX=1 so sandbox suites fail instead of skipping.
+test("sandboxAvailable: false when missing, a hard failure when REWIRE_REQUIRE_SANDBOX=1", () => {
+  const missing = { REWIRE_SANDBOX_BIN: "/nonexistent/rewire-sandbox" };
+  expect(sandboxAvailable({ env: missing })).toBe(false);
+  expect(() => sandboxAvailable({ env: { ...missing, REWIRE_REQUIRE_SANDBOX: "1" } })).toThrow(
+    /REWIRE_REQUIRE_SANDBOX/,
+  );
+  expect(sandboxAvailable({ env: { REWIRE_SANDBOX_BIN: fake("exit 0") } })).toBe(true);
 });

@@ -24,8 +24,10 @@ import {
  *    aliases or tsconfig-paths. Projects needing them fail closed (with a hint).
  *  - jest is covered by unit tests only (no real jest run); transform stays the jest default
  *    (babel-jest), whose config files are drift-checked and protected.
- *  - Untracked, gitignored nested package.json files (e.g. dist/package.json) are drift-checked
- *    too and cause fail-closed false positives.
+ *  - The console-summary cross-check reads the last summary in the output: in-process code that
+ *    prints a forged summary after the runner's own is not detected.
+ *  - __mocks__ directories are protected config: mocks cannot be added or changed during a run.
+ *  (Gitignored files, e.g. dist/package.json, are deleted before every gate run since R38.)
  *  - A worktree path containing glob metacharacters fails closed.
  */
 
@@ -53,7 +55,9 @@ export const ONLY_PATTERNS = [/\.only\s*\(/, /\b(?:fit|fdescribe)\s*\(/];
 export const SKIP_TOKEN =
   /\b(?:it|test|describe|suite|bench)(?:\.\w+)*\.(?:skip|todo|skipIf|runIf)\b|\b(?:xit|xdescribe|xtest)\b/;
 const MAX_LIST = 50;
-const TEST_DEF_RE = /\b(?:test|it|describe)(?:\.\w+)?\s*\(/;
+// Row 76: not after `.`, `$` or a word character, so `/re/.test(s)` and `re.test (s)` in a
+// helper are not test definitions.
+const TEST_DEF_RE = /(?<![.\w$])(?:test|it|describe)(?:\.\w+)?\s*\(/;
 /** Only these files are collected as tests; other files under the test globs are just hash-frozen. */
 const RUNNABLE_TEST_RE = /\.(?:test|spec)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 export const isRunnable = (p: string): boolean => RUNNABLE_TEST_RE.test(basename(p));
