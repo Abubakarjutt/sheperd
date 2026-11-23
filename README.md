@@ -22,8 +22,9 @@ lists what must hold on a live run before v0.1 is called released.
    sandboxed helper (`rewire-sandbox`), and frozen tests cannot be edited.
 4. **Gates.** Hard-block checks: tests, types, lint, semgrep, gitleaks, dependency audit, frozen
    test integrity.
-5. **Review.** Three reviewers inspect the diff and must back each finding with evidence; a
-   verifier tries to refute them. Reviewer and verifier models are chosen from a different
+5. **Review.** Up to three reviewers inspect the diff (security and spec compliance always;
+   silent-failure when the added lines match its patterns) and must back each finding with
+   evidence, which may quote lines the diff removed; a verifier tries to refute them. Reviewer and verifier models are chosen from a different
    model family than the implementer when one is available.
 6. **Fix loop.** Findings go back to the implementer, with progress and oscillation detection,
    a re-plan, and escalation to you when it stops converging.
@@ -186,7 +187,8 @@ These are rendered into every evidence report (the first list) or are known gaps
 Stated in every report (this list is checked against the pipeline's `KNOWN_LIMITATIONS` by a test):
 
 - The audit gate uses a registry network exception: on Linux it has full network access during that
-  gate, because bwrap has no domain filtering.
+  gate, because bwrap has no domain filtering; on macOS it can reach any host on tcp/443 plus DNS,
+  because Seatbelt cannot filter by domain.
 - Test-writer isolation from implementation bodies is prompt-level until the code index ships.
 - Disputes escalate to the human; automated adjudication is deferred.
 - TypeScript only: other languages are refused with pack_undetected.
@@ -202,8 +204,9 @@ Stated in every report (this list is checked against the pipeline's `KNOWN_LIMIT
   read and sent to a model provider.
 - Dependency installs are not harness-mediated in v0.1: the gates run against the dependencies
   already present (the repo's node_modules is shared into the worktree by a symlink, never
-  committed); a change to a manifest's dependencies fails the drift and lockfile checks instead of
-  being installed.
+  committed); a new dependency name missing from the baseRef lockfile fails the audit gate and any
+  lockfile change fails as protected, but other manifest dependency edits (changed ranges, file: or
+  git+ specs, removals) pass both.
 - Tests run in the same process as the code under test: implementer code imported by a frozen test
   can tamper with the assertion library or the reporter in-process; only cheap forgery is detected.
 - The test runner config is owned by the harness: projects that need setupFiles, plugins, aliases or
@@ -239,7 +242,7 @@ Also known:
 - The benchmark's trap checks are pattern-based and have documented false-positive and
   false-negative edges (for example SQL placeholder detection).
 - gitleaks' default allowlist skips some file types (svg, pdf, go.sum).
-- The review's diff summary shares one 60 s git budget and depends on `/usr/bin/head`.
+- The review's diff summary shares one 60 s git budget and depends on `/usr/bin/od`.
 - Linux sandboxing needs unprivileged user namespaces; some distributions and containers
   restrict them, in which case `rewire doctor` and runs will fail. macOS and Linux are the only
   supported platforms.

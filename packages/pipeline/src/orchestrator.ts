@@ -118,7 +118,7 @@ export const GATE_REGISTRY: Readonly<Record<string, Gate>> = {
  * the test-runner items are restated here.
  */
 export const KNOWN_LIMITATIONS: readonly string[] = [
-  "the audit gate uses a registry network exception: on Linux it has full network access during that gate, because bwrap has no domain filtering",
+  "the audit gate uses a registry network exception: on Linux it has full network access during that gate, because bwrap has no domain filtering; on macOS it can reach any host on tcp/443 plus DNS, because Seatbelt cannot filter by domain",
   "test-writer isolation from implementation bodies is prompt-level until the code index ships",
   "disputes escalate to the human; automated adjudication is deferred",
   "TypeScript only: other languages are refused with pack_undetected",
@@ -126,7 +126,7 @@ export const KNOWN_LIMITATIONS: readonly string[] = [
   "gitignored untracked files are deleted before every gate run and before the final commit (the report lists them), so the gates see exactly the committed tree; build output the implementer creates does not survive between gate runs",
   "host PATH passed through the sandbox",
   "credential read-deny is a deny-list, not an allow-list: listed secret files (ssh, cloud and registry credentials, shell rc and history files, ~/.claude*, .env files in the worktree, the run's repo and up to three directories below HOME) are unreadable, but the rest of HOME, other repositories and system files stay readable by every stage, so a secret stored elsewhere can be read and sent to a model provider",
-  "dependency installs are not harness-mediated in v0.1: the gates run against the dependencies already present (the repo's node_modules is shared into the worktree by a symlink, never committed); a change to a manifest's dependencies fails the drift and lockfile checks instead of being installed",
+  "dependency installs are not harness-mediated in v0.1: the gates run against the dependencies already present (the repo's node_modules is shared into the worktree by a symlink, never committed); a new dependency name missing from the baseRef lockfile fails the audit gate and any lockfile change fails as protected, but other manifest dependency edits (changed ranges, file: or git+ specs, removals) pass both",
   "tests run in the same process as the code under test: implementer code imported by a frozen test can tamper with the assertion library or the reporter in-process; only cheap forgery is detected",
   "the test runner config is owned by the harness: projects that need setupFiles, plugins, aliases or tsconfig paths fail closed",
   "jest support is covered by unit tests only (no real jest run in the harness test suite)",
