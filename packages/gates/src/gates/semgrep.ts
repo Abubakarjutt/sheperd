@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import vm from "node:vm";
 import { z } from "zod";
@@ -294,11 +294,17 @@ export const semgrepGate: Gate = {
 
     // C1: a fresh, unpredictable HOME per run, created here (mkdtemp is exclusive, so nothing an
     // earlier sandboxed command wrote can already be in it) and removed when the scan ends.
+    // The ruleset is copied in too: the sandbox need not see where rewire is installed (bwrap
+    // gives every command a fresh /tmp, and an npm install can live anywhere).
     let home: string;
+    let rules: string;
     try {
       home = await mkdtemp(join(ctx.scratch, "semgrep-home-"));
       await chmod(home, 0o700);
       for (const d of [".config", ".cache", "tmp"]) await mkdir(join(home, d), { mode: 0o700 });
+      rules = join(home, "rules.yml");
+      await copyFile(SEMGREP_RULES_FILE, rules);
+      await chmod(rules, 0o400);
     } catch (e) {
       return err(`cannot prepare semgrep scratch: ${errMsg(e)}`, base);
     }
@@ -344,7 +350,7 @@ export const semgrepGate: Gate = {
           semgrep,
           "scan",
           "--config",
-          SEMGREP_RULES_FILE,
+          rules,
           "--json",
           "--quiet",
           "--metrics=off",
