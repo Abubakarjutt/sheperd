@@ -325,8 +325,33 @@ fn deeper(a: Option<usize>, b: Option<usize>) -> Option<usize> {
     }
 }
 
-/// Same as [`walk`] but only for readDeny (outside the writable trees),
-/// descending at most `depth` levels below `start` (`None`: unbounded).
+/// Directories a depth-limited (home-wide) walk never enters below its
+/// start: package caches and VCS metadata, where a `.env*` is a package's
+/// or a tool's file, not the user's credential. Each is large, so walking it
+/// on every exec costs real latency. A credential store inside one that a
+/// glob names explicitly (`~/.cache/x/**`) has its own walk prefix and is
+/// unaffected.
+const HEAVY_DIRS: [&str; 5] = ["node_modules", ".git", ".cache", ".npm", "Library"];
+
+/// Mask readDeny matches outside the writable trees, at most `depth`
+/// levels below `start` (`None`: unbounded, for `**` globs).
+///
+/// Matching is lexical: the path as written (the policy's literal prefix
+/// plus directory entries) against the deny globs, never resolving
+/// symlinks, so a loop, a dangling link or a link into an unreadable place
+/// cannot fail the exec (NEW-1). The walk descends only into real
+/// directories (lstat), never through a symlink, so it stays in scope.
+/// Entries that vanish or cannot be stat'ed are skipped: the command runs as
+/// the same user and cannot read them either.
+///
+/// Depth-limited globs (`~/*/.env*`) name files: a matching directory (a
+/// Python venv called `.env`) is not hidden, matching macOS, where such a
+/// rule denies only that path. Directory denies are written `dir/**`, which
+/// are unbounded and hide the whole directory.
+///
+/// Fails closed only when an unbounded walk cannot list a directory it must
+/// search (other than one that vanished): a same-user, execute-only
+/// directory could hold a matching file the command can open by name.
 fn walk_read_only(
     p: &Profile,
     start: &Path,
@@ -334,24 +359,51 @@ fn walk_read_only(
     m: &mut Masks,
     budget: &mut usize,
 ) -> Result<()> {
-    if hide_if_read_denied(p, start, m)? {
-        return Ok(());
+    let Ok(md) = fs::symlink_metadata(start) else {
+        return Ok(()); // gone, or unreachable to this user too
+    };
+    if p.read_denial(&[start]).is_some() {
+        if md.file_type().is_symlink() {
+            // bwrap mounts over the link's target: only a file target
+            // (a dangling link has nothing to read).
+            match fs::metadata(start) {
+                Ok(t) if t.is_file() => m.hide_files.push(start.to_path_buf()),
+                Ok(t) if t.is_dir() && depth.is_none() => m.hide_dirs.push(start.to_path_buf()),
+                _ => {}
+            }
+            return Ok(());
+        }
+        if !md.is_dir() {
+            m.hide_files.push(start.to_path_buf());
+            return Ok(());
+        }
+        if depth.is_none() {
+            m.hide_dirs.push(start.to_path_buf());
+            return Ok(());
+        }
+        // A depth-limited match on a directory: leave it visible, keep walking.
     }
-    if depth == Some(0) || !fs::symlink_metadata(start)?.is_dir() {
+    if depth == Some(0) || !md.is_dir() {
         return Ok(());
     }
     let entries = match fs::read_dir(start) {
         Ok(e) => e,
-        // A depth-limited walk spans home-wide globs (`~/*/.env*`); one
-        // unlistable dir there (root-owned, 0711) must not make every exec
-        // fail. Residual: a file inside a dir we cannot list but the command
-        // can enter by name stays readable. Unbounded walks fail closed.
-        Err(_) if depth.is_some() => return Ok(()),
+        Err(e) if depth.is_some() || e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", start.display())),
     };
     for entry in entries {
-        let path = entry?.path();
+        let Ok(entry) = entry else { continue };
         *budget = budget.checked_sub(1).context("tree too large to sandbox")?;
+        let path = entry.path();
+        if depth.is_some()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| HEAVY_DIRS.contains(&n))
+            && p.read_denial(&[&path]).is_none()
+        {
+            continue;
+        }
         walk_read_only(p, &path, depth.map(|d| d - 1), m, budget)?;
     }
     Ok(())
@@ -706,6 +758,74 @@ mod tests {
 
     fn s(p: &Path) -> String {
         p.to_str().unwrap().to_owned()
+    }
+
+    /// NEW-1: one unresolvable entry under HOME must not fail every exec.
+    /// Built from scratch and run through `collect_masks` on every platform.
+    #[test]
+    fn home_wide_walk_survives_loops_dangling_links_and_locked_dirs() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let t = TempDir::new().unwrap();
+        let base = fs::canonicalize(t.path()).unwrap();
+        let root = base.join("root");
+        let home = base.join("home");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(home.join("a/b")).unwrap();
+        // Secrets that must be masked.
+        fs::write(home.join("a/b/.env"), "").unwrap();
+        fs::write(home.join("a/real.txt"), "").unwrap();
+        symlink(home.join("a/real.txt"), home.join("a/.env.link")).unwrap();
+        // Hostile or unresolvable entries.
+        let locked = home.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join(".env"), "").unwrap();
+        symlink(&locked, home.join("a/b/to-locked")).unwrap();
+        symlink(home.join("a/loop2"), home.join("a/loop1")).unwrap();
+        symlink(home.join("a/loop1"), home.join("a/loop2")).unwrap();
+        symlink(home.join("a/gone"), home.join("a/.env.dangling")).unwrap();
+        symlink("/", home.join("a/to-root")).unwrap();
+        // A Python venv named like the glob stays visible (as on macOS).
+        fs::create_dir_all(home.join("a/.envs/bin")).unwrap();
+        // Heavy dirs are not walked.
+        fs::create_dir_all(home.join("p/node_modules/x")).unwrap();
+        fs::write(home.join("p/node_modules/x/.env"), "").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let h = s(&home);
+        let p = Profile::from_spec(ProfileSpec {
+            root: root.clone(),
+            write: vec![],
+            write_deny: vec![],
+            read_deny: vec![
+                format!("{h}/.env*"),
+                format!("{h}/*/.env*"),
+                format!("{h}/*/*/.env*"),
+                format!("{h}/*/*/*/.env*"),
+            ],
+            network: Network::Deny,
+            extra_write: vec![],
+        })
+        .unwrap();
+        let m = collect_masks(&p);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let m = m.unwrap();
+        assert!(m.hide_files.contains(&home.join("a/b/.env")), "{m:?}");
+        assert!(m.hide_files.contains(&home.join("a/.env.link")), "{m:?}");
+        assert!(
+            !m.hide_files.contains(&home.join("a/.env.dangling")),
+            "{m:?}"
+        );
+        assert!(!m.hide_dirs.contains(&home.join("a/.envs")), "{m:?}");
+        assert!(
+            !m.hide_files.contains(&home.join("p/node_modules/x/.env")),
+            "{m:?}"
+        );
+        // Nothing reached through a symlink was walked.
+        assert!(
+            m.hide_files
+                .iter()
+                .all(|f| !f.starts_with(home.join("a/to-root"))),
+            "{m:?}"
+        );
     }
 
     #[test]
