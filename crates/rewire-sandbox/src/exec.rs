@@ -524,6 +524,27 @@ fn pending_signal() -> Option<i32> {
     }
 }
 
+/// macOS: a new session (I1). The command has no controlling terminal, so
+/// it cannot open /dev/tty, and it leads a new process group whose pgid is
+/// its pid, exactly as `process_group(0)` gives (the kill and tracking code
+/// relies on pgid == child pid). Linux: its own process group; bwrap's
+/// `--new-session` already detaches the command from the terminal.
+fn start_detached(command: &mut Command) {
+    if cfg!(target_os = "macos") {
+        // SAFETY: setsid is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    } else {
+        command.process_group(0);
+    }
+}
+
 fn spawn_and_wait(
     mut command: Command,
     timeout: Option<Duration>,
@@ -536,19 +557,7 @@ fn spawn_and_wait(
         }
     }
     mask_term_signals(libc::SIG_BLOCK);
-    // SAFETY: setsid is async-signal-safe. A new session (I1): the command
-    // has no controlling terminal, so it cannot open /dev/tty, and it leads
-    // a new process group whose pgid is its pid, exactly as
-    // `process_group(0)` gave before (the kill and tracking code relies on
-    // pgid == child pid).
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    start_detached(&mut command);
     let spawned = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

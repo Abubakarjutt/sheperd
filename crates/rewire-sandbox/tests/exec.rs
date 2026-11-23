@@ -855,8 +855,8 @@ fn exec_sigterm_during_timeout_still_sweeps() {
 
 /// Run `script` under the sandbox with a fresh pty as the sandbox binary's
 /// controlling terminal (as when a user runs rewire in a terminal). `input`
-/// is typed into the terminal first. Returns (stdout, everything the
-/// terminal displayed).
+/// is typed into the terminal first. Returns (stdout plus a trailer line
+/// with the exit code and stderr, everything the terminal displayed).
 fn exec_on_pty(f: &Fixture, script: &str, input: &[u8]) -> (String, String) {
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
@@ -909,7 +909,7 @@ fn exec_on_pty(f: &Fixture, script: &str, input: &[u8]) -> (String, String) {
     }
     let child = c
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     // SAFETY: closing our copy of the slave; the child holds its own.
@@ -931,7 +931,12 @@ fn exec_on_pty(f: &Fixture, script: &str, input: &[u8]) -> (String, String) {
     let out = child.wait_with_output().unwrap();
     let shown = reader.join().unwrap();
     (
-        String::from_utf8_lossy(&out.stdout).into_owned(),
+        format!(
+            "{}\n[exit {:?}] [stderr {}]",
+            String::from_utf8_lossy(&out.stdout),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
         String::from_utf8_lossy(&shown).into_owned(),
     )
 }
@@ -969,6 +974,9 @@ fn exec_cannot_write_or_read_the_users_terminal() {
     );
 }
 
+/// macOS only: on Linux bwrap's `--new-session` detaches the command (its
+/// session leader is bwrap's child inside the pid namespace).
+#[cfg(target_os = "macos")]
 #[test]
 fn exec_command_leads_its_own_session() {
     let f = Fixture::new();
