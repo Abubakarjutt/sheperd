@@ -423,7 +423,10 @@ test("git status calls are scoped away from node_modules and ignored files outsi
 }, 120_000);
 
 test("a runner that dies without a report reaches the retry, then red_check_failed", async () => {
-  const src = `import { test } from "vitest";\nimport { add } from "../src/math.js";\ntest("AC-1: a", () => { add(1, 1); process.kill(process.ppid, "SIGKILL"); process.kill(process.pid, "SIGKILL"); });\ntest("AC-2: b", () => { add(1, 1); });\n`;
+  // One kill of the whole process group (runner, workers, package-manager wrapper) at once:
+  // killing the parent and then itself left a window in which a still-living sibling counted
+  // as an escaped descendant (sandbox_escape, flaky on slow CI runners).
+  const src = `import { test } from "vitest";\nimport { add } from "../src/math.js";\ntest("AC-1: a", () => { add(1, 1); process.kill(0, "SIGKILL"); });\ntest("AC-2: b", () => { add(1, 1); });\n`;
   const { err, provider } = await rejected(twice("test/ac.test.ts", src));
   expect(err.message).toMatch(/runner failed/);
   expect(provider.callCount).toBe(4);
