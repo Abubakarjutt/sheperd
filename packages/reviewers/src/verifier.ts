@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { posix } from "node:path";
 import {
   type Contract,
   type Finding,
@@ -12,7 +13,7 @@ import { type ModelRef, type Provider, structured } from "@rewire/providers";
 import type { SandboxClient } from "@rewire/sandbox";
 import { z } from "zod";
 import { type DiffSummary, unquote } from "./diff.js";
-import { readInsideWorktree } from "./evidence.js";
+import { readInsideWorktree, removedNear } from "./evidence.js";
 import { forcedFindingsFor } from "./framework.js";
 import { wrapUntrusted } from "./untrusted.js";
 
@@ -159,9 +160,21 @@ export async function verifyFindings(findings: Finding[], ctx: VerifyContext): P
       }
       const from = Math.max(1, f.lineStart - CONTEXT_LINES);
       const to = f.lineEnd + CONTEXT_LINES;
+      // I2: a finding about deleted code needs the deleted text to be judged at all.
+      const path = posix.normalize(f.file);
+      const gone = removedNear(
+        ctx.diff.files.find((x) => posix.normalize(x.path) === path)?.removed ?? [],
+        f,
+      );
+      const removedText =
+        gone.length === 0
+          ? ""
+          : `\n(lines this diff removed here, old-side numbers)\n${gone
+              .map((g) => `-${g.oldLine}| ${g.text}`)
+              .join("\n")}`;
       excerpt.set(
         f.id + "\0" + f.file + "\0" + f.lineStart + "\0" + f.lineEnd,
-        numbered(r.text, from, to),
+        numbered(r.text, from, to) + removedText,
       );
     }
     // A forced occurrence found after a clean one still overrides it.

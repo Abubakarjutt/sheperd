@@ -1,6 +1,12 @@
 /** Re-exported from @rewire/core (the one implementation, I9); import it from there. */
 export { redact, SECRET } from "@rewire/core";
-export { buildDiffSummary, type DiffSummary, PATCH_CAP, parseDiff } from "./diff.js";
+export {
+  buildDiffSummary,
+  type DiffSummary,
+  PATCH_CAP,
+  parseDiff,
+  type RemovedLine,
+} from "./diff.js";
 export {
   type Dropped,
   type FilterOptions,

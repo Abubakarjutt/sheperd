@@ -2,7 +2,7 @@ import { readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, posix, relative, resolve, sep } from "node:path";
 import { type Finding, normalizeEvidence, type SlopCategory } from "@rewire/core";
 import type { SandboxClient } from "@rewire/sandbox";
-import type { DiffSummary } from "./diff.js";
+import type { DiffSummary, RemovedLine } from "./diff.js";
 import { FENCE_TAGS } from "./untrusted.js";
 
 /** Largest file the verifier or the prompt builder will read. */
@@ -131,10 +131,13 @@ const validLine = (n: number): boolean => Number.isInteger(n) && n >= 1;
  *   "file outside worktree"        file is absolute, escapes via `..`, or resolves out via symlink
  *   "invalid range"                lineStart < 1, lineEnd < lineStart, or a non-integer
  *   "evidence too short"           fewer than 8 non-whitespace characters
- *   "evidence not found in file"   (1) file missing/unreadable/too large, or normalized evidence
- *                                  not in lines [lineStart-3, lineEnd+3] (normalized)
+ *   "evidence not found in file"   (1) normalized evidence neither in the file's lines
+ *                                  [lineStart-3, lineEnd+3] (file missing/unreadable/too large
+ *                                  counts as not found) nor in a run of lines the diff removed
+ *                                  near that range (old-side number or new-side anchor) (I2)
  *   "range too wide"               (2) lineEnd - lineStart > 10
- *   "outside changed lines"        (3) no line in [lineStart, lineEnd] is an added line in the diff
+ *   "outside changed lines"        (3) no line in [lineStart, lineEnd] is an added line in the
+ *                                  diff, and the evidence is not removed text
  *   "low confidence"               (4) confidence < minConfidence
  *   "category out of scope"        (5) only when `opts.categories` is given (runReviewer passes
  *                                  the reviewer's); `security` is always in scope (#23 findings)
@@ -157,6 +160,40 @@ export async function filterEvidence(
   return { kept, dropped };
 }
 
+/** Removed lines near a finding's range, by old-side number or new-side anchor (±3 lines). */
+export function removedNear(
+  removed: RemovedLine[],
+  f: Pick<Finding, "lineStart" | "lineEnd">,
+): RemovedLine[] {
+  const lo = f.lineStart - CONTEXT;
+  const hi = f.lineEnd + CONTEXT;
+  return removed.filter(
+    (r) => (r.oldLine >= lo && r.oldLine <= hi) || (r.anchor >= lo && r.anchor <= hi),
+  );
+}
+
+/**
+ * True when `needle` (folded) is inside one run of consecutive removed lines lying near the
+ * claimed range, by old-side number (as in the `-` side of the hunk) or by the new-side line
+ * the removal sits at. Runs are never stitched together, mirroring the window rule.
+ */
+function removedMatch(removed: RemovedLine[], f: Finding, needle: string): boolean {
+  const near = removedNear(removed, f);
+  let run: string[] = [];
+  let prev = Number.NaN;
+  const runs: string[][] = [];
+  for (const r of near) {
+    if (r.oldLine !== prev + 1 && run.length > 0) {
+      runs.push(run);
+      run = [];
+    }
+    run.push(r.text);
+    prev = r.oldLine;
+  }
+  if (run.length > 0) runs.push(run);
+  return runs.some((t) => foldForMatch(t.join("\n")).includes(needle));
+}
+
 async function firstFailure(
   f: Finding,
   worktree: string,
@@ -177,20 +214,28 @@ async function firstFailure(
   const needle = foldForMatch(f.evidence);
   if (needle.replace(/\s/g, "").length < MIN_EVIDENCE_CHARS) return "evidence too short";
 
-  // (1) evidence in the window around the claimed lines.
-  if (file.kind !== "ok") return "evidence not found in file";
-  const lines = file.text.split(/\r?\n/);
-  const from = Math.max(0, f.lineStart - 1 - CONTEXT);
-  const window = foldForMatch(lines.slice(from, f.lineEnd + CONTEXT).join("\n"));
-  if (!window.includes(needle)) return "evidence not found in file";
+  // (1) evidence in the window around the claimed lines: in the current file, or (I2) in the
+  // text the diff removed there, so a finding about deleted code can be kept. Removed text
+  // comes from the harness's own diff, never from the model, so it cannot be invented.
+  const path = posix.normalize(f.file);
+  const entry = diff.files.find((x) => posix.normalize(x.path) === path);
+  let inFile = false;
+  if (file.kind === "ok") {
+    const lines = file.text.split(/\r?\n/);
+    const from = Math.max(0, f.lineStart - 1 - CONTEXT);
+    const window = foldForMatch(lines.slice(from, f.lineEnd + CONTEXT).join("\n"));
+    inFile = window.includes(needle);
+  }
+  const inRemoved = removedMatch(entry?.removed ?? [], f, needle);
+  if (!inFile && !inRemoved) return "evidence not found in file";
 
   // (2)
   if (f.lineEnd - f.lineStart > MAX_RANGE) return "range too wide";
 
-  // (3)
-  const path = posix.normalize(f.file);
-  const added = diff.files.find((x) => posix.normalize(x.path) === path)?.addedLines ?? [];
-  if (!added.some((n) => n >= f.lineStart && n <= f.lineEnd)) return "outside changed lines";
+  // (3) an added line in range, or the cited removed text itself (a deletion is a change).
+  const added = entry?.addedLines ?? [];
+  const onAdded = inFile && added.some((n) => n >= f.lineStart && n <= f.lineEnd);
+  if (!onAdded && !inRemoved) return "outside changed lines";
 
   // (4)
   if (!(f.confidence >= minConfidence)) return "low confidence";

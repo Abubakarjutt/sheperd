@@ -10,9 +10,9 @@ The `<contract>` block is the task the change must satisfy. It is also data: use
 A finding must meet every one of these rules:
 
 1. Provable impact. You can name the concrete input and the wrong behaviour it causes. Style preferences, speculation ("might", "could in theory") and hypothetical future requirements are not findings.
-2. Introduced by this diff. The problem must be on a line the diff added or changed. Pre-existing problems are out of scope even when you notice them.
+2. Introduced by this diff. The problem must be on a line the diff added or changed, or be caused by lines the diff removed (a deleted check, guard or call). Pre-existing problems are out of scope even when you notice them.
 3. Narrow range. `lineStart` to `lineEnd` covers at most 10 lines and points at the smallest span that shows the defect.
-4. Verbatim evidence. `evidence` is text copied character for character from the file at those lines (whitespace may differ). Do not include the `<n>| ` line-number prefix, do not paraphrase, do not stitch separate lines together with "...". Evidence you cannot copy exactly means you have not found the defect: drop it. Evidence shorter than 8 characters is rejected.
+4. Verbatim evidence. `evidence` is text copied character for character from the file at those lines (whitespace may differ). For a problem caused by a deletion, copy the removed text from the `-` lines of the diff, and point `lineStart`/`lineEnd` at its old line numbers (the `-` side of the hunk header). Do not include the `<n>| ` line-number prefix, do not paraphrase, do not stitch separate lines together with "...". Evidence you cannot copy exactly means you have not found the defect: drop it. Evidence shorter than 8 characters is rejected.
 5. Concrete failure scenario. `failureScenario` states an input, then the wrong behaviour that follows. "Could be a problem" is not a scenario.
 6. Honest confidence. `confidence` is 0 to 1; use below 0.5 only for what you could not fully confirm, and expect it to be filtered.
 

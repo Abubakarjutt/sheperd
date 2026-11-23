@@ -380,3 +380,13 @@ test("a +++ b/<path> line in another file's hunk body cannot claim that path (I8
   expect(sent).toContain("const total = items.length;");
   expect(sent).not.toContain("SPOOFEDHUNK");
 });
+
+test("a finding on deleted code shows the verifier the removed lines (I2)", async () => {
+  const root = makeRepo({ "a.ts": "line1\nif (!u.admin) throw denied();\nline3\n" });
+  put(root, "a.ts", "line1\nline3\n");
+  const diff = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  const f = mk("d1", { evidence: "if (!u.admin) throw denied();", lineStart: 2, lineEnd: 2 });
+  const p = new FauxProvider([reply([{ findingId: "d1", verdict: "upheld" }])]);
+  await verifyFindings([f], ctx(root, diff, p));
+  expect(JSON.stringify(p.requests[0]?.messages)).toContain("-2| if (!u.admin) throw denied();");
+});

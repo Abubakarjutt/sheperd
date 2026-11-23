@@ -2,8 +2,16 @@ import { checkRef, GateExec } from "@rewire/gates";
 import type { SandboxClient } from "@rewire/sandbox";
 import { readInsideWorktree, resolveInsideWorktree } from "./evidence.js";
 
+/**
+ * A line the diff removed (I2): its old-side number, the new-side line the removal sits at
+ * (`anchor`), and its text. Findings about deleted code anchor here, and their evidence must be
+ * this text, so deleting a guard is reviewable without letting a finding cite invented text.
+ */
+export type RemovedLine = { oldLine: number; anchor: number; text: string };
+
 export type DiffSummary = {
-  files: { path: string; addedLines: number[] }[];
+  /** `removed` is present only when the diff removed lines from the file. */
+  files: { path: string; addedLines: number[]; removed?: RemovedLine[] }[];
   patch: string;
   /** True when `patch` was cut at PATCH_CAP characters (added lines still cover the whole diff). */
   truncated: boolean;
@@ -245,17 +253,26 @@ export function unquote(raw: string): string {
   return Buffer.from(bytes).toString("utf8");
 }
 
-/** Parse `git diff -U0` into per-file added line numbers (new-file numbering). */
+/**
+ * Parse `git diff -U0` into per-file added line numbers (new-file numbering) and removed lines
+ * (old-file numbering, plus the new-side line each removal sits at).
+ */
 export function parseDiff(
   patch: string,
-): { path: string; addedLines: number[]; nulLine?: number }[] {
+): { path: string; addedLines: number[]; removed?: RemovedLine[]; nulLine?: number }[] {
   const out = new Map<string, number[]>();
+  const removedBy = new Map<string, RemovedLine[]>();
   const nul = new Map<string, number>();
   let currentPath = "";
   let current: number[] | undefined;
+  let currentRemoved: RemovedLine[] | undefined;
   let oldLeft = 0;
   let newLeft = 0;
   let nextNew = 0;
+  let nextOld = 0;
+  let hunkNew = 0;
+  let hunkNewCount = 0;
+  let removedInHunk = 0;
   let oldPath = "";
   for (const line of patch.split("\n")) {
     if (oldLeft > 0 || newLeft > 0) {
@@ -264,11 +281,22 @@ export function parseDiff(
         newLeft--;
         if (line.includes("\0") && !nul.has(currentPath)) nul.set(currentPath, nextNew);
         current?.push(nextNew++);
-      } else if (line.startsWith("-")) oldLeft--;
+      } else if (line.startsWith("-")) {
+        oldLeft--;
+        // A pure deletion (`+c,0`) sits after new line c; a replacement maps the k-th removed
+        // line onto the k-th new line of the hunk (clamped to its last).
+        const anchor =
+          hunkNewCount === 0
+            ? Math.max(1, hunkNew)
+            : hunkNew + Math.min(removedInHunk, hunkNewCount - 1);
+        removedInHunk++;
+        currentRemoved?.push({ oldLine: nextOld++, anchor, text: line.slice(1) });
+      }
       continue;
     }
     if (line.startsWith("diff --git ")) {
       current = undefined;
+      currentRemoved = undefined;
       oldPath = "";
     } else if (line.startsWith("--- ")) {
       const p = unquote(line.slice(4));
@@ -280,19 +308,31 @@ export function parseDiff(
         currentPath = path;
         current = out.get(path) ?? [];
         out.set(path, current);
+        currentRemoved = removedBy.get(path) ?? [];
+        removedBy.set(path, currentRemoved);
       }
     } else {
       const m = HUNK.exec(line);
       if (m) {
         oldLeft = m[2] === undefined ? 1 : Number(m[2]);
         newLeft = m[4] === undefined ? 1 : Number(m[4]);
+        nextOld = Number(m[1]);
         nextNew = Number(m[3]);
+        hunkNew = nextNew;
+        hunkNewCount = newLeft;
+        removedInHunk = 0;
       }
     }
   }
   return [...out].map(([path, addedLines]) => {
     const nulLine = nul.get(path);
-    return nulLine === undefined ? { path, addedLines } : { path, addedLines, nulLine };
+    const removed = removedBy.get(path) ?? [];
+    return {
+      path,
+      addedLines,
+      ...(removed.length > 0 ? { removed } : {}),
+      ...(nulLine === undefined ? {} : { nulLine }),
+    };
   });
 }
 
@@ -405,7 +445,11 @@ export async function buildDiffSummary(
     });
   };
   for (const f of parsed) {
-    files.push({ path: f.path, addedLines: f.addedLines });
+    files.push({
+      path: f.path,
+      addedLines: f.addedLines,
+      ...(f.removed ? { removed: f.removed } : {}),
+    });
     if (f.nulLine !== undefined) nulFinding(f.path, f.nulLine);
   }
   // R21c: an asset-named file that is not a real asset but holds a NUL is always forced, even

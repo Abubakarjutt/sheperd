@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Finding } from "@rewire/core";
 import { expect, test } from "vitest";
@@ -771,4 +771,87 @@ test("R23(c): an OpenType 00010000 .otf and empty / spanned zips are assets", as
     expect(d.omitted, f).toContain(`${f} (binary asset)`);
   }
   expect(d.forced).toEqual([]);
+});
+
+// ---- I2: deletion-only changes can carry blocking findings ----
+
+const AUTH = [
+  "export function f(u){",
+  "  if (!u.admin) throw new Error('forbidden');",
+  "  return secretData();",
+  "}",
+  "",
+].join("\n");
+
+/** A repo with AUTH committed, then `edit` applied to the worktree; the real diff summary. */
+async function deletionRepo(edit: (root: string) => void) {
+  const root = makeRepo({ "src/auth.ts": AUTH, "src/other.ts": "export const x = 1;\n" });
+  edit(root);
+  const diff = await buildDiffSummary(root, "HEAD", { client: hostClient() });
+  return { root, diff };
+}
+
+const guard = (over: Partial<Finding> = {}): Finding =>
+  finding({
+    category: "security",
+    severity: 3,
+    file: "src/auth.ts",
+    lineStart: 2,
+    lineEnd: 2,
+    evidence: "if (!u.admin) throw new Error('forbidden');",
+    failureScenario: "the admin check was deleted; any user reaches secretData()",
+    confidence: 0.95,
+    ...over,
+  });
+
+test("a finding citing a deleted guard is kept (the review probe)", async () => {
+  const { root, diff } = await deletionRepo((r) =>
+    put(r, "src/auth.ts", AUTH.replace("  if (!u.admin) throw new Error('forbidden');\n", "")),
+  );
+  expect(diff.files.find((f) => f.path === "src/auth.ts")?.addedLines).toEqual([]);
+  // Old-side numbering (the guard was line 2) ...
+  const r = await filterEvidence([guard()], root, diff, 0.5, { client: hostClient() });
+  expect(r.dropped.map((d) => d.reason)).toEqual([]);
+  expect(r.kept).toHaveLength(1);
+  // ... and new-side numbering (the deletion sits after new line 1) both anchor to it.
+  const n = await filterEvidence([guard({ lineStart: 1, lineEnd: 1 })], root, diff, 0.5, {
+    client: hostClient(),
+  });
+  expect(n.kept).toHaveLength(1);
+});
+
+test("a finding on a wholly deleted file is kept when it cites the removed text", async () => {
+  const { root, diff } = await deletionRepo((r) => rmSync(join(r, "src/auth.ts")));
+  const r = await filterEvidence([guard()], root, diff, 0.5, { client: hostClient() });
+  expect(r.dropped.map((d) => d.reason)).toEqual([]);
+  expect(r.kept).toHaveLength(1);
+});
+
+test("deleted-line evidence stays anti-fabrication: text not removed by the diff is dropped", async () => {
+  const { root, diff } = await deletionRepo((r) =>
+    put(r, "src/auth.ts", AUTH.replace("  if (!u.admin) throw new Error('forbidden');\n", "")),
+  );
+  const bad = await filterEvidence(
+    [
+      // Invented text.
+      guard({ evidence: "if (!u.isRoot) return denyAccess();" }),
+      // Real file text that was not removed (still present, not an added line).
+      guard({ evidence: "return secretData();", lineStart: 2, lineEnd: 2 }),
+      // Removed text, but cited far from where it was removed.
+      guard({ lineStart: 40, lineEnd: 41 }),
+      // Removed text attributed to another file.
+      guard({ file: "src/other.ts", lineStart: 1, lineEnd: 1 }),
+    ],
+    root,
+    diff,
+    0.5,
+    { client: hostClient() },
+  );
+  expect(bad.kept).toEqual([]);
+  expect(bad.dropped.map((d) => d.reason)).toEqual([
+    "evidence not found in file",
+    "outside changed lines",
+    "evidence not found in file",
+    "evidence not found in file",
+  ]);
 });
