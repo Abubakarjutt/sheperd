@@ -60,10 +60,13 @@ export const realRootOf = (ctx: GateContext): Promise<string> => realpath(ctx.wo
  * it back on.
  */
 export const PNPM_NO_INSTALL = "--config.verify-deps-before-run=false";
+/** The same setting as an environment variable, so a pnpm a script runs (`pnpm run lint` whose
+ * script calls `pnpm exec eslint`) inherits it too. */
+export const PNPM_NO_INSTALL_ENV = "pnpm_config_verify_deps_before_run=false";
 export function noInstall(argv: string[]): string[] {
   const [bin, ...rest] = argv;
   if (bin === undefined || basename(bin) !== "pnpm") return argv;
-  return [bin, PNPM_NO_INSTALL, ...rest];
+  return [ENV_BIN, PNPM_NO_INSTALL_ENV, bin, PNPM_NO_INSTALL, ...rest];
 }
 
 /** What GateExec needs: a fixed deadline, or the policy's gate timeout to compute one. */

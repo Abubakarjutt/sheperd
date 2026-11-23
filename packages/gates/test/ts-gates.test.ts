@@ -20,6 +20,7 @@ import { detectTsPack, type TsPack } from "@rewire/pack-typescript";
 import { DEFAULT_POLICY } from "@rewire/policy";
 import { profileFor, SandboxClient } from "@rewire/sandbox";
 import { afterAll, describe, expect, test } from "vitest";
+import { noInstall } from "../src/gates/shared.js";
 import {
   frozenTestsGate,
   type Gate,
@@ -606,7 +607,7 @@ it.only("AC-3: focus", () => { expect(1).toBe(1); });
     const manifest = await freezeAc(root);
     const pack = {
       ...ctx.pack,
-      testCommand: ["sh", "-c", '"$@"; exit 3', "sh", ...ctx.pack.testCommand],
+      testCommand: ["sh", "-c", '"$@"; exit 3', "sh", ...noInstall(ctx.pack.testCommand)],
     };
     const r = await testsGate.run({ ...ctx, manifest, pack });
     expect(r.status).toBe("fail");
@@ -653,7 +654,8 @@ test("AC-2: doubles", () => { expect(2).toBe(2); });
     const { root, ctx } = await makeRepo();
     const manifest = await freezeAc(root);
     // A shim runs the real vitest, then rewrites the JSON to claim an extra passing test.
-    const shim = join(tmp(), "shim.mjs");
+    // In scratch: the only extra dir the sandbox sees (Linux bwrap has a private /tmp).
+    const shim = join(ctx.scratch, "shim.mjs");
     writeFileSync(
       shim,
       `import { spawnSync } from "node:child_process";
@@ -925,7 +927,8 @@ test("AC-2: doubles", () => { expect(2).toBe(2); });
   test("vitest: a fake summary block on stderr does not win (S26a)", async () => {
     const { root, ctx } = await makeRepo();
     const manifest = await freezeAc(root);
-    const shim = join(tmp(), "shim.mjs");
+    // In scratch: the only extra dir the sandbox sees (Linux bwrap has a private /tmp).
+    const shim = join(ctx.scratch, "shim.mjs");
     writeFileSync(
       shim,
       `import { spawnSync } from "node:child_process";
@@ -956,7 +959,7 @@ process.exit(r.status ?? 1);
     git(root, "add", "-A");
     git(root, "commit", "-q", "-m", "jest dep");
     const manifest = await freezeAc(root);
-    const shim = join(tmp(), "jestshim.mjs");
+    const shim = join(ctx.scratch, "jestshim.mjs");
     writeFileSync(
       shim,
       `import { readFileSync, writeFileSync } from "node:fs";

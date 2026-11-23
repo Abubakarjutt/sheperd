@@ -27,9 +27,10 @@ describe("GateExec never lets pnpm install dependencies", () => {
     await g.exec(["pnpm", "exec", "vitest", "run"]);
     await g.exec(["/opt/bin/pnpm", "run", "lint"]);
     await g.exec(["node", "-e", "0"]);
+    const env = ["/usr/bin/env", "pnpm_config_verify_deps_before_run=false"];
     expect(calls).toEqual([
-      ["pnpm", "--config.verify-deps-before-run=false", "exec", "vitest", "run"],
-      ["/opt/bin/pnpm", "--config.verify-deps-before-run=false", "run", "lint"],
+      [...env, "pnpm", "--config.verify-deps-before-run=false", "exec", "vitest", "run"],
+      [...env, "/opt/bin/pnpm", "--config.verify-deps-before-run=false", "run", "lint"],
       ["node", "-e", "0"],
     ]);
   });
@@ -38,7 +39,12 @@ describe("GateExec never lets pnpm install dependencies", () => {
     const root = tmp();
     writeFileSync(
       join(root, "package.json"),
-      JSON.stringify({ name: "x", private: true, dependencies: { "is-number": "7.0.0" } }),
+      JSON.stringify({
+        name: "x",
+        private: true,
+        dependencies: { "is-number": "7.0.0" },
+        scripts: { nested: "pnpm exec node -e \"process.stdout.write('ran-nested')\"" },
+      }),
     );
     writeFileSync(join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
     const client = new RealClient(profileFor("verify", root, DEFAULT_POLICY, tmp()));
@@ -48,6 +54,12 @@ describe("GateExec never lets pnpm install dependencies", () => {
       expect(r.stdout).toBe("ran");
       expect(r.stderr).not.toMatch(/install/i);
       expect(r.exitCode).toBe(0);
+      expect(existsSync(join(root, "node_modules"))).toBe(false);
+      // A pnpm started by a script inherits the setting (a lint script calling pnpm again).
+      const n = await g.exec(["pnpm", "run", "nested"]);
+      expect(n.stdout).toContain("ran-nested");
+      expect(n.stderr).not.toMatch(/install/i);
+      expect(n.exitCode).toBe(0);
       expect(existsSync(join(root, "node_modules"))).toBe(false);
     } finally {
       client.dispose();
