@@ -41,3 +41,33 @@ test("failing self-test is rejected", async () => {
     ),
   ).rejects.toMatchObject({ code: "policy_selftest_failed" });
 });
+test("a repo policy raising reviewerMinConfidence is policy_loosening (R39)", async () => {
+  await expect(loadPolicy(await repoWith("reviewerMinConfidence = 1"))).rejects.toMatchObject({
+    code: "policy_loosening",
+  });
+});
+test("malformed TOML is policy_invalid (row 3)", async () => {
+  await expect(loadPolicy(await repoWith("gates = [\n"))).rejects.toMatchObject({
+    code: "policy_invalid",
+  });
+});
+test("numeric guards: non-positive, non-integer and out-of-range values are policy_invalid (row 3)", async () => {
+  for (const toml of [
+    "maxFixRounds = 0",
+    "maxFixRounds = 1.5",
+    "noProgressRounds = -1",
+    "gateTimeoutMs = 0",
+    "reviewerMinConfidence = 1.5",
+    "reviewerMinConfidence = -0.1",
+    'maxFixRounds = "3"',
+  ]) {
+    await expect(loadPolicy(await repoWith(toml)), toml).rejects.toMatchObject({
+      code: "policy_invalid",
+    });
+  }
+});
+test("unknown key is rejected with policy_invalid", async () => {
+  await expect(loadPolicy(await repoWith("maxFixRound = 3"))).rejects.toMatchObject({
+    code: "policy_invalid",
+  });
+});

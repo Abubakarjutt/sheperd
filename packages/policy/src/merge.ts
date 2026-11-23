@@ -8,7 +8,10 @@ function loosening(field: string, why: string): RewireError {
   return new RewireError("policy_loosening", `policy_loosening: ${field} ${why}`);
 }
 
-/** Overlay may only tighten the base: supersets, higher confidence, lower limits, appended rules. */
+/**
+ * Overlay may only tighten the base: supersets, lower limits, a lower reviewer confidence
+ * threshold (findings below it are dropped, so lower keeps more), appended rules.
+ */
 export function mergeTightenOnly(base: Policy, overlay: Partial<Policy>): Policy {
   const out: Policy = structuredClone(base);
 
@@ -21,12 +24,14 @@ export function mergeTightenOnly(base: Policy, overlay: Partial<Policy>): Policy
     out[f] = [...new Set([...base[f], ...v])];
   }
 
+  // R39: lower-only with a floor of 0; raising it drops more findings, which loosens review.
   const conf = overlay.reviewerMinConfidence;
   if (conf !== undefined) {
-    if (conf < base.reviewerMinConfidence)
+    if (!(conf >= 0)) throw loosening("reviewerMinConfidence", `must be at least 0 (got ${conf})`);
+    if (conf > base.reviewerMinConfidence)
       throw loosening(
         "reviewerMinConfidence",
-        `may not be lowered below ${base.reviewerMinConfidence}`,
+        `may not be raised above ${base.reviewerMinConfidence} (a higher threshold drops more findings)`,
       );
     out.reviewerMinConfidence = conf;
   }

@@ -75,7 +75,16 @@ export const CONFIG_FILE_GLOBS: readonly string[] = [
   "**/mise/conf.d/**",
 ];
 
-export const DEFAULT_POLICY: Policy = {
+function deepFreeze<T>(v: T): T {
+  if (typeof v === "object" && v !== null && !Object.isFrozen(v)) {
+    Object.freeze(v);
+    for (const x of Object.values(v)) deepFreeze(x);
+  }
+  return v;
+}
+
+/** Deep-frozen: callers that need a mutable policy take a `structuredClone` (row 5). */
+export const DEFAULT_POLICY: Policy = deepFreeze({
   testGlobs: [
     "**/*.{test,spec}.{ts,tsx,mts,cts,js,jsx,mjs,cjs}",
     "**/__tests__/**",
@@ -102,6 +111,21 @@ export const DEFAULT_POLICY: Policy = {
     "~/.npmrc",
     "**/.env*",
     "~/Library/Keychains/**",
+    // I10: other credential stores an agent could read and send to a provider.
+    "~/.git-credentials",
+    "~/.docker/config.json",
+    "~/.kube/**",
+    "~/.config/gcloud/**",
+    "~/.azure/**",
+    "~/.gnupg/**",
+    "~/.pypirc",
+    "~/.config/rewire/**",
+    // Private-key PEMs by name only: a blanket `**/*.pem` also denies CA bundles such as
+    // /etc/ssl/cert.pem, and semgrep (and any TLS client) then fails in every gate.
+    "**/*key*.pem",
+    "**/*.key",
+    "**/id_rsa*",
+    "**/id_ed25519*",
   ],
   gates: ["frozen-tests", "tsc", "lint", "tests", "semgrep", "gitleaks", "audit"],
   reviewerMinConfidence: 0.5,
@@ -109,4 +133,4 @@ export const DEFAULT_POLICY: Policy = {
   noProgressRounds: 2,
   gateTimeoutMs: 300000,
   commandRules: [],
-};
+});
