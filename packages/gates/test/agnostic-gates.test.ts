@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -140,6 +141,65 @@ describe("semgrep gate", () => {
     const { root, ctx } = makeRepo();
     write(root, "a.js", "export const f = (req) => eval(req.body.x); // nosemgrep\n");
     expect((await semgrepGate.run(ctx)).status).toBe("fail");
+  });
+
+  test("a usercustomize planted in scratch by sandboxed code cannot forge a pass (C1)", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "evil.js", "export function f(x) { return eval(x); }\n");
+    // What code under test (tests gate) or a lint plugin could do in the same scratch: plant a
+    // Python user-site hook under every HOME semgrep has used, printing a clean report.
+    const py = [
+      "import sys,json,os",
+      'if "scan" in sys.argv:',
+      '    f = sys.argv[sys.argv.index("--")+1:]',
+      '    sys.stdout.write(json.dumps({"results":[],"errors":[],"paths":{"scanned":f}})); sys.stdout.flush(); os._exit(0)',
+      "",
+    ].join("\n");
+    const sh = [
+      "for v in 3.9 3.10 3.11 3.12 3.13 3.14 3.15; do",
+      '  for d in "$0/semgrep-home/Library/Python/$v/lib/python/site-packages" "$0/semgrep-home/.local/lib/python$v/site-packages"; do',
+      '    mkdir -p "$d" && printf "%s" "$1" > "$d/usercustomize.py" || exit 9',
+      "  done",
+      "done",
+    ].join("\n");
+    const plant = await ctx.client.exec(["/bin/sh", "-c", sh, ctx.scratch, py], {
+      timeoutMs: 20_000,
+      cwd: root,
+    });
+    expect(plant.exitCode).toBe(0);
+    const r = await semgrepGate.run(ctx);
+    expect(r.status, r.summary).toBe("fail");
+    expect(JSON.stringify(r.details)).toContain("evil.js");
+  });
+
+  test("semgrep runs with a fresh random HOME and Python user site, path and env hooks off (C1)", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "src/ok.js", "export const add = (a, b) => a + b;\n");
+    const real = ctx.client;
+    const scans: string[][] = [];
+    const client = {
+      exec: (argv: string[], opts: unknown) => {
+        if (argv.includes("scan")) scans.push(argv);
+        return real.exec(argv, opts as Parameters<SandboxClient["exec"]>[1]);
+      },
+    } as unknown as SandboxClient;
+    expect((await semgrepGate.run({ ...ctx, client })).status).toBe("pass");
+    expect((await semgrepGate.run({ ...ctx, client })).status).toBe("pass");
+    expect(scans.length).toBeGreaterThanOrEqual(2);
+    const homes = scans.map((a) => a.find((x) => x.startsWith("HOME="))?.slice(5) ?? "");
+    for (const [i, argv] of scans.entries()) {
+      const home = homes[i] ?? "";
+      expect(home.startsWith(`${ctx.scratch}/`)).toBe(true);
+      expect(home).not.toBe(join(ctx.scratch, "semgrep-home"));
+      expect(argv).toContain("PYTHONNOUSERSITE=1");
+      expect(argv).toContain("PYTHONSAFEPATH=1");
+      for (const v of ["PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"]) {
+        expect(argv.join("\0")).toContain(`-u\0${v}`);
+      }
+    }
+    // A new HOME per gate run, removed afterwards.
+    expect(new Set(homes).size).toBeGreaterThanOrEqual(2);
+    for (const h of homes) expect(existsSync(h)).toBe(false);
   });
 
   test("a filename starting with -- is not interpreted as an option", async () => {

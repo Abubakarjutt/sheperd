@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
@@ -35,6 +35,27 @@ const CA_BUNDLES = [
   "/etc/pki/tls/certs/ca-bundle.crt",
   "/opt/homebrew/etc/ca-certificates/cert.pem",
 ];
+/**
+ * Python start-up hooks semgrep's interpreter would otherwise honour (C1). The sandbox already
+ * drops every PYTHON* variable (env allowlist); unsetting them again here keeps the gate safe
+ * if that list ever grows. User site-packages (usercustomize, .pth) and the script-dir
+ * sys.path entry are switched off: together with the scrub this is `python -I` for a console
+ * script, which cannot take interpreter flags.
+ */
+const PYTHON_UNSET = [
+  "PYTHONPATH",
+  "PYTHONHOME",
+  "PYTHONSTARTUP",
+  "PYTHONUSERBASE",
+  "PYTHONINSPECT",
+  "PYTHONEXECUTABLE",
+  "PYTHONPYCACHEPREFIX",
+  "PYTHONBREAKPOINT",
+  "PYTHONWARNINGS",
+  "PYTHONPLATLIBDIR",
+] as const;
+const PYTHON_HARDEN = ["PYTHONNOUSERSITE=1", "PYTHONSAFEPATH=1", "PYTHONDONTWRITEBYTECODE=1"];
+
 const caBundleEnv = (): string[] => {
   const f = CA_BUNDLES.find((p) => existsSync(p));
   return f ? [`SSL_CERT_FILE=${f}`] : [];
@@ -277,10 +298,13 @@ export const semgrepGate: Gate = {
     }
     const changed = new Set(files);
 
-    const home = join(ctx.scratch, "semgrep-home");
-    const dirs = [home, join(home, ".config"), join(home, ".cache"), join(home, "tmp")];
+    // C1: a fresh, unpredictable HOME per run, created here (mkdtemp is exclusive, so nothing an
+    // earlier sandboxed command wrote can already be in it) and removed when the scan ends.
+    let home: string;
     try {
-      for (const d of dirs) await mkdir(d, { recursive: true, mode: 0o700 });
+      home = await mkdtemp(join(ctx.scratch, "semgrep-home-"));
+      await chmod(home, 0o700);
+      for (const d of [".config", ".cache", "tmp"]) await mkdir(join(home, d), { mode: 0o700 });
     } catch (e) {
       return err(`cannot prepare semgrep scratch: ${errMsg(e)}`, base);
     }
@@ -314,6 +338,8 @@ export const semgrepGate: Gate = {
       for (const { chunk, unknown } of jobs) {
         const r = await g.exec([
           ENV_BIN,
+          ...PYTHON_UNSET.flatMap((v) => ["-u", v]),
+          ...PYTHON_HARDEN,
           `HOME=${home}`,
           `XDG_CONFIG_HOME=${join(home, ".config")}`,
           `XDG_CACHE_HOME=${join(home, ".cache")}`,
@@ -391,6 +417,8 @@ export const semgrepGate: Gate = {
       return (
         missingBinaryOutput(e, "semgrep", NET) ?? err(`semgrep failed to run: ${errMsg(e)}`, base)
       );
+    } finally {
+      await rm(home, { recursive: true, force: true }).catch(() => {});
     }
 
     const unscanned = [...problemFiles.entries()]

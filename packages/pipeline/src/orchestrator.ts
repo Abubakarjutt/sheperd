@@ -894,54 +894,70 @@ async function runAllGates(
     }
     return results;
   }
-  const scratch = await realpath(await mkdtemp(join(tmpdir(), "rewire-gates-")));
-  const owned: SandboxClient[] = [];
-  try {
-    const mk = (stage: "verify" | "verify-registry" | "implementer"): SandboxClient => {
-      const c = ctx.build(profileFor(stage, a.worktree, policy, scratch));
-      owned.push(c);
-      return c;
+  // C1: every gate gets its own fresh scratch dir (and clients whose only writable extra dir is
+  // that scratch), created when the gate starts and removed when it ends. Code that runs inside
+  // one gate (lint plugins, code under test) can then never plant files a later gate reads, e.g.
+  // a Python usercustomize under semgrep's HOME.
+  const results: GateResult[] = [];
+  for (const gate of gates) {
+    const runner = async (scratch: string): Promise<GateResult[]> => {
+      const owned: SandboxClient[] = [];
+      try {
+        const mk = (stage: "verify" | "verify-registry" | "implementer"): SandboxClient => {
+          const c = ctx.build(profileFor(stage, a.worktree, policy, scratch));
+          owned.push(c);
+          return c;
+        };
+        const gctx: GateContext = {
+          worktree: a.worktree,
+          baseRef: a.head,
+          client: mk("verify"),
+          // The audit gate's network exception gets its own client (T15 carry-in).
+          registryClient: mk("verify-registry"),
+          // checkPath only (R37): which touched paths the implementer profile denies.
+          implementerClient: mk("implementer"),
+          pack: a.pack,
+          policy,
+          manifest: a.manifest,
+          contract: a.contract,
+          scratch,
+          runId: ctx.runId,
+          stage: "gates",
+          ...(signal ? { signal } : {}),
+        };
+        return await runGates([gate], gctx, ctx.log.emit);
+      } finally {
+        for (const c of owned) {
+          try {
+            c.dispose();
+          } catch {
+            // keep disposing
+          }
+        }
+      }
     };
-    const gctx: GateContext = {
-      worktree: a.worktree,
-      baseRef: a.head,
-      client: mk("verify"),
-      // The audit gate's network exception gets its own client (T15 carry-in).
-      registryClient: mk("verify-registry"),
-      // checkPath only (R37): which touched paths the implementer profile denies.
-      implementerClient: mk("implementer"),
-      pack: a.pack,
-      policy,
-      manifest: a.manifest,
-      contract: a.contract,
-      scratch,
-      runId: ctx.runId,
-      stage: "gates",
-      ...(signal ? { signal } : {}),
-    };
+    let scratch: string | undefined;
     try {
-      return await runGates(gates, gctx, ctx.log.emit);
+      scratch = await realpath(
+        await mkdtemp(join(tmpdir(), `rewire-gate-${gate.name.replace(/[^a-z0-9-]/gi, "_")}-`)),
+      );
+      results.push(...(await runner(scratch)));
     } catch (e) {
       // runGates records per-gate throws itself; anything escaping it still fails closed.
-      return gates.map((g) => ({
-        gate: g.name,
-        category: g.category,
+      results.push({
+        gate: gate.name,
+        category: gate.category,
         status: "error" as const,
         summary: `gate runner failed: ${errText(e)}`,
         details: null,
         durationMs: 0,
-      }));
+      });
+    } finally {
+      if (scratch !== undefined)
+        await rm(scratch, { recursive: true, force: true }).catch(() => {});
     }
-  } finally {
-    for (const c of owned) {
-      try {
-        c.dispose();
-      } catch {
-        // keep disposing
-      }
-    }
-    await rm(scratch, { recursive: true, force: true }).catch(() => {});
   }
+  return results;
 }
 
 /**

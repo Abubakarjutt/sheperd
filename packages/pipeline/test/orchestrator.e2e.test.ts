@@ -492,6 +492,53 @@ describe.skipIf(!sandboxAvailable)(
       expect(seen).toEqual([{ client: "deny", registry: "registry" }]);
     });
 
+    test("every gate gets its own fresh scratch dir; nothing an earlier gate wrote is visible (C1)", async () => {
+      const seen: Array<{ gate: string; scratch: string; entries: string[]; write: string[] }> = [];
+      const extraWrite = (c: SandboxClient): string[] =>
+        (JSON.parse(readFileSync(c.profilePath, "utf8")) as CapabilityProfile).extraWrite;
+      const gates = Object.fromEntries(
+        DEFAULT_POLICY.gates.map((n) => [
+          n,
+          {
+            name: n,
+            category: "broken" as const,
+            async run(ctx: GateContext) {
+              seen.push({
+                gate: n,
+                scratch: ctx.scratch,
+                entries: readdirSync(ctx.scratch),
+                write: extraWrite(ctx.client),
+              });
+              // What code under test can do: plant files in the (writable) scratch.
+              await ctx.client.exec(
+                [
+                  "/bin/sh",
+                  "-c",
+                  'mkdir -p "$0/semgrep-home" && echo x > "$0/planted"',
+                  ctx.scratch,
+                ],
+                { timeoutMs: 20_000, cwd: ctx.worktree },
+              );
+              return { status: "pass" as const, summary: "stubbed", details: null };
+            },
+          },
+        ]),
+      );
+      const { outcome } = await run(
+        { impl: implementer(() => [["src/sum.ts", GOOD_SUM]]) },
+        { seams: { gates } },
+      );
+      expect(outcome.status).toBe("verified");
+      const ran = seen.filter((s) => DEFAULT_POLICY.gates.includes(s.gate));
+      expect(ran.length).toBeGreaterThanOrEqual(DEFAULT_POLICY.gates.length);
+      for (const s of ran) {
+        expect(s.entries, `${s.gate} saw an earlier gate's files`).toEqual([]);
+        expect(s.write).toEqual([s.scratch]);
+        expect(existsSync(s.scratch), `${s.gate} scratch was not removed`).toBe(false);
+      }
+      expect(new Set(ran.map((s) => s.scratch)).size).toBe(ran.length);
+    });
+
     const passAll = (): Record<string, Gate> =>
       Object.fromEntries(
         DEFAULT_POLICY.gates.map((n) => [
