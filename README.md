@@ -32,6 +32,31 @@ lists what must hold on a live run before v0.1 is called released.
 
 ## Install
 
+### Install from npm
+
+rewire is published to npm as the package **`sheperd`** (pre-release, on the `next` tag). The
+command it installs is `rewire`:
+
+```sh
+npm i -g sheperd@next
+rewire doctor
+```
+
+The package carries the CLI as one bundled file plus a prebuilt `rewire-sandbox` for your
+platform, which npm installs automatically as an optional dependency
+(`sheperd-darwin-arm64`, `sheperd-darwin-x64`, `sheperd-linux-x64` or `sheperd-linux-arm64`).
+Supported platforms: macOS on Apple silicon or Intel, and Linux on x64 or arm64 (glibc).
+Windows is not supported. If your npm install skips optional dependencies
+(`--omit=optional`, `--no-optional`), the sandbox binary is missing and `rewire doctor` says so.
+
+You still need these system tools on `PATH`: git,
+[ripgrep](https://github.com/BurntSushi/ripgrep), [semgrep](https://semgrep.dev),
+[gitleaks](https://github.com/gitleaks/gitleaks), and on Linux
+[bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer. macOS uses the built-in
+`sandbox-exec`. See the per-OS install commands below.
+
+### Build from source
+
 Requirements: git, Node.js 22+, pnpm, a Rust toolchain (to build the sandbox helper),
 [ripgrep](https://github.com/BurntSushi/ripgrep), [semgrep](https://semgrep.dev),
 [gitleaks](https://github.com/gitleaks/gitleaks), and on Linux
@@ -65,10 +90,17 @@ pnpm -r build
 alias rewire='node '"$PWD"'/packages/cli/dist/main.js'
 ```
 
-The CLI looks for the sandbox binary in this order: `REWIRE_SANDBOX_BIN`; the newer of
-`target/release/` and `target/debug/` in the checkout; the first absolute `PATH` entry that has
-`rewire-sandbox`. `rewire doctor` reports exactly this lookup, and a run that cannot find the
-binary stops in preflight, before any model call.
+The CLI looks for the sandbox binary in this order:
+
+1. `REWIRE_SANDBOX_BIN` (a missing file is an error, never a fall-through);
+2. the newer of `target/release/` and `target/debug/` in the checkout (source builds only; the npm
+   package never looks for a checkout);
+3. the installed `sheperd-<os>-<arch>` package (an installed package whose binary is missing, not
+   executable, or of a different version than the CLI is an error, never a fall-through);
+4. the first absolute `PATH` entry that has `rewire-sandbox`.
+
+`rewire doctor` reports exactly this lookup, including which step found the binary, and a run
+that cannot find the binary stops in preflight, before any model call.
 
 ## `rewire doctor`
 
