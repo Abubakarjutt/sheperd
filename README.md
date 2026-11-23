@@ -180,6 +180,19 @@ pnpm bench            # runs the tasks against real models: costs money
 See [`bench/README.md`](bench/README.md). **No live run has been made yet**; the release checklist
 defines what a first run must show.
 
+## Behaviour changes in this release
+
+- Leftover processes fail the command on Linux too: a command that leaves a child running more than
+  300 ms after it exits (a server a test suite never closes, slow workers) now fails as a sandbox
+  escape (`sandbox_escape`), matching macOS. Test suites that relied on this passing on Linux need
+  to close what they start.
+- More home files are unreadable inside the sandbox: shell start-up, history and backup files
+  (`~/.zshrc*`, `~/.zshenv*`, `~/.zprofile*`, `~/.bashrc*`, `~/.bash_profile*`, `~/.profile*`, the
+  histories and `~/.zsh_sessions/`), `~/.claude*`, `~/.codex/`, `~/.gemini/`, `~/.mcp.json*`,
+  `~/.cursor/mcp.json`, `~/.config/openai/`, `~/.ollama/id_*`, and `.env*` files outside the
+  worktree. A zsh or login shell run inside the sandbox therefore does not see what those files
+  set; PATH still comes from the host environment.
+
 ## Known v0.1 limitations
 
 These are rendered into every evidence report (the first list) or are known gaps in the harness.
@@ -198,8 +211,9 @@ Stated in every report (this list is checked against the pipeline's `KNOWN_LIMIT
   creates does not survive between gate runs.
 - Host PATH passed through the sandbox.
 - Credential read-deny is a deny-list, not an allow-list: listed secret files (ssh, cloud and
-  registry credentials, shell rc and history files, ~/.claude*, .env files in the worktree, the
-  run's repo and up to three directories below HOME) are unreadable, but the rest of HOME, other
+  registry credentials, shell rc, history and backup files, ~/.claude*, other agent CLIs'
+  credentials and MCP configs, .env files in the worktree, the run's repo and up to three
+  directories below HOME) are unreadable, but the rest of HOME, other
   repositories and system files stay readable by every stage, so a secret stored elsewhere can be
   read and sent to a model provider.
 - Dependency installs are not harness-mediated in v0.1: the gates run against the dependencies
@@ -218,6 +232,9 @@ Stated in every report (this list is checked against the pipeline's `KNOWN_LIMIT
   profile); a nested .git created after the sandbox starts fails the protected-paths gate and the
   gated-tree snapshot refuses it as a new gitlink, so it is never committed; case-variant spellings
   are caught by the path layer and the gates, not the OS.
+- Linux escape reporting is best-effort: a command that kills the in-namespace reaper (kill -9 -1,
+  which ends the exec with 137) or ptraces it (Yama ptrace_scope 0) avoids the escape label; the
+  leftover is still killed when the pid namespace is torn down.
 - On macOS, a process that detaches from the sandbox faster than one poll interval can outlive its
   stage; a worktree change it makes after the last gate run fails the final tree-equality check, but
   the process itself may keep running.
