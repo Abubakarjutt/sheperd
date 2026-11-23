@@ -684,10 +684,10 @@ int main(int argc, char **argv) {
         // documented in KNOWN_LIMITATIONS): a link that forks and exits
         // faster than a sweep's list-then-check is gone before it is checked
         // and its child was not listed, so under load a sweep can come back
-        // empty while the chain lives (seen about 1 run in 10 on CI and
-        // locally under a parallel test load). The guarantees asserted: a
-        // reported run always fails closed with the escape named, and the
-        // sweep reports and kills the chain in most runs (regression guard).
+        // empty while the chain lives (about 1-2% of runs, measured). The
+        // guarantees asserted: a reported run always fails closed with the
+        // escape named, and the sweep reports and kills the chain in nearly
+        // every run (limits below).
         if code(&a) == INTERNAL {
             assert!(
                 stderr(&a).contains("sandbox: escaped descendant "),
@@ -706,11 +706,17 @@ int main(int argc, char **argv) {
             eprintln!("run {i}: hopping chain outlived the sweep (R8)");
         }
     }
+    // Limits from a measurement of 180 runs (6 x 30, two under full CPU
+    // load): about 1.1% unreported and 2.2% surviving, the same order as
+    // before the settle change. With 10 runs, P(>= 2 unreported) is about
+    // 0.5% and P(>= 3 surviving) about 0.1%, so CI noise rarely trips them,
+    // while a regression to a 25% miss rate fails about 3 runs in 4 and to
+    // 50% about 99 in 100.
     assert!(
-        missed <= 3,
+        missed <= 1,
         "the chain went unreported in {missed} of 10 runs"
     );
-    assert!(survived <= 5, "the chain survived {survived} of 10 runs");
+    assert!(survived <= 2, "the chain survived {survived} of 10 runs");
 }
 
 /// S10: the pinned bind-source fds (Linux) and every internal fd must not
