@@ -10,12 +10,14 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RunEvent } from "@rewire/core";
-import { sandboxAvailable as sandboxIsAvailable } from "@rewire/sandbox";
+import { platformPackageName, sandboxAvailable as sandboxIsAvailable } from "@rewire/sandbox";
 import { afterAll, afterEach, describe, expect, test } from "vitest";
+import { runDoctor } from "../src/doctor.js";
 import { exitCodeFor } from "../src/exit.js";
 import { loadFauxScript } from "../src/faux.js";
 import { discoverModels } from "../src/models.js";
@@ -417,6 +419,39 @@ describe("process", () => {
     expect(r.stdout).toMatch(/✗ semgrep.*brew install semgrep/);
     expect(r.stdout).toMatch(/✓ git/);
     expect(r.stdout).toMatch(/✓ rg/);
+  });
+
+  // I1: doctor reports the run's own lookup, including where the binary came from.
+  test("doctor names the source of the sandbox binary (REWIRE_SANDBOX_BIN)", async () => {
+    const d = tmp();
+    const bin = join(d, "rewire-sandbox");
+    writeFileSync(bin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const r = await exec(["doctor"], cleanEnv({ PATH: d, REWIRE_SANDBOX_BIN: bin }));
+    expect(r.stdout).toContain(`✓ rewire-sandbox ${bin} (REWIRE_SANDBOX_BIN)`);
+  });
+
+  test("doctor reports a binary from the installed platform package", async () => {
+    const root = tmp();
+    const name = platformPackageName(process.platform, process.arch) ?? "sheperd-linux-x64";
+    const pkg = join(root, "node_modules", name);
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ name, version: "0.1.0-beta.1" }));
+    writeFileSync(join(pkg, "rewire-sandbox"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const out: string[] = [];
+    await runDoctor(undefined, "darwin", {
+      stdout: { write: (s: string) => out.push(s) } as unknown as NodeJS.WritableStream,
+      env: { PATH: "" },
+      cwd: root,
+      sandboxLookup: {
+        sourceRoot: null,
+        resolvePackage: createRequire(join(root, "cli.js")).resolve,
+        platform: process.platform === "linux" ? "linux" : "darwin",
+        arch: name.endsWith("arm64") ? "arm64" : "x64",
+      },
+    } as Parameters<typeof runDoctor>[2]);
+    expect(out.join("")).toContain(
+      `✓ rewire-sandbox ${join(pkg, "rewire-sandbox")} (platform package ${name})`,
+    );
   });
 
   test("unknown flag prints usage and message without a stack", async () => {

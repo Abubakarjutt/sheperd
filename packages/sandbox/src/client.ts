@@ -4,15 +4,17 @@ import {
   constants,
   existsSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { RewireError } from "@rewire/core";
+import { BUNDLE_VERSION, RewireError } from "@rewire/core";
 import type { CapabilityProfile } from "./profiles.js";
 
 export type CheckResult = { allowed: true } | { allowed: false; canonical: string; rule: string };
@@ -30,6 +32,9 @@ const EXIT_NOT_FOUND = 127;
 
 /** The rewire source checkout (not the target repo): nearest ancestor with Cargo.toml and pnpm-workspace.yaml. */
 function rewireRepoRoot(): string | undefined {
+  // The npm bundle is never a checkout: walking up from node_modules could land in whatever
+  // Rust + pnpm repo sheperd happens to be installed in, and take its target/ binary.
+  if (BUNDLE_VERSION !== undefined) return undefined;
   let dir = dirname(fileURLToPath(import.meta.url));
   for (;;) {
     if (existsSync(join(dir, "Cargo.toml")) && existsSync(join(dir, "pnpm-workspace.yaml"))) {
@@ -52,24 +57,91 @@ function executableFile(p: string): { mtimeMs: number } | undefined {
   }
 }
 
+/** The npm platform packages that carry a prebuilt binary, keyed `<platform>-<arch>`. */
+const PLATFORM_PACKAGES = new Set(["darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64"]);
+
+/** `sheperd-<platform>-<arch>`, or undefined when no prebuilt binary is published for the host. */
+export function platformPackageName(platform: string, arch: string): string | undefined {
+  const key = `${platform}-${arch}`;
+  return PLATFORM_PACKAGES.has(key) ? `sheperd-${key}` : undefined;
+}
+
 export type FindBinaryOptions = {
   /** Default `process.env` (REWIRE_SANDBOX_BIN, PATH). */
   env?: NodeJS.ProcessEnv;
   /** The rewire source checkout to look in; `null` skips it. Default: found from this module. */
   sourceRoot?: string | null;
+  /**
+   * Resolves `<name>/package.json` to an absolute path, or throws when it is not installed.
+   * Default: `require.resolve` from this module, i.e. from the installed sheperd package. `null`
+   * skips the platform package.
+   */
+  resolvePackage?: ((specifier: string) => string) | null;
+  /** Default `process.platform` / `process.arch`. */
+  platform?: string;
+  arch?: string;
+  /** The version the platform package must have. Default: the bundle's own version, if any. */
+  expectedVersion?: string;
 };
 
+export type SandboxBinarySource = "env" | "checkout" | "platform-package" | "path";
+export type SandboxBinary = { path: string; source: SandboxBinarySource; detail?: string };
+
+const notInstalled = (e: unknown): boolean =>
+  e instanceof Error && (e as NodeJS.ErrnoException).code === "MODULE_NOT_FOUND";
+
 /**
- * The rewire-sandbox binary, in this order: `REWIRE_SANDBOX_BIN` (a missing file is an error,
- * never a fall-through); the newer of `target/release` and `target/debug` in the rewire source
- * checkout; the first absolute PATH entry that has it (relative entries are skipped, #25).
- * `rewire doctor` reports exactly this lookup, and the pipeline calls it in preflight (I1).
+ * The installed `sheperd-<platform>-<arch>` package's binary, or undefined when that package is
+ * not installed. An installed package that cannot supply a usable binary throws (#22): a broken
+ * or mismatched install never falls through to whatever is on PATH.
  */
-export function findSandboxBinary(opts: FindBinaryOptions = {}): string {
+function platformPackageBinary(
+  name: string,
+  resolvePackage: (specifier: string) => string,
+  expectedVersion: string | undefined,
+): string | undefined {
+  const broken = (why: string) =>
+    new RewireError(
+      "binary_missing",
+      `the installed ${name} package ${why}`,
+      `reinstall sheperd (npm i -g sheperd@${expectedVersion ?? "next"}) or set REWIRE_SANDBOX_BIN`,
+    );
+  let manifest: string;
+  try {
+    manifest = resolvePackage(`${name}/package.json`);
+  } catch (e) {
+    if (notInstalled(e)) return undefined;
+    throw broken(`cannot be resolved: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (!isAbsolute(manifest)) throw broken(`resolved to a relative path: ${manifest}`);
+  if (expectedVersion !== undefined) {
+    let version: unknown;
+    try {
+      version = (JSON.parse(readFileSync(manifest, "utf8")) as { version?: unknown }).version;
+    } catch (e) {
+      throw broken(`has an unreadable package.json: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (version !== expectedVersion) {
+      throw broken(`is version ${String(version)}, but sheperd is ${expectedVersion}`);
+    }
+  }
+  const bin = join(dirname(manifest), "rewire-sandbox");
+  if (!executableFile(bin)) throw broken(`has no executable regular file at ${bin}`);
+  return bin;
+}
+
+/**
+ * Where the rewire-sandbox binary is, in this order: `REWIRE_SANDBOX_BIN` (a missing file is an
+ * error, never a fall-through); the newer of `target/release` and `target/debug` in the rewire
+ * source checkout (never from the npm bundle); the installed `sheperd-<platform>-<arch>`
+ * package; the first absolute PATH entry that has it (relative entries are skipped, #25).
+ * The run (preflight and every SandboxClient) and `rewire doctor` both use exactly this (I1).
+ */
+export function locateSandboxBinary(opts: FindBinaryOptions = {}): SandboxBinary {
   const env = opts.env ?? process.env;
   const override = env.REWIRE_SANDBOX_BIN;
   if (override) {
-    if (existsSync(override)) return override;
+    if (existsSync(override)) return { path: override, source: "env" };
     throw new RewireError(
       "binary_missing",
       `REWIRE_SANDBOX_BIN points at a missing file: ${override}`,
@@ -85,18 +157,34 @@ export function findSandboxBinary(opts: FindBinaryOptions = {}): string {
       if (st && (best === undefined || st.mtimeMs > best.mtimeMs))
         best = { p, mtimeMs: st.mtimeMs };
     }
-    if (best) return best.p;
+    if (best) return { path: best.p, source: "checkout" };
+  }
+  const name = platformPackageName(opts.platform ?? process.platform, opts.arch ?? process.arch);
+  const resolvePackage =
+    opts.resolvePackage === undefined
+      ? createRequire(import.meta.url).resolve
+      : opts.resolvePackage;
+  if (name && resolvePackage) {
+    const expected = "expectedVersion" in opts ? opts.expectedVersion : BUNDLE_VERSION;
+    const bin = platformPackageBinary(name, resolvePackage, expected);
+    if (bin) return { path: bin, source: "platform-package", detail: name };
   }
   for (const dir of (env.PATH ?? "").split(delimiter)) {
     if (!dir || !isAbsolute(dir)) continue;
     const p = join(dir, "rewire-sandbox");
-    if (executableFile(p)) return p;
+    if (executableFile(p)) return { path: p, source: "path" };
   }
+  const reinstall = name ? `reinstall sheperd so its optional ${name} package installs, ` : "";
   throw new RewireError(
     "binary_missing",
     "rewire-sandbox binary not found",
-    "run cargo build -p rewire-sandbox, put rewire-sandbox on PATH, or set REWIRE_SANDBOX_BIN",
+    `${reinstall}run cargo build -p rewire-sandbox, put rewire-sandbox on PATH, or set REWIRE_SANDBOX_BIN`,
   );
+}
+
+/** The path {@link locateSandboxBinary} finds. */
+export function findSandboxBinary(opts: FindBinaryOptions = {}): string {
+  return locateSandboxBinary(opts).path;
 }
 
 /**

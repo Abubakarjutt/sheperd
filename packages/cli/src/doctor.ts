@@ -5,7 +5,7 @@ import { RewireError } from "@rewire/core";
 import { INSTALL_HINTS } from "@rewire/gates";
 import { loadModelsFile } from "@rewire/pipeline";
 import { probeOllama } from "@rewire/providers";
-import { findSandboxBinary } from "@rewire/sandbox";
+import { type FindBinaryOptions, locateSandboxBinary, type SandboxBinary } from "@rewire/sandbox";
 import { discoverModels, ollamaBase } from "./models.js";
 import { defaultModelsFile } from "./run.js";
 import { oneLine } from "./sanitize.js";
@@ -14,7 +14,7 @@ export const HINTS: Record<string, string> = {
   ...INSTALL_HINTS,
   git: "install git: https://git-scm.com/downloads",
   "rewire-sandbox":
-    "build it with: cargo build -p rewire-sandbox (or set REWIRE_SANDBOX_BIN to the binary)",
+    "reinstall sheperd (npm i -g sheperd@next), build it with cargo build -p rewire-sandbox, or set REWIRE_SANDBOX_BIN to the binary",
   "sandbox-exec":
     "sandbox-exec ships with macOS (/usr/bin/sandbox-exec); this system looks damaged",
 };
@@ -34,7 +34,26 @@ export function findOnPath(bin: string, env: NodeJS.ProcessEnv): string | undefi
   return undefined;
 }
 
-export type DoctorIo = { stdout: Writable; env: NodeJS.ProcessEnv; cwd: string };
+export type DoctorIo = {
+  stdout: Writable;
+  env: NodeJS.ProcessEnv;
+  cwd: string;
+  /** Test seam: lookup options other than `env` (default: the run's own defaults). */
+  sandboxLookup?: Omit<FindBinaryOptions, "env">;
+};
+
+const SOURCE_LABEL: Record<SandboxBinary["source"], string> = {
+  env: "REWIRE_SANDBOX_BIN",
+  checkout: "source checkout",
+  "platform-package": "platform package",
+  path: "PATH",
+};
+
+/** `<path> (<where it came from>)`, e.g. `.../rewire-sandbox (platform package sheperd-linux-x64)`. */
+export function describeSandboxBinary(b: SandboxBinary): string {
+  const from = b.detail ? `${SOURCE_LABEL[b.source]} ${b.detail}` : SOURCE_LABEL[b.source];
+  return `${b.path} (${from})`;
+}
 
 /** One line per check; returns the exit code (1 when anything required is missing). */
 export async function runDoctor(
@@ -51,7 +70,8 @@ export async function runDoctor(
 
   // The exact lookup a run uses (I1): doctor never accepts a binary the run cannot find.
   try {
-    ok("rewire-sandbox", oneLine(findSandboxBinary({ env: io.env }), 300));
+    const found = locateSandboxBinary({ ...io.sandboxLookup, env: io.env });
+    ok("rewire-sandbox", oneLine(describeSandboxBinary(found), 300));
   } catch (e) {
     bad(
       "rewire-sandbox",
