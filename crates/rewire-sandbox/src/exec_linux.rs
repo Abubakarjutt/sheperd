@@ -7,7 +7,8 @@
 //! - `--ro-bind / /`, private `/dev`, `/proc`, `/tmp`.
 //! - `--tmpfs` over `/run`, `/var/run` and `$XDG_RUNTIME_DIR` (real dirs
 //!   only): host unix sockets (docker.sock, ssh-agent, dbus) are hidden.
-//! - `--ro-bind root root` (root may live under the private /tmp).
+//! - `--ro-bind root root` (root may live under the private /tmp), and the
+//!   target of a `<root>/node_modules` symlink pointing outside root.
 //! - `--bind` (rw) only the literal prefixes of the `write` globs inside
 //!   root, and existing `extraWrite` dirs.
 //! - `--ro-bind` every existing writeDeny match and git path found by
@@ -176,6 +177,13 @@ pub fn build_bwrap_argv(
         Ok(())
     };
     bind("--ro-bind-fd", p.root())?;
+    // The worktree's node_modules link (the repo's real node_modules, shared
+    // read-only, never installed into) must resolve inside the sandbox even
+    // when its target sits under the private /tmp: bind the target at its
+    // own path, read-only, pinned by fd like every other source.
+    if let Some(t) = node_modules_target(p.root()) {
+        bind("--ro-bind-fd", &t)?;
+    }
     for w in write_binds(p)? {
         bind("--bind-fd", &w)?;
     }
@@ -204,6 +212,17 @@ pub fn build_bwrap_argv(
     argv.extend([REAPER_PATH.into(), "ns-reap".into(), "--".into()]);
     argv.extend(cmd.iter().cloned());
     Ok(argv)
+}
+
+/// Canonical target of `<root>/node_modules` when it is a symlink to a
+/// directory outside root.
+fn node_modules_target(root: &Path) -> Option<PathBuf> {
+    let link = root.join("node_modules");
+    if !fs::symlink_metadata(&link).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let t = fs::canonicalize(&link).ok()?;
+    (t.is_dir() && !t.starts_with(root)).then_some(t)
 }
 
 fn collect_masks(p: &Profile) -> Result<Masks> {
@@ -929,6 +948,26 @@ mod tests {
         let reaper = pos(&argv, &v(&["--ro-bind-fd", "REAPER", REAPER_PATH]));
         assert!(tmp < reaper && reaper < sep);
         assert!(has_seq(&argv, &["--chdir".into(), s(&root.join("src"))]));
+    }
+
+    #[test]
+    fn root_node_modules_link_target_is_bound_read_only() {
+        // The orchestrator links <wt>/node_modules to the repo's real
+        // node_modules; under the private /tmp (a repo in /tmp) it would
+        // not exist inside the sandbox.
+        let (_t, root, p) = fixture(Network::Deny);
+        let t2 = TempDir::new().unwrap();
+        let target = fs::canonicalize(t2.path()).unwrap().join("nm");
+        fs::create_dir_all(target.join(".bin")).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("node_modules")).unwrap();
+        let a = argv(&p, &root, &v(&["true"])).unwrap();
+        let tmp = pos(&a, &v(&["--tmpfs", "/tmp"]));
+        let nm = pos(&a, &["--ro-bind-fd".into(), fd(&target), s(&target)]);
+        assert!(tmp < nm);
+        // Not a link (or a link into root): nothing extra.
+        let (_t3, root3, p3) = fixture(Network::Deny);
+        let argv3 = argv(&p3, &root3, &v(&["true"])).unwrap();
+        assert!(!argv3.iter().any(|a| a.ends_with("/nm")));
     }
 
     #[test]
