@@ -218,6 +218,15 @@ importers:
         specifier: workspace:*
         version: link:../policy
 
+  packages/skills:
+    dependencies:
+      '@rewire/core':
+        specifier: workspace:*
+        version: link:../core
+      '@rewire/policy':
+        specifier: workspace:*
+        version: link:../policy
+
   packages/tools:
     dependencies:
       '@rewire/core':
