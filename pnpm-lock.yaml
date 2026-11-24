@@ -221,6 +221,33 @@ importers:
         specifier: workspace:*
         version: link:../policy
 
+  packages/session:
+    dependencies:
+      '@rewire/core':
+        specifier: workspace:*
+        version: link:../core
+      '@rewire/loop':
+        specifier: workspace:*
+        version: link:../loop
+      '@rewire/policy':
+        specifier: workspace:*
+        version: link:../policy
+      '@rewire/providers':
+        specifier: workspace:*
+        version: link:../providers
+      '@rewire/sandbox':
+        specifier: workspace:*
+        version: link:../sandbox
+      '@rewire/skills':
+        specifier: workspace:*
+        version: link:../skills
+      '@rewire/tools':
+        specifier: workspace:*
+        version: link:../tools
+      zod:
+        specifier: ^4.6.7
+        version: 4.6.7
+
   packages/skills:
     dependencies:
       '@rewire/core':
