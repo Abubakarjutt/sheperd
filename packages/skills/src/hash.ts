@@ -140,8 +140,6 @@ export async function listStrict(dir: string, caps = REPO_SKILL_CAPS): Promise<S
 
 /** Subtrees of a USER skill that are never hashed or copied (dependencies and VCS data). */
 const EXCLUDED_DIRS = new Set(["node_modules", ".git"]);
-const isDir = async (p: string): Promise<boolean> =>
-  (await lstat(p).catch(() => undefined))?.isDirectory() === true;
 
 /**
  * Following walk (user skills): symlinks are followed, every resolved path passes `guard` (again
@@ -160,7 +158,7 @@ export async function listFollowing(
     const st = await stat(real);
     if (st.isDirectory()) {
       for (const name of await readdir(real)) {
-        if (EXCLUDED_DIRS.has(name) && (await isDir(join(real, name)))) continue;
+        if (EXCLUDED_DIRS.has(name)) continue; // skipped even when a symlink: never followed
         await walk(join(real, name), rel ? `${rel}/${name}` : name, [...ancestors, real]);
       }
     } else if (st.isFile()) {

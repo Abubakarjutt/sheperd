@@ -14,10 +14,12 @@ function nameList(names: string[]): string {
 }
 
 /**
- * The on-demand `skill` tool. First load of a skill materializes it (see `createSkillSet`) and
- * calls `onLoad` once; later loads of the same skill return the cached copy without calling it.
+ * The on-demand `skill` tool. A skill is materialized once per set (see `createSkillSet`); this
+ * tool instance calls `onLoad` the first time IT loads each skill.
  */
 export function skillTool(set: SkillSet, onLoad: (s: Skill) => void): AgentTool {
+  // Reported per tool instance, so each stage that builds its own tool records what it used.
+  const reported = new Set<string>();
   return {
     spec: {
       name: "skill",
@@ -37,7 +39,8 @@ export function skillTool(set: SkillSet, onLoad: (s: Skill) => void): AgentTool 
       }
       try {
         const loaded = await set.load(name);
-        if (loaded.first) {
+        if (!reported.has(name)) {
+          reported.add(name);
           try {
             onLoad(loaded.skill);
           } catch {
@@ -56,7 +59,7 @@ export function skillTool(set: SkillSet, onLoad: (s: Skill) => void): AgentTool 
         } else {
           lines.push(`bundled files unavailable: ${loaded.unavailable ?? "not materialized"}`);
         }
-        lines.push("", fenceUntrusted("skill", s.body));
+        lines.push("", fenceUntrusted("untrusted_skill", loaded.body));
         return { content: lines.join("\n"), isError: false };
       } catch (e) {
         const code = e && typeof e === "object" && "code" in e ? String(e.code) : "skill_invalid";
