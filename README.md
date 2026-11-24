@@ -96,8 +96,10 @@ The CLI looks for the sandbox binary in this order:
 1. `REWIRE_SANDBOX_BIN` (a missing file is an error, never a fall-through);
 2. the newer of `target/release/` and `target/debug/` in the checkout (source builds only; the npm
    package never looks for a checkout);
-3. the installed `sheperd-<os>-<arch>` package (an installed package whose binary is missing, not
-   executable, or of a different version than the CLI is an error, never a fall-through);
+3. the `sheperd-<os>-<arch>` package installed next to the CLI (only there: never via `NODE_PATH`
+   or other global folders). Its binary must match the sha256 recorded in the npm bundle at
+   build time; a package whose binary is missing, not executable, modified, or of a different
+   version than the CLI is an error, never a fall-through;
 4. the first absolute `PATH` entry that has `rewire-sandbox`.
 
 `rewire doctor` reports exactly this lookup, including which step found the binary, and a run
