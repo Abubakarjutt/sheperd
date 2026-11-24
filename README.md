@@ -19,21 +19,31 @@ lists what must hold on a live run before v0.1 is called released.
    acceptance criteria, non-goals and affected areas. Each criterion has a kind: `change` (new or
    corrected behaviour) or `preserve` (behaviour that works today and the task says must keep
    working, e.g. "everything else keeps working"). A contract needs at least one `change`
-   criterion; one with none is retried once, then refused (`contract_without_change`).
+   criterion; one with none is retried once, then refused (`contract_without_change`), so
+   refactor-only tasks (no behaviour change) are not supported in v0.1.
 2. **Tests first.** A test-writer model writes at least one test per criterion, each titled with
-   its criterion id, and the harness runs them against the unchanged repo (the red check): a test
-   for a `change` criterion must fail with an assertion error, a test for a `preserve` criterion
-   must pass (one that fails means the behaviour does not work today, so the criterion is
-   mislabelled), a test with no criterion id is held to the `change` rule, and every test must make
-   an assertion. The tests are then frozen and hashed. After implementation, every frozen test, of
-   either kind, must pass. The report lists each criterion with its kind.
+   its criterion id, and the harness runs them against the unchanged repo (the red check):
+   - a test for a `change` criterion must fail with an assertion error, as must a test with no
+     criterion id; these problems get one retry;
+   - a test for a `preserve` criterion must pass. One that fails stops the run at once, never
+     retried (`preserve_fails_now`), and asks you whether the criterion is mislabelled (really a
+     `change`) or the test is wrong. A retry could only make it pass by weakening it;
+   - every test must make an assertion. The harness runs its own no-assertion probe test in the
+     same run and stops (`assertion_rule_unenforced`) if the test runner does not fail it.
+
+   The tests are then frozen and hashed. After implementation, every frozen test, of either kind,
+   must pass. The report lists each criterion with its kind. What this does not catch: a bug
+   labelled `preserve` whose test does not exercise the bug passes the red check; the
+   spec-compliance reviewer, which sees the task text, is asked to report such a label.
 3. **Implement.** An implementer model works in a git worktree. Writes happen only through a
    sandboxed helper (`rewire-sandbox`), and frozen tests cannot be edited.
 4. **Gates.** Hard-block checks: tests, types, lint, semgrep, gitleaks, dependency audit, frozen
    test integrity.
 5. **Review.** Up to three reviewers inspect the diff (security and spec compliance always;
    silent-failure when the added lines match its patterns) and must back each finding with
-   evidence, which may quote lines the diff removed; a verifier tries to refute them. Reviewer and verifier models are chosen from a different
+   evidence, which may quote lines the diff removed; a verifier tries to refute them. The
+   spec-compliance reviewer and the verifier also get your task text (fenced as data), to check
+   the contract's criterion kinds against it. Reviewer and verifier models are chosen from a different
    model family than the implementer when one is available.
 6. **Fix loop.** Findings go back to the implementer, with progress and oscillation detection,
    a re-plan, and escalation to you when it stops converging.
@@ -285,7 +295,10 @@ Stated in every report (this list is checked against the pipeline's `KNOWN_LIMIT
 - Fake-verification residuals: the red check and the tests gate do not detect every vacuous test (a
   snapshot alias, a hand-thrown AssertionError; the tests gate also accepts a test with no expect
   call, which the red check rejects); a preserve criterion's test passes before and after the
-  change, so it is only as strong as what it asserts; mutation testing is deferred.
+  change, so it is only as strong as what it asserts: a bug the spec stage labels preserve stops
+  the run only if its test exercises the bug, otherwise only the spec-compliance reviewer (which
+  compares the labels with the task) or a human reading the report can catch it; mutation testing
+  is deferred.
 - The console-summary cross-check reads the last summary in the runner output, so in-process code
   that prints a forged summary after the real one is not detected.
 - `__mocks__` directories are protected config: mocks cannot be added or changed during a run.
