@@ -254,10 +254,18 @@ function escalationSection(e: EscalationReport): string {
 }
 
 function skillsSection(skills: SkillUse[]): string {
+  // The name is regex-restricted by the skills package, so it is shown verbatim (redact() would
+  // rewrite e.g. "sk-review"); markup characters are still escaped defensively.
   return skills
+    .filter((s) => (s.source === "user" || s.source === "repo") && /^[0-9a-f]{64}$/.test(s.sha256))
     .map(
       (s) =>
-        `- ${inline(s.name)} (${s.source}, sha256 ${s.sha256.slice(0, 12)}) — ${s.stages.map(inline).join(", ")}`,
+        `- ${stripControls(s.name)
+          .replace(/\r\n?|\n/g, " ")
+          .replace(
+            MARKUP,
+            "\\$&",
+          )} (${s.source}, sha256 ${s.sha256.slice(0, 12)}) — ${s.stages.map(inline).join(", ")}`,
     )
     .join("\n");
 }

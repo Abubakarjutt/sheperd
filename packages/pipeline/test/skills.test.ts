@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -34,6 +35,7 @@ import {
 } from "@rewire/skills";
 import { afterAll, describe, expect, test } from "vitest";
 import { type RoleRouting, runPipeline } from "../src/index.js";
+import { authorSkills } from "../src/skills.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = resolve(here, "fixtures/sum-lib");
@@ -44,7 +46,7 @@ const dirs: string[] = [];
 const sets: SkillSet[] = [];
 afterAll(async () => {
   for (const s of sets) disposeSkillSet(s);
-  for (const d of dirs) await makeWritable(d);
+  for (const d of dirs) await makeWritable(d).catch(() => {});
   for (const d of dirs) rmSync(d, { recursive: true, force: true });
 });
 
@@ -72,6 +74,7 @@ async function makeSet(): Promise<SkillSet> {
   const home = join(base, "home");
   const xdgConfig = join(base, "config");
   mkdirSync(join(home, ".claude", "skills", "tdd"), { recursive: true });
+  writeFileSync(join(home, ".claude", "skills", "tdd", "REFERENCE.md"), "bundled reference text\n");
   writeFileSync(
     join(home, ".claude", "skills", "tdd", "SKILL.md"),
     "---\nname: tdd\ndescription: Test-driven development helper\n---\nWrite the test first.\n",
@@ -107,7 +110,15 @@ const ROUTING: RoleRouting = {
   independence: "cross-family",
 };
 
-async function run(skills: SkillSet | undefined, twLoadsSkill: boolean) {
+const MARKED_SUM =
+  "export function sum(a: number, b: number): number {\n  return a + b; // trusts caller input\n}\n";
+const MARK = "return a + b; // trusts caller input";
+
+async function run(
+  skills: SkillSet | undefined,
+  twLoadsSkill: boolean,
+  o: { withFinding?: boolean; impl?: Provider } = {},
+) {
   const spec = new FauxProvider([text("explored"), text(contractJson)]);
   const tw = new FauxProvider(
     twLoadsSkill
@@ -118,17 +129,54 @@ async function run(skills: SkillSet | undefined, twLoadsSkill: boolean) {
         ]
       : [call("write", { path: "tests/sum.test.ts", content: TEST_SRC }), text("done")],
   );
-  const impl = responder((req) =>
-    lastIsTool(req)
-      ? text("done")
-      : {
-          toolCalls: [
-            { id: "", name: "write", arguments: { path: "src/sum.ts", content: GOOD_SUM } },
-          ],
-        },
+  const sumSrc = o.withFinding ? MARKED_SUM : GOOD_SUM;
+  const impl = (o.impl ??
+    responder((req) =>
+      lastIsTool(req)
+        ? text("done")
+        : {
+            toolCalls: [
+              { id: "", name: "write", arguments: { path: "src/sum.ts", content: sumSrc } },
+            ],
+          },
+    )) as FauxProvider;
+  const rev = responder((req) =>
+    o.withFinding &&
+    req.system.includes("## Your focus: security") &&
+    (req.messages[0]?.content ?? "").includes(MARK)
+      ? text(
+          JSON.stringify({
+            findings: [
+              {
+                category: "security",
+                severity: 3,
+                file: "src/sum.ts",
+                lineStart: 2,
+                lineEnd: 2,
+                evidence: MARK,
+                failureScenario: "unchecked input",
+                confidence: 0.9,
+                suggestedFix: "validate",
+              },
+            ],
+          }),
+        )
+      : text(JSON.stringify({ findings: [] })),
   );
-  const rev = responder(() => text(JSON.stringify({ findings: [] })));
-  const ver = responder(() => text(JSON.stringify({ verdicts: [] })));
+  const ver = responder((req) => {
+    const ids = [...(req.messages[0]?.content ?? "").matchAll(/"id": "([0-9a-f]{16})"/g)].map(
+      (m) => m[1],
+    );
+    return text(
+      JSON.stringify({
+        verdicts: [...new Set(ids)].map((findingId) => ({
+          findingId,
+          verdict: "refuted",
+          reasoning: "not reproducible",
+        })),
+      }),
+    );
+  });
   const by: Record<string, FauxProvider> = { spec, tw, impl, rev, ver };
   const events: RunEvent[] = [];
   const outcome = await runPipeline({
@@ -152,7 +200,7 @@ describe.skipIf(!sandboxAvailable)("skills in the author stages", { timeout: 240
   test("author stages get the index and tool; review and verify get neither", async () => {
     const set = await makeSet();
     const index = skillIndex(set).replace(UUID, "<uuid>");
-    const { outcome, events, by } = await run(set, true);
+    const { outcome, events, by } = await run(set, true, { withFinding: true });
     expect(outcome.status).toBe("verified");
     for (const k of ["spec", "tw", "impl"] as const) {
       const reqs = (by[k] as FauxProvider).requests;
@@ -166,6 +214,8 @@ describe.skipIf(!sandboxAvailable)("skills in the author stages", { timeout: 240
       }
     }
     for (const k of ["rev", "ver"] as const) {
+      // non-vacuous: the verifier only runs when a finding exists
+      expect((by[k] as FauxProvider).requests.length).toBeGreaterThan(0);
       for (const r of (by[k] as FauxProvider).requests) {
         expect(r.system).not.toContain("untrusted_skills_index");
         expect(r.system).not.toContain("Test-driven development helper");
@@ -175,6 +225,7 @@ describe.skipIf(!sandboxAvailable)("skills in the author stages", { timeout: 240
     }
     const loaded = events.filter((e) => e.type === "skill_loaded");
     expect(loaded).toHaveLength(1);
+    expect(loaded.every((e) => /^[0-9a-f]{64}$/.test(e.sha256))).toBe(true);
     expect(loaded[0]).toMatchObject({ stage: "test-writer", name: "tdd", source: "user" });
     for (const e of events) RunEvent.parse(e);
     const sha = (loaded[0] as { sha256: string }).sha256;
@@ -190,13 +241,57 @@ describe.skipIf(!sandboxAvailable)("skills in the author stages", { timeout: 240
     expect(readFileSync(outcome.reportPath, "utf8")).not.toContain("Skills used");
     const snap = ["spec", "tw", "impl", "rev", "ver"].map((k) => ({
       k,
-      calls: (by[k] as FauxProvider).requests.map((r) => ({
-        system: r.system,
-        tools: toolNames(r),
-      })),
+      // parallel reviewers hit one faux provider: order by content, not arrival
+      calls: (by[k] as FauxProvider).requests
+        .map((r) => ({ system: r.system, tools: toolNames(r) }))
+        .sort((a, b) => a.system.localeCompare(b.system)),
     }));
     // Normalise per-run random fence ids so the snapshot is stable.
     const norm = JSON.stringify(snap, null, 1).replace(UUID, "<uuid>");
     expect(norm).toMatchSnapshot();
+  });
+
+  test("a sandboxed implementer reads a materialized bundled file but cannot write there", async () => {
+    const set = await makeSet();
+    const seen: string[] = [];
+    let dir = "";
+    let step = 0;
+    const impl = responder((req) => {
+      const last = req.messages[req.messages.length - 1];
+      if (last?.role === "tool") seen.push(last.content);
+      step++;
+      if (step === 1) return call("skill", { name: "tdd" });
+      if (step === 2) {
+        dir = /are in: (\S+)/.exec(seen[0] ?? "")?.[1] ?? "";
+        return call("bash", { command: `cat ${dir}/REFERENCE.md` });
+      }
+      if (step === 3) return call("bash", { command: `touch ${dir}/x` });
+      if (step === 4) {
+        return call("write", { path: "src/sum.ts", content: GOOD_SUM });
+      }
+      return text("done");
+    });
+    const { outcome } = await run(set, false, { impl });
+    expect(outcome.status).toBe("verified");
+    expect(dir).toContain(set.root ?? "<none>");
+    expect(seen[1]).toContain("bundled reference text");
+    expect(seen[2]).not.toContain("bundled reference text");
+    expect(existsSync(join(dir, "x"))).toBe(false);
+  });
+});
+
+describe("authorSkills", () => {
+  test("one tool per stage per run: repeated builds report a skill once", async () => {
+    const set = await makeSet();
+    const events: RunEvent[] = [];
+    const a = authorSkills(set, "test-writer", "r1", (e) => events.push(e));
+    const b = authorSkills(set, "test-writer", "r1", (e) => events.push(e));
+    expect(b.tools[0]).toBe(a.tools[0]);
+    await a.tools[0]?.execute({ name: "tdd" });
+    await b.tools[0]?.execute({ name: "tdd" });
+    expect(events.filter((e) => e.type === "skill_loaded")).toHaveLength(1);
+    const c = authorSkills(set, "implementer", "r1", (e) => events.push(e));
+    expect(c.tools[0]).not.toBe(a.tools[0]);
+    expect(authorSkills(undefined, "x", "r1", () => {}).tools).toEqual([]);
   });
 });

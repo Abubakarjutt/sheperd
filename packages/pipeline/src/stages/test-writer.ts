@@ -282,7 +282,7 @@ async function execute(
         stage: STAGE,
         allow: ["read", "write", "edit", "grep", "find"],
       }),
-      ...authorSkills(input.skills, STAGE, input.runId, safeEmit).tools,
+      ...sk.tools,
     ];
     const result = await runAgent({
       provider: input.provider,

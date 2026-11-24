@@ -264,3 +264,17 @@ test("skillsUsed renders a Skills used section; omitted when empty", () => {
   expect(renderReport(base({ skillsUsed: [] }))).not.toContain("Skills used");
   expect(renderReport(base())).not.toContain("Skills used");
 });
+
+test("a skill name is shown verbatim (not redacted) and invalid entries are dropped", () => {
+  const ok = "b".repeat(64);
+  const md = renderReport(
+    base({
+      skillsUsed: [
+        { name: "sk-review", source: "repo", sha256: ok, stages: ["spec"] },
+        { name: "bad", source: "user", sha256: "zz", stages: ["spec"] },
+      ],
+    }),
+  );
+  expect(md).toContain("- sk-review (repo, sha256 bbbbbbbbbbbb) — spec");
+  expect(md).not.toContain("- bad");
+});

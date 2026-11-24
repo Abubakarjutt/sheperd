@@ -8,7 +8,7 @@ import {
   type GateResult,
   newRunId,
   RewireError,
-  type RunEvent,
+  RunEvent,
   redact,
   stripControls,
   type Verdict,
@@ -194,15 +194,19 @@ class EventLog {
       this.writeFailed();
       return;
     }
-    if (clean.type === "skill_loaded") {
-      const u = this.skills.get(clean.name) ?? {
-        name: clean.name,
-        source: clean.source,
-        sha256: clean.sha256,
+    // Aggregate from the raw event (a skill name is regex-restricted, so redact() must not
+    // rewrite it), but only when it is schema-valid.
+    const sl = e.type === "skill_loaded" ? RunEvent.safeParse(e) : undefined;
+    if (sl?.success && sl.data.type === "skill_loaded") {
+      const d = sl.data;
+      const u = this.skills.get(d.name) ?? {
+        name: d.name,
+        source: d.source,
+        sha256: d.sha256,
         stages: [],
       };
-      if (!u.stages.includes(clean.stage)) u.stages.push(clean.stage);
-      this.skills.set(clean.name, u);
+      if (!u.stages.includes(d.stage)) u.stages.push(d.stage);
+      this.skills.set(d.name, u);
     }
     if (this.started) this.append(`${line}\n`);
     else this.buffered.push(`${line}\n`);
