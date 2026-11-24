@@ -26,6 +26,7 @@ import type { Policy } from "@rewire/policy";
 import type { ChatRequest, ChatResponse, ModelRef, Provider, StopReason } from "@rewire/providers";
 import { type CapabilityProfile, profileFor, SandboxClient } from "@rewire/sandbox";
 import { createTools } from "@rewire/tools";
+import { PACKAGE_ROOT } from "../assets.js";
 
 const STAGE = "implementer";
 const DEFAULT_MAX_TURNS = 60;
@@ -73,8 +74,7 @@ export type ImplementerResult = {
 
 let promptCache: string | undefined;
 function implementerPrompt(): string {
-  // Same relative path from src/stages and dist/stages.
-  promptCache ??= readFileSync(new URL("../../prompts/implementer.md", import.meta.url), "utf8");
+  promptCache ??= readFileSync(join(PACKAGE_ROOT, "prompts", "implementer.md"), "utf8");
   return promptCache;
 }
 

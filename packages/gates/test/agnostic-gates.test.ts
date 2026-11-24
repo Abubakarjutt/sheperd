@@ -202,6 +202,31 @@ describe("semgrep gate", () => {
     for (const h of homes) expect(existsSync(h)).toBe(false);
   });
 
+  // The sandbox may not see where rewire is installed (bwrap gives every command a fresh /tmp),
+  // so semgrep reads a copy of the ruleset from its own per-run scratch HOME.
+  test("semgrep reads a copy of the shipped ruleset from its scratch HOME", async () => {
+    const { root, ctx } = makeRepo();
+    write(root, "src/ok.js", "export const add = (a, b) => a + b;\n");
+    const real = ctx.client;
+    const seen: Array<{ config: string; home: string; text: string }> = [];
+    const client = {
+      exec: (argv: string[], opts: unknown) => {
+        if (argv.includes("scan")) {
+          const config = argv[argv.indexOf("--config") + 1] ?? "";
+          const home = argv.find((x) => x.startsWith("HOME="))?.slice(5) ?? "";
+          seen.push({ config, home, text: readFileSync(config, "utf8") });
+        }
+        return real.exec(argv, opts as Parameters<SandboxClient["exec"]>[1]);
+      },
+    } as unknown as SandboxClient;
+    expect((await semgrepGate.run({ ...ctx, client })).status).toBe("pass");
+    expect(seen.length).toBeGreaterThan(0);
+    for (const s of seen) {
+      expect(s.config.startsWith(`${s.home}/`)).toBe(true);
+      expect(s.text).toBe(readFileSync(RULES, "utf8"));
+    }
+  });
+
   test("a filename starting with -- is not interpreted as an option", async () => {
     const { root, ctx } = makeRepo();
     write(root, "--config=evil.js", "export const f = (req) => eval(req.query.x);\n");

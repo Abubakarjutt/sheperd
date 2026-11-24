@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   type Contract,
   Finding,
@@ -12,6 +13,7 @@ import type { Policy } from "@rewire/policy";
 import { type ModelRef, type Provider, structured } from "@rewire/providers";
 import { type CapabilityProfile, profileFor, SandboxClient } from "@rewire/sandbox";
 import { z } from "zod";
+import { PACKAGE_ROOT } from "./assets.js";
 import type { DiffSummary } from "./diff.js";
 import { type Dropped, filterEvidence, readInsideWorktree } from "./evidence.js";
 import { wrapUntrusted } from "./untrusted.js";
@@ -64,8 +66,7 @@ function prompt(file: string): string {
   }
   let p = promptCache.get(file);
   if (p === undefined) {
-    // Same relative path from src and dist.
-    p = readFileSync(new URL(`../prompts/${file}`, import.meta.url), "utf8");
+    p = readFileSync(join(PACKAGE_ROOT, "prompts", file), "utf8");
     promptCache.set(file, p);
   }
   return p;

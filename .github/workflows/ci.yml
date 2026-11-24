@@ -107,3 +107,17 @@ jobs:
           REWIRE_SANDBOX_BIN: ${{ github.workspace }}/target/release/rewire-sandbox
           # Sandbox suites fail instead of skipping when the binary is missing (R40).
           REWIRE_REQUIRE_SANDBOX: "1"
+
+      # Packaging regressions are caught here, before a release: bundle sheperd, stage this
+      # host's sheperd-<os>-<arch> from a fresh remapped release build (before the bundle, which
+      # records its sha256), check the pack file lists, install the tarballs into a project and
+      # globally (offline) and run --help, doctor (must resolve the sandbox from the platform
+      # package, and refuse a modified binary) and one verified faux run (proves the bundled
+      # prompts and semgrep rules resolve from the installed package).
+      - name: npm package smoke test
+        run: |
+          node scripts/npm/build.mjs sandbox
+          node scripts/npm/build.mjs platform
+          node scripts/npm/build.mjs sheperd
+          node scripts/npm/build.mjs pack
+          node scripts/npm/smoke.mjs --faux-run

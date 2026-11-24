@@ -1,0 +1,53 @@
+{
+  "name": "sheperd",
+  "version": "0.1.0-beta.1",
+  "description": "rewire: an anti-slop coding harness. Tests first, frozen; a sandboxed implementer; hard gates and an independent multi-model review before anything is committed.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "rewire": "dist/main.js"
+  },
+  "files": [
+    "dist",
+    "assets",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "optionalDependencies": {
+    "sheperd-darwin-arm64": "0.1.0-beta.1",
+    "sheperd-darwin-x64": "0.1.0-beta.1",
+    "sheperd-linux-arm64": "0.1.0-beta.1",
+    "sheperd-linux-x64": "0.1.0-beta.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Abubakarjutt/sheperd.git"
+  },
+  "homepage": "https://github.com/Abubakarjutt/sheperd#readme",
+  "bugs": {
+    "url": "https://github.com/Abubakarjutt/sheperd/issues"
+  },
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "llm",
+    "sandbox",
+    "code-review",
+    "testing",
+    "cli",
+    "anthropic",
+    "openai",
+    "ollama"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

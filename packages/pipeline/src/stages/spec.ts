@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { Contract, defangUntrustedClosers, RewireError, type RunEvent, redact } from "@rewire/core";
 import { runAgent } from "@rewire/loop";
 import type { Policy } from "@rewire/policy";
 import { type ChatMessage, type ModelRef, type Provider, structured } from "@rewire/providers";
 import { type CapabilityProfile, profileFor, SandboxClient } from "@rewire/sandbox";
 import { createTools } from "@rewire/tools";
+import { PACKAGE_ROOT } from "../assets.js";
 
 const STAGE = "spec";
 const MAX_TURNS = 20;
@@ -33,8 +35,7 @@ export type SpecInput = {
 
 let promptCache: string | undefined;
 function specPrompt(): string {
-  // Same relative path from src/stages and dist/stages.
-  promptCache ??= readFileSync(new URL("../../prompts/spec.md", import.meta.url), "utf8");
+  promptCache ??= readFileSync(join(PACKAGE_ROOT, "prompts", "spec.md"), "utf8");
   return promptCache;
 }
 
