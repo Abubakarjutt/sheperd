@@ -223,6 +223,9 @@ importers:
       '@rewire/core':
         specifier: workspace:*
         version: link:../core
+      '@rewire/loop':
+        specifier: workspace:*
+        version: link:../loop
       '@rewire/policy':
         specifier: workspace:*
         version: link:../policy
