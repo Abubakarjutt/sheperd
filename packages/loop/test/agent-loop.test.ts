@@ -34,6 +34,31 @@ const base = (provider: Provider, tools: AgentTool[], extra: object = {}) => ({
 });
 
 describe("runAgent", () => {
+  test("history is sent before the new prompt", async () => {
+    const faux = new FauxProvider([text("ok")]);
+    const h1 = { role: "user" as const, content: "a" };
+    const h2 = { role: "assistant" as const, content: "b" };
+    const res = await runAgent(base(faux, [], { history: [h1, h2], prompt: "p" }));
+    expect(faux.requests[0]?.messages).toEqual([h1, h2, { role: "user", content: "p" }]);
+    expect(res.messages.slice(0, 3)).toEqual([h1, h2, { role: "user", content: "p" }]);
+  });
+
+  test("history with a dangling tool call is rejected", async () => {
+    const faux = new FauxProvider([text("ok")]);
+    const history = [
+      { role: "user" as const, content: "a" },
+      {
+        role: "assistant" as const,
+        content: "x",
+        toolCalls: [{ id: "t1", name: "echo", arguments: {} }],
+      },
+    ];
+    const err = await runAgent(base(faux, [], { history })).catch((e) => e);
+    expect(err).toBeInstanceOf(RewireError);
+    expect(err.code).toBe("loop_history_invalid");
+    expect(faux.requests).toHaveLength(0);
+  });
+
   test("executes tool calls and feeds results back", async () => {
     const faux = new FauxProvider([call("echo", { value: "a" }), text("done")]);
     const echo = mkTool("echo");

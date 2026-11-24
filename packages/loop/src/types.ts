@@ -24,6 +24,8 @@ export type RunAgentOptions = {
   model: string;
   system: string;
   prompt: string;
+  /** Prior conversation; the loop continues from it. Must not end in a dangling tool call. */
+  history?: ChatMessage[];
   tools: AgentTool[];
   hooks?: LoopHooks;
   maxTurns: number;
