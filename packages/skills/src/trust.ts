@@ -59,45 +59,46 @@ async function assertNotSymlink(path: string): Promise<void> {
   }
 }
 
-/** Copies the original aside without ever overwriting an earlier backup. */
-async function backup(path: string, move: boolean): Promise<void> {
+/**
+ * Copies the original aside (timestamped, never overwriting an earlier backup). ENOENT is benign
+ * (the file was already replaced); any other error other than EEXIST is rethrown. `copy` is a test seam.
+ */
+export async function backup(path: string, copy: typeof copyFile = copyFile): Promise<void> {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   for (let n = 0; n < 1000; n++) {
     const dest = `${path}.${stamp}${n ? `-${n}` : ""}.bak`;
     try {
-      await copyFile(path, dest, constants.COPYFILE_EXCL);
-      if (move) await unlink(path);
+      await copy(path, dest, constants.COPYFILE_EXCL);
       return;
     } catch (e) {
-      if (errCode(e) !== "EEXIST")
-        throw unreadable(`cannot back up trust file: ${errCode(e) ?? e}`);
+      const c = errCode(e);
+      if (c === "ENOENT") return;
+      if (c !== "EEXIST") throw unreadable(`cannot back up trust file: ${c ?? e}`);
     }
   }
   throw unreadable("cannot back up trust file: too many backups");
 }
 
-async function readStore(path: string): Promise<{ store: TrustStore; dropped: boolean }> {
+/** Read-only: never touches the file. `needsBackup` marks corrupt or partly invalid content. */
+async function readStore(path: string): Promise<{ store: TrustStore; needsBackup: boolean }> {
   await assertNotSymlink(path);
   let text: string;
   try {
     text = await readFile(path, "utf8");
   } catch (e) {
-    if (errCode(e) === "ENOENT") return { store: empty(), dropped: false };
+    if (errCode(e) === "ENOENT") return { store: empty(), needsBackup: false };
     throw unreadable(`cannot read trust file: ${errCode(e) ?? e}`);
   }
   const parsed = parseStore(text);
-  if (!parsed) {
-    await backup(path, true);
-    return { store: empty(), dropped: false };
-  }
-  return { store: { repos: parsed.repos }, dropped: parsed.dropped };
+  if (!parsed) return { store: empty(), needsBackup: true };
+  return { store: { repos: parsed.repos }, needsBackup: parsed.dropped };
 }
 
 /**
- * A missing file is an empty store; a corrupt one is backed up (timestamped `.bak`) and treated as
- * empty; a file with some invalid entries loads without them (and is backed up when next written).
- * Any other read error (EACCES, EISDIR, ...) or a symlinked path throws `trust_store_unreadable`
- * and touches nothing.
+ * Never mutates the file. A missing file, corrupt JSON or a wrong shape gives an empty store;
+ * invalid entries are dropped. The original is backed up (timestamped `.bak`) when next written by
+ * `trustRepo`/`saveTrust`. Any other read error (EACCES, EISDIR, ...) or a symlinked path throws
+ * `trust_store_unreadable`.
  */
 export async function loadTrust(path: string): Promise<TrustStore> {
   return (await readStore(path)).store;
@@ -221,7 +222,7 @@ async function writeStore(path: string, store: TrustStore): Promise<void> {
 /** Whole-store write under the same lock as `trustRepo`. */
 export async function saveTrust(path: string, store: TrustStore): Promise<void> {
   await withLock(path, async () => {
-    if ((await readStore(path)).dropped) await backup(path, false);
+    if ((await readStore(path)).needsBackup) await backup(path);
     await writeStore(path, store);
   });
 }
@@ -230,8 +231,8 @@ export async function saveTrust(path: string, store: TrustStore): Promise<void> 
 export async function trustRepo(path: string, repo: string, hash: string): Promise<void> {
   const key = await trustKey(repo);
   await withLock(path, async () => {
-    const { store, dropped } = await readStore(path);
-    if (dropped) await backup(path, false);
+    const { store, needsBackup } = await readStore(path);
+    if (needsBackup) await backup(path);
     await writeStore(path, trust(store, key, hash));
   });
 }

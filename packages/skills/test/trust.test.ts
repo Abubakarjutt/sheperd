@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import {
+  backup,
   discoverSkills,
   isTrusted,
   loadTrust,
@@ -101,12 +102,31 @@ describe("trust store", () => {
     expect(r.active.find((s) => s.name === "mine")?.source).toBe("user");
   });
 
-  test("corrupt JSON is empty, kept as .bak, does not throw", async () => {
+  test("concurrent loads of a corrupt file are empty and leave it byte-identical", async () => {
     await mkdir(join(root, "cfg"), { recursive: true });
     await writeFile(file, "{not json");
-    const store = await loadTrust(file);
-    expect(store.repos.size).toBe(0);
+    const stores = await Promise.all([loadTrust(file), loadTrust(file), loadTrust(file)]);
+    for (const s of stores) expect(s.repos.size).toBe(0);
+    expect(await readFile(file, "utf8")).toBe("{not json");
+    expect(await baks()).toEqual([]);
+  });
+
+  test("trustRepo on a corrupt file leaves one .bak with the original and a valid store", async () => {
+    await mkdir(join(root, "cfg"), { recursive: true });
+    await writeFile(file, "{not json");
+    await trustRepo(file, repo, "f".repeat(64));
     expect(await baks()).toEqual(["{not json"]);
+    expect(isTrusted(await loadTrust(file), repo, "f".repeat(64))).toBe(true);
+  });
+
+  test("backup rethrows non-ENOENT/EEXIST errors, tolerates ENOENT", async () => {
+    const boom = (code: string) => async () => {
+      throw Object.assign(new Error(code), { code });
+    };
+    await expect(backup(file, boom("EACCES"))).rejects.toMatchObject({
+      code: "trust_store_unreadable",
+    });
+    await expect(backup(file, boom("ENOENT"))).resolves.toBeUndefined();
   });
 
   test("hostile or wrong-shaped files never trust anything", async () => {
@@ -188,9 +208,9 @@ describe("trust store", () => {
   test("a second corruption never overwrites the first .bak", async () => {
     await mkdir(join(root, "cfg"), { recursive: true });
     await writeFile(file, "{one");
-    await loadTrust(file);
+    await trustRepo(file, repo, "a".repeat(64));
     await writeFile(file, "{two");
-    await loadTrust(file);
+    await trustRepo(file, repo, "a".repeat(64));
     expect((await baks()).sort()).toEqual(["{one", "{two"]);
   });
 
