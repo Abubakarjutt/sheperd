@@ -165,7 +165,16 @@ export const testsGate: Gate = {
 export async function runTestFiles(
   ctx: GateContext,
   files: string[],
-  opts: { exec?: GateExec; hint?: (text: string) => string } = {},
+  opts: {
+    exec?: GateExec;
+    hint?: (text: string) => string;
+    /**
+     * Make a test that calls no assertion fail (vitest `expect.requireAssertions`; jest
+     * `expect.hasAssertions()` in a harness-owned setup file). Used by the red check, where a
+     * test that must pass now would otherwise pass with no assertion at all.
+     */
+    requireAssertions?: boolean;
+  } = {},
 ): Promise<ParsedRun> {
   const g = opts.exec ?? new GateExec(ctx);
   const runFiles = files;
@@ -196,7 +205,7 @@ export async function runTestFiles(
       const include = runFiles.map(escapeGlob);
       await writeFile(
         cfg,
-        `export default { cacheDir: ${JSON.stringify(join(gateDir, "cache"))}, test: { include: ${JSON.stringify(include)} } };\n`,
+        `export default { cacheDir: ${JSON.stringify(join(gateDir, "cache"))}, test: { include: ${JSON.stringify(include)}${opts.requireAssertions ? ", expect: { requireAssertions: true }" : ""} } };\n`,
       );
       // --update=none: never write new snapshots (the verify profile is read-only too).
       argv.push("--reporter=default", "--update=none", `--config=${cfg}`, `--root=${root}`);
@@ -209,6 +218,12 @@ export async function runTestFiles(
       // roots = the (frozen) directories of the run files, so jest's automatic `__mocks__`
       // substitution cannot pick up implementer-written mocks from elsewhere.
       const roots = [...new Set(runFiles.map((f) => `<rootDir>/${dirname(f)}`))].sort();
+      let setup: { setupFilesAfterEnv: string[] } | undefined;
+      if (opts.requireAssertions) {
+        const file = join(gateDir, "jest.harness.setup.cjs");
+        await writeFile(file, "beforeEach(() => {\n  expect.hasAssertions();\n});\n");
+        setup = { setupFilesAfterEnv: [file] };
+      }
       await writeFile(
         cfg,
         JSON.stringify({
@@ -217,6 +232,7 @@ export async function runTestFiles(
           testMatch,
           roots,
           cacheDirectory: join(gateDir, "jest-cache"),
+          ...setup,
         }),
       );
       argv.push(`--config=${cfg}`, "--ci");
