@@ -81,7 +81,7 @@ const contractJson = (over: Record<string, unknown> = {}): string =>
   JSON.stringify({
     id: "c1",
     title: "add sum",
-    criteria: [{ id: "x", statement: "sum(a, b) returns a + b" }],
+    criteria: [{ id: "x", kind: "change", statement: "sum(a, b) returns a + b" }],
     nonGoals: [],
     affectedAreas: ["src/sum.ts"],
     openQuestions: [],
@@ -91,6 +91,11 @@ const contractJson = (over: Record<string, unknown> = {}): string =>
 const TEST_FILE = "tests/sum.test.ts";
 // Greenfield red test: the module does not exist yet, so it fails on the assertion.
 const TEST_SRC = `import { expect, test } from "vitest";\ntest("AC-1: adds two numbers", async () => {\n  const mod = await import("../src/sum.js").catch(() => ({}) as Record<string, any>);\n  expect(typeof mod.sum).toBe("function");\n  expect(mod.sum?.(2, 3)).toBe(5);\n});\n`;
+// A bug for the bug-fix run: a negative second argument is ignored.
+const BUGGY_SUM =
+  "export function sum(a: number, b: number): number {\n  return b < 0 ? a : a + b;\n}\n";
+// One red test (change) and two that pass against BUGGY_SUM already (preserve).
+const BUGFIX_TEST_SRC = `import { expect, test } from "vitest";\nimport { sum } from "../src/sum.js";\ntest("AC-1: adds a negative second argument", () => {\n  expect(sum(5, -2)).toBe(3);\n});\ntest("AC-2: still adds two positive numbers", () => {\n  expect(sum(2, 3)).toBe(5);\n});\ntest("AC-3: zero plus zero is still zero", () => {\n  expect(sum(0, 0)).toBe(0);\n});\n`;
 const GOOD_SUM = "export function sum(a: number, b: number): number {\n  return a + b;\n}\n";
 const MARKED_SUM =
   "export function sum(a: number, b: number): number {\n  return a + b; // trusts caller input\n}\n";
@@ -270,6 +275,60 @@ describe.skipIf(!sandboxAvailable)(
       expect(events.at(-1)).toMatchObject({ type: "run_end", status: "verified" });
       // the user's repo is still clean for the next run
       expect(git(repo, "status", "--porcelain", "--", ".", ":(exclude).rewire")).toBe("");
+    });
+
+    test("bug fix with one change and two preserve criteria reaches verified", async () => {
+      // The live-run shape: a bug fix whose task says everything else keeps working. The
+      // preserve tests pass before the fix (red check), and every frozen test passes after it.
+      const repo = makeRepo();
+      writeFileSync(join(repo, "src/sum.ts"), BUGGY_SUM);
+      git(repo, "add", "src/sum.ts");
+      git(repo, "commit", "-q", "-m", "buggy sum");
+      const spec = new FauxProvider([
+        text("explored"),
+        text(
+          contractJson({
+            title: "fix sum with a negative addend",
+            criteria: [
+              { id: "x", kind: "change", statement: "sum(5, -2) returns 3" },
+              { id: "y", kind: "preserve", statement: "sum(2, 3) still returns 5" },
+              { id: "z", kind: "preserve", statement: "sum(0, 0) still returns 0" },
+            ],
+          }),
+        ),
+      ]);
+      const tw = new FauxProvider([
+        call("write", { path: "tests/sum-fix.test.ts", content: BUGFIX_TEST_SRC }),
+        text("done"),
+      ]);
+      const { outcome } = await run(
+        { spec, tw, impl: implementer(() => [["src/sum.ts", GOOD_SUM]]) },
+        {
+          repo,
+          task: "Fix sum: a negative second argument is ignored. Everything that works today keeps working.",
+        },
+      );
+      expect(outcome.escalation).toBeUndefined();
+      expect(outcome.status).toBe("verified");
+      const m = manifestOf(outcome);
+      expect(m.criteriaToTests).toEqual({
+        "AC-1": ["tests/sum-fix.test.ts::AC-1: adds a negative second argument"],
+        "AC-2": ["tests/sum-fix.test.ts::AC-2: still adds two positive numbers"],
+        "AC-3": ["tests/sum-fix.test.ts::AC-3: zero plus zero is still zero"],
+      });
+      const contract = JSON.parse(
+        readFileSync(join(dirname(outcome.reportPath), "contract.json"), "utf8"),
+      );
+      expect(contract.criteria.map((c: { kind: string }) => c.kind)).toEqual([
+        "change",
+        "preserve",
+        "preserve",
+      ]);
+      const report = readFileSync(outcome.reportPath, "utf8");
+      expect(report).toMatch(/^- AC\\?-1 \(change\): /m);
+      expect(report).toMatch(/^- AC\\?-2 \(preserve\): /m);
+      expect(report).toMatch(/\| tests \| broken \| pass/);
+      expect(git(repo, "show", `${outcome.branch}:src/sum.ts`)).toBe(GOOD_SUM);
     });
 
     test("implementer editing a frozen test cannot get verified", async () => {
