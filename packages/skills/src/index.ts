@@ -7,3 +7,4 @@ export {
   USER_SKILL_CAPS,
 } from "./hash.js";
 export * from "./parse.js";
+export * from "./trust.js";
