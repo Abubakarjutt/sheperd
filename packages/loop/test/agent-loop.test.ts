@@ -43,6 +43,46 @@ describe("runAgent", () => {
     expect(res.messages.slice(0, 3)).toEqual([h1, h2, { role: "user", content: "p" }]);
   });
 
+  const calls2 = {
+    role: "assistant" as const,
+    content: "x",
+    toolCalls: [
+      { id: "t1", name: "echo", arguments: {} },
+      { id: "t2", name: "echo", arguments: {} },
+    ],
+  };
+  const res = (id: string) => ({ role: "tool" as const, content: id, toolCallId: id });
+
+  test("history with reversed tool results is accepted unchanged", async () => {
+    const faux = new FauxProvider([text("ok")]);
+    const history = [{ role: "user" as const, content: "a" }, calls2, res("t2"), res("t1")];
+    await runAgent(base(faux, [], { history }));
+    expect(faux.requests[0]?.messages.slice(0, 4)).toEqual(history);
+  });
+
+  test("history with partially answered tool calls is rejected", async () => {
+    const faux = new FauxProvider([text("ok")]);
+    const history = [{ role: "user" as const, content: "a" }, calls2, res("t1")];
+    const err = await runAgent(base(faux, [], { history })).catch((e) => e);
+    expect(err).toBeInstanceOf(RewireError);
+    expect(err.code).toBe("loop_history_invalid");
+    expect(faux.requests).toHaveLength(0);
+  });
+
+  test("history with an unmatched call in a non-last assistant message is rejected", async () => {
+    const faux = new FauxProvider([text("ok")]);
+    const history = [
+      { role: "user" as const, content: "a" },
+      calls2,
+      { role: "user" as const, content: "b" },
+      { role: "assistant" as const, content: "done" },
+    ];
+    const err = await runAgent(base(faux, [], { history })).catch((e) => e);
+    expect(err).toBeInstanceOf(RewireError);
+    expect(err.code).toBe("loop_history_invalid");
+    expect(faux.requests).toHaveLength(0);
+  });
+
   test("history with a dangling tool call is rejected", async () => {
     const faux = new FauxProvider([text("ok")]);
     const history = [
