@@ -27,7 +27,7 @@ const contract = (openQuestions: string[]): string =>
   JSON.stringify({
     id: "c1",
     title: "selftest",
-    criteria: [{ id: "x", statement: "the requested function exists and works" }],
+    criteria: [{ id: "x", kind: "change", statement: "the requested function exists and works" }],
     nonGoals: [],
     affectedAreas: [],
     openQuestions,

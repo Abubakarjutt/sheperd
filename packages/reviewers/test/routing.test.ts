@@ -8,7 +8,7 @@ const model = { provider: "ollama", model: "faux" } as const;
 const contract = {
   id: "c1",
   title: "t",
-  criteria: [{ id: "AC-1", statement: "does a thing" }],
+  criteria: [{ id: "AC-1", kind: "change" as const, statement: "does a thing" }],
   nonGoals: [],
   affectedAreas: [],
   openQuestions: [],

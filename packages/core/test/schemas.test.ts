@@ -55,12 +55,22 @@ describe("schemas", () => {
       Contract.safeParse({
         id: "c1",
         title: "t",
-        criteria: [{ id: "AC-1", statement: "s" }],
+        criteria: [{ id: "AC-1", kind: "change", statement: "s" }],
         nonGoals: [],
         affectedAreas: [],
         openQuestions: [],
       }).success,
     ).toBe(true);
+  });
+
+  test("a criterion must say its kind: change or preserve, no default", () => {
+    const base = { id: "c1", title: "t", nonGoals: [], affectedAreas: [], openQuestions: [] };
+    const parse = (criterion: Record<string, unknown>) =>
+      Contract.safeParse({ ...base, criteria: [{ id: "AC-1", statement: "s", ...criterion }] });
+    expect(parse({}).success).toBe(false);
+    expect(parse({ kind: "keep" }).success).toBe(false);
+    expect(parse({ kind: "preserve" }).success).toBe(true);
+    expect(parse({ kind: "change" }).success).toBe(true);
   });
 
   test("finding without evidence is invalid", () => {
