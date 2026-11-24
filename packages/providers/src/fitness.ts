@@ -2,7 +2,13 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { RewireError } from "@rewire/core";
 import { z } from "zod";
-import { getModelInfo, normalizeOllamaHost, OllamaProvider, probeOllama } from "./ollama.js";
+import {
+  getModelInfo,
+  normalizeOllamaHost,
+  OllamaProvider,
+  ollamaChatTimeoutMs,
+  probeOllama,
+} from "./ollama.js";
 import { structured } from "./structured.js";
 import type { ModelRef, Provider } from "./types.js";
 
@@ -134,7 +140,7 @@ export async function assertRoleFit(
   let reason: string | undefined;
   try {
     reason = await smokeTest(
-      opts.provider ?? new OllamaProvider(baseUrl),
+      opts.provider ?? new OllamaProvider(baseUrl, ollamaChatTimeoutMs(process.env)),
       ref,
       role,
       opts.chatTimeoutMs,

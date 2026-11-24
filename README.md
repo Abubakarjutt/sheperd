@@ -205,6 +205,10 @@ review is weaker than a cross-family one. Rewire still runs, and marks the evide
 `independence: same-family` so you can discount it. Ollama models must support tool calling;
 rewire checks this.
 
+Each Ollama reply may take up to 300 seconds. A larger local model on modest hardware can need
+more: set `REWIRE_OLLAMA_TIMEOUT_S` (whole seconds, 1 to 86400), e.g.
+`REWIRE_OLLAMA_TIMEOUT_S=900 rewire run ...`. `rewire doctor` shows the value in use.
+
 ## Benchmark
 
 ```sh

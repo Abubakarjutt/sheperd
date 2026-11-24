@@ -1,7 +1,7 @@
 import { RewireError } from "@rewire/core";
 import { AnthropicProvider } from "./anthropic.js";
 import { FauxProvider } from "./faux.js";
-import { normalizeOllamaHost, OllamaProvider } from "./ollama.js";
+import { normalizeOllamaHost, OllamaProvider, ollamaChatTimeoutMs } from "./ollama.js";
 import { OpenAIProvider } from "./openai.js";
 import type { ModelRef, Provider } from "./types.js";
 
@@ -41,4 +41,7 @@ registerProvider(
 );
 registerProvider("openai", (_ref, env) => new OpenAIProvider(requireKey(env, "OPENAI_API_KEY")));
 registerProvider("faux", () => new FauxProvider([]));
-registerProvider("ollama", (_ref, env) => new OllamaProvider(normalizeOllamaHost(env.OLLAMA_HOST)));
+registerProvider(
+  "ollama",
+  (_ref, env) => new OllamaProvider(normalizeOllamaHost(env.OLLAMA_HOST), ollamaChatTimeoutMs(env)),
+);

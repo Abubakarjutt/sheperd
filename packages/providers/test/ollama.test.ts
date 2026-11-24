@@ -11,7 +11,9 @@ import {
   getModelInfo,
   MIN_OLLAMA_VERSION,
   normalizeOllamaHost,
+  OLLAMA_TIMEOUT_ENV,
   OllamaProvider,
+  ollamaChatTimeoutMs,
   probeOllama,
 } from "../src/index.js";
 
@@ -210,6 +212,24 @@ describe("normalizeOllamaHost", () => {
   });
 });
 
+describe("ollamaChatTimeoutMs", () => {
+  test("unset or blank is the 300s default", () => {
+    expect(OLLAMA_TIMEOUT_ENV).toBe("REWIRE_OLLAMA_TIMEOUT_S");
+    expect(ollamaChatTimeoutMs({})).toBe(300_000);
+    expect(ollamaChatTimeoutMs({ REWIRE_OLLAMA_TIMEOUT_S: "  " })).toBe(300_000);
+  });
+  test("whole seconds from 1 to 86400", () => {
+    expect(ollamaChatTimeoutMs({ REWIRE_OLLAMA_TIMEOUT_S: "900" })).toBe(900_000);
+    expect(ollamaChatTimeoutMs({ REWIRE_OLLAMA_TIMEOUT_S: " 1 " })).toBe(1_000);
+    expect(ollamaChatTimeoutMs({ REWIRE_OLLAMA_TIMEOUT_S: "86400" })).toBe(86_400_000);
+  });
+  test.each(["0", "-5", "1.5", "15m", "86401", "abc", "1e3"])("%j is refused", (v) => {
+    expect(() => ollamaChatTimeoutMs({ REWIRE_OLLAMA_TIMEOUT_S: v })).toThrow(
+      expect.objectContaining({ code: "ollama_timeout_invalid" }),
+    );
+  });
+});
+
 describe("OllamaProvider", () => {
   test("sends max_tokens (the field Ollama's OpenAI compat honors), not max_completion_tokens", async () => {
     const p = new OllamaProvider(base);
@@ -253,6 +273,38 @@ describe("OllamaProvider", () => {
     await expect(
       p.chat({ model: "m", system: "s", messages: [], maxTokens: 5 }),
     ).rejects.toMatchObject({ code: "ollama_unreachable" });
+  });
+  test("the reply timeout comes from the constructor and the error names the variable", async () => {
+    mock.chat = () => "hang";
+    const p = new OllamaProvider(base, 100);
+    const err = await p
+      .chat({ model: "m", system: "s", messages: [], maxTokens: 5 })
+      .catch((e) => e);
+    expect(err).toMatchObject({ code: "ollama_timeout" });
+    expect(err.message).toMatch(/timed out after 0s/);
+    expect(err.hint).toMatch(/REWIRE_OLLAMA_TIMEOUT_S/);
+  });
+  test("createProvider takes the reply timeout from REWIRE_OLLAMA_TIMEOUT_S", async () => {
+    mock.chat = () => "hang";
+    const p = createProvider(ref, { OLLAMA_HOST: base, REWIRE_OLLAMA_TIMEOUT_S: "1" });
+    const t0 = Date.now();
+    const err = await p
+      .chat({ model: "tiny:1b", system: "s", messages: [], maxTokens: 5 })
+      .catch((e) => e);
+    expect(err).toMatchObject({ code: "ollama_timeout" });
+    expect(err.message).toMatch(/timed out after 1s/);
+    expect(Date.now() - t0).toBeLessThan(10_000);
+  });
+  test("a dropped request while Ollama still answers is not reported as unreachable", async () => {
+    mock.chat = () => "destroy";
+    const p = new OllamaProvider(base);
+    const err = await p
+      .chat({ model: "m", system: "s", messages: [], maxTokens: 5 })
+      .catch((e) => e);
+    expect(err).toMatchObject({ code: "ollama_request_dropped" });
+    expect(err.message).toMatch(/dropped the chat request after \d+s/);
+    expect(err.message).not.toMatch(/not reachable/);
+    expect(err.hint).toMatch(/one request at a time/);
   });
   test("caller abort maps to provider_aborted", async () => {
     const ac = new AbortController();
@@ -375,9 +427,9 @@ describe("assertRoleFit", () => {
     expect(chats()).toBe(1);
     expect((await readCache())["sha256:abc:reviewer"].testVersion).toBe(FITNESS_TEST_VERSION);
   });
-  test("transient unreachable during smoke test is not cached", async () => {
+  test("a transient dropped request during the smoke test is not cached", async () => {
     mock.chat = () => "destroy";
-    await expect(fit("reviewer")).rejects.toMatchObject({ code: "ollama_unreachable" });
+    await expect(fit("reviewer")).rejects.toMatchObject({ code: "ollama_request_dropped" });
     await expect(readFile(join(cache, "fitness.json"), "utf8")).rejects.toThrow();
   });
   test("5xx on the structured step is not cached and the next call re-runs it", async () => {
