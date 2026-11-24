@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   access,
@@ -30,6 +31,7 @@ import {
   skillIndex,
   skillTool,
 } from "../src/index.js";
+import { createSkillSetWith } from "../src/snapshot.js";
 
 let root: string;
 let home: string;
@@ -98,7 +100,7 @@ describe("skill tool", () => {
   test("nothing is copied until first load", async () => {
     await put(join(userDir("alpha"), "SKILL.md"), md("alpha", "A"));
     mk(await discover());
-    expect(await readdir(last.root)).toEqual([]);
+    expect(await readdir(last.root as string)).toEqual([".owner"]);
   });
 
   test("unknown name is an error listing available names", async () => {
@@ -228,28 +230,91 @@ describe("host-only root and hardening", () => {
     await mkdir(outside);
     await mkdir(join(root, "cache", "rewire"), { recursive: true });
     await symlink(outside, join(root, "cache", "rewire", "skill-sets"));
-    expect(() => createSkillSet([], opts())).toThrow(/symlink/);
+    expect(createSkillSet([], opts()).root).toBeUndefined();
     expect(await readdir(outside)).toEqual([]);
     await rm(join(root, "cache", "rewire"), { recursive: true });
     await symlink(outside, join(root, "cache", "rewire"));
-    expect(() => createSkillSet([], opts())).toThrow(/symlink/);
+    expect(createSkillSet([], opts()).root).toBeUndefined();
     expect(await readdir(outside)).toEqual([]);
   });
 
-  test("stale set-* dirs (> 24h) are removed, fresh ones and others kept", async () => {
-    const parent = join(root, "cache", "rewire", "skill-sets");
-    await mkdir(parent, { recursive: true });
-    await put(join(parent, "set-old", "a", "f"), "x");
-    await put(join(parent, "set-new", "f"), "x");
-    await put(join(parent, "other-old", "f"), "x");
-    await chmod(join(parent, "set-old", "a"), 0o555);
-    const past = new Date(Date.now() - 48 * 3600 * 1000);
-    await utimes(join(parent, "set-old"), past, past);
-    await utimes(join(parent, "other-old"), past, past);
+  const age = async (dir: string, days: number) => {
+    const past = new Date(Date.now() - days * 24 * 3600 * 1000);
+    await utimes(dir, past, past);
+  };
+  const owner = (dir: string, pid: number) => put(join(dir, ".owner"), JSON.stringify({ pid }));
+  const parentDir = () => join(root, "cache", "rewire", "skill-sets");
+
+  test("a live set (owner pid alive) older than 24h survives a second createSkillSet", async () => {
+    const first = mk([]);
+    await age(first.root as string, 3);
     mk([]);
-    await expect(stat(join(parent, "set-old"))).rejects.toThrow();
-    await stat(join(parent, "set-new"));
+    await stat(first.root as string);
+  });
+
+  test("a set whose owner is dead and older than 24h is removed; a fresh one is kept", async () => {
+    const parent = parentDir();
+    const dead = spawnSync("true").pid as number;
+    await put(join(parent, "set-dead", "a", "f"), "x");
+    await owner(join(parent, "set-dead"), dead);
+    await chmod(join(parent, "set-dead", "a"), 0o555);
+    await age(join(parent, "set-dead"), 2);
+    await put(join(parent, "set-fresh", "f"), "x");
+    await owner(join(parent, "set-fresh"), dead);
+    await put(join(parent, "other-old", "f"), "x");
+    await age(join(parent, "other-old"), 30);
+    mk([]);
+    await expect(stat(join(parent, "set-dead"))).rejects.toThrow();
+    await stat(join(parent, "set-fresh"));
     await stat(join(parent, "other-old"));
+  });
+
+  test("an ownerless set is removed only after 7 days", async () => {
+    const parent = parentDir();
+    await put(join(parent, "set-a", "f"), "x");
+    await put(join(parent, "set-b", "f"), "x");
+    await put(join(parent, "set-c", ".owner"), "not json");
+    await age(join(parent, "set-a"), 2);
+    await age(join(parent, "set-b"), 8);
+    await age(join(parent, "set-c"), 8);
+    mk([]);
+    await stat(join(parent, "set-a"));
+    await expect(stat(join(parent, "set-b"))).rejects.toThrow();
+    await expect(stat(join(parent, "set-c"))).rejects.toThrow();
+  });
+
+  test("a relative XDG_CACHE_HOME is ignored", () => {
+    const saved = process.env.XDG_CACHE_HOME;
+    process.env.XDG_CACHE_HOME = "relative/cache";
+    try {
+      const set = createSkillSet([], { home, xdgConfig });
+      sets.push(set);
+      expect(set.root?.startsWith(join(home, ".cache", "rewire"))).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.XDG_CACHE_HOME;
+      else process.env.XDG_CACHE_HOME = saved;
+    }
+  });
+
+  test("an uncreatable cache dir degrades instead of throwing", async () => {
+    await put(join(userDir("alpha"), "SKILL.md"), md("alpha", "A", "UBODY\n"));
+    await put(join(repoDir("rs"), "SKILL.md"), md("rs", "R"));
+    const ro = join(root, "ro");
+    await mkdir(ro);
+    await chmod(ro, 0o555);
+    const set = createSkillSet(await discover(), { home, xdgConfig, cacheDir: ro });
+    expect(set.root).toBeUndefined();
+    const tool = skillTool(set, () => {});
+    const u = await tool.execute({ name: "alpha" });
+    expect(u.isError).toBe(false);
+    expect(u.content).toContain("UBODY");
+    expect(u.content).toContain("bundled files unavailable");
+    expect(u.content).toContain("no skill cache");
+    const r = await tool.execute({ name: "rs" });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain("skill_invalid");
+    expect(r.content).toContain("no skill cache");
+    await disposeSkillSet(set);
   });
 
   test("load() results are frozen", async () => {
@@ -314,12 +379,9 @@ describe("host-only root and hardening", () => {
   test("two concurrent first loads materialize once and agree", async () => {
     await put(join(userDir("alpha"), "SKILL.md"), md("alpha", "A"));
     let calls = 0;
-    const set = createSkillSet(await discover(), {
-      ...opts(),
-      materialize: (...a) => {
-        calls++;
-        return materializeSkill(...a);
-      },
+    const set = createSkillSetWith(await discover(), opts(), (...a) => {
+      calls++;
+      return materializeSkill(...a);
     });
     sets.push(set);
     const loads: Skill[] = [];

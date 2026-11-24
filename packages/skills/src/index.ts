@@ -7,6 +7,19 @@ export {
   USER_SKILL_CAPS,
 } from "./hash.js";
 export * from "./parse.js";
-export * from "./snapshot.js";
+export {
+  createSkillSet,
+  disposeSkillSet,
+  INDEX_BUDGET_BYTES,
+  type IndexTier,
+  indexList,
+  indexTier,
+  invocable,
+  type LoadedSkill,
+  makeWritable,
+  type SkillSet,
+  type SkillSetOptions,
+  skillIndex,
+} from "./snapshot.js";
 export * from "./tool.js";
 export * from "./trust.js";

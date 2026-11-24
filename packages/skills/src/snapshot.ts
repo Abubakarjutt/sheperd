@@ -7,9 +7,10 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { chmod, lstat, readdir, rename, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { assetRoot, fenceUntrusted, RewireError } from "@rewire/core";
 import { MAX_SKILL_MD_BYTES, materializeSkill, type Skill } from "./discover.js";
 import { openNoFollow, UserGuard } from "./hash.js";
@@ -31,11 +32,10 @@ export type SkillSetOptions = {
    * tmpfs over /tmp, which would hide the copies from sandboxed readers.
    */
   cacheDir?: string;
-  /** Test seam: replaces `materializeSkill`. */
-  materialize?: typeof materializeSkill;
 };
 
 const STALE_MS = 24 * 60 * 60 * 1000;
+const STALE_UNOWNED_MS = 7 * STALE_MS;
 
 /** A skill after its first load. */
 export type LoadedSkill = {
@@ -56,12 +56,12 @@ export type LoadedSkill = {
 export type SkillSet = {
   skills: Skill[];
   /**
-   * HOST-ONLY directory holding the read-only copies, `<root>/<name>/`. Created by
+   * HOST-ONLY directory (undefined when the cache dir could not be created: loads then degrade) holding the read-only copies, `<root>/<name>/`. Created by
    * `createSkillSet` with mkdtemp (0700). It must NEVER be added to any sandbox profile's write
    * or extraWrite set: a sandboxed agent that could write here could redirect or alter the host's
    * copies. Read access for sandboxed agents (same user) is all they need.
    */
-  readonly root: string;
+  readonly root: string | undefined;
   /** Materialize (once per set) and return a skill. Throws skill_invalid for a repo skill that
    *  no longer matches its pinned hash, or for an unknown name. */
   load(name: string): Promise<LoadedSkill>;
@@ -111,16 +111,42 @@ function ensureParent(cacheDir: string): string {
   return dir;
 }
 
-/** Best effort: remove `set-*` dirs older than 24 h (real directories under our parent only). */
+function ownerAlive(dir: string): boolean | undefined {
+  try {
+    const f = join(dir, ".owner");
+    const st = lstatSync(f);
+    if (!st.isFile()) return undefined;
+    const o = JSON.parse(readFileSync(f, "utf8")) as { pid?: unknown };
+    if (typeof o.pid !== "number" || !Number.isInteger(o.pid) || o.pid <= 0) return undefined;
+    try {
+      process.kill(o.pid, 0);
+      return true;
+    } catch (e) {
+      return (e as { code?: string }).code !== "ESRCH";
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Best effort: remove `set-*` dirs (real directories under our parent only) that are older than
+ * 24 h AND whose owner process is dead, or older than 7 days when `.owner` is missing/unreadable.
+ * A live session's set is never swept.
+ */
 function sweepStale(parent: string): void {
   try {
-    const cutoff = Date.now() - STALE_MS;
+    const now = Date.now();
     for (const name of readdirSync(parent)) {
       if (!name.startsWith("set-")) continue;
       const p = join(parent, name);
       try {
         const st = lstatSync(p);
-        if (!st.isDirectory() || st.isSymbolicLink() || st.mtimeMs >= cutoff) continue;
+        if (!st.isDirectory() || st.isSymbolicLink()) continue;
+        const age = now - st.mtimeMs;
+        const alive = ownerAlive(p);
+        const stale = alive === undefined ? age > STALE_UNOWNED_MS : !alive && age > STALE_MS;
+        if (!stale) continue;
         makeWritableSync(p);
         rmSync(p, { recursive: true, force: true });
       } catch {
@@ -193,6 +219,15 @@ function freezeLoaded(l: LoadedSkill): LoadedSkill {
  * degrades to its SKILL.md body alone. Call `disposeSkillSet` at session end.
  */
 export function createSkillSet(skills: Skill[], opts: SkillSetOptions): SkillSet {
+  return createSkillSetWith(skills, opts, materializeSkill);
+}
+
+/** @internal Test seam (not re-exported by index.ts): inject the materializer. */
+export function createSkillSetWith(
+  skills: Skill[],
+  opts: SkillSetOptions,
+  doMaterialize: typeof materializeSkill,
+): SkillSet {
   const seen = new Set<string>();
   for (const s of skills) {
     if (!SKILL_NAME_RE.test(s.name)) throw invalid(`invalid skill name: ${JSON.stringify(s.name)}`);
@@ -201,19 +236,29 @@ export function createSkillSet(skills: Skill[], opts: SkillSetOptions): SkillSet
       seen.add(s.name);
     }
   }
-  const parent = ensureParent(
-    opts.cacheDir ?? join(process.env.XDG_CACHE_HOME || join(opts.home, ".cache")),
-  );
-  sweepStale(parent);
-  const root = mkdtempSync(join(parent, "set-"));
-  const doMaterialize = opts.materialize ?? materializeSkill;
+  const xdg = process.env.XDG_CACHE_HOME;
+  const base = opts.cacheDir ?? (xdg && isAbsolute(xdg) ? xdg : join(opts.home, ".cache"));
+  let root: string | undefined;
+  try {
+    const parent = ensureParent(base);
+    sweepStale(parent);
+    root = mkdtempSync(join(parent, "set-"));
+    writeFileSync(
+      join(root, ".owner"),
+      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
+      { flag: "wx", mode: 0o600 },
+    );
+  } catch {
+    root = undefined; // no skill cache: loads degrade
+  }
   const byName = new Map(invocable(skills).map((s) => [s.name, s]));
   const cache = new Map<string, Promise<LoadedSkill>>();
 
   const materialize = async (skill: Skill): Promise<LoadedSkill> => {
-    const tmp = join(root, `${skill.name}.tmp`);
-    const dest = join(root, skill.name);
+    const tmp = join(root ?? "", `${skill.name}.tmp`);
+    const dest = join(root ?? "", skill.name);
     try {
+      if (root === undefined) throw invalid("no skill cache");
       await checkRoot(root);
       await clearLeftover(tmp);
       await clearLeftover(dest);
@@ -232,8 +277,10 @@ export function createSkillSet(skills: Skill[], opts: SkillSetOptions): SkillSet
         files: snap.files,
       });
     } catch (e) {
-      await clearLeftover(tmp).catch(() => undefined);
-      await clearLeftover(dest).catch(() => undefined);
+      if (root !== undefined) {
+        await clearLeftover(tmp).catch(() => undefined);
+        await clearLeftover(dest).catch(() => undefined);
+      }
       if (skill.source === "repo") throw e;
       const guard = await UserGuard.create(opts);
       const md = await readSkillMd(await guard.resolve(join(skill.dir, "SKILL.md")));
@@ -264,6 +311,7 @@ export function createSkillSet(skills: Skill[], opts: SkillSetOptions): SkillSet
 
 /** Session end: remove the set's root (never follows a symlink root). */
 export async function disposeSkillSet(set: SkillSet): Promise<void> {
+  if (set.root === undefined) return;
   const st = await lstat(set.root).catch(() => undefined);
   if (!st || st.isSymbolicLink()) return;
   await makeWritable(set.root);
