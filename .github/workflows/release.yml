@@ -29,6 +29,9 @@ concurrency:
 env:
   # Release binaries are built with exactly this toolchain, never "whatever stable is today".
   RUST_TOOLCHAIN: "1.100.0"
+  # The npm that publishes (trusted publishing needs 11.5.1+); the package job rehearses the
+  # publish with the same version.
+  NPM_VERSION: "11.19.0"
 
 jobs:
   plan:
@@ -192,6 +195,19 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      # The publish job's exact npm and command, as a dry run, so a PR catches what would break
+      # the real publish (npm 11 reads a bare "dir/file.tgz" as a GitHub owner/repo).
+      - name: Rehearse npm publish (dry run, publish job's npm and paths)
+        working-directory: dist-npm
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm install -g "npm@$NPM_VERSION"
+          for name in sheperd-darwin-arm64 sheperd-darwin-x64 sheperd-linux-x64 sheperd-linux-arm64 sheperd; do
+            npm publish "./tarballs/$name-$VERSION.tgz" --access public --tag next --dry-run
+          done
+
   # Only this job can publish, and it runs no repository code: it publishes the tarballs the
   # package job checked and smoke-tested. It runs in the npm-publish environment, which must be
   # limited to v* tags with a required reviewer, and authenticates to npm by trusted publishing
@@ -236,7 +252,7 @@ jobs:
       # Trusted publishing needs npm 11.5.1 or newer; Node 22 ships npm 10.
       - name: npm with trusted publishing support
         run: |
-          npm install -g npm@11.19.0
+          npm install -g "npm@$NPM_VERSION"
           npm --version
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -296,7 +312,8 @@ jobs:
             # `check_all before` must match byte for byte, or nothing more is published.
             got=$(registry_sri "$name")
             if [ -z "$got" ]; then
-              npm publish "tarballs/$name-$VERSION.tgz" --provenance --access public --tag next
+              # "./": npm 11 reads a bare "tarballs/x.tgz" as the GitHub repository tarballs/x.tgz.
+              npm publish "./tarballs/$name-$VERSION.tgz" --provenance --access public --tag next
             elif [ "$got" = "$(local_sri "$name")" ]; then
               echo "$name@$VERSION is already published with this exact tarball; skipping"
             else
