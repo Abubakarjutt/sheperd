@@ -1,10 +1,9 @@
 export * from "./discover.js";
 export {
-  hashFiles,
   hashSkillDir,
-  MAX_SKILL_DIR_BYTES,
-  MAX_SKILL_FILES,
-  type SkillFile,
+  REPO_SKILL_CAPS,
+  type SkillCaps,
   type SkillSnapshot,
+  USER_SKILL_CAPS,
 } from "./hash.js";
 export * from "./parse.js";

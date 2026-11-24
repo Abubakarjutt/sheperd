@@ -1,8 +1,15 @@
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { discoverSkills, hashSkill, hashSkillDir, parseSkillMd } from "../src/index.js";
+import {
+  discoverSkills,
+  hashSkill,
+  hashSkillDir,
+  materializeSkill,
+  parseSkillMd,
+  snapshotSkill,
+} from "../src/index.js";
 
 let root: string;
 let home: string;
@@ -103,11 +110,21 @@ describe("discoverSkills", () => {
     expect(problems[0]?.dir).toBe(userDir("nodesc"));
   });
 
-  test("a SKILL.md larger than 64 KiB is skill_invalid", async () => {
-    await put(join(userDir("big"), "SKILL.md"), md("big", "Big.", "x".repeat(64 * 1024)));
+  test("a 257 KiB SKILL.md is skill_invalid (user and repo)", async () => {
+    await put(join(userDir("big"), "SKILL.md"), md("big", "Big.", "x".repeat(257 * 1024)));
+    await put(join(repoDir("big2"), "SKILL.md"), md("big2", "Big.", "x".repeat(257 * 1024)));
     const { skills, problems } = await discoverSkills(opts());
     expect(skills).toEqual([]);
-    expect(problems.map((p) => p.code)).toEqual(["skill_invalid"]);
+    expect(problems.map((p) => p.code)).toEqual(["skill_invalid", "skill_invalid"]);
+  });
+
+  test("a 100 KiB SKILL.md is accepted (user and repo)", async () => {
+    await put(join(userDir("mid"), "SKILL.md"), md("mid", "Mid.", "x".repeat(100 * 1024)));
+    await put(join(repoDir("mid2"), "SKILL.md"), md("mid2", "Mid.", "x".repeat(100 * 1024)));
+    const { skills, problems } = await discoverSkills(opts());
+    expect(problems).toEqual([]);
+    expect(skills.map((s) => s.name)).toEqual(["mid", "mid2"]);
+    expect(skills[0]?.body).toHaveLength(100 * 1024);
   });
 
   test('name "../x" is skill_invalid', async () => {
@@ -273,11 +290,95 @@ describe("hashing", () => {
     await expect(hashSkillDir(d)).rejects.toMatchObject({ code: "skill_invalid" });
   });
 
-  test("a skill dir over 2 MiB is skill_invalid", async () => {
+  test("a skill dir over 2 MiB is skill_invalid for hashSkillDir", async () => {
     const d = join(root, "huge");
     await put(join(d, "a.bin"), "x".repeat(1024 * 1024 + 1));
     await put(join(d, "b.bin"), "x".repeat(1024 * 1024));
     await expect(hashSkillDir(d)).rejects.toMatchObject({ code: "skill_invalid" });
+  });
+
+  test("a repo skill dir over 2 MiB is skill_invalid at discovery", async () => {
+    await put(join(repoDir("fat"), "SKILL.md"), md("fat", "Fat."));
+    await put(join(repoDir("fat"), "blob.bin"), "x".repeat(2 * 1024 * 1024));
+    const { skills, problems } = await discoverSkills(opts());
+    expect(skills).toEqual([]);
+    expect(problems.map((p) => p.code)).toEqual(["skill_invalid"]);
+  });
+
+  test("a 3 MiB user skill dir is accepted and hashes", async () => {
+    await put(join(userDir("fat"), "SKILL.md"), md("fat", "Fat."));
+    await put(join(userDir("fat"), "blob.bin"), "x".repeat(3 * 1024 * 1024));
+    const { skills, problems } = await discoverSkills(opts());
+    expect(problems).toEqual([]);
+    const s = skills[0];
+    if (!s) throw new Error("missing");
+    const snap = await snapshotSkill(s, { home, xdgConfig });
+    expect(snap.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(snap.files.map((f) => [f.path, f.bytes])).toEqual([
+      ["SKILL.md", Buffer.byteLength(md("fat", "Fat."))],
+      ["blob.bin", 3 * 1024 * 1024],
+    ]);
+  });
+});
+
+describe("materializeSkill", () => {
+  test("copies a user skill (through its symlinks) file by file; hash matches", async () => {
+    const target = join(home, ".agents", "skills", "m");
+    await put(join(target, "SKILL.md"), md("m", "M."));
+    await put(join(target, "bin", "tool.sh"), "#!/bin/sh\necho hi\n");
+    await mkdir(join(home, ".claude", "skills"), { recursive: true });
+    await symlink(target, userDir("m"));
+    const { skills } = await discoverSkills(opts());
+    const s = skills[0];
+    if (!s) throw new Error("missing");
+    const dest = join(root, "scratch", "m");
+    const snap = await materializeSkill(s, dest, { home, xdgConfig });
+    expect(snap.sha256).toBe(await hashSkill(s, { home, xdgConfig }));
+    expect(snap.sha256).toBe(await hashSkillDir(dest));
+    expect(snap.files.map((f) => f.path)).toEqual(["SKILL.md", "bin/tool.sh"]);
+    expect(await readFile(join(dest, "bin", "tool.sh"), "utf8")).toBe("#!/bin/sh\necho hi\n");
+  });
+
+  test("a repo skill materializes to the hash pinned at discovery", async () => {
+    await put(join(repoDir("r"), "SKILL.md"), md("r", "R."));
+    await put(join(repoDir("r"), "a", "b.txt"), "b");
+    const { skills } = await discoverSkills(opts());
+    const s = skills[0];
+    if (!s) throw new Error("missing");
+    const snap = await materializeSkill(s, join(root, "scratch", "r"), { home, xdgConfig });
+    expect(snap.sha256).toBe(s.sha256);
+  });
+
+  test("a credential symlink stops materialization; the secret is not copied", async () => {
+    await put(join(home, ".ssh", "id_ed25519"), "SECRET\n");
+    await put(join(userDir("k"), "SKILL.md"), md("k", "K."));
+    await symlink(join(home, ".ssh", "id_ed25519"), join(userDir("k"), "zz.md"));
+    const { skills } = await discoverSkills(opts());
+    const s = skills[0];
+    if (!s) throw new Error("missing");
+    const dest = join(root, "scratch", "k");
+    await expect(materializeSkill(s, dest, { home, xdgConfig })).rejects.toMatchObject({
+      code: "skill_invalid",
+    });
+    await expect(stat(join(dest, "zz.md"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("a file swapped for a credential symlink after the walk is re-checked on copy", async () => {
+    await put(join(home, ".ssh", "id_ed25519"), "SECRET\n");
+    await put(join(userDir("w"), "SKILL.md"), md("w", "W."));
+    await put(join(userDir("w"), "notes.md"), "notes\n");
+    const { skills } = await discoverSkills(opts());
+    const s = skills[0];
+    if (!s) throw new Error("missing");
+    const dest = join(root, "scratch", "w");
+    // Swap between walk and open: materialize re-resolves each file through the guard.
+    const { listFollowing, UserGuard } = await import("../src/hash.js");
+    const entries = await listFollowing(s.dir, await UserGuard.create({ home, xdgConfig }));
+    await rm(join(userDir("w"), "notes.md"));
+    await symlink(join(home, ".ssh", "id_ed25519"), join(userDir("w"), "notes.md"));
+    const { hashEntries } = await import("../src/hash.js");
+    await expect(hashEntries(entries, dest)).rejects.toMatchObject({ code: "skill_invalid" });
+    await expect(stat(join(dest, "notes.md"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 

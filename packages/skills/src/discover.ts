@@ -1,17 +1,20 @@
-import { lstat, open, readdir, stat } from "node:fs/promises";
+import { type FileHandle, lstat, mkdir, open, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { RewireError, redact } from "@rewire/core";
 import {
+  hashEntries,
+  listFollowing,
+  listStrict,
+  openNoFollow,
+  type SkillEntry,
   type SkillSnapshot,
-  snapshotFollowing,
-  snapshotStrict,
   UserGuard,
   userSkillRoots,
 } from "./hash.js";
 import { parseSkillMd, validateSkillMd } from "./parse.js";
 
 /** SKILL.md at most this many bytes (global constraint); checked at discovery. */
-export const MAX_SKILL_MD_BYTES = 64 * 1024;
+export const MAX_SKILL_MD_BYTES = 256 * 1024;
 
 export type SkillSource = "user" | "repo";
 
@@ -22,11 +25,11 @@ export type Skill = {
   /** The skill dir as found under its root (for a symlinked user skill, the link's path). */
   dir: string;
   /**
-   * sha256 over all the skill's files (see `hashFiles`). Set at discovery for REPO skills (trust
+   * sha256 over all the skill's files (see `hashEntries`). Set at discovery for REPO skills (trust
    * pins it). Left unset for USER skills to keep discovery cheap; `hashSkill` computes it.
    */
   sha256?: string;
-  /** Every file for repo skills; only `SKILL.md` for user skills until `snapshotSkill`. */
+  /** Every file for repo skills; only `SKILL.md` for user skills (see `snapshotSkill`). */
   files: Array<{ path: string; bytes: number }>;
   /** The markdown after the frontmatter. */
   body: string;
@@ -64,8 +67,7 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-async function readCapped(path: string): Promise<string> {
-  const fh = await open(path, "r");
+async function readCapped(fh: FileHandle): Promise<string> {
   try {
     const st = await fh.stat();
     if (!st.isFile()) throw invalid("SKILL.md is not a regular file");
@@ -115,7 +117,7 @@ async function loadUserSkill(
   const md = join(real, "SKILL.md");
   if (!(await exists(md))) return SKIP;
   const mdReal = await guard.resolve(md);
-  const text = await readCapped(mdReal);
+  const text = await readCapped(await open(mdReal, "r"));
   return build(text, entry, "user", dir, [{ path: "SKILL.md", bytes: Buffer.byteLength(text) }]);
 }
 
@@ -132,19 +134,9 @@ async function loadRepoSkill(dir: string, entry: string): Promise<Skill | typeof
   if (mdSt.isSymbolicLink()) throw invalid("repo SKILL.md is a symlink");
   if (mdSt.size > MAX_SKILL_MD_BYTES)
     throw invalid(`SKILL.md is larger than ${MAX_SKILL_MD_BYTES} bytes`);
-  const snap = await snapshotStrict(dir);
-  const md = snap.files.find((f) => f.path === "SKILL.md");
-  if (!md) return SKIP;
-  if (md.bytes > MAX_SKILL_MD_BYTES)
-    throw invalid(`SKILL.md is larger than ${MAX_SKILL_MD_BYTES} bytes`);
-  return build(
-    md.content.toString("utf8"),
-    entry,
-    "repo",
-    dir,
-    snap.files.map((f) => ({ path: f.path, bytes: f.bytes })),
-    snap.sha256,
-  );
+  const text = await readCapped(await openNoFollow(join(dir, "SKILL.md")));
+  const snap = await hashEntries(await listStrict(dir));
+  return build(text, entry, "repo", dir, snap.files, snap.sha256);
 }
 
 /**
@@ -221,22 +213,39 @@ async function repoSkillsRoot(repo: string, problems: SkillProblem[]): Promise<s
   return root;
 }
 
+type HomeOpts = { home: string; xdgConfig: string };
+
+/** The skill's files under its source's rules and caps (see `listStrict` / `listFollowing`). */
+async function entriesFor(skill: Skill, opts: HomeOpts): Promise<SkillEntry[]> {
+  if (skill.source === "repo") return listStrict(skill.dir);
+  return listFollowing(skill.dir, await UserGuard.create(opts));
+}
+
 /**
- * Read every file of a discovered skill with its source's rules (repo: no symlinks; user:
- * symlinks confined to HOME and away from credentials) and the size/file-count caps.
+ * List and hash every file of a discovered skill with its source's rules (repo: no symlinks,
+ * 2 MiB / 200 files; user: symlinks confined to HOME and away from credentials, 64 MiB / 5000
+ * files). Streams; no file is held in memory whole.
  */
-export async function snapshotSkill(
-  skill: Skill,
-  opts: { home: string; xdgConfig: string },
-): Promise<SkillSnapshot> {
-  if (skill.source === "repo") return snapshotStrict(skill.dir);
-  return snapshotFollowing(skill.dir, await UserGuard.create(opts));
+export async function snapshotSkill(skill: Skill, opts: HomeOpts): Promise<SkillSnapshot> {
+  return hashEntries(await entriesFor(skill, opts));
 }
 
 /** The skill's sha256, computed lazily (user skills are not hashed at discovery). */
-export async function hashSkill(
-  skill: Skill,
-  opts: { home: string; xdgConfig: string },
-): Promise<string> {
+export async function hashSkill(skill: Skill, opts: HomeOpts): Promise<string> {
   return (await snapshotSkill(skill, opts)).sha256;
+}
+
+/**
+ * Copy the skill file by file into `destDir` (created if missing; existing files are never
+ * overwritten), hashing as it copies. Each file is re-checked against the source's rules when it
+ * is opened. The returned sha256 is the hash of exactly the bytes written.
+ */
+export async function materializeSkill(
+  skill: Skill,
+  destDir: string,
+  opts: HomeOpts,
+): Promise<SkillSnapshot> {
+  const entries = await entriesFor(skill, opts);
+  await mkdir(destDir, { recursive: true });
+  return hashEntries(entries, destDir);
 }
