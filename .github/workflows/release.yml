@@ -286,10 +286,16 @@ jobs:
           }
           check_all before
           for name in $packages; do
-            if [ -z "$(registry_sri "$name")" ]; then
+            # Re-compare right before each publish: a version that appeared after
+            # `check_all before` must match byte for byte, or nothing more is published.
+            got=$(registry_sri "$name")
+            if [ -z "$got" ]; then
               npm publish "tarballs/$name-$VERSION.tgz" --provenance --access public --tag next
-            else
+            elif [ "$got" = "$(local_sri "$name")" ]; then
               echo "$name@$VERSION is already published with this exact tarball; skipping"
+            else
+              echo "::error::$name@$VERSION appeared on the registry with different contents ($got); stopping before publishing anything else"
+              exit 1
             fi
           done
           # The registry can take a moment to serve a new version.
