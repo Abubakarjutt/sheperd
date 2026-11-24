@@ -331,6 +331,50 @@ describe.skipIf(!sandboxAvailable)(
       expect(git(repo, "show", `${outcome.branch}:src/sum.ts`)).toBe(GOOD_SUM);
     });
 
+    test("a bug labelled preserve escalates with preserve_fails_now and never verifies", async () => {
+      // The attack: the bug is labelled preserve beside a trivial change criterion. The faithful
+      // preserve test fails today; the scripted retry would weaken it, but is never requested.
+      const repo = makeRepo();
+      writeFileSync(join(repo, "src/sum.ts"), BUGGY_SUM);
+      git(repo, "add", "src/sum.ts");
+      git(repo, "commit", "-q", "-m", "buggy sum");
+      const spec = new FauxProvider([
+        text("explored"),
+        text(
+          contractJson({
+            title: "fix sum with a negative addend",
+            criteria: [
+              { id: "x", kind: "change", statement: "sum(0, 0) returns 0" },
+              { id: "y", kind: "preserve", statement: "sum(5, -2) returns 3" },
+            ],
+          }),
+        ),
+      ]);
+      const red = `import { expect, test } from "vitest";\nimport { sum } from "../src/sum.js";\ntest("AC-1: zero", () => {\n  expect(sum(0, 0)).toBe(1);\n});\n`;
+      const faithful = `${red}test("AC-2: the bug", () => {\n  expect(sum(5, -2)).toBe(3);\n});\n`;
+      const weakened = `${red}test("AC-2: the bug", () => {\n  expect(typeof sum(5, -2)).toBe("number");\n});\n`;
+      const tw = new FauxProvider([
+        call("write", { path: "tests/sum-fix.test.ts", content: faithful }),
+        text("done"),
+        call("write", { path: "tests/sum-fix.test.ts", content: weakened }),
+        text("done"),
+      ]);
+      const impl = implementer(() => [["src/sum.ts", BUGGY_SUM]]);
+      const { outcome } = await run(
+        { spec, tw, impl },
+        { repo, task: "Fix sum: a negative second argument is ignored." },
+      );
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.reason).toBe("stage_error");
+      expect(outcome.escalation?.details?.join("\n")).toMatch(/test-writer: preserve_fails_now: /);
+      expect(outcome.escalation?.question).toMatch(/Is AC-2 mislabelled/);
+      expect(outcome.escalation?.hypothesis).toMatch(/labels AC-2 as preserve/);
+      expect(tw.callCount).toBe(2); // no retry
+      expect((impl as FauxProvider).callCount).toBe(0);
+      const report = readFileSync(outcome.reportPath, "utf8");
+      expect(report).toMatch(/preserve\\?_fails\\?_now/);
+    });
+
     test("implementer editing a frozen test cannot get verified", async () => {
       const { outcome, repo } = await run(
         {

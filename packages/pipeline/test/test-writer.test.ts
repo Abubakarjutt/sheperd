@@ -14,13 +14,14 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Contract, RewireError, type RunEvent } from "@rewire/core";
-import { detectTsPack } from "@rewire/pack-typescript";
+import { detectTsPack, type TsPack } from "@rewire/pack-typescript";
 import { DEFAULT_POLICY } from "@rewire/policy";
 import { call, FauxProvider, type ScriptEntry, text } from "@rewire/providers";
 import { type CapabilityProfile, profileFor, SandboxClient } from "@rewire/sandbox";
 import { afterAll, expect, test } from "vitest";
 import {
   hashFiles,
+  PreserveFailsNowError,
   referencesCodeUnderTest,
   runTestWriterStage,
   scanExports,
@@ -77,9 +78,15 @@ const write = (path: string, content: string): ScriptEntry => call("write", { pa
 
 async function run(
   script: ScriptEntry[],
-  over: { contract?: Contract; client?: SandboxClient; events?: RunEvent[] } = {},
+  over: {
+    contract?: Contract;
+    client?: SandboxClient;
+    events?: RunEvent[];
+    pack?: (p: TsPack) => TsPack;
+  } = {},
 ) {
   const root = makeRepo();
+  const detected = await detectTsPack(root);
   const provider = new FauxProvider(script);
   const events = over.events ?? [];
   const promise = runTestWriterStage({
@@ -88,7 +95,7 @@ async function run(
     baseRef: "HEAD",
     model,
     provider,
-    pack: await detectTsPack(root),
+    pack: over.pack ? over.pack(detected) : detected,
     emit: (e) => events.push(e),
     runId: "r1",
     policy: DEFAULT_POLICY,
@@ -522,18 +529,26 @@ test("a preserve test that passes now is accepted next to a red change test", as
   });
 });
 
-test("a preserve test that fails now is rejected: the contract says it already works", async () => {
-  const { err } = await rejected(
+test("a preserve test that fails now stops the stage at once, never retried", async () => {
+  const { promise, provider } = await run(
     twice("test/ac.test.ts", `${HEAD}${failing("AC-1", "adds")}${failing("AC-2", "keeps")}`),
     { contract: KINDS },
   );
+  const err = await fails(promise);
+  expect(err).toBeInstanceOf(PreserveFailsNowError);
+  expect(err.code).toBe("preserve_fails_now");
+  expect((err as PreserveFailsNowError).criteria).toEqual(["AC-2"]);
   expect(err.message).toContain("test/ac.test.ts :: AC-2: keeps");
   expect(err.message).toMatch(/preserve test fails now: the contract says AC-2 already works/);
   expect(err.message).not.toContain("AC-1: adds");
+  expect(err.hint).toMatch(/mislabelled/);
+  expect(provider.callCount).toBe(2); // one attempt; the model is never asked to turn it green
 });
 
-test("a bug mislabelled as preserve fails the red check (its test is red today)", async () => {
-  // The real change ("add(2, 2) is 5") labelled preserve; a trivial change criterion beside it.
+test("attack: a bug labelled preserve beside a trivial change criterion cannot be weakened through", async () => {
+  // The reviewer's scenario: the real bug ("add(2, 2) is 5") is labelled preserve, a trivial
+  // change criterion sits beside it. A faithful AC-2 test fails today; a compliant retry would
+  // rewrite it into something that passes now (a typeof check) and the run would verify.
   const mislabelled: Contract = {
     ...CONTRACT,
     criteria: [
@@ -541,9 +556,34 @@ test("a bug mislabelled as preserve fails the red check (its test is red today)"
       { id: "AC-2", kind: "preserve", statement: "add(2, 2) is 5" },
     ],
   };
-  const src = `${HEAD}${failing("AC-1", "adds")}test("AC-2: the bug", () => { expect(add(2, 2)).toBe(5); });\n`;
-  const { err } = await rejected(twice("test/ac.test.ts", src), { contract: mislabelled });
+  const faithful = `${HEAD}${failing("AC-1", "adds")}test("AC-2: the bug", () => { expect(add(2, 2)).toBe(5); });\n`;
+  const weakened = `${HEAD}${failing("AC-1", "adds")}test("AC-2: the bug", () => { expect(typeof add(2, 2)).toBe("number"); });\n`;
+  const { promise, provider } = await run(
+    [write("test/ac.test.ts", faithful), text("d"), write("test/ac.test.ts", weakened), text("d")],
+    { contract: mislabelled },
+  );
+  const err = await fails(promise);
+  expect(err.code).toBe("preserve_fails_now");
+  expect((err as PreserveFailsNowError).criteria).toEqual(["AC-2"]);
   expect(err.message).toMatch(/AC-2: the bug: preserve test fails now/);
+  expect(provider.callCount).toBe(2); // the weakened rewrite is never requested
+});
+
+test("a preserve test that fails on the retry stops the stage too", async () => {
+  // Attempt 1 fails for another reason (a passing change test); the retry adds a failing
+  // preserve test: still terminal, never a second chance to weaken it.
+  const { promise, provider } = await run(
+    [
+      write("test/ac.test.ts", `${HEAD}${passing("AC-1", "adds")}${passing("AC-2")}`),
+      text("d"),
+      write("test/ac.test.ts", `${HEAD}${failing("AC-1", "adds")}${failing("AC-2", "keeps")}`),
+      text("d"),
+    ],
+    { contract: KINDS },
+  );
+  const err = await fails(promise);
+  expect(err.code).toBe("preserve_fails_now");
+  expect(provider.callCount).toBe(4);
 });
 
 test("a change test that passes now is still rejected", async () => {
@@ -559,7 +599,7 @@ test("a change criterion whose only tests pass is rejected", async () => {
   const src = `${HEAD}${passing("AC-1", "one")}${passing("AC-1", "two")}${passing("AC-2")}`;
   const { err } = await rejected(twice("test/ac.test.ts", src), { contract: KINDS });
   expect(err.message).toContain(
-    "AC-1 is a change criterion with no test that fails now with an assertion error",
+    "AC-1 is a change criterion but none of its tests fails now: a change test must fail with an assertion error before the change",
   );
 });
 
@@ -590,7 +630,7 @@ test("a contract with no change criterion is refused before any model call", asy
 test("the prompt shows each criterion's kind, and the retry states both rules", async () => {
   const { promise, provider } = await run(
     [
-      write("test/ac.test.ts", `${HEAD}${failing("AC-1", "adds")}${failing("AC-2", "keeps")}`),
+      write("test/ac.test.ts", `${HEAD}${passing("AC-1", "adds")}${passing("AC-2")}`),
       text("d"),
       write("test/ac.test.ts", `${HEAD}${failing("AC-1", "adds")}${passing("AC-2")}`),
       text("d"),
@@ -603,7 +643,24 @@ test("the prompt shows each criterion's kind, and the retry states both rules", 
   expect(first).toContain("- AC-2 (preserve): add(1, 1) is still 2");
   const retry = provider.requests[2]?.messages[0]?.content ?? "";
   expect(retry).toMatch(/`change` criterion must fail now with an assertion error/);
-  expect(retry).toMatch(/`preserve` criterion must pass now/);
+  // The retry never tells the model to make a failing preserve test pass.
+  expect(retry).toMatch(/Do not weaken or rewrite a `preserve` test's assertions/);
+  expect(retry).not.toMatch(/preserve` criterion must pass now/);
   const system = provider.requests[0]?.system ?? "";
   expect(system).toMatch(/preserve/);
+});
+
+test("a runner that ignores the assertion requirement fails the stage closed", async () => {
+  // Stands in for a vitest that drops `expect.requireAssertions`: the CLI flag overrides it.
+  const { promise, provider } = await run(
+    [write("test/ac.test.ts", `${HEAD}${failing("AC-1", "adds")}${passing("AC-2")}`), text("d")],
+    {
+      contract: KINDS,
+      pack: (p) => ({ ...p, testCommand: [...p.testCommand, "--expect.requireAssertions=false"] }),
+    },
+  );
+  const err = await fails(promise);
+  expect(err.code).toBe("assertion_rule_unenforced");
+  expect(err.message).toMatch(/did not fail the harness's no-assertion probe test/);
+  expect(provider.callCount).toBe(2); // not a retryable model problem
 });
