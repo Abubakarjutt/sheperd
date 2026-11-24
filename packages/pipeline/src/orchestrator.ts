@@ -64,6 +64,7 @@ import {
 } from "./node-modules-guard.js";
 import { type ReportData, type ReviewData, renderReport, type SkillUse } from "./report.js";
 import { ROLES, type Role, type RoleRouting } from "./routing.js";
+import { endRunSkills } from "./skills.js";
 import { runImplementerStage } from "./stages/implementer.js";
 import { runSpecStage } from "./stages/spec.js";
 import { PreserveFailsNowError, runTestWriterStage } from "./stages/test-writer.js";
@@ -344,6 +345,8 @@ export async function runPipeline(input: RunPipelineInput): Promise<RunOutcome> 
       reason: escalation.reason,
       question: escalation.question,
     });
+  } finally {
+    endRunSkills(input.skills, runId);
   }
 
   if (!log.started) {

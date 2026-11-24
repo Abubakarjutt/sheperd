@@ -35,7 +35,7 @@ import {
 } from "@rewire/skills";
 import { afterAll, describe, expect, test } from "vitest";
 import { type RoleRouting, runPipeline } from "../src/index.js";
-import { authorSkills } from "../src/skills.js";
+import { authorSkills, skillMemoSize } from "../src/skills.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = resolve(here, "fixtures/sum-lib");
@@ -202,6 +202,8 @@ describe.skipIf(!sandboxAvailable)("skills in the author stages", { timeout: 240
     const index = skillIndex(set).replace(UUID, "<uuid>");
     const { outcome, events, by } = await run(set, true, { withFinding: true });
     expect(outcome.status).toBe("verified");
+    // the run released its per-stage skill tools
+    expect(skillMemoSize(set, outcome.runId)).toBe(0);
     for (const k of ["spec", "tw", "impl"] as const) {
       const reqs = (by[k] as FauxProvider).requests;
       expect(reqs.length).toBeGreaterThan(0);

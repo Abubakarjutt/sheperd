@@ -17,7 +17,10 @@ function nameList(names: string[]): string {
  * The on-demand `skill` tool. A skill is materialized once per set (see `createSkillSet`); this
  * tool instance calls `onLoad` the first time IT loads each skill.
  */
-export function skillTool(set: SkillSet, onLoad: (s: Skill) => void): AgentTool {
+export function skillTool(
+  set: SkillSet,
+  onLoad: (s: Skill & { sha256: string }) => void,
+): AgentTool {
   // Reported per tool instance, so each stage that builds its own tool records what it used.
   const reported = new Set<string>();
   return {
@@ -39,10 +42,14 @@ export function skillTool(set: SkillSet, onLoad: (s: Skill) => void): AgentTool 
       }
       try {
         const loaded = await set.load(name);
+        const sha256 = loaded.skill.sha256;
+        if (sha256 === undefined) {
+          return fail(`skill_invalid: skill "${name}" has no content hash; not served`);
+        }
         if (!reported.has(name)) {
           reported.add(name);
           try {
-            onLoad(loaded.skill);
+            onLoad({ ...loaded.skill, sha256 });
           } catch {
             // an observer must not break the load
           }

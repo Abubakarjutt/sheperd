@@ -39,18 +39,22 @@ export function authorSkills(
     system: (base) => `${base}\n\n${skillIndex(set)}`,
     tools: [
       skillTool(set, (s) => {
-        if (s.sha256 !== undefined) return send(s.name, s.source, s.sha256);
-        // Use the hash the load computed; never drop a loaded skill from the record.
-        set
-          .load(s.name)
-          .then((l) => {
-            if (l.skill.sha256 === undefined) throw new Error("loaded skill has no sha256");
-            send(l.skill.name, l.skill.source, l.skill.sha256);
-          })
-          .catch((e) => console.error(`rewire: skill ${s.name} loaded without a hash: ${e}`));
+        send(s.name, s.source, s.sha256);
       }),
     ],
   };
   byKey.set(key, made);
   return made;
+}
+
+/** Release a finished run's tools (and the event log they close over). */
+export function endRunSkills(set: SkillSet | undefined, runId: string): void {
+  const byKey = set && memo.get(set);
+  if (!byKey) return;
+  for (const k of [...byKey.keys()]) if (k.startsWith(`${runId}\0`)) byKey.delete(k);
+}
+
+/** @internal test seam: number of memoised stage entries for a run. */
+export function skillMemoSize(set: SkillSet, runId: string): number {
+  return [...(memo.get(set)?.keys() ?? [])].filter((k) => k.startsWith(`${runId}\0`)).length;
 }

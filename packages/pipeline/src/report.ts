@@ -253,6 +253,15 @@ function escalationSection(e: EscalationReport): string {
   return out.join("\n");
 }
 
+/** `inline` without redact(): a regex-restricted skill name must not become [redacted]. */
+function verbatim(s: string): string {
+  return stripControls(s)
+    .replace(/\r\n?|\n/g, " ")
+    .replace(MARKUP, "\\$&")
+    .replace(AUTOLINK, "$1\\$2")
+    .replace(WWW, "www\\.");
+}
+
 function skillsSection(skills: SkillUse[]): string {
   // The name is regex-restricted by the skills package, so it is shown verbatim (redact() would
   // rewrite e.g. "sk-review"); markup characters are still escaped defensively.
@@ -260,12 +269,7 @@ function skillsSection(skills: SkillUse[]): string {
     .filter((s) => (s.source === "user" || s.source === "repo") && /^[0-9a-f]{64}$/.test(s.sha256))
     .map(
       (s) =>
-        `- ${stripControls(s.name)
-          .replace(/\r\n?|\n/g, " ")
-          .replace(
-            MARKUP,
-            "\\$&",
-          )} (${s.source}, sha256 ${s.sha256.slice(0, 12)}) — ${s.stages.map(inline).join(", ")}`,
+        `- ${verbatim(s.name)} (${s.source}, sha256 ${s.sha256.slice(0, 12)}) — ${s.stages.map(inline).join(", ")}`,
     )
     .join("\n");
 }

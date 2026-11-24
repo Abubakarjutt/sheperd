@@ -523,3 +523,27 @@ describe("skillIndex", () => {
     expect(text.length).toBeLessThan(400);
   });
 });
+
+describe("skill tool without a hash", () => {
+  test("a load that cannot produce a hash fails with skill_invalid and reports nothing", async () => {
+    const skill: Skill = {
+      name: "tdd",
+      description: "d",
+      source: "user",
+      dir: "/x",
+      files: [],
+      body: "b",
+      modelInvocable: true,
+    };
+    const set: SkillSet = {
+      skills: [skill],
+      root: undefined,
+      load: async () => ({ skill, body: "b", files: [] }),
+    };
+    const seen: string[] = [];
+    const r = await skillTool(set, (x) => seen.push(x.name)).execute({ name: "tdd" });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain("skill_invalid");
+    expect(seen).toEqual([]);
+  });
+});

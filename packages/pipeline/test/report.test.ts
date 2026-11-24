@@ -278,3 +278,15 @@ test("a skill name is shown verbatim (not redacted) and invalid entries are drop
   expect(md).toContain("- sk-review (repo, sha256 bbbbbbbbbbbb) — spec");
   expect(md).not.toContain("- bad");
 });
+
+test("a skill name is autolink-escaped like inline text", () => {
+  const md = renderReport(
+    base({
+      skillsUsed: [
+        { name: "http://x.test", source: "user", sha256: "c".repeat(64), stages: ["spec"] },
+      ],
+    }),
+  );
+  expect(md).not.toContain("- http://x.test");
+  expect(md).toContain("- http");
+});
