@@ -4,18 +4,25 @@
 //   node scripts/npm/build.mjs sandbox
 //       cargo build --release of rewire-sandbox into target/npm/, with local paths remapped so
 //       the binary does not embed the build machine's home or checkout path.
-//   node scripts/npm/build.mjs sheperd  [--out dir]
-//       Bundles packages/cli/dist/main.js (run `pnpm -r build` first) into <out>/sheperd/.
+//   node scripts/npm/build.mjs sheperd  [--out dir] [--all-platforms]
+//       Bundles packages/cli/dist/main.js (run `pnpm -r build` first) into <out>/sheperd/,
+//       recording the sha256 of every platform binary already staged in <out> (stage them
+//       first); the installed CLI refuses a platform binary that does not match.
+//       --all-platforms (release) requires all four.
 //   node scripts/npm/build.mjs platform [--target <os>-<arch>] [--binary <path>] [--out dir]
 //       Stages the prebuilt rewire-sandbox (default: the `sandbox` output) as
 //       <out>/sheperd-<os>-<arch>/. The target defaults to this host; the binary's own header
-//       must match it.
+//       must match it. Also writes THIRD_PARTY_LICENSES.md for the Rust crates linked in.
+//   node scripts/npm/build.mjs check    [--out dir]
+//       Runs pack's file-list and local-path checks on every staged package, without packing
+//       (the release workflow runs it on each native build runner).
 //   node scripts/npm/build.mjs pack     [--out dir] [--all-platforms]
 //       Checks every staged package's `npm pack --dry-run` file list and contents, then packs
 //       each into <out>/tarballs/. --all-platforms (release) requires every platform package.
 //
 // <out> defaults to dist-npm/ in the repository root.
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
@@ -40,11 +47,22 @@ const SANDBOX_TARGET_DIR = join(ROOT, "target", "npm");
 const SANDBOX_BINARY = join(SANDBOX_TARGET_DIR, "release", "rewire-sandbox");
 /** The prebuilt targets, with the ELF / Mach-O machine each binary must declare. */
 const TARGETS = {
-  "darwin-arm64": { format: "macho", machine: 0x0100000c },
-  "darwin-x64": { format: "macho", machine: 0x01000007 },
-  "linux-arm64": { format: "elf", machine: 183 },
-  "linux-x64": { format: "elf", machine: 62 },
+  "darwin-arm64": { format: "macho", machine: 0x0100000c, triple: "aarch64-apple-darwin" },
+  "darwin-x64": { format: "macho", machine: 0x01000007, triple: "x86_64-apple-darwin" },
+  "linux-arm64": { format: "elf", machine: 183, triple: "aarch64-unknown-linux-gnu" },
+  "linux-x64": { format: "elf", machine: 62, triple: "x86_64-unknown-linux-gnu" },
 };
+const sha256 = (file) => createHash("sha256").update(readFileSync(file)).digest("hex");
+
+/** sha256 of each staged platform binary in <out>, keyed by target. */
+function stagedHashes(out) {
+  const hashes = {};
+  for (const t of Object.keys(TARGETS)) {
+    const bin = join(out, `sheperd-${t}`, "rewire-sandbox");
+    if (existsSync(bin)) hashes[t] = sha256(bin);
+  }
+  return hashes;
+}
 
 const fail = (msg) => {
   process.stderr.write(`build.mjs: ${msg}\n`);
@@ -112,8 +130,15 @@ function licenseText(dir) {
   return f ? readFileSync(join(dir, f), "utf8").trim() : undefined;
 }
 
-async function buildSheperd(out) {
+async function buildSheperd(out, allPlatforms) {
   const m = manifest();
+  const hashes = stagedHashes(out);
+  const missing = Object.keys(TARGETS).filter((t) => !hashes[t]);
+  if (Object.keys(hashes).length === 0) {
+    fail(`no platform package staged in ${out}: run 'build.mjs platform' first`);
+  }
+  if (allPlatforms && missing.length > 0)
+    fail(`platform packages not staged: ${missing.join(", ")}`);
   if (!existsSync(ENTRY)) fail(`${relative(ROOT, ENTRY)} is missing: run pnpm -r build first`);
   const dest = join(out, "sheperd");
   rmSync(dest, { recursive: true, force: true });
@@ -132,7 +157,10 @@ async function buildSheperd(out) {
     metafile: true,
     logLevel: "warning",
     absWorkingDir: ROOT,
-    define: { REWIRE_BUNDLE_VERSION: JSON.stringify(m.version) },
+    define: {
+      REWIRE_BUNDLE_VERSION: JSON.stringify(m.version),
+      REWIRE_BUNDLE_SANDBOX_SHA256: JSON.stringify(hashes),
+    },
     // CommonJS dependencies call require() on node builtins; give the ESM bundle one.
     banner: {
       js: 'import { createRequire as __sheperdRequire } from "node:module";\nconst require = __sheperdRequire(import.meta.url);',
@@ -144,6 +172,7 @@ async function buildSheperd(out) {
   const third = new Map();
   const workspace = new Set();
   for (const input of Object.keys(result.metafile.inputs)) {
+    if (input.startsWith("<define:")) continue; // an object `define`, not a file
     const abs = resolve(ROOT, input);
     const root = pkgRootOf(abs);
     const pkg = readJson(join(root, "package.json"));
@@ -186,6 +215,7 @@ async function buildSheperd(out) {
   process.stdout.write(
     `staged ${relative(process.cwd(), dest) || dest} (sheperd ${m.version}; bundled ${third.size} third-party packages)\n`,
   );
+  for (const [t, h] of Object.entries(hashes)) process.stdout.write(`  sandbox sha256 ${t} ${h}\n`);
 }
 
 /** The architecture a 64-bit ELF or Mach-O binary declares, checked against the target. */
@@ -199,6 +229,80 @@ function checkBinary(bin, target) {
     if (b.readUInt32LE(0) !== 0xfeedfacf) fail(`${bin} is not a 64-bit Mach-O binary`);
     if (b.readUInt32LE(4) !== want.machine) fail(`${bin} is not built for ${target}`);
   }
+}
+
+/**
+ * Licence notices for the Rust crates linked into rewire-sandbox for `target`: the normal
+ * (non-dev, non-build) dependency closure from `cargo metadata --locked` for that target's
+ * triple. Identical licence texts are printed once, with every crate that ships them.
+ */
+function crateNotices(target) {
+  const meta = JSON.parse(
+    execFileSync(
+      "cargo",
+      [
+        "metadata",
+        "--format-version",
+        "1",
+        "--locked",
+        "--filter-platform",
+        TARGETS[target].triple,
+      ],
+      { cwd: ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+    ),
+  );
+  const byId = new Map(meta.packages.map((p) => [p.id, p]));
+  const nodes = new Map(meta.resolve.nodes.map((n) => [n.id, n]));
+  const root = meta.packages.find((p) => p.name === "rewire-sandbox" && p.source === null);
+  if (!root) fail("cargo metadata has no rewire-sandbox package");
+  const seen = new Set();
+  const stack = [root.id];
+  while (stack.length > 0) {
+    const id = stack.pop();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    for (const d of nodes.get(id)?.deps ?? []) {
+      if (d.dep_kinds.some((k) => k.kind === null)) stack.push(d.pkg);
+    }
+  }
+  const texts = new Map(); // licence text -> the crate files that carry it
+  const bare = [];
+  const crates = [...seen]
+    .map((id) => byId.get(id))
+    .filter((p) => p.source !== null) // workspace members are rewire's own (LICENSE)
+    .sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version));
+  for (const p of crates) {
+    const dir = dirname(p.manifest_path);
+    const files = readdirSync(dir)
+      .filter((n) => /^(licen[cs]e|copying|notice|copyright)/i.test(n))
+      .filter((n) => statSync(join(dir, n)).isFile())
+      .sort();
+    const label = `${p.name}@${p.version} (${p.license ?? "no license field"})`;
+    if (files.length === 0) {
+      if (!p.license) fail(`crate ${p.name}@${p.version} has neither a licence file nor a licence`);
+      bare.push(label);
+      continue;
+    }
+    for (const f of files) {
+      const text = readFileSync(join(dir, f), "utf8").trim();
+      texts.set(text, [...(texts.get(text) ?? []), `${label}: ${f}`]);
+    }
+  }
+  const lines = [
+    `# Third-party software in rewire-sandbox (${target})`,
+    "",
+    `rewire-sandbox statically links these ${crates.length} Rust crates:`,
+    "",
+    ...crates.map((p) => `- ${p.name} ${p.version} (${p.license ?? "see below"})`),
+  ];
+  if (bare.length > 0) {
+    lines.push("", "These crates ship no licence file; their declared licence applies:", "");
+    lines.push(...bare.map((l) => `- ${l}`));
+  }
+  for (const [text, users] of texts) {
+    lines.push("", "---", "", ...users.map((u) => `- ${u}`), "", "```", text, "```");
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 function buildPlatform(out, target, binary) {
@@ -216,6 +320,7 @@ function buildPlatform(out, target, binary) {
   copyFileSync(binary, join(dest, "rewire-sandbox"));
   chmodSync(join(dest, "rewire-sandbox"), 0o755);
   copyFileSync(join(ROOT, "LICENSE"), join(dest, "LICENSE"));
+  writeFileSync(join(dest, "THIRD_PARTY_LICENSES.md"), crateNotices(target));
   writeJson(join(dest, "package.json"), {
     name,
     version: m.version,
@@ -226,7 +331,10 @@ function buildPlatform(out, target, binary) {
     bugs: m.bugs,
     os: [os],
     cpu: [cpu],
-    files: ["rewire-sandbox", "LICENSE"],
+    // The Linux binaries link glibc; npm skips the package on musl (Alpine), and doctor then
+    // reports a missing binary instead of an exec failure.
+    ...(os === "linux" ? { libc: ["glibc"] } : {}),
+    files: ["rewire-sandbox", "LICENSE", "THIRD_PARTY_LICENSES.md"],
     preferUnplugged: true,
     publishConfig: m.publishConfig,
   });
@@ -243,7 +351,7 @@ const ALLOWED = {
     /^dist\/THIRD_PARTY_LICENSES\.md$/,
     /^assets\/[a-z-]+\/(prompts\/[\w.-]+\.md|rules\/[\w.-]+\.yml)$/,
   ],
-  platform: [/^LICENSE$/, /^rewire-sandbox$/],
+  platform: [/^LICENSE$/, /^THIRD_PARTY_LICENSES\.md$/, /^rewire-sandbox$/],
 };
 /** Strings that would leak the build machine into a published file. */
 const LEAKS = [ROOT, homedir()].filter((s) => s.length > 1);
@@ -260,7 +368,7 @@ function checkPack(dir) {
   const must =
     kind === "sheperd"
       ? ["dist/main.js", "LICENSE", "README.md", "assets/gates/rules/semgrep-default.yml"]
-      : ["rewire-sandbox", "LICENSE"];
+      : ["rewire-sandbox", "LICENSE", "THIRD_PARTY_LICENSES.md"];
   for (const p of must) if (!paths.includes(p)) problems.push(`missing ${p}`);
   for (const f of report.files) {
     const bytes = readFileSync(join(dir, f.path));
@@ -283,14 +391,29 @@ function checkPack(dir) {
   return report;
 }
 
+/** The bundle must record the sha256 of every platform binary packed with it. */
+function checkBundleHashes(out) {
+  const bundle = readFileSync(join(out, "sheperd", "dist", "main.js"), "utf8");
+  for (const [t, h] of Object.entries(stagedHashes(out))) {
+    if (!bundle.includes(`"${t}": "${h}"`) && !bundle.includes(`"${t}":"${h}"`)) {
+      fail(`the sheperd bundle does not record sha256 ${h} for sheperd-${t}; rebuild sheperd`);
+    }
+  }
+}
+
+function stagedDirs(out) {
+  return readdirSync(out)
+    .filter((d) => d === "sheperd" || d.startsWith("sheperd-"))
+    .map((d) => join(out, d));
+}
+
 function pack(out, allPlatforms) {
   const dest = join(out, "tarballs");
   rmSync(dest, { recursive: true, force: true });
   mkdirSync(dest, { recursive: true });
-  const dirs = readdirSync(out)
-    .filter((d) => d === "sheperd" || d.startsWith("sheperd-"))
-    .map((d) => join(out, d));
+  const dirs = stagedDirs(out);
   if (!dirs.some((d) => d.endsWith(`${sep}sheperd`))) fail(`no staged sheperd in ${out}`);
+  checkBundleHashes(out);
   if (allPlatforms) {
     const missing = Object.keys(TARGETS).filter((t) => !existsSync(join(out, `sheperd-${t}`)));
     if (missing.length > 0) fail(`platform packages not staged: ${missing.join(", ")}`);
@@ -319,8 +442,14 @@ switch (positionals[0]) {
     buildSandbox();
     break;
   case "sheperd":
-    await buildSheperd(out);
+    await buildSheperd(out, values["all-platforms"]);
     break;
+  case "check": {
+    const dirs = stagedDirs(out);
+    if (dirs.length === 0) fail(`nothing staged in ${out}`);
+    for (const d of dirs) checkPack(d);
+    break;
+  }
   case "platform":
     buildPlatform(out, values.target, values.binary ? resolve(values.binary) : SANDBOX_BINARY);
     break;
@@ -329,6 +458,6 @@ switch (positionals[0]) {
     break;
   default:
     fail(
-      "usage: build.mjs sandbox|sheperd|platform|pack [--out dir] [--target os-arch] [--binary path]",
+      "usage: build.mjs sandbox|sheperd|platform|check|pack [--out dir] [--target os-arch] [--binary path] [--all-platforms]",
     );
 }

@@ -1,9 +1,11 @@
 #!/usr/bin/env node
-// Installs the packed npm tarballs into a fresh directory, the way a user would, and checks the
-// installed CLI (docs/RELEASING.md):
+// Installs the packed npm tarballs the way a user would, into a project and globally
+// (`npm i -g --prefix`, the documented install), offline so the registry never takes part, and
+// checks the installed CLI (docs/RELEASING.md):
 //   - `rewire --help` exits 0 and prints the usage;
-//   - `rewire doctor` resolves rewire-sandbox from the installed sheperd-<os>-<arch> package
-//     (other doctor checks, e.g. a missing semgrep or no models, are reported but not asserted).
+//   - `rewire doctor` resolves rewire-sandbox from the installed sheperd-<os>-<arch> package, in
+//     both installs (other doctor checks, e.g. a missing semgrep or no models, are not asserted);
+//   - a platform binary whose bytes differ from the ones the bundle recorded is refused.
 // With --faux-run it also drives one headless `rewire run` with the faux provider against a copy
 // of the sum-lib fixture and requires a verified result. That loads every prompt and the semgrep
 // rules from the installed package, so it proves the bundled assets resolve. It needs git, rg,
@@ -57,19 +59,24 @@ const app = mkdtempSync(join(work, "install-"));
 writeFileSync(join(app, "package.json"), '{ "name": "sheperd-smoke", "private": true }\n');
 // Both tarballs in one install: sheperd's optional dependency on this host's platform package is
 // then satisfied by the local tarball. The other platforms' optional packages do not match this
-// host's os/cpu and are skipped, as they are for a user.
-execFileSync(
-  "npm",
-  [
-    "install",
-    "--no-audit",
-    "--no-fund",
-    "--no-package-lock",
-    join(tarballDir, sheperdTgz),
-    join(tarballDir, platformTgz),
-  ],
-  { cwd: app, stdio: "inherit" },
-);
+// host's os/cpu and are skipped, as they are for a user. --offline: a registry copy of the same
+// version (after a release) must never replace the tarball under test.
+const npmInstall = (extra, cwd) =>
+  execFileSync(
+    "npm",
+    [
+      "install",
+      "--offline",
+      "--no-audit",
+      "--no-fund",
+      "--no-package-lock",
+      ...extra,
+      join(tarballDir, sheperdTgz),
+      join(tarballDir, platformTgz),
+    ],
+    { cwd, stdio: "inherit" },
+  );
+npmInstall([], app);
 const bin = join(app, "node_modules", ".bin", "rewire");
 pass(`installed ${sheperdTgz} and ${platformTgz} into ${app}`);
 
@@ -80,8 +87,8 @@ const userEnv = { ...process.env };
 for (const k of Object.keys(userEnv)) if (k.startsWith("REWIRE_")) delete userEnv[k];
 const freshHome = mkdtempSync(join(work, "home-"));
 const env = { ...userEnv, HOME: freshHome, XDG_CONFIG_HOME: join(freshHome, ".config") };
-const run = (args, extra = {}, cwd = app, base = env) =>
-  spawnSync(bin, args, { cwd, env: { ...base, ...extra }, encoding: "utf8", timeout: 600_000 });
+const run = (args, extra = {}, cwd = app, base = env, exe = bin) =>
+  spawnSync(exe, args, { cwd, env: { ...base, ...extra }, encoding: "utf8", timeout: 600_000 });
 
 const help = run(["--help"]);
 if (help.status !== 0 || !help.stdout.includes("usage:")) {
@@ -89,14 +96,53 @@ if (help.status !== 0 || !help.stdout.includes("usage:")) {
 }
 pass("rewire --help");
 
-const doctor = run(["doctor"]);
-process.stdout.write(`${doctor.stdout.trimEnd().replace(/^/gm, "  | ")}\n`);
-const expected = join(app, "node_modules", platformPkg, "rewire-sandbox");
-const line = `✓ rewire-sandbox ${expected} (platform package ${platformPkg})`;
-if (!doctor.stdout.split("\n").includes(line)) {
-  fail(`rewire doctor did not resolve the sandbox from ${platformPkg}; wanted:\n  ${line}`);
+const sandboxLine = (path) => `✓ rewire-sandbox ${path} (platform package ${platformPkg})`;
+/** Runs doctor and requires its sandbox line to be one of `paths`; returns the path found. */
+function doctorFinds(exe, paths, label) {
+  const doctor = run(["doctor"], {}, app, env, exe);
+  process.stdout.write(`${doctor.stdout.trimEnd().replace(/^/gm, "  | ")}\n`);
+  const lines = doctor.stdout.split("\n");
+  const found = paths.find((p) => lines.includes(sandboxLine(p)));
+  if (!found) {
+    fail(
+      `${label}: doctor did not resolve the sandbox from ${platformPkg}; wanted one of:\n  ${paths.map(sandboxLine).join("\n  ")}`,
+    );
+  }
+  pass(`${label}: rewire doctor resolves the sandbox from ${platformPkg}`);
+  return found;
 }
-pass(`rewire doctor resolves the sandbox from ${platformPkg}`);
+const localBinary = doctorFinds(
+  bin,
+  [join(app, "node_modules", platformPkg, "rewire-sandbox")],
+  "project install",
+);
+
+// The documented install. npm nests the optional platform package under sheperd, or (installed
+// from a tarball, offline) leaves it a hoisted sibling in the global node_modules.
+const prefix = mkdtempSync(join(work, "global-"));
+npmInstall(["--global", "--prefix", prefix], work);
+const globalModules = join(prefix, "lib", "node_modules");
+doctorFinds(
+  join(prefix, "bin", "rewire"),
+  [
+    join(globalModules, "sheperd", "node_modules", platformPkg, "rewire-sandbox"),
+    join(globalModules, platformPkg, "rewire-sandbox"),
+  ],
+  "npm i -g --prefix",
+);
+
+// A substituted binary (same package name and version, other bytes) is refused, fail closed.
+const original = readFileSync(localBinary);
+writeFileSync(localBinary, Buffer.concat([original, Buffer.from("\n")]));
+const tampered = run(["doctor"]);
+writeFileSync(localBinary, original);
+if (
+  tampered.stdout.includes("✓ rewire-sandbox") ||
+  !/sha256 does not match/.test(tampered.stdout)
+) {
+  fail(`doctor accepted a modified platform binary:\n${tampered.stdout}`);
+}
+pass("a modified platform binary is refused (sha256 mismatch)");
 
 if (values["faux-run"]) {
   const repo = mkdtempSync(join(work, "repo-"));
