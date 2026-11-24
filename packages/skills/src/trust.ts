@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import {
   chmod,
   copyFile,
+  link,
   lstat,
   mkdir,
   open,
@@ -68,32 +69,38 @@ async function backup(path: string, move: boolean): Promise<void> {
       if (move) await unlink(path);
       return;
     } catch (e) {
-      if (errCode(e) !== "EEXIST") return; // best effort: the store is empty/trimmed either way
+      if (errCode(e) !== "EEXIST")
+        throw unreadable(`cannot back up trust file: ${errCode(e) ?? e}`);
     }
   }
+  throw unreadable("cannot back up trust file: too many backups");
 }
 
-/**
- * A missing file is an empty store; a corrupt one is backed up (timestamped `.bak`) and treated as
- * empty; a file with some invalid entries is backed up and loaded without them. Any other read error
- * (EACCES, EISDIR, ...) or a symlinked path throws `trust_store_unreadable` and touches nothing.
- */
-export async function loadTrust(path: string): Promise<TrustStore> {
+async function readStore(path: string): Promise<{ store: TrustStore; dropped: boolean }> {
   await assertNotSymlink(path);
   let text: string;
   try {
     text = await readFile(path, "utf8");
   } catch (e) {
-    if (errCode(e) === "ENOENT") return empty();
+    if (errCode(e) === "ENOENT") return { store: empty(), dropped: false };
     throw unreadable(`cannot read trust file: ${errCode(e) ?? e}`);
   }
   const parsed = parseStore(text);
   if (!parsed) {
     await backup(path, true);
-    return empty();
+    return { store: empty(), dropped: false };
   }
-  if (parsed.dropped) await backup(path, false);
-  return { repos: parsed.repos };
+  return { store: { repos: parsed.repos }, dropped: parsed.dropped };
+}
+
+/**
+ * A missing file is an empty store; a corrupt one is backed up (timestamped `.bak`) and treated as
+ * empty; a file with some invalid entries loads without them (and is backed up when next written).
+ * Any other read error (EACCES, EISDIR, ...) or a symlinked path throws `trust_store_unreadable`
+ * and touches nothing.
+ */
+export async function loadTrust(path: string): Promise<TrustStore> {
+  return (await readStore(path)).store;
 }
 
 /**
@@ -123,35 +130,75 @@ export function trust(store: TrustStore, repoRealpath: string, repoSkillsHash: s
 const LOCK_STALE_MS = 30_000;
 const LOCK_WAIT_MS = 2_000;
 
-async function withLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const lock = `${path}.lock`;
+/** Test seam: runs after a waiter has judged the lock stale and before it tries to steal it. */
+export type LockHooks = { afterStaleSeen?: () => Promise<void> };
+
+async function acquireLock(lock: string, hooks?: LockHooks): Promise<string> {
+  const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
   const deadline = Date.now() + LOCK_WAIT_MS;
   for (let attempt = 0; ; attempt++) {
     try {
-      (await open(lock, "wx", 0o600)).close();
-      break;
+      const fh = await open(lock, "wx", 0o600);
+      try {
+        await fh.writeFile(token);
+      } finally {
+        await fh.close();
+      }
+      return token;
     } catch (e) {
       if (errCode(e) !== "EEXIST") throw unreadable(`cannot lock trust file: ${errCode(e) ?? e}`);
-      try {
-        if (Date.now() - (await stat(lock)).mtimeMs > LOCK_STALE_MS) {
-          await unlink(lock).catch(() => {});
-          continue;
-        }
-      } catch {
-        continue; // lock vanished: retry immediately
-      }
-      if (Date.now() > deadline)
-        throw new RewireError("trust_store_locked", "trust file is locked");
-      await new Promise((r) =>
-        setTimeout(r, Math.min(200, 5 * 2 ** Math.min(attempt, 5)) * (0.5 + Math.random())),
-      );
     }
+    try {
+      if (Date.now() - (await stat(lock)).mtimeMs > LOCK_STALE_MS) {
+        await hooks?.afterStaleSeen?.();
+        // Steal by atomic rename to a unique name: only one renamer gets the file.
+        const stolen = `${lock}.stale-${token}`;
+        try {
+          await rename(lock, stolen);
+        } catch {
+          continue; // someone else stole it first
+        }
+        if (Date.now() - (await stat(stolen)).mtimeMs > LOCK_STALE_MS) {
+          await unlink(stolen).catch(() => {});
+        } else {
+          // We raced a fresh holder and took its live lock: put it back (link fails if retaken).
+          await link(stolen, lock).catch(() => {});
+          await unlink(stolen).catch(() => {});
+        }
+        continue;
+      }
+    } catch {
+      continue; // lock vanished: retry immediately
+    }
+    if (Date.now() > deadline) throw new RewireError("trust_store_locked", "trust file is locked");
+    await new Promise((r) =>
+      setTimeout(r, Math.min(200, 5 * 2 ** Math.min(attempt, 5)) * (0.5 + Math.random())),
+    );
   }
+}
+
+/** Removes the lock only if it still carries our token (it may have been stolen as stale). */
+async function releaseLock(lock: string, token: string): Promise<void> {
+  try {
+    if ((await readFile(lock, "utf8")) === token) await unlink(lock);
+  } catch {
+    // already gone
+  }
+}
+
+/** Exported for tests only. */
+export async function withLock<T>(
+  path: string,
+  fn: () => Promise<T>,
+  hooks?: LockHooks,
+): Promise<T> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const lock = `${path}.lock`;
+  const token = await acquireLock(lock, hooks);
   try {
     return await fn();
   } finally {
-    await unlink(lock).catch(() => {});
+    await releaseLock(lock, token);
   }
 }
 
@@ -173,15 +220,21 @@ async function writeStore(path: string, store: TrustStore): Promise<void> {
 
 /** Whole-store write under the same lock as `trustRepo`. */
 export async function saveTrust(path: string, store: TrustStore): Promise<void> {
-  await withLock(path, () => writeStore(path, store));
+  await withLock(path, async () => {
+    if ((await readStore(path)).dropped) await backup(path, false);
+    await writeStore(path, store);
+  });
 }
 
 /** Locked read-merge-write: concurrent callers never lose each other's approvals. */
 export async function trustRepo(path: string, repo: string, hash: string): Promise<void> {
   const key = await trustKey(repo);
-  await withLock(path, async () => writeStore(path, trust(await loadTrust(path), key, hash)));
+  await withLock(path, async () => {
+    const { store, dropped } = await readStore(path);
+    if (dropped) await backup(path, false);
+    await writeStore(path, trust(store, key, hash));
+  });
 }
-
 /**
  * sha256 over the sorted `name:sha256` pairs of the REPO skills. Shadowed repo skills are included:
  * one could become active if the user skill is removed, so it must be covered by the approval.

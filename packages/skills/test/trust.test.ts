@@ -23,6 +23,7 @@ import {
   trust,
   trustKey,
   trustRepo,
+  withLock,
 } from "../src/index.js";
 
 let root: string;
@@ -179,6 +180,8 @@ describe("trust store", () => {
     await writeFile(file, text);
     const store = await loadTrust(file);
     expect([...store.repos.keys()]).toEqual(["/ok"]);
+    expect(await baks()).toEqual([]); // reading alone leaves the file untouched
+    await trustRepo(file, repo, "e".repeat(64));
     expect(await baks()).toEqual([text]);
   });
 
@@ -254,5 +257,51 @@ describe("trust store", () => {
     expect(isTrusted(await loadTrust(file), await trustKey(link), h)).toBe(true);
     expect(await trustKey(link)).toBe(repo);
     expect(isTrusted(await loadTrust(file), link, h)).toBe(false);
+  });
+
+  test("two waiters seeing the same stale lock never both hold it", async () => {
+    await mkdir(join(root, "cfg"), { recursive: true });
+    const lock = `${file}.lock`;
+    await writeFile(lock, "dead-holder");
+    const old = new Date(Date.now() - 60_000);
+    await utimes(lock, old, old);
+    let holders = 0;
+    let maxHolders = 0;
+    let insideB!: () => void;
+    const bInside = new Promise<void>((r) => {
+      insideB = r;
+    });
+    const crit = (first: boolean) => async () => {
+      holders++;
+      maxHolders = Math.max(maxHolders, holders);
+      if (first) insideB();
+      await new Promise((r) => setTimeout(r, 150));
+      holders--;
+    };
+    let seen = 0;
+    // A judges the lock stale, then stalls until B holds a fresh lock.
+    const a = withLock(file, crit(false), {
+      afterStaleSeen: async () => {
+        if (seen++ === 0) await bInside;
+      },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    const b = withLock(file, crit(true), {
+      afterStaleSeen: async () => {
+        seen++;
+      },
+    });
+    await Promise.all([a, b]);
+    expect(maxHolders).toBe(1);
+  });
+
+  test("a holder whose lock was stolen does not delete the new holder's lock", async () => {
+    await mkdir(join(root, "cfg"), { recursive: true });
+    const lock = `${file}.lock`;
+    await withLock(file, async () => {
+      await rm(lock);
+      await writeFile(lock, "someone-else");
+    });
+    expect(await readFile(lock, "utf8")).toBe("someone-else");
   });
 });
