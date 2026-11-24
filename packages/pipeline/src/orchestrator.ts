@@ -54,6 +54,7 @@ import {
   trustedGit,
   trustedGitOk,
 } from "@rewire/sandbox";
+import type { SkillSet } from "@rewire/skills";
 import { z } from "zod";
 import { type EscalationReport, FixLoopController, type RoundState, score } from "./fix-loop.js";
 import {
@@ -61,7 +62,7 @@ import {
   type NodeModulesState,
   nodeModulesTampered,
 } from "./node-modules-guard.js";
-import { type ReportData, type ReviewData, renderReport } from "./report.js";
+import { type ReportData, type ReviewData, renderReport, type SkillUse } from "./report.js";
 import { ROLES, type Role, type RoleRouting } from "./routing.js";
 import { runImplementerStage } from "./stages/implementer.js";
 import { runSpecStage } from "./stages/spec.js";
@@ -91,6 +92,8 @@ export type RunPipelineInput = {
   seams?: PipelineSeams;
   /** The models are the faux provider (a harness self-test): the commit says so (M7). */
   faux?: boolean;
+  /** Claude skills for the author stages (spec, test-writer, implementer) only. The caller owns the set. */
+  skills?: SkillSet;
 };
 
 export type RunOutcome = {
@@ -167,6 +170,8 @@ class Escalation extends Error {
  */
 class EventLog {
   incomplete = false;
+  /** Skills the author stages loaded, by name (from `skill_loaded` events). */
+  readonly skills = new Map<string, SkillUse>();
   /** Lines are buffered until `start` (the run dir exists only after preflight, M8). */
   started = false;
   private buffered: string[] = [];
@@ -188,6 +193,16 @@ class EventLog {
     } catch {
       this.writeFailed();
       return;
+    }
+    if (clean.type === "skill_loaded") {
+      const u = this.skills.get(clean.name) ?? {
+        name: clean.name,
+        source: clean.source,
+        sha256: clean.sha256,
+        stages: [],
+      };
+      if (!u.stages.includes(clean.stage)) u.stages.push(clean.stage);
+      this.skills.set(clean.name, u);
     }
     if (this.started) this.append(`${line}\n`);
     else this.buffered.push(`${line}\n`);
@@ -370,6 +385,7 @@ export async function runPipeline(input: RunPipelineInput): Promise<RunOutcome> 
       ...(input.routing.independence === "same-family" ? ["independence: same-family"] : []),
     ],
     ...(escalation ? { escalation } : {}),
+    skillsUsed: [...log.skills.values()],
     eventLogIncomplete: log.incomplete,
   };
   await writeFile(reportPath, renderReport(data));
@@ -605,6 +621,7 @@ async function execute(ctx: Ctx): Promise<void> {
     emit: log.emit,
     runId,
     policy,
+    ...(input.skills ? { skills: input.skills } : {}),
     ...sig,
     ...clientFactory,
   });
@@ -624,6 +641,7 @@ async function execute(ctx: Ctx): Promise<void> {
     runId,
     policy,
     gateGuard: preGate(worktree, st, sig),
+    ...(input.skills ? { skills: input.skills } : {}),
     ...sig,
     ...clientFactory,
   });
@@ -669,6 +687,7 @@ async function execute(ctx: Ctx): Promise<void> {
       ...(feedback !== undefined ? { feedback } : {}),
       ...(input.seams?.implementerMaxTurns ? { maxTurns: input.seams.implementerMaxTurns } : {}),
       gateGuard: preGate(worktree, st, sig),
+      ...(input.skills ? { skills: input.skills } : {}),
       ...sig,
       ...clientFactory,
     });

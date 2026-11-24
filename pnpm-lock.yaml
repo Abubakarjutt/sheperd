@@ -144,6 +144,9 @@ importers:
       '@rewire/sandbox':
         specifier: workspace:*
         version: link:../sandbox
+      '@rewire/skills':
+        specifier: workspace:*
+        version: link:../skills
       '@rewire/tools':
         specifier: workspace:*
         version: link:../tools

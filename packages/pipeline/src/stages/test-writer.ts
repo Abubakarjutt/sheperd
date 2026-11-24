@@ -32,8 +32,10 @@ import type { TsPack } from "@rewire/pack-typescript";
 import type { Policy } from "@rewire/policy";
 import type { ModelRef, Provider } from "@rewire/providers";
 import { type CapabilityProfile, profileFor, SandboxClient } from "@rewire/sandbox";
+import type { SkillSet } from "@rewire/skills";
 import { createTools } from "@rewire/tools";
 import { PACKAGE_ROOT } from "../assets.js";
+import { authorSkills } from "../skills.js";
 
 const STAGE = "test-writer";
 const MAX_TURNS = 40;
@@ -68,6 +70,8 @@ export type TestWriterInput = {
   emit: (e: RunEvent) => void;
   runId: string;
   signal?: AbortSignal;
+  /** Claude skills: the index and the `skill` tool are added to the writer agent. */
+  skills?: SkillSet;
   /** Required: the stage never invents a policy (#20). */
   policy: Policy;
   /** Test seam: a caller-owned client for the agent (test-writer profile). Not disposed. */
@@ -268,14 +272,18 @@ async function execute(
   const { symbols, existingTests } = await repoContext(ctx);
   const basePrompt = buildPrompt(contract, symbols, existingTests);
   const kinds = new Map(contract.criteria.map((c) => [c.id, c.kind]));
-  const system = `${writerPrompt()}\n\n${UNTRUSTED_NOTICE}`;
+  const sk = authorSkills(input.skills, STAGE, input.runId, safeEmit);
+  const system = sk.system(`${writerPrompt()}\n\n${UNTRUSTED_NOTICE}`);
 
   const attempt = async (prompt: string): Promise<Analysis> => {
-    const tools = createTools(writerClient, {
-      policy,
-      stage: STAGE,
-      allow: ["read", "write", "edit", "grep", "find"],
-    });
+    const tools = [
+      ...createTools(writerClient, {
+        policy,
+        stage: STAGE,
+        allow: ["read", "write", "edit", "grep", "find"],
+      }),
+      ...authorSkills(input.skills, STAGE, input.runId, safeEmit).tools,
+    ];
     const result = await runAgent({
       provider: input.provider,
       model: input.model.model,

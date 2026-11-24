@@ -25,8 +25,10 @@ import type { TsPack } from "@rewire/pack-typescript";
 import type { Policy } from "@rewire/policy";
 import type { ChatRequest, ChatResponse, ModelRef, Provider, StopReason } from "@rewire/providers";
 import { type CapabilityProfile, profileFor, SandboxClient } from "@rewire/sandbox";
+import type { SkillSet } from "@rewire/skills";
 import { createTools } from "@rewire/tools";
 import { PACKAGE_ROOT } from "../assets.js";
+import { authorSkills } from "../skills.js";
 
 const STAGE = "implementer";
 const DEFAULT_MAX_TURNS = 60;
@@ -51,6 +53,8 @@ export type ImplementerInput = {
   /** Default 60. */
   maxTurns?: number;
   signal?: AbortSignal;
+  /** Claude skills: the index and the `skill` tool are added to the implementer agent. */
+  skills?: SkillSet;
   /** Required: the stage never invents a policy (#20). */
   policy: Policy;
   /** Test seam: a caller-owned client for the agent (implementer profile). Not disposed. */
@@ -280,11 +284,15 @@ async function execute(
   const gates = input.gates ?? [frozenTestsGate, tscGate, testsGate];
   const known = new Set(contract.criteria.map((c) => c.id));
   const stop = trackStop(input.provider);
-  const tools = createTools(agentClient, {
-    policy,
-    stage: STAGE,
-    allow: ["read", "write", "edit", "bash", "grep", "find"],
-  });
+  const sk = authorSkills(input.skills, STAGE, input.runId, safeEmit);
+  const tools = [
+    ...createTools(agentClient, {
+      policy,
+      stage: STAGE,
+      allow: ["read", "write", "edit", "bash", "grep", "find"],
+    }),
+    ...sk.tools,
+  ];
 
   let fastGates: GateResult[] = [];
   let lastHash: string | undefined;
@@ -367,7 +375,7 @@ async function execute(
   const result = await runAgent({
     provider: stop.provider,
     model: input.model.model,
-    system: `${implementerPrompt()}\n\n${UNTRUSTED_NOTICE}`,
+    system: sk.system(`${implementerPrompt()}\n\n${UNTRUSTED_NOTICE}`),
     prompt: buildPrompt(input),
     tools,
     hooks: { finishTurn },

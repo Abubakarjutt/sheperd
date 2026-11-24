@@ -21,6 +21,8 @@ export type ReviewData = {
   escalationReasons: string[];
 };
 
+export type SkillUse = { name: string; source: "user" | "repo"; sha256: string; stages: string[] };
+
 export type ReportData = {
   runId: string;
   task: string;
@@ -43,6 +45,8 @@ export type ReportData = {
   /** Ignored untracked entries deleted before gate runs and the final commit (R38). */
   removedIgnored?: string[];
   escalation?: EscalationReport;
+  /** Skills the author stages loaded; the section is omitted when empty or absent. */
+  skillsUsed?: SkillUse[];
   eventLogIncomplete: boolean;
 };
 
@@ -249,6 +253,15 @@ function escalationSection(e: EscalationReport): string {
   return out.join("\n");
 }
 
+function skillsSection(skills: SkillUse[]): string {
+  return skills
+    .map(
+      (s) =>
+        `- ${inline(s.name)} (${s.source}, sha256 ${s.sha256.slice(0, 12)}) — ${s.stages.map(inline).join(", ")}`,
+    )
+    .join("\n");
+}
+
 export function renderReport(d: ReportData): string {
   const sections: Array<[string, string]> = [
     ["Status", statusSection(d)],
@@ -258,6 +271,9 @@ export function renderReport(d: ReportData): string {
       ? ([["Ignored files removed", removedSection(d.removedIgnored)]] as Array<[string, string]>)
       : []),
     ["Review", reviewSection(d)],
+    ...(d.skillsUsed && d.skillsUsed.length > 0
+      ? ([["Skills used", skillsSection(d.skillsUsed)]] as Array<[string, string]>)
+      : []),
     ["Models & independence", modelsSection(d)],
     ["Network exceptions", networkSection(d)],
     ["Fix rounds", roundsSection(d)],

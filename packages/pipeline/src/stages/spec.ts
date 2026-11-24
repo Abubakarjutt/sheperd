@@ -6,8 +6,10 @@ import { runAgent } from "@rewire/loop";
 import type { Policy } from "@rewire/policy";
 import { type ChatMessage, type ModelRef, type Provider, structured } from "@rewire/providers";
 import { type CapabilityProfile, profileFor, SandboxClient } from "@rewire/sandbox";
+import type { SkillSet } from "@rewire/skills";
 import { createTools } from "@rewire/tools";
 import { PACKAGE_ROOT } from "../assets.js";
+import { authorSkills } from "../skills.js";
 
 const STAGE = "spec";
 const MAX_TURNS = 20;
@@ -25,6 +27,8 @@ export type SpecInput = {
   emit: (e: RunEvent) => void;
   runId: string;
   signal?: AbortSignal;
+  /** Claude skills: the index and the `skill` tool are added to the exploration agent. */
+  skills?: SkillSet;
   /** Required: the stage never invents a policy (#20). */
   policy: Policy;
   /** Test seam: a caller-owned client. It is not disposed by the stage. */
@@ -165,13 +169,17 @@ async function explore(
 ): Promise<Contract> {
   // Row 58: an oversized task cannot fit the digest; refuse it before spending any tokens.
   buildDigest(input.task, [], randomUUID());
-  const tools = createTools(client, { policy, stage: STAGE, allow: ["read", "grep", "find"] });
+  const sk = authorSkills(input.skills, STAGE, input.runId, safeEmit);
+  const tools = [
+    ...createTools(client, { policy, stage: STAGE, allow: ["read", "grep", "find"] }),
+    ...sk.tools,
+  ];
   const system = specPrompt();
 
   const explored = await runAgent({
     provider: input.provider,
     model: input.model.model,
-    system,
+    system: sk.system(system),
     prompt: input.task,
     tools,
     maxTurns: MAX_TURNS,
