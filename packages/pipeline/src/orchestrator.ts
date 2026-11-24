@@ -1,4 +1,13 @@
-import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -38,6 +47,7 @@ import {
   type Usage,
 } from "@rewire/providers";
 import {
+  BINARY_ASSET_EXTS,
   blockingFindings,
   buildDiffSummary,
   type DiffSummary,
@@ -572,8 +582,8 @@ const checkpointOn = (ctx: Ctx, kind: CheckpointKind): boolean =>
 
 /**
  * Ask the user at one checkpoint. The pending promise races the run's abort signal, so Ctrl-C
- * ends the run as interrupted even if the callback never settles. The decision is validated,
- * logged as a `checkpoint` event and recorded for the report.
+ * ends the run as interrupted even if the callback never settles. The decision is validated;
+ * the caller records it (`recordCheckpoint`) as what actually happens.
  */
 async function awaitCheckpoint(ctx: Ctx, cp: Checkpoint): Promise<CheckpointDecision> {
   const ask = ctx.input.checkpoint;
@@ -594,37 +604,112 @@ async function awaitCheckpoint(ctx: Ctx, cp: Checkpoint): Promise<CheckpointDeci
   } catch (e) {
     if (e instanceof Escalation) throw e;
     checkAbort(ctx);
-    throw new Escalation("stage_error", [], [`the ${cp.kind} checkpoint failed: ${errClip(e)}`]);
+    throw checkpointFault(cp.kind, `the ${cp.kind} checkpoint failed: ${errClip(e)}`);
   } finally {
     if (onAbort) signal?.removeEventListener("abort", onAbort);
   }
   checkAbort(ctx);
   const parsed = CheckpointDecision.safeParse(raw);
   if (!parsed.success) {
-    throw new Escalation(
-      "stage_error",
-      [],
-      [`the ${cp.kind} checkpoint returned an invalid decision`],
-    );
+    throw checkpointFault(cp.kind, `the ${cp.kind} checkpoint returned an invalid decision`);
   }
   const decision = parsed.data;
   if (cp.kind !== "contract" && decision.action === "revise") {
-    throw new Escalation("stage_error", [], [`the ${cp.kind} checkpoint does not accept revise`]);
+    throw checkpointFault(cp.kind, `the ${cp.kind} checkpoint does not accept revise`);
   }
+  return decision;
+}
+
+/** A checkpoint protocol error (a caller bug): fixed text, never a model call to explain it. */
+function checkpointFault(kind: CheckpointKind, detail: string): Escalation {
+  return new Escalation("stage_error", [], [detail], {
+    hypothesis: `The ${kind} approval checkpoint did not return a valid decision (a bug in the caller, not in the task), so the run stopped.`,
+    question: "Re-run the task; if it happens again, report the checkpoint error in the details?",
+  });
+}
+
+/** Log a checkpoint decision (events.jsonl) and keep it for the report. */
+function recordCheckpoint(ctx: Ctx, kind: CheckpointKind, decision: CheckpointDecision): void {
   ctx.log.emit({
     type: "checkpoint",
     runId: ctx.runId,
     ts: new Date().toISOString(),
     stage: ctx.st.stage,
-    kind: cp.kind,
+    kind,
     decision,
   });
   ctx.st.checkpoints.push({
-    kind: cp.kind,
+    kind,
     action: decision.action,
     ...("note" in decision && decision.note !== undefined ? { note: decision.note } : {}),
   });
-  return decision;
+}
+
+/** Ask, then record what happens (a non-contract checkpoint has no revise). */
+async function checkpointDecision(ctx: Ctx, cp: Checkpoint): Promise<CheckpointDecision> {
+  const d = await awaitCheckpoint(ctx, cp);
+  recordCheckpoint(ctx, cp.kind, d);
+  return d;
+}
+
+/**
+ * The frozen test files for the tests checkpoint, read on the host without following links: a
+ * non-regular entry (a symlink to a secret, a directory) is refused, never read.
+ */
+async function frozenFiles(
+  worktree: string,
+  manifest: FrozenTestManifest,
+): Promise<Array<{ path: string; content: string }>> {
+  const out: Array<{ path: string; content: string }> = [];
+  for (const f of manifest.files) {
+    const abs = join(worktree, f.path);
+    const st = await lstat(abs).catch(() => undefined);
+    if (!st?.isFile()) {
+      throw new Escalation(
+        "stage_error",
+        [],
+        [`frozen test ${f.path} is not a regular file at the tests checkpoint`],
+      );
+    }
+    out.push({ path: f.path, content: await readFile(abs, "utf8") });
+  }
+  return out;
+}
+
+/**
+ * The staged change against the frozen-tests commit for the commit checkpoint, hardened like the
+ * reviewers' diff: attributes from the frozen commit only (never the worktree or the user's global
+ * file), no external diff or textconv driver, text forced, binary assets left out.
+ */
+async function commitDiff(
+  worktree: string,
+  frozenCommit: string,
+  sig: { signal?: AbortSignal },
+): Promise<string> {
+  return trustedGitOk(
+    worktree,
+    [
+      `--attr-source=${frozenCommit}`,
+      "-c",
+      "core.quotepath=off",
+      "-c",
+      "core.attributesFile=/dev/null",
+      "diff",
+      "--cached",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-renames",
+      "--text",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
+      frozenCommit,
+      "--",
+      ".",
+      ...BINARY_ASSET_EXTS.map((e) => `:(exclude,icase,glob)**/*.${e}`),
+    ],
+    sig,
+  );
 }
 
 /** `stop` (or a revision past the limit): hand the run back to the user, exit 2 semantics. */
@@ -748,11 +833,14 @@ async function execute(ctx: Ctx): Promise<void> {
     checkAbort(ctx);
     if (!checkpointOn(ctx, "contract")) break;
     const d = await awaitCheckpoint(ctx, { kind: "contract", contract });
-    if (d.action === "approve") break;
-    if (d.action === "stop") throw stoppedByUser("contract", d.note);
-    if (notes.length >= MAX_REVISIONS) {
+    if (d.action === "revise" && notes.length >= MAX_REVISIONS) {
+      // A revise past the limit is treated as stop, and recorded as what happens.
+      recordCheckpoint(ctx, "contract", { action: "stop", note: d.note });
       throw stoppedByUser("contract", d.note, `revision limit of ${MAX_REVISIONS} reached`);
     }
+    recordCheckpoint(ctx, "contract", d);
+    if (d.action === "approve") break;
+    if (d.action === "stop") throw stoppedByUser("contract", d.note);
     notes.push(d.note);
     st.tried.push(`contract checkpoint: revision ${notes.length} requested`);
   }
@@ -777,13 +865,8 @@ async function execute(ctx: Ctx): Promise<void> {
   await writeFile(join(ctx.runDir, "manifest.json"), redact(JSON.stringify(manifest, null, 2)));
   checkAbort(ctx);
   if (checkpointOn(ctx, "tests")) {
-    const files = await Promise.all(
-      manifest.files.map(async (f) => ({
-        path: f.path,
-        content: await readFile(join(worktree, f.path), "utf8"),
-      })),
-    );
-    const d = await awaitCheckpoint(ctx, { kind: "tests", manifest, files });
+    const files = await frozenFiles(worktree, manifest);
+    const d = await checkpointDecision(ctx, { kind: "tests", manifest, files });
     if (d.action !== "approve")
       throw stoppedByUser("tests", d.action === "stop" ? d.note : undefined);
   }
@@ -943,13 +1026,9 @@ async function execute(ctx: Ctx): Promise<void> {
   }
   if (checkpointOn(ctx, "commit")) {
     // Computed only when the commit checkpoint is on: the staged change against the frozen tests.
-    const diff = await trustedGitOk(
-      worktree,
-      ["diff", "--cached", "--no-color", "--no-ext-diff", frozenCommit],
-      sig,
-    );
+    const diff = await commitDiff(worktree, frozenCommit, sig);
     const reportPreview = renderReport(reportData(ctx, "verified", false));
-    const d = await awaitCheckpoint(ctx, { kind: "commit", diff, reportPreview });
+    const d = await checkpointDecision(ctx, { kind: "commit", diff, reportPreview });
     if (d.action !== "approve")
       throw stoppedByUser("commit", d.action === "stop" ? d.note : undefined);
   }
