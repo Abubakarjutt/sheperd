@@ -26,6 +26,10 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  # Release binaries are built with exactly this toolchain, never "whatever stable is today".
+  RUST_TOOLCHAIN: "1.100.0"
+
 jobs:
   plan:
     runs-on: ubuntu-latest
@@ -95,15 +99,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Rust toolchain
+      - name: Rust toolchain ${{ env.RUST_TOOLCHAIN }}
         run: |
           if command -v rustup >/dev/null; then
-            rustup toolchain install stable --profile minimal && rustup default stable
+            rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           else
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-              | sh -s -- -y --profile minimal --default-toolchain stable
+              | sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
+          # Every later cargo/rustc call in this job uses the pinned toolchain.
+          echo "RUSTUP_TOOLCHAIN=$RUST_TOOLCHAIN" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -127,6 +133,10 @@ jobs:
               exit 1
             fi
           fi
+          rustc --version
+          # File list and local-path check on this runner, where the paths that must not leak
+          # (this home directory and checkout) are known.
+          node scripts/npm/build.mjs check --out dist-npm
           # upload-artifact drops the executable bit; a tar keeps it.
           tar -C dist-npm -cf "sheperd-${{ matrix.target }}.tar" "sheperd-${{ matrix.target }}"
 
@@ -156,7 +166,6 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r build
-      - run: node scripts/npm/build.mjs sheperd --out dist-npm
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -165,12 +174,15 @@ jobs:
           merge-multiple: true
 
       - name: Unpack the platform packages
-        run: for f in artifacts/*.tar; do tar -xf "$f" -C dist-npm; done
+        run: mkdir -p dist-npm && for f in artifacts/*.tar; do tar -xf "$f" -C dist-npm; done
+
+      # After the binaries: the bundle records each one's sha256 and refuses any other.
+      - run: node scripts/npm/build.mjs sheperd --all-platforms --out dist-npm
 
       - name: Check and pack all five packages
         run: node scripts/npm/build.mjs pack --all-platforms --out dist-npm
 
-      - name: Smoke-test the packed tarballs (install, --help, doctor)
+      - name: Smoke-test the packed tarballs (install, install -g, --help, doctor, tamper)
         run: node scripts/npm/smoke.mjs --tarballs dist-npm/tarballs
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -181,16 +193,40 @@ jobs:
           retention-days: 30
 
   # Only this job can publish, and it runs no repository code: it publishes the tarballs the
-  # package job checked and smoke-tested.
+  # package job checked and smoke-tested. It runs in the npm-publish environment, which holds
+  # NPM_TOKEN and must be limited to v* tags with a required reviewer (docs/RELEASING.md).
   publish:
     needs: [plan, package]
     if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+    environment: npm-publish
     permissions:
+      actions: read
       contents: read
       id-token: write
     steps:
+      # GitHub creates an unknown environment on the fly, with no protection; refuse to publish
+      # from one, or without the token.
+      - name: Require a protected npm-publish environment and its NPM_TOKEN
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HAS_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+        run: |
+          fail() { echo "::error::$1 (see docs/RELEASING.md, one-time setup)"; exit 1; }
+          env_json=$(gh api "repos/$REPO/environments/npm-publish") \
+            || fail "cannot read the npm-publish environment"
+          reviewers=$(jq '[.protection_rules[]? | select(.type == "required_reviewers")] | length' <<<"$env_json")
+          [ "$reviewers" -gt 0 ] || fail "the npm-publish environment has no required reviewer"
+          [ "$(jq -r '.deployment_branch_policy.custom_branch_policies // false' <<<"$env_json")" = true ] \
+            || fail "the npm-publish environment is not limited to selected tags"
+          tags=$(gh api "repos/$REPO/environments/npm-publish/deployment-branch-policies" \
+            --jq '.branch_policies[] | select(.type == "tag") | .name') \
+            || fail "cannot read the npm-publish deployment policies"
+          grep -qx 'v\*' <<<"$tags" || fail "the npm-publish environment does not allow the tag pattern v*"
+          [ "$HAS_TOKEN" = true ] || fail "NPM_TOKEN is not set in the npm-publish environment"
+
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
@@ -201,20 +237,66 @@ jobs:
           name: npm-tarballs
           path: tarballs
 
+      # A version already on the registry is skipped only when it is byte-for-byte these
+      # tarballs (a re-run after a partial publish). Anything else, e.g. a squatted or hijacked
+      # sheperd-<os>-<arch>@<version>, fails the job before sheperd is published.
       - name: npm publish (platform packages first, then sheperd) with --tag next
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
-          publish() {
-            # A re-run after a partial publish skips what is already on the registry.
-            if npm view "$1@$VERSION" version >/dev/null 2>&1; then
-              echo "$1@$VERSION is already published; skipping"
+          set -euo pipefail
+          packages="sheperd-darwin-arm64 sheperd-darwin-x64 sheperd-linux-x64 sheperd-linux-arm64 sheperd"
+          local_sri() { echo "sha512-$(openssl dgst -sha512 -binary "tarballs/$1-$VERSION.tgz" | openssl base64 -A)"; }
+          # Prints the registry's dist.integrity for $1@$VERSION, or nothing when it is not
+          # published; any other registry error fails.
+          registry_sri() {
+            local out err
+            err=$(mktemp)
+            if out=$(npm view "$1@$VERSION" dist.integrity 2>"$err"); then
+              echo "$out"
+            elif grep -q E404 "$err"; then
+              echo ""
             else
-              npm publish "tarballs/$1-$VERSION.tgz" --provenance --access public --tag next
+              cat "$err" >&2
+              echo "::error::npm view $1@$VERSION failed"
+              return 1
             fi
           }
-          for target in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
-            publish "sheperd-$target"
+          check_all() { # $1 = "before" or "after"
+            local bad=0 name want got
+            for name in $packages; do
+              want=$(local_sri "$name")
+              got=$(registry_sri "$name")
+              if [ -z "$got" ]; then
+                if [ "$1" = after ]; then
+                  echo "::error::$name@$VERSION is not on the registry after publishing"
+                  bad=1
+                else
+                  echo "$name@$VERSION: not published yet"
+                fi
+              elif [ "$got" = "$want" ]; then
+                echo "$name@$VERSION: registry integrity matches the local tarball"
+              else
+                echo "::error::$name@$VERSION on the registry ($got) is not the local tarball ($want)"
+                bad=1
+              fi
+            done
+            return "$bad"
+          }
+          check_all before
+          for name in $packages; do
+            if [ -z "$(registry_sri "$name")" ]; then
+              npm publish "tarballs/$name-$VERSION.tgz" --provenance --access public --tag next
+            else
+              echo "$name@$VERSION is already published with this exact tarball; skipping"
+            fi
           done
-          publish sheperd
+          # The registry can take a moment to serve a new version.
+          for attempt in 1 2 3 4 5 6; do
+            if check_all after; then exit 0; fi
+            echo "registry not consistent yet (attempt $attempt); retrying in 20s"
+            sleep 20
+          done
+          echo "::error::the registry does not serve exactly the published tarballs"
+          exit 1
