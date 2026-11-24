@@ -18,10 +18,26 @@ export const HARD_BLOCK_CATEGORIES: ReadonlySet<SlopCategory> = new Set(
   SlopCategory.options.slice(0, 5),
 );
 
+/**
+ * What a criterion asks of the change. `change`: new or corrected behaviour; its tests must fail
+ * before the fix. `preserve`: behaviour that works today and the task says must keep working; its
+ * tests must pass before the fix. Both kinds must pass after it.
+ */
+export const CriterionKind = z.enum(["change", "preserve"]);
+export type CriterionKind = z.infer<typeof CriterionKind>;
+
+export const Criterion = z.object({ id: z.string(), kind: CriterionKind, statement: z.string() });
+export type Criterion = z.infer<typeof Criterion>;
+
+/**
+ * `kind` is required, with no default: the only place a contract is parsed is the spec model's
+ * output (contract.json is written for the record, never read back), and a silent default would
+ * hide an unlabelled criterion.
+ */
 export const Contract = z.object({
   id: z.string(),
   title: z.string(),
-  criteria: z.array(z.object({ id: z.string(), statement: z.string() })).min(1),
+  criteria: z.array(Criterion).min(1),
   nonGoals: z.array(z.string()),
   affectedAreas: z.array(z.string()),
   openQuestions: z.array(z.string()),

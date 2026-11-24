@@ -104,6 +104,11 @@ function buildDigest(
   return { digest: head + open + defangUntrustedClosers(body) + close, trimmed };
 }
 
+const hasChange = (c: Contract): boolean => c.criteria.some((x) => x.kind === "change");
+
+const NO_CHANGE_FEEDBACK =
+  'Your contract was not valid: no criterion has kind "change". The new or corrected behaviour the task asks for (the bug being fixed, the feature being added) is always a "change" criterion; "preserve" is only for behaviour that already works today and must keep working. Return the corrected contract JSON only.';
+
 function numbered(c: Contract): Contract {
   return { ...c, criteria: c.criteria.map((x, i) => ({ ...x, id: `AC-${i + 1}` })) };
 }
@@ -196,13 +201,32 @@ async function explore(
       ? " The transcript was capped at about 200 KB: the oldest tool results were dropped."
       : ""
   }`;
-  const compileWith = (content: string) =>
+  const structuredContract = (messages: ChatMessage[]) =>
     structured(input.provider, input.model, Contract, {
       system: sys,
-      messages: [{ role: "user", content }],
+      messages,
       maxTokens: 8192,
       ...(input.signal ? { signal: input.signal } : {}),
     });
+  // A contract with no `change` criterion asks for nothing new: its tests would all pass before
+  // the fix, so nothing could ever be red-checked. Same pattern as an invalid structured reply:
+  // one corrective retry, then a stage error. A contract with open questions is not final (it is
+  // recompiled after answers, or ends as clarification_required), so the rule waits for that.
+  const compileWith = async (content: string): Promise<Contract> => {
+    const first = await structuredContract([{ role: "user", content }]);
+    if (hasChange(first) || first.openQuestions.length > 0) return first;
+    const second = await structuredContract([
+      { role: "user", content },
+      { role: "assistant", content: JSON.stringify(first) },
+      { role: "user", content: NO_CHANGE_FEEDBACK },
+    ]);
+    if (hasChange(second) || second.openQuestions.length > 0) return second;
+    throw new RewireError(
+      "contract_without_change",
+      'the compiled contract has no criterion of kind "change": every criterion is "preserve" (behaviour that already works), so there is nothing to build or red-check',
+      "the task must ask for new or corrected behaviour; if it does, the spec model mislabelled it as preserve. Refactor-only tasks (no behaviour change) are not supported in v0.1",
+    );
+  };
 
   let contract = await compileWith(digest);
   if (contract.openQuestions.length > 0) {

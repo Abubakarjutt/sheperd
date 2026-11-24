@@ -104,7 +104,9 @@ function contractSection(d: ReportData): string {
   const map = d.manifest?.criteriaToTests ?? {};
   const out = [`Title: ${inline(d.contract.title)}`, ""];
   for (const c of d.contract.criteria) {
-    out.push(`- ${inline(c.id)}: ${inline(c.statement)}`);
+    // The kind is shown so a mislabel (a bug marked preserve, an existing behaviour marked change)
+    // is visible to whoever reads the evidence. It is a schema enum, never free text.
+    out.push(`- ${inline(c.id)} (${c.kind}): ${inline(c.statement)}`);
     const tests = map[c.id] ?? [];
     if (tests.length === 0) out.push("  - (no linked test)");
     for (const t of tests) out.push(`  - test: ${inline(t)}`);

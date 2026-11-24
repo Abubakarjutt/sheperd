@@ -54,8 +54,8 @@ const CONTRACT: Contract = {
   id: "c1",
   title: "math",
   criteria: [
-    { id: "AC-1", statement: "adds" },
-    { id: "AC-2", statement: "doubles" },
+    { id: "AC-1", kind: "change", statement: "adds" },
+    { id: "AC-2", kind: "preserve", statement: "doubles" },
   ],
   nonGoals: ["no new deps"],
   affectedAreas: ["src/math.ts"],

@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { RewireError, type RunEvent } from "@rewire/core";
 import { DEFAULT_POLICY } from "@rewire/policy";
 import { call, FauxProvider, type ScriptEntry, text } from "@rewire/providers";
@@ -5,6 +8,7 @@ import { type CapabilityProfile, profileFor, type SandboxClient } from "@rewire/
 import { expect, test } from "vitest";
 import { runSpecStage } from "../src/index.js";
 
+const here = dirname(fileURLToPath(import.meta.url));
 const client = {} as SandboxClient;
 const model = { provider: "ollama", model: "faux" } as const;
 
@@ -13,8 +17,8 @@ function contractJson(over: Record<string, unknown> = {}): string {
     id: "c1",
     title: "Add thing",
     criteria: [
-      { id: "x", statement: "returns 1" },
-      { id: "y", statement: "returns 2" },
+      { id: "x", kind: "change", statement: "returns 1" },
+      { id: "y", kind: "preserve", statement: "returns 2" },
     ],
     nonGoals: ["no ui"],
     affectedAreas: ["src/a.ts"],
@@ -54,6 +58,7 @@ test("compiles contract and renumbers criteria", async () => {
   const c = await run();
   expect(c.criteria.map((x) => x.id)).toEqual(["AC-1", "AC-2"]);
   expect(c.criteria.map((x) => x.statement)).toEqual(["returns 1", "returns 2"]);
+  expect(c.criteria.map((x) => x.kind)).toEqual(["change", "preserve"]);
   expect(events.map((e) => e.type)).toEqual(["stage_start", "stage_end"]);
   const end = events[1];
   expect(end?.type === "stage_end" && end.ok).toBe(true);
@@ -73,13 +78,13 @@ test("answers trigger exactly one recompile", async () => {
     [
       text("x"),
       text(contractJson({ openQuestions: ["Which db?"] })),
-      text(contractJson({ criteria: [{ id: "q", statement: "uses sqlite" }] })),
+      text(contractJson({ criteria: [{ id: "q", kind: "change", statement: "uses sqlite" }] })),
     ],
     async () => ["sqlite"],
   );
   const c = await run();
   expect(provider.callCount).toBe(3); // 1 exploration + 2 structured
-  expect(c.criteria).toEqual([{ id: "AC-1", statement: "uses sqlite" }]);
+  expect(c.criteria).toEqual([{ id: "AC-1", kind: "change", statement: "uses sqlite" }]);
   const second = provider.requests[2]?.messages[0]?.content ?? "";
   const first = provider.requests[1]?.messages[0]?.content ?? "";
   expect(second.startsWith(first)).toBe(true);
@@ -271,4 +276,89 @@ test("an oversized task is refused before any model call (row 58)", async () => 
   const err = await run().catch((e: unknown) => e);
   expect((err as RewireError).code).toBe("spec_task_too_large");
   expect(provider.callCount).toBe(0);
+});
+
+// ---- criterion kinds ----
+
+const allPreserve = contractJson({
+  criteria: [
+    { id: "x", kind: "preserve", statement: "wrap still splits on spaces" },
+    { id: "y", kind: "preserve", statement: "an invalid width still throws RangeError" },
+  ],
+});
+
+test("an all-preserve contract is retried once, then refused with contract_without_change", async () => {
+  const { run, provider, events } = setup([text("explored"), text(allPreserve), text(allPreserve)]);
+  const err = await run().catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(RewireError);
+  expect((err as RewireError).code).toBe("contract_without_change");
+  expect((err as RewireError).message).toMatch(/no criterion of kind "change"/);
+  expect(provider.callCount).toBe(3); // exploration + compile + one corrective retry
+  const retry = provider.requests[2]?.messages ?? [];
+  expect(retry.at(-1)?.content).toMatch(/no criterion has kind "change"/);
+  expect(retry.at(-2)?.role).toBe("assistant");
+  const end = events.at(-1);
+  expect(end?.type === "stage_end" && end.ok).toBe(false);
+});
+
+test("an all-preserve contract corrected on the retry compiles", async () => {
+  const { run, provider } = setup([text("explored"), text(allPreserve), text(contractJson())]);
+  const c = await run();
+  expect(provider.callCount).toBe(3);
+  expect(c.criteria.map((x) => x.kind)).toEqual(["change", "preserve"]);
+});
+
+test("the recompile after clarification is held to the same rule", async () => {
+  const { run } = setup(
+    [
+      text("x"),
+      text(contractJson({ openQuestions: ["Which db?"] })),
+      text(allPreserve),
+      text(allPreserve),
+    ],
+    async () => ["sqlite"],
+  );
+  const err = await run().catch((e: unknown) => e);
+  expect((err as RewireError).code).toBe("contract_without_change");
+});
+
+test("a criterion without a kind is invalid structured output", async () => {
+  const noKind = contractJson({ criteria: [{ id: "x", statement: "returns 1" }] });
+  const { run } = setup([text("x"), text(noKind), text(noKind)]);
+  const err = await run().catch((e: unknown) => e);
+  expect((err as RewireError).code).toBe("structured_output_invalid");
+  expect((err as RewireError).message).toMatch(/kind/);
+});
+
+test("the spec prompt explains both kinds and that the bug is always change", () => {
+  const prompt = readFileSync(join(here, "../prompts/spec.md"), "utf8");
+  expect(prompt).toMatch(/`change`: new or corrected behaviour/);
+  expect(prompt).toMatch(/`preserve`: behaviour that already works today/);
+  expect(prompt).toMatch(/The bug being fixed, or the feature being added, is always `change`/);
+});
+
+test("an ambiguous all-preserve compile asks for clarification instead of failing the rule", async () => {
+  const ambiguous = contractJson({
+    criteria: [{ id: "x", kind: "preserve", statement: "wrap still works" }],
+    openQuestions: ["Which behaviour is broken today?"],
+  });
+  const { run, provider } = setup([text("explored"), text(ambiguous)]);
+  const err = await run().catch((e: unknown) => e);
+  expect((err as RewireError).code).toBe("clarification_required");
+  expect((err as RewireError).message).toBe("Which behaviour is broken today?");
+  expect(provider.callCount).toBe(2); // no corrective retry for a contract that is not final
+});
+
+test("after clarification answers, the final contract is held to the change rule", async () => {
+  const ambiguous = contractJson({
+    criteria: [{ id: "x", kind: "preserve", statement: "wrap still works" }],
+    openQuestions: ["Which behaviour is broken today?"],
+  });
+  const { run, provider } = setup(
+    [text("x"), text(ambiguous), text(allPreserve), text(contractJson())],
+    async () => ["negative widths"],
+  );
+  const c = await run();
+  expect(provider.callCount).toBe(4); // exploration, compile, recompile, one corrective retry
+  expect(c.criteria.map((x) => x.kind)).toEqual(["change", "preserve"]);
 });

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 /** Every fence tag. Both the defanging here and the fold in evidence.ts derive from this list. */
-export const FENCE_TAGS = ["diff", "file", "contract", "findings"] as const;
+export const FENCE_TAGS = ["diff", "file", "contract", "findings", "task"] as const;
 export type FenceTag = (typeof FENCE_TAGS)[number];
 const CLOSER = new RegExp(`<\\s*\\/\\s*(${FENCE_TAGS.join("|")})`, "gi");
 const ATTR_NAME = /^[A-Za-z_][A-Za-z0-9_-]*$/;

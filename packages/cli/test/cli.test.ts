@@ -120,7 +120,7 @@ const contract = (openQuestions: string[] = []) =>
   JSON.stringify({
     id: "c1",
     title: "t",
-    criteria: [{ id: "x", statement: "does a thing" }],
+    criteria: [{ id: "x", kind: "change", statement: "does a thing" }],
     nonGoals: [],
     affectedAreas: [],
     openQuestions,

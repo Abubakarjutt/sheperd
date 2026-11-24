@@ -162,7 +162,7 @@ if (values["faux-run"]) {
   const contract = JSON.stringify({
     id: "c1",
     title: "add sum",
-    criteria: [{ id: "x", statement: "sum(a, b) returns a + b" }],
+    criteria: [{ id: "x", kind: "change", statement: "sum(a, b) returns a + b" }],
     nonGoals: [],
     affectedAreas: ["src/sum.ts"],
     openQuestions: [],

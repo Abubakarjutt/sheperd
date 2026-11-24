@@ -27,7 +27,9 @@ import {
   type GateContext,
   hashFiles,
   lintGate,
+  NO_ASSERTION_RE,
   runGates,
+  runTestFiles,
   testsGate,
   tscGate,
   verifyFrozen,
@@ -60,8 +62,8 @@ const CONTRACT: Contract = {
   id: "c1",
   title: "t",
   criteria: [
-    { id: "AC-1", statement: "adds" },
-    { id: "AC-2", statement: "doubles" },
+    { id: "AC-1", kind: "change", statement: "adds" },
+    { id: "AC-2", kind: "change", statement: "doubles" },
   ],
   nonGoals: [],
   affectedAreas: [],
@@ -519,11 +521,31 @@ test("AC-2: doubles", () => { expect(1).toBe(2); });
     const manifest = await freezeAc(root);
     const contract = {
       ...CONTRACT,
-      criteria: [...CONTRACT.criteria, { id: "AC-9", statement: "nothing" }],
+      criteria: [
+        ...CONTRACT.criteria,
+        { id: "AC-9", kind: "change" as const, statement: "nothing" },
+      ],
     };
     const r = await testsGate.run({ ...ctx, manifest, contract });
     expect(r.status).toBe("fail");
     expect((r.details as { uncoveredCriteria: string[] }).uncoveredCriteria).toEqual(["AC-9"]);
+  });
+
+  test("a frozen test for a preserve criterion must pass like any other", async () => {
+    const { root, ctx } = await makeRepo();
+    const contract: Contract = {
+      ...CONTRACT,
+      criteria: [
+        { id: "AC-1", kind: "change", statement: "adds" },
+        { id: "AC-2", kind: "preserve", statement: "doubles" },
+      ],
+    };
+    const manifest = await freezeAc(root, AC_TEST.replace("toBe(8)", "toBe(9)"));
+    const r = await testsGate.run({ ...ctx, manifest, contract });
+    expect(r.status).toBe("fail");
+    expect((r.details as { uncoveredCriteria: string[] }).uncoveredCriteria).toEqual(["AC-2"]);
+    const ok = await testsGate.run({ ...ctx, manifest: await freezeAc(root), contract });
+    expect(ok.status).toBe("pass");
   });
 
   test("tests gate fails on newly added it.skip in a frozen file", async () => {
@@ -857,6 +879,86 @@ test("AC-2: doubles", () => { expect(2).toBe(2); });
     for (const k of ["setupFiles", "setupFilesAfterEnv", "globalSetup", "reporters", "transform"]) {
       expect(cfg).not.toHaveProperty(k);
     }
+  });
+
+  test("requireAssertions (the red check) adds only a harness-owned hasAssertions setup for jest", async () => {
+    const { ctx } = await makeRepo();
+    write(ctx.worktree, "test/ac.test.ts", AC_TEST);
+    const out = join(ctx.scratch, "jest-setup.json");
+    const script = `const fs=require('fs');const c=JSON.parse(fs.readFileSync(process.argv.find(a=>a.startsWith('--config=')).slice(9),'utf8'));const probe=c.testMatch.find(m=>m.includes('rewire-assertion-probe'));fs.writeFileSync(${JSON.stringify(out)},JSON.stringify({c,probe:probe&&fs.readFileSync(probe.replace(/\\\\(.)/g,'$1'),'utf8'),setup:(c.setupFilesAfterEnv||[]).map(f=>fs.readFileSync(f,'utf8'))}));`;
+    const pack: TsPack = {
+      ...ctx.pack,
+      testRunner: "jest",
+      testCommand: ["node", "-e", script, "--"],
+      testJsonArgs: ["--json", "--outputFile=<path>"],
+    };
+    // The fake runner writes no report: only the config it was given matters here.
+    await expect(
+      runTestFiles({ ...ctx, pack }, ["test/ac.test.ts"], { requireAssertions: true }),
+    ).rejects.toThrow(/no JSON report/);
+    const { c, setup, probe } = JSON.parse(readFileSync(out, "utf8"));
+    // The no-assertion probe runs in the same invocation, from the private gate dir.
+    expect(probe).toBe('test("rewire assertion probe: makes no assertion", () => {});\n');
+    expect(c.testMatch).toHaveLength(2);
+    expect(c.roots).toHaveLength(2);
+    expect(c.setupFilesAfterEnv).toHaveLength(1);
+    expect(c.setupFilesAfterEnv[0].startsWith(ctx.scratch)).toBe(true);
+    expect(setup).toEqual(["beforeEach(() => {\n  expect.hasAssertions();\n});\n"]);
+    for (const k of ["setupFiles", "globalSetup", "reporters", "transform"]) {
+      expect(c).not.toHaveProperty(k);
+    }
+  });
+
+  test("requireAssertions makes a vitest test with no assertion fail (the red check)", async () => {
+    const { ctx } = await makeRepo();
+    write(
+      ctx.worktree,
+      "test/ac.test.ts",
+      `import { test } from "vitest";\nimport { add } from "../src/math.js";\ntest("AC-1: adds", () => { add(1, 2); });\n`,
+    );
+    const plain = await runTestFiles(ctx, ["test/ac.test.ts"]);
+    expect(plain.tests.map((t) => t.status)).toEqual(["passed"]);
+    expect(plain.assertionProbe).toBeUndefined();
+    const strict = await runTestFiles(ctx, ["test/ac.test.ts"], { requireAssertions: true });
+    // The probe is reported separately, never as one of the run's tests.
+    expect(strict.tests.map((t) => t.status)).toEqual(["failed"]);
+    expect([...strict.ranFiles.keys()]).toEqual(["test/ac.test.ts"]);
+    expect(strict.tests[0]?.failureMessages.join("\n")).toMatch(/expected any number of assertion/);
+    expect(strict.assertionProbe).toEqual({
+      enforced: true,
+      detail: "the probe test failed with the no-assertion error",
+    });
+  });
+
+  test("a runner that ignores requireAssertions is detected by the probe (fails closed)", async () => {
+    const { ctx } = await makeRepo();
+    write(ctx.worktree, "test/ac.test.ts", AC_TEST);
+    // Stands in for a vitest that drops the unknown config key: the CLI flag overrides it.
+    const pack: TsPack = {
+      ...ctx.pack,
+      testCommand: [...ctx.pack.testCommand, "--expect.requireAssertions=false"],
+    };
+    const r = await runTestFiles({ ...ctx, pack }, ["test/ac.test.ts"], {
+      requireAssertions: true,
+    });
+    expect(r.tests.map((t) => t.status)).toEqual(["passed", "passed"]);
+    expect(r.assertionProbe?.enforced).toBe(false);
+    expect(r.assertionProbe?.detail).toMatch(/the probe test ended passed/);
+  });
+
+  test("NO_ASSERTION_RE matches both runners' messages, including jest's bare Error header", () => {
+    expect(NO_ASSERTION_RE.test("Error: expected any number of assertion, but got none")).toBe(
+      true,
+    );
+    expect(
+      NO_ASSERTION_RE.test(
+        "Error: \n\nExpected at least one assertion to be called but received none.",
+      ),
+    ).toBe(true);
+    expect(NO_ASSERTION_RE.test("Error: expect.hasAssertions()\n\nExpected at least one")).toBe(
+      true,
+    );
+    expect(NO_ASSERTION_RE.test("AssertionError: expected 4 to be 5")).toBe(false);
   });
 
   // The sandbox drops a TMPDIR outside its write space, so os.tmpdir() fell back to /tmp, which

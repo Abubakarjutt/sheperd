@@ -22,8 +22,16 @@ const contract = {
   id: "c-live",
   title: "Add a file download endpoint and a settings loader",
   criteria: [
-    { id: "AC-1", statement: "GET /files?name=<n> returns a file from the uploads directory only" },
-    { id: "AC-2", statement: "loadSettings(path) throws when the file is missing or invalid" },
+    {
+      id: "AC-1",
+      kind: "change" as const,
+      statement: "GET /files?name=<n> returns a file from the uploads directory only",
+    },
+    {
+      id: "AC-2",
+      kind: "change" as const,
+      statement: "loadSettings(path) throws when the file is missing or invalid",
+    },
   ],
   nonGoals: ["No caching layer"],
   affectedAreas: ["src"],

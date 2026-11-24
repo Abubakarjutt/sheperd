@@ -65,7 +65,7 @@ import { type ReportData, type ReviewData, renderReport } from "./report.js";
 import { ROLES, type Role, type RoleRouting } from "./routing.js";
 import { runImplementerStage } from "./stages/implementer.js";
 import { runSpecStage } from "./stages/spec.js";
-import { runTestWriterStage } from "./stages/test-writer.js";
+import { PreserveFailsNowError, runTestWriterStage } from "./stages/test-writer.js";
 import { pruneIgnored, snapshotTree, stageAll } from "./tree-guard.js";
 
 /** Test seams. Production callers leave them unset. */
@@ -134,7 +134,7 @@ export const KNOWN_LIMITATIONS: readonly string[] = [
   "Linux has reduced OS-layer guarantees: the OS layer doesn't block creation on Linux; the protected-paths gate does (it re-checks every changed or untracked path against the implementer profile); a nested .git created after the sandbox starts fails the protected-paths gate and the gated-tree snapshot refuses it as a new gitlink, so it is never committed; case-variant spellings are caught by the path layer and the gates, not the OS",
   "Linux escape reporting is best-effort: a command that kills the in-namespace reaper (kill -9 -1, which ends the exec with 137) or ptraces it (Yama ptrace_scope 0) avoids the escape label; the leftover is still killed when the pid namespace is torn down",
   "on macOS, a process that detaches from the sandbox faster than one poll interval can outlive its stage; a worktree change it makes after the last gate run fails the final tree-equality check, but the process itself may keep running",
-  "fake-verification residuals: the red check and the tests gate do not detect every vacuous test (no expect call, a snapshot alias, a hand-thrown AssertionError); mutation testing is deferred",
+  "fake-verification residuals: the red check and the tests gate do not detect every vacuous test (a snapshot alias, a hand-thrown AssertionError; the tests gate also accepts a test with no expect call, which the red check rejects); a preserve criterion's test passes before and after the change, so it is only as strong as what it asserts: a bug the spec stage labels preserve stops the run only if its test exercises the bug, otherwise only the spec-compliance reviewer (which compares the labels with the task) or a human reading the report can catch it; mutation testing is deferred",
   "the console-summary cross-check reads the last summary in the runner output, so in-process code that prints a forged summary after the real one is not detected",
   "`__mocks__` directories are protected config: mocks cannot be added or changed during a run",
   "only npm, pnpm and yarn are recognised (bun and others fall back to npm), and the lint fallback runs a local binary named like the npx command",
@@ -403,6 +403,14 @@ function toEscalation(e: unknown, ctx: Ctx): Escalation | undefined {
       });
     case "implementer_truncated":
       return new Escalation("implementer_truncated", [], [detail]);
+    case "preserve_fails_now": {
+      // Never retried (a retry could only weaken the test): a human decides.
+      const ids = e instanceof PreserveFailsNowError ? e.criteria.join(", ") : "a criterion";
+      return new Escalation("stage_error", [], [detail], {
+        hypothesis: `The contract labels ${ids} as preserve (behaviour that already works), but its test fails against the unchanged code, so either the criterion is mislabelled (it is the change the task asks for) or the test is wrong.`,
+        question: `Is ${ids} mislabelled (new or corrected behaviour, so a change criterion), or is its test wrong? Re-run with the task saying which behaviour is broken today.`,
+      });
+    }
     default:
       return new Escalation("stage_error", [], [detail]);
   }
@@ -983,6 +991,7 @@ async function review(
       panel = await runPanel({
         diff,
         contract: a.contract,
+        task: input.task,
         worktree: a.worktree,
         model: routing.reviewer,
         provider: ctx.providerFor("reviewer"),
@@ -1011,6 +1020,7 @@ async function review(
         emit: log.emit,
         runId,
         contract: a.contract,
+        task: input.task,
         client,
         ...sig,
       });

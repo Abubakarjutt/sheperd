@@ -7,7 +7,7 @@ const req = { system: "sys", messages: [{ role: "user" as const, content: "go" }
 const valid = {
   id: "c1",
   title: "t",
-  criteria: [{ id: "a", statement: "s" }],
+  criteria: [{ id: "a", kind: "change", statement: "s" }],
   nonGoals: [],
   affectedAreas: [],
   openQuestions: [],

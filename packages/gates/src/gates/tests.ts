@@ -1,5 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { createRequire } from "node:module";
 import { basename, dirname, join, normalize, relative } from "node:path";
 import { z } from "zod";
 import type { Gate, GateContext, GateOutput } from "../types.js";
@@ -88,6 +98,20 @@ export class TestRunError extends Error {
   }
 }
 
+/**
+ * The error a test that made no assertion call fails with when assertions are required: vitest
+ * `expect.requireAssertions` ("expected any number of assertion, but got none"), jest
+ * `expect.hasAssertions()` ("Expected at least one assertion to be called but received none";
+ * jest may print a bare `Error` header, so the whole message is matched, not only its header).
+ */
+export const NO_ASSERTION_RE =
+  /expected any number of assertion|expect\.hasAssertions\(\)|Expected at least one assertion to be called/;
+
+const PROBE_TITLE = "rewire assertion probe: makes no assertion";
+
+/** Whether the runner really failed the harness's no-assertion probe test (requireAssertions). */
+export type AssertionProbe = { enforced: boolean; detail: string };
+
 export type ParsedRun = {
   tests: RanTest[];
   /** Assertion count per report file (worktree-relative), including files with zero assertions. */
@@ -97,7 +121,28 @@ export type ParsedRun = {
   exitCode: number;
   stdout: string;
   stderr: string;
+  /**
+   * Set when `requireAssertions` was asked for. The probe test is removed from `tests`,
+   * `ranFiles` and `brokenSuites`.
+   */
+  assertionProbe?: AssertionProbe;
 };
+
+/**
+ * The node_modules directory `vitest` resolves from in the worktree (what its tests import), so
+ * a probe outside the worktree imports the same vitest instance. Falls back to
+ * `<root>/node_modules`; a probe that cannot load reports the rule as not enforced.
+ */
+function vitestModulesDir(root: string): string {
+  try {
+    const entry = createRequire(join(root, "package.json")).resolve("vitest");
+    const at = entry.lastIndexOf("/node_modules/vitest/");
+    if (at >= 0) return entry.slice(0, at + "/node_modules".length);
+  } catch {
+    // not resolvable from the root: fall back
+  }
+  return join(root, "node_modules");
+}
 
 const err = (summary: string, details: unknown = null): GateOutput => ({
   status: "error",
@@ -165,7 +210,19 @@ export const testsGate: Gate = {
 export async function runTestFiles(
   ctx: GateContext,
   files: string[],
-  opts: { exec?: GateExec; hint?: (text: string) => string } = {},
+  opts: {
+    exec?: GateExec;
+    hint?: (text: string) => string;
+    /**
+     * Make a test that calls no assertion fail (vitest `expect.requireAssertions`; jest
+     * `expect.hasAssertions()` in a harness-owned setup file). Used by the red check, where a
+     * test that must pass now would otherwise pass with no assertion at all. A runner can
+     * silently ignore the setting (an older vitest drops the unknown config key), so a
+     * harness-owned probe test with no assertion runs in the same invocation, from the private
+     * gate dir, and the result says whether it failed with the no-assertion error.
+     */
+    requireAssertions?: boolean;
+  } = {},
 ): Promise<ParsedRun> {
   const g = opts.exec ?? new GateExec(ctx);
   const runFiles = files;
@@ -191,12 +248,31 @@ export async function runTestFiles(
         a.replaceAll("<path>", outFile),
       ),
     ];
+    let probe: string | undefined;
+    if (opts.requireAssertions) {
+      const name = `rewire-assertion-probe-${randomUUID()}.test.${ctx.pack.testRunner === "vitest" ? "mjs" : "js"}`;
+      // Its own subdirectory: vite writes its bundled config into the node_modules nearest the
+      // config file, so the link must not sit beside the config in gateDir.
+      const probeDir = join(gateDir, "probe");
+      await mkdir(probeDir, { mode: 0o700 });
+      probe = join(probeDir, name);
+      await writeFile(
+        probe,
+        ctx.pack.testRunner === "vitest"
+          ? `import { test } from "vitest";\ntest(${JSON.stringify(PROBE_TITLE)}, () => {});\n`
+          : `test(${JSON.stringify(PROBE_TITLE)}, () => {});\n`,
+      );
+      if (ctx.pack.testRunner === "vitest") {
+        await symlink(vitestModulesDir(root), join(probeDir, "node_modules"));
+      }
+      probe = await realpath(probe);
+    }
     if (ctx.pack.testRunner === "vitest") {
       const cfg = join(gateDir, "vitest.harness.config.mjs");
-      const include = runFiles.map(escapeGlob);
+      const include = [...runFiles, ...(probe ? [probe] : [])].map(escapeGlob);
       await writeFile(
         cfg,
-        `export default { cacheDir: ${JSON.stringify(join(gateDir, "cache"))}, test: { include: ${JSON.stringify(include)} } };\n`,
+        `export default { cacheDir: ${JSON.stringify(join(gateDir, "cache"))}, test: { include: ${JSON.stringify(include)}${opts.requireAssertions ? ", expect: { requireAssertions: true }" : ""} } };\n`,
       );
       // --update=none: never write new snapshots (the verify profile is read-only too).
       argv.push("--reporter=default", "--update=none", `--config=${cfg}`, `--root=${root}`);
@@ -209,6 +285,16 @@ export async function runTestFiles(
       // roots = the (frozen) directories of the run files, so jest's automatic `__mocks__`
       // substitution cannot pick up implementer-written mocks from elsewhere.
       const roots = [...new Set(runFiles.map((f) => `<rootDir>/${dirname(f)}`))].sort();
+      if (probe) {
+        testMatch.push(escapeGlob(probe));
+        roots.push(dirname(probe));
+      }
+      let setup: { setupFilesAfterEnv: string[] } | undefined;
+      if (opts.requireAssertions) {
+        const file = join(gateDir, "jest.harness.setup.cjs");
+        await writeFile(file, "beforeEach(() => {\n  expect.hasAssertions();\n});\n");
+        setup = { setupFilesAfterEnv: [file] };
+      }
       await writeFile(
         cfg,
         JSON.stringify({
@@ -217,6 +303,7 @@ export async function runTestFiles(
           testMatch,
           roots,
           cacheDirectory: join(gateDir, "jest-cache"),
+          ...setup,
         }),
       );
       argv.push(`--config=${cfg}`, "--ci");
@@ -256,8 +343,17 @@ export async function runTestFiles(
     const tests: Flat[] = [];
     const brokenSuites: Array<{ file: string; message: string }> = [];
     const ranFiles = new Map<string, number>();
+    const probeFile = probe ? normalize(relative(root, probe)) : undefined;
     for (const tr of parsed.data.testResults) {
-      const file = normalize(relative(root, tr.name));
+      let file = normalize(relative(root, tr.name));
+      if (probe && file !== probeFile) {
+        // The report may name the probe by a non-canonical spelling (/var vs /private/var).
+        try {
+          if ((await realpath(tr.name)) === probe) file = probeFile ?? file;
+        } catch {
+          // not a real path: not the probe
+        }
+      }
       ranFiles.set(file, (ranFiles.get(file) ?? 0) + tr.assertionResults.length);
       for (const a of tr.assertionResults) {
         tests.push({
@@ -286,13 +382,32 @@ export async function runTestFiles(
         summary: summary ?? null,
       });
     }
+    let assertionProbe: AssertionProbe | undefined;
+    if (probeFile !== undefined) {
+      const ran = tests.filter((t) => t.file === probeFile);
+      const broken = brokenSuites.find((b) => b.file === probeFile);
+      const enforced =
+        ran.length === 1 &&
+        ran[0]?.status === "failed" &&
+        ran[0].failureMessages.some((m) => NO_ASSERTION_RE.test(stripAnsi(m)));
+      assertionProbe = {
+        enforced,
+        detail: enforced
+          ? "the probe test failed with the no-assertion error"
+          : ran.length === 0
+            ? `the probe test did not run${broken ? `: ${broken.message.slice(0, 300)}` : ""}`
+            : `the probe test ended ${ran.map((t) => t.status).join(", ")}${ran[0]?.failureMessages[0] ? `: ${stripAnsi(ran[0].failureMessages[0]).split("\n")[0]?.slice(0, 200)}` : ""}`,
+      };
+    }
+    const own = (f: string) => f !== probeFile;
     return {
-      tests,
-      ranFiles,
-      brokenSuites,
+      tests: tests.filter((t) => own(t.file)),
+      ranFiles: new Map([...ranFiles].filter(([f]) => own(f))),
+      brokenSuites: brokenSuites.filter((b) => own(b.file)),
       exitCode: r.exitCode,
       stdout: r.stdout,
       stderr: r.stderr,
+      ...(assertionProbe ? { assertionProbe } : {}),
     };
   } finally {
     await rm(gateDir, { recursive: true, force: true }).catch(() => {});
