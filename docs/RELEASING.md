@@ -111,8 +111,8 @@ The workflow cannot do these for you; it refuses to publish until they are in pl
 
 ```sh
 git checkout main && git pull
-git tag v0.1.0-beta.3
-git push origin v0.1.0-beta.3
+git tag v0.1.0-beta.4
+git push origin v0.1.0-beta.4
 ```
 
 The tag push runs `release.yml`:
@@ -155,7 +155,7 @@ release:
 
 ```sh
 npm view sheperd dist-tags                    # see where latest and next point
-npm dist-tag add sheperd@0.1.0-beta.3 latest  # promote a release (or move latest back)
+npm dist-tag add sheperd@0.1.0-beta.4 latest  # promote a release (or move latest back)
 ```
 
 Later pre-releases only move `next`. To promote one, run `npm dist-tag add sheperd@<version>
