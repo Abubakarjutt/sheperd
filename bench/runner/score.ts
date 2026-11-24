@@ -47,6 +47,9 @@ export const MODEL_STAGE_ERRORS: ReadonlyArray<{ name: string; re: RegExp }> = [
   { name: "unknown_criterion", re: /^test-writer: unknown_criterion: / },
   // test-writer.ts:266 `throw new RewireError("criteria_uncovered", ...)`: a criterion with no test
   { name: "criteria_uncovered", re: /^test-writer: criteria_uncovered: / },
+  // stages/spec.ts `throw new RewireError("contract_without_change", ...)`: the spec model wrote a
+  // contract with no `change` criterion (after one corrective retry); test-writer.ts refuses one too
+  { name: "contract_without_change", re: /^(?:spec|test-writer): contract_without_change: / },
   // packages/pipeline/src/orchestrator.ts:668 `frozen test ${path}: ${reason} before the final commit`
   { name: "frozen_test_mismatch", re: /^frozen test .+ before the final commit$/ },
   // orchestrator.ts:489 TAMPERED and :672 `${TAMPERED} before the final commit`
