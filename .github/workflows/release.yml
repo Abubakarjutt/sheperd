@@ -275,7 +275,8 @@ jobs:
           registry_sri() {
             local out err
             err=$(mktemp)
-            if out=$(npm view "$1@$VERSION" dist.integrity 2>"$err"); then
+            # --prefer-online: never answer from npm's local metadata cache.
+            if out=$(npm view --prefer-online "$1@$VERSION" dist.integrity 2>"$err"); then
               echo "$out"
             elif grep -q E404 "$err"; then
               echo ""
@@ -285,7 +286,8 @@ jobs:
               return 1
             fi
           }
-          check_all() { # $1 = "before" or "after"
+          # Returns 0 when all match, 1 when some are not served, 2 on a contents mismatch.
+          check_all() { # $1 = "before", "pending" (after, not final) or "after" (final)
             local bad=0 name want got
             for name in $packages; do
               want=$(local_sri "$name")
@@ -293,7 +295,10 @@ jobs:
               if [ -z "$got" ]; then
                 if [ "$1" = after ]; then
                   echo "::error::$name@$VERSION is not on the registry after publishing"
-                  bad=1
+                  [ "$bad" = 2 ] || bad=1
+                elif [ "$1" = pending ]; then
+                  echo "$name@$VERSION: not served by the registry yet"
+                  [ "$bad" = 2 ] || bad=1
                 else
                   echo "$name@$VERSION: not published yet"
                 fi
@@ -301,7 +306,7 @@ jobs:
                 echo "$name@$VERSION: registry integrity matches the local tarball"
               else
                 echo "::error::$name@$VERSION on the registry ($got) is not the local tarball ($want)"
-                bad=1
+                bad=2
               fi
             done
             return "$bad"
@@ -321,11 +326,19 @@ jobs:
               exit 1
             fi
           done
-          # The registry can take a moment to serve a new version.
-          for attempt in 1 2 3 4 5 6; do
-            if check_all after; then exit 0; fi
-            echo "registry not consistent yet (attempt $attempt); retrying in 20s"
-            sleep 20
+          # The registry can take minutes to serve a new version (v0.1.0-beta.2: over 2 minutes).
+          # Wait up to 10 minutes; only the final attempt reports missing versions as errors. A
+          # served version with different contents fails at once.
+          for attempt in $(seq 1 20); do
+            mode=pending
+            [ "$attempt" = 20 ] && mode=after
+            rc=0
+            check_all "$mode" || rc=$?
+            [ "$rc" = 0 ] && exit 0
+            [ "$rc" = 2 ] && break        # different contents: no point waiting
+            [ "$mode" = after ] && break
+            echo "registry not consistent yet (attempt $attempt of 20); retrying in 30s"
+            sleep 30
           done
           echo "::error::the registry does not serve exactly the published tarballs"
           exit 1
