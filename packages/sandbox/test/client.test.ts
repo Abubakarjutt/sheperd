@@ -127,3 +127,13 @@ test.skipIf(!mac)(
     expect(alive).toBe(false);
   },
 );
+
+test("chat profile: exec cannot write the root but can write scratch", async () => {
+  const { root, scratch, c } = setup("chat");
+  const denied = await c.exec(["sh", "-c", "echo x > a.txt"], { timeoutMs: 10000, cwd: root });
+  expect(denied.exitCode).not.toBe(0);
+  expect(existsSync(join(root, "a.txt"))).toBe(false);
+  const ok = await c.exec(["sh", "-c", `echo x > "${scratch}/a"`], { timeoutMs: 10000, cwd: root });
+  expect(ok.exitCode).toBe(0);
+  expect(readFileSync(join(scratch, "a"), "utf8")).toBe("x\n");
+});
