@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { type FileHandle, lstat, mkdir, open, readdir, realpath, stat } from "node:fs/promises";
-import { dirname, isAbsolute, join, matchesGlob, relative, sep } from "node:path";
-import { RewireError } from "@rewire/core";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { RewireError, stripControls } from "@rewire/core";
 import { DEFAULT_POLICY } from "@rewire/policy";
 
 /** Caps on one skill dir: total bytes and file count. */
@@ -42,18 +42,69 @@ class Budget {
   }
 }
 
-/** Open a regular file without following a final symlink (repo rules). */
-export async function openNoFollow(path: string): Promise<FileHandle> {
+/** An untrusted file name, safe for a message: no control characters, at most 200 chars. */
+export function safeName(name: string): string {
+  const clean = stripControls(name);
+  return clean.length > 200 ? `${clean.slice(0, 200)}...` : clean;
+}
+
+/**
+ * Translate a glob to a RegExp in which `*`, `?` and `**` also match dot segments (as git does).
+ * `path.matchesGlob` does not, so `~/.claude/**` would miss `~/.claude/.credentials.json`.
+ */
+export function globToRegExp(glob: string): RegExp {
+  let re = "^";
+  let i = 0;
+  while (i < glob.length) {
+    const atSegStart = i === 0 || glob[i - 1] === "/";
+    if (atSegStart && glob.startsWith("**/", i)) {
+      re += "(?:.*/)?";
+      i += 3;
+    } else if (atSegStart && glob.startsWith("**", i) && i + 2 === glob.length) {
+      re += ".*";
+      i += 2;
+    } else {
+      const c = glob[i] ?? "";
+      if (c === "*") re += "[^/]*";
+      else if (c === "?") re += "[^/]";
+      else re += c.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+      i++;
+    }
+  }
+  return new RegExp(`${re}$`);
+}
+
+/** `a{b,c}d` -> `abd`, `acd` (no nesting across braces). */
+export function expandBraces(glob: string): string[] {
+  const m = /\{([^{}]*)\}/.exec(glob);
+  if (!m) return [glob];
+  const [whole, inner] = m;
+  return (inner ?? "")
+    .split(",")
+    .flatMap((alt) =>
+      expandBraces(glob.slice(0, m.index) + alt + glob.slice(m.index + whole.length)),
+    );
+}
+
+const NOFOLLOW_RO = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
+/**
+ * Open a regular file read-only without following a final symlink. O_NONBLOCK keeps a FIFO
+ * swapped in after the type check from blocking the open; the fstat then rejects it.
+ * `singleLink` (repo rules) rejects hardlinks, which could alias a file outside the dir.
+ */
+export async function openNoFollow(path: string, singleLink = true): Promise<FileHandle> {
   let fh: FileHandle;
   try {
-    fh = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fh = await open(path, NOFOLLOW_RO);
   } catch (e) {
     if (errCode(e) === "ELOOP") throw invalid("skill file is a symlink");
     throw e;
   }
-  if (!(await fh.stat()).isFile()) {
+  const st = await fh.stat();
+  if (!st.isFile() || (singleLink && st.nlink > 1)) {
     await fh.close();
-    throw invalid("skill file is not a regular file");
+    throw invalid(st.isFile() ? "skill file is hardlinked" : "skill file is not a regular file");
   }
   return fh;
 }
@@ -72,12 +123,13 @@ export async function listStrict(dir: string, caps = REPO_SKILL_CAPS): Promise<S
       const p = join(abs, name);
       const r = rel ? `${rel}/${name}` : name;
       const st = await lstat(p);
-      if (st.isSymbolicLink()) throw invalid(`skill dir contains a symlink: ${r}`);
+      if (st.isSymbolicLink()) throw invalid(`skill dir contains a symlink: ${safeName(r)}`);
       if (st.isDirectory()) await walk(p, r);
       else if (st.isFile()) {
+        if (st.nlink > 1) throw invalid(`skill dir contains a hardlink: ${safeName(r)}`);
         budget.add(st.size);
         out.push({ path: r, size: st.size, open: () => openNoFollow(p) });
-      } else throw invalid(`skill dir contains a non-regular file: ${r}`);
+      } else throw invalid(`skill dir contains a non-regular file: ${safeName(r)}`);
     }
   };
   await walk(dir, "");
@@ -109,16 +161,11 @@ export async function listFollowing(
       out.push({
         path: rel,
         size: st.size,
-        open: async () => {
-          const fh = await open(await guard.resolve(abs), "r");
-          if (!(await fh.stat()).isFile()) {
-            await fh.close();
-            throw invalid(`skill file is not a regular file: ${rel}`);
-          }
-          return fh;
-        },
+        // Re-resolve and re-check right before opening; the resolved path has no symlinks,
+        // so O_NOFOLLOW catches a swap between the check and the open.
+        open: async () => openNoFollow(await guard.resolve(abs), false),
       });
-    } else throw invalid(`skill dir contains a non-regular file: ${rel}`);
+    } else throw invalid(`skill dir contains a non-regular file: ${safeName(rel)}`);
   };
   await walk(dir, "", []);
   return sortEntries(out);
@@ -132,7 +179,12 @@ const CHUNK = 64 * 1024;
  * Files are never held in memory whole. A file whose size changed since the walk is rejected, so
  * the caps hold.
  */
-export async function hashEntries(entries: SkillEntry[], destDir?: string): Promise<SkillSnapshot> {
+export async function hashEntries(
+  entries: SkillEntry[],
+  destDir?: string,
+  capture?: string,
+): Promise<SkillSnapshot & { captured?: Buffer }> {
+  let captured: Buffer[] | undefined;
   const h = createHash("sha256");
   const buf = Buffer.alloc(CHUNK);
   for (const e of sortEntries([...entries])) {
@@ -155,17 +207,23 @@ export async function hashEntries(entries: SkillEntry[], destDir?: string): Prom
         const chunk = buf.subarray(0, bytesRead);
         h.update(chunk);
         if (dst) await dst.write(chunk);
+        if (e.path === capture) {
+          captured ??= [];
+          captured.push(Buffer.from(chunk));
+        }
       }
-      if (total !== e.size) throw invalid(`skill file changed while reading: ${e.path}`);
+      if (total !== e.size) throw invalid(`skill file changed while reading: ${safeName(e.path)}`);
     } finally {
       await src.close();
       await dst?.close();
     }
   }
-  return {
+  const snap: SkillSnapshot & { captured?: Buffer } = {
     sha256: h.digest("hex"),
     files: sortEntries(entries.map((e) => ({ path: e.path, bytes: e.size }))),
   };
+  if (capture !== undefined) snap.captured = Buffer.concat(captured ?? []);
+  return snap;
 }
 
 /** Hash a skill dir with repo rules: rejects any symlink; at most 2 MiB and 200 files. */
@@ -190,7 +248,7 @@ export class UserGuard {
   private constructor(
     private readonly home: string,
     private readonly roots: string[],
-    private readonly globs: string[],
+    private readonly globs: RegExp[],
   ) {}
 
   static async create(opts: { home: string; xdgConfig: string }): Promise<UserGuard> {
@@ -200,11 +258,13 @@ export class UserGuard {
       const real = await realpath(r).catch(() => undefined);
       if (real) roots.push(real);
     }
-    const globs: string[] = [];
+    const globs: RegExp[] = [];
     for (const g of DEFAULT_POLICY.credentialDenyGlobs) {
-      if (g === "~") globs.push(home);
-      else if (g.startsWith("~/")) globs.push(home + g.slice(1));
-      else if (!g.startsWith("~")) globs.push(g);
+      let abs: string | undefined;
+      if (g === "~") abs = home;
+      else if (g.startsWith("~/")) abs = home + g.slice(1);
+      else if (!g.startsWith("~")) abs = g;
+      if (abs !== undefined) globs.push(...expandBraces(abs).map(globToRegExp));
       // `~user/...` cannot be expanded here; the sandbox layer rejects it as policy_invalid.
     }
     return new UserGuard(home, roots, globs);
@@ -218,8 +278,8 @@ export class UserGuard {
     }
     const probe = join(root ?? "", "__rewire_probe__");
     for (const g of this.globs) {
-      if (root && matchesGlob(probe, g)) continue;
-      if (matchesGlob(real, g)) {
+      if (root && g.test(probe)) continue;
+      if (g.test(real)) {
         throw invalid("a user skill path resolves into a credential location");
       }
     }

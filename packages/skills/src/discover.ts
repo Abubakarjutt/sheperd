@@ -1,6 +1,6 @@
-import { type FileHandle, lstat, mkdir, open, readdir, stat } from "node:fs/promises";
+import { type FileHandle, lstat, mkdir, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { RewireError, redact } from "@rewire/core";
+import { RewireError, redact, stripControls } from "@rewire/core";
 import {
   hashEntries,
   listFollowing,
@@ -50,7 +50,11 @@ const errCode = (e: unknown): string | undefined =>
 
 /** Never echo an unexpected error's text (it could quote file content); keep only its code. */
 function toProblem(dir: string, e: unknown): SkillProblem {
-  if (e instanceof RewireError) return { dir, code: e.code, message: redact(e.message) };
+  if (e instanceof RewireError) {
+    // Messages may quote untrusted file names: no control characters, bounded length.
+    const msg = redact(stripControls(e.message));
+    return { dir, code: e.code, message: msg.length > 300 ? `${msg.slice(0, 300)}...` : msg };
+  }
   return { dir, code: "skill_invalid", message: `cannot read skill (${errCode(e) ?? "error"})` };
 }
 
@@ -117,7 +121,9 @@ async function loadUserSkill(
   const md = join(real, "SKILL.md");
   if (!(await exists(md))) return SKIP;
   const mdReal = await guard.resolve(md);
-  const text = await readCapped(await open(mdReal, "r"));
+  // Type-check before opening: opening a FIFO for read would block forever.
+  if (!(await stat(mdReal)).isFile()) throw invalid("SKILL.md is not a regular file");
+  const text = await readCapped(await openNoFollow(mdReal, false));
   return build(text, entry, "user", dir, [{ path: "SKILL.md", bytes: Buffer.byteLength(text) }]);
 }
 
@@ -132,10 +138,17 @@ async function loadRepoSkill(dir: string, entry: string): Promise<Skill | typeof
   });
   if (!mdSt) return SKIP;
   if (mdSt.isSymbolicLink()) throw invalid("repo SKILL.md is a symlink");
+  if (!mdSt.isFile()) throw invalid("SKILL.md is not a regular file");
   if (mdSt.size > MAX_SKILL_MD_BYTES)
     throw invalid(`SKILL.md is larger than ${MAX_SKILL_MD_BYTES} bytes`);
-  const text = await readCapped(await openNoFollow(join(dir, "SKILL.md")));
-  const snap = await hashEntries(await listStrict(dir));
+  const entries = await listStrict(dir);
+  const mdEntry = entries.find((e) => e.path === "SKILL.md");
+  if (!mdEntry) return SKIP;
+  if (mdEntry.size > MAX_SKILL_MD_BYTES)
+    throw invalid(`SKILL.md is larger than ${MAX_SKILL_MD_BYTES} bytes`);
+  // One read per file: the body shown at trust time is the exact bytes the hash pins.
+  const snap = await hashEntries(entries, undefined, "SKILL.md");
+  const text = (snap.captured ?? Buffer.alloc(0)).toString("utf8");
   return build(text, entry, "repo", dir, snap.files, snap.sha256);
 }
 

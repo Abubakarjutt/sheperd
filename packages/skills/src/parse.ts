@@ -1,4 +1,4 @@
-import { RewireError } from "@rewire/core";
+import { RewireError, stripControls } from "@rewire/core";
 
 /** `name` must match this (global constraint). */
 export const SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -7,14 +7,14 @@ export const MAX_DESCRIPTION_CHARS = 1024;
 export type ParsedSkillMd = {
   name: string | undefined;
   description: string | undefined;
-  /** `disable-model-invocation: true` sets this to false. */
+  /** `disable-model-invocation: true` (or True/TRUE/yes) sets this to false. */
   modelInvocable: boolean;
   body: string;
 };
 
 const invalid = (message: string) => new RewireError("skill_invalid", message);
 
-const KEY_RE = /^([A-Za-z0-9_-]+):(?:\s+(.*))?$/;
+const KEY_NAME_RE = /^[A-Za-z0-9_-]+$/;
 const BLOCK_RE = /^([|>])[-+]?[1-9]?\s*(?:#.*)?$/;
 
 /**
@@ -39,10 +39,14 @@ export function parseSkillMd(text: string): ParsedSkillMd {
     if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
     // Indented lines belong to a key we skipped (list items, nested maps).
     if (/^\s/.test(line) || line.startsWith("- ")) continue;
-    const m = KEY_RE.exec(line);
-    if (!m) throw invalid("SKILL.md frontmatter has a line that is not `key: value`");
-    const key = m[1] ?? "";
-    const raw = (m[2] ?? "").trim();
+    // Split on the first ':' by hand: a regex here backtracked quadratically on hostile lines.
+    const colon = line.indexOf(":");
+    const key = colon > 0 ? line.slice(0, colon) : "";
+    const rest = line.slice(colon + 1);
+    if (!KEY_NAME_RE.test(key) || (rest !== "" && rest[0] !== " " && rest[0] !== "\t")) {
+      throw invalid("SKILL.md frontmatter has a line that is not `key: value`");
+    }
+    const raw = rest.trim();
     const block = BLOCK_RE.exec(raw);
     let value: string | undefined;
     if (block) {
@@ -73,7 +77,7 @@ export function parseSkillMd(text: string): ParsedSkillMd {
   return {
     name: values.get("name"),
     description: values.get("description"),
-    modelInvocable: values.get("disable-model-invocation") !== "true",
+    modelInvocable: !/^(?:true|yes)$/i.test(values.get("disable-model-invocation") ?? ""),
     body,
   };
 }
@@ -156,7 +160,13 @@ function blockScalar(lines: string[], fold: boolean): string {
   return paras.join("\n").trim();
 }
 
-/** Validate the parsed frontmatter; `fallbackName` (the dir name) is used when `name` is absent. */
+/**
+ * Validate the parsed frontmatter. A missing `name` falls back to `fallbackName` (the skill's
+ * directory name), as Claude Code does; the result must still match `SKILL_NAME_RE`, which also
+ * excludes control characters. The description is stripped of ANSI sequences and C0/C1 control
+ * characters and its whitespace (newlines included) collapses to single spaces: it goes into the
+ * model's skill index and onto one terminal line.
+ */
 export function validateSkillMd(
   parsed: ParsedSkillMd,
   fallbackName: string,
@@ -165,7 +175,9 @@ export function validateSkillMd(
   if (!SKILL_NAME_RE.test(name)) {
     throw invalid(`skill name must match ${SKILL_NAME_RE.source}`);
   }
-  const description = parsed.description?.trim() ?? "";
+  const description = stripControls(parsed.description ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
   if (description.length < 1) throw invalid("SKILL.md frontmatter has no description");
   if (description.length > MAX_DESCRIPTION_CHARS) {
     throw invalid(`skill description is longer than ${MAX_DESCRIPTION_CHARS} characters`);

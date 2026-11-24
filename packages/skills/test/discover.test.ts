@@ -471,7 +471,7 @@ test("a fixture tree shaped like a real ~/.claude/skills", async () => {
     [join(skills, "_bad"), "skill_invalid"],
   ]);
   const review = result.skills.find((s) => s.name === "review");
-  expect(review?.description).toBe("Pre-landing PR review.\n(gstack)");
+  expect(review?.description).toBe("Pre-landing PR review. (gstack)");
   expect(review?.body).toBe("Review body.");
   if (!review) throw new Error("missing");
   expect(await hashSkill(review, { home, xdgConfig })).toMatch(/^[0-9a-f]{64}$/);
