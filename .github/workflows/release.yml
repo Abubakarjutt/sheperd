@@ -193,8 +193,10 @@ jobs:
           retention-days: 30
 
   # Only this job can publish, and it runs no repository code: it publishes the tarballs the
-  # package job checked and smoke-tested. It runs in the npm-publish environment, which holds
-  # NPM_TOKEN and must be limited to v* tags with a required reviewer (docs/RELEASING.md).
+  # package job checked and smoke-tested. It runs in the npm-publish environment, which must be
+  # limited to v* tags with a required reviewer, and authenticates to npm by trusted publishing
+  # (OIDC): npm accepts only this workflow in this environment, and no npm token exists
+  # (docs/RELEASING.md).
   publish:
     needs: [plan, package]
     if: needs.plan.outputs.publish == 'true'
@@ -207,12 +209,11 @@ jobs:
       id-token: write
     steps:
       # GitHub creates an unknown environment on the fly, with no protection; refuse to publish
-      # from one, or without the token.
-      - name: Require a protected npm-publish environment and its NPM_TOKEN
+      # from one.
+      - name: Require a protected npm-publish environment
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          HAS_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
         run: |
           fail() { echo "::error::$1 (see docs/RELEASING.md, one-time setup)"; exit 1; }
           env_json=$(gh api "repos/$REPO/environments/npm-publish") \
@@ -225,12 +226,18 @@ jobs:
             --jq '.branch_policies[] | select(.type == "tag") | .name') \
             || fail "cannot read the npm-publish deployment policies"
           grep -qx 'v\*' <<<"$tags" || fail "the npm-publish environment does not allow the tag pattern v*"
-          [ "$HAS_TOKEN" = true ] || fail "NPM_TOKEN is not set in the npm-publish environment"
 
+      # No registry-url: setup-node would write an .npmrc expecting NODE_AUTH_TOKEN, and there is
+      # no token. The default registry is https://registry.npmjs.org.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or newer; Node 22 ships npm 10.
+      - name: npm with trusted publishing support
+        run: |
+          npm install -g npm@11.19.0
+          npm --version
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -242,7 +249,6 @@ jobs:
       # sheperd-<os>-<arch>@<version>, fails the job before sheperd is published.
       - name: npm publish (platform packages first, then sheperd) with --tag next
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail

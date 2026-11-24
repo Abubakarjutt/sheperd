@@ -59,9 +59,13 @@ The workflow cannot do these for you; it refuses to publish until they are in pl
    `--tag reserved`. If any name is already taken, the names must change everywhere
    (`npm/sheperd/package.json`, `platformPackageName` in `packages/sandbox/src/client.ts`,
    `build.mjs`, the workflow).
-3. **Automation token.** On npmjs.com: Access Tokens, "Generate New Token". Use a granular
-   token with read and write access to the five packages, or a classic "Automation" token,
-   which bypasses 2FA for CI. Set a short expiry.
+3. **Trusted publisher on npm.** The workflow authenticates by npm trusted publishing (OIDC);
+   no npm token is created or stored. On npmjs.com, for each of the five packages: Settings,
+   "Trusted Publisher", GitHub Actions, organization or user `Abubakarjutt`, repository
+   `sheperd`, workflow filename `release.yml`, environment `npm-publish`. Then, under
+   "Publishing access", choose "Require two-factor authentication and disallow tokens":
+   trusted publishing still works, and a leaked token cannot publish. Do not create a token
+   with "bypass 2FA".
 4. **GitHub environment `npm-publish`.** The `publish` job runs in this environment and checks
    it before publishing. In the repository: Settings, Environments, "New environment", name
    `npm-publish`:
@@ -69,13 +73,12 @@ The workflow cannot do these for you; it refuses to publish until they are in pl
      then waits for an approval.
    - **Deployment branches and tags:** "Selected branches and tags", add a **tag** rule `v*`
      (and no branch rules).
-   - **Environment secrets:** add `NPM_TOKEN` with the token here, **not** as a repository
-     secret (a repository secret is readable by any workflow on any branch). Delete any
-     repository-level `NPM_TOKEN`.
+   - **No secrets.** There is no `NPM_TOKEN`; npm trusts this workflow in this environment.
 
    If the environment is missing (GitHub would create an unprotected one on the fly), has no
-   required reviewer, is not limited to the `v*` tag pattern, or has no `NPM_TOKEN`, the
-   publish job fails with an error naming what is missing.
+   required reviewer, or is not limited to the `v*` tag pattern, the publish job fails with an
+   error naming what is missing. If the trusted publisher on npm does not match (repository,
+   `release.yml`, `npm-publish`), `npm publish` fails with an authentication error.
 5. **Tag ruleset.** Settings, Rules, Rulesets, "New tag ruleset": target tags matching `v*`,
    enforcement Active, rules "Restrict creations", "Restrict updates" and "Restrict deletions",
    with only yourself (or a release team) in the bypass list. Without it anyone with push access
@@ -156,19 +159,6 @@ npm dist-tag add sheperd@0.1.0-beta.1 latest  # promote a release (or move lates
 
 Later pre-releases only move `next`. To promote one, run `npm dist-tag add sheperd@<version>
 latest`. The platform packages need no promotion: `sheperd` pins their exact version.
-
-## Switching to trusted publishing
-
-Once the five packages exist on npm, replace the long-lived token with npm trusted publishing
-(OIDC):
-
-1. On npmjs.com, for each of the five packages: Settings, "Trusted Publisher", GitHub Actions,
-   repository `Abubakarjutt/sheperd`, workflow `release.yml`, environment `npm-publish`.
-2. In `release.yml`, remove `NODE_AUTH_TOKEN` from the publish step and the `NPM_TOKEN` check
-   (the job already has `id-token: write`; trusted publishing needs npm 11.5 or newer, so add
-   `npm install -g npm@latest` before publishing if the runner's npm is older).
-3. Delete the `NPM_TOKEN` environment secret and revoke the token on npmjs.com.
-4. Optionally, in each package's settings, require 2FA and disallow tokens.
 
 ## Yanking a bad release
 
