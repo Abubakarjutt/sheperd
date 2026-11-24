@@ -87,7 +87,7 @@ The workflow cannot do these for you; it refuses to publish until they are in pl
 ## Before tagging
 
 - The version in `npm/sheperd/package.json` (and its four pins) is the version to release.
-  The first release is `0.1.0-beta.2`. (The tag `v0.1.0-beta.1` exists, but its run failed
+  The first published release was `0.1.0-beta.2`. (The tag `v0.1.0-beta.1` exists, but its run failed
   before publishing anything, so `0.1.0-beta.1` was never released.)
 - `main` is green in CI. The `ci` workflow's "npm package smoke test" step packs, installs and
   smoke-tests the packages on Linux x64 and macOS arm64 on every push and PR.
@@ -111,8 +111,8 @@ The workflow cannot do these for you; it refuses to publish until they are in pl
 
 ```sh
 git checkout main && git pull
-git tag v0.1.0-beta.2
-git push origin v0.1.0-beta.2
+git tag v0.1.0-beta.3
+git push origin v0.1.0-beta.3
 ```
 
 The tag push runs `release.yml`:
@@ -155,7 +155,7 @@ release:
 
 ```sh
 npm view sheperd dist-tags                    # see where latest and next point
-npm dist-tag add sheperd@0.1.0-beta.2 latest  # promote a release (or move latest back)
+npm dist-tag add sheperd@0.1.0-beta.3 latest  # promote a release (or move latest back)
 ```
 
 Later pre-releases only move `next`. To promote one, run `npm dist-tag add sheperd@<version>
