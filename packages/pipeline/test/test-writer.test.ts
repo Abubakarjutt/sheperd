@@ -45,10 +45,11 @@ const git = (cwd: string, ...args: string[]): string =>
     encoding: "utf8",
   });
 
-function makeRepo(): string {
+function makeRepo(files: Record<string, string> = {}): string {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "rewire-tw-")));
   dirs.push(root);
   cpSync(FIXTURE, root, { recursive: true });
+  for (const [path, content] of Object.entries(files)) writeFileSync(join(root, path), content);
   symlinkSync(WORKSPACE_MODULES, join(root, "node_modules"));
   git(root, "init", "-q", "-b", "main");
   git(root, "add", "-A");
@@ -83,9 +84,10 @@ async function run(
     client?: SandboxClient;
     events?: RunEvent[];
     pack?: (p: TsPack) => TsPack;
+    files?: Record<string, string>;
   } = {},
 ) {
-  const root = makeRepo();
+  const root = makeRepo(over.files);
   const detected = await detectTsPack(root);
   const provider = new FauxProvider(script);
   const events = over.events ?? [];
@@ -584,6 +586,50 @@ test("a preserve test that fails on the retry stops the stage too", async () => 
   const err = await fails(promise);
   expect(err.code).toBe("preserve_fails_now");
   expect(provider.callCount).toBe(4);
+});
+
+// N1: a preserve test that crashes in its own code is a test-writer mistake: retried once.
+const crashesInTest = (id: string, name = "keeps") =>
+  `test("${id}: ${name}", () => { expect((add as any).nope(1, 1)).toBe(2); });\n`;
+
+test("a preserve test that crashes in its own code is retried, not terminal", async () => {
+  const { promise, provider } = await run(
+    [
+      write("test/ac.test.ts", `${HEAD}${failing("AC-1", "adds")}${crashesInTest("AC-2")}`),
+      text("d"),
+      write("test/ac.test.ts", `${HEAD}${failing("AC-1", "adds")}${passing("AC-2")}`),
+      text("d"),
+    ],
+    { contract: KINDS },
+  );
+  const m = await promise;
+  expect(m.criteriaToTests["AC-2"]).toEqual(["test/ac.test.ts::AC-2: keeps"]);
+  expect(provider.callCount).toBe(4);
+  const retry = provider.requests[2]?.messages[0]?.content ?? "";
+  expect(retry).toMatch(/preserve test crashed in its own code, not on an assertion/);
+  expect(retry).toMatch(/keeping the same assertion/);
+});
+
+test("a preserve test that crashes in its own code on the retry too is red_check_failed", async () => {
+  const src = `${HEAD}${failing("AC-1", "adds")}${crashesInTest("AC-2")}`;
+  const { err } = await rejected(twice("test/ac.test.ts", src), { contract: KINDS });
+  expect(err.code).toBe("red_check_failed");
+  expect(err.message).toMatch(/AC-2: keeps: preserve test crashed in its own code/);
+});
+
+test("attack: a crash bug labelled preserve (error thrown in the code under test) stays terminal", async () => {
+  const boom = `export function parse(s: string): number {\n  const o: any = undefined;\n  return o.x + s.length;\n}\n`;
+  const head = `${HEAD}import { parse } from "../src/boom.js";\n`;
+  const crashBug = `test("AC-2: parse", () => { expect(parse("a")).toBe(1); });\n`;
+  const { promise, provider } = await run(
+    twice("test/ac.test.ts", `${head}${failing("AC-1", "adds")}${crashBug}`),
+    { contract: KINDS, files: { "src/boom.ts": boom } },
+  );
+  const err = await fails(promise);
+  expect(err.code).toBe("preserve_fails_now");
+  expect((err as PreserveFailsNowError).criteria).toEqual(["AC-2"]);
+  expect(err.message).toMatch(/TypeError/);
+  expect(provider.callCount).toBe(2);
 });
 
 test("a change test that passes now is still rejected", async () => {

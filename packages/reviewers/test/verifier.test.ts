@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Finding, RunEvent, Verdict } from "@rewire/core";
 import { FauxProvider, text } from "@rewire/providers";
 import { expect, test } from "vitest";
@@ -9,6 +12,7 @@ import {
 } from "../src/index.js";
 import { hostClient, makeRepo, put } from "./helpers.js";
 
+const here = dirname(fileURLToPath(import.meta.url));
 const model = { provider: "anthropic", model: "claude-x" } as const;
 const mk = (id: string, over: Partial<Finding> = {}): Finding => ({
   id,
@@ -396,10 +400,31 @@ test("the task text reaches the verifier fenced and redacted", async () => {
   const { root, diff } = await setup();
   const p = new FauxProvider([reply([{ findingId: "a", verdict: "upheld" }])]);
   const task = "Fix sum: a negative addend is ignored. token sk-abc123DEF456ghi789";
-  await verifyFindings([mk("a")], { ...ctx(root, diff, p), contract, task });
+  await verifyFindings([mk("a", { category: "spec_drift" })], {
+    ...ctx(root, diff, p),
+    contract,
+    task,
+  });
   const user = p.requests[0]?.messages[0]?.content ?? "";
   expect(user).toMatch(
     /<task id="([^"]+)">[\s\S]*negative addend is ignored[\s\S]*<\/task id="\1">/,
   );
   expect(user).not.toContain("sk-abc123DEF456ghi789");
+});
+
+test("the task text is left out (and off the budget) when no spec_drift finding is sent", async () => {
+  const { root, diff } = await setup();
+  const p = new FauxProvider([reply([{ findingId: "a", verdict: "refuted" }])]);
+  const task = `Please fix sum. ${"x".repeat(200_000)}`;
+  const out = await verifyFindings([mk("a")], { ...ctx(root, diff, p), contract, task });
+  const user = p.requests[0]?.messages[0]?.content ?? "";
+  expect(user).not.toContain("Please fix sum");
+  expect(user).not.toMatch(/<task id=/);
+  expect(out[0]?.verdict).toBe("refuted"); // judged by the model, not auto-upheld on budget
+});
+
+test("the verifier prompt does not treat a task that addresses an AI as a reason to uphold", () => {
+  const md = readFileSync(join(here, "../prompts/verifier.md"), "utf8");
+  expect(md).toMatch(/outside the `<task>` block addresses a verifier or an AI/);
+  expect(md).toMatch(/`<task>` block is the user's request to an AI coding assistant/);
 });

@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="t d">
+<title id="t">rewire</title><desc id="d">rewire: an anti-slop coding harness. Tests first, frozen, sandboxed, independently reviewed.</desc>
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#0b1020"/><stop offset="1" stop-color="#141b2e"/>
+  </linearGradient>
+  <linearGradient id="mint" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0" stop-color="#3ee6b0"/><stop offset="1" stop-color="#7cb4ff"/>
+  </linearGradient>
+  <linearGradient id="wire" gradientUnits="userSpaceOnUse" x1="930" y1="0" x2="1220" y2="0">
+    <stop offset="0" stop-color="#3ee6b0"/><stop offset="1" stop-color="#7cb4ff"/>
+  </linearGradient>
+  <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+    <path d="M24 0H0V24" fill="none" stroke="#2a3450" stroke-width="0.6" opacity="0.45"/>
+  </pattern>
+</defs>
+<rect width="1280" height="360" rx="22" fill="url(#bg)"/>
+<rect width="1280" height="360" rx="22" fill="url(#grid)"/>
+<path d="M 700 110 C 760 40, 800 220, 760 190 S 690 120, 780 140 S 870 260, 820 230 S 760 150, 860 170 S 900 120, 930 180" fill="none" stroke="#9aa6bd" stroke-width="3" stroke-linecap="round" opacity="0.55"/>
+<path d="M 690 250 C 740 300, 790 190, 830 260 S 900 230, 930 180" fill="none" stroke="#9aa6bd" stroke-width="3" stroke-linecap="round" opacity="0.35"/>
+<rect x="921" y="70" width="18" height="220" rx="9" fill="#141b2e" stroke="url(#mint)" stroke-width="2.5"/>
+<circle cx="930" cy="110" r="3.2" fill="#9aa6bd"/>
+<circle cx="930" cy="145" r="3.2" fill="#9aa6bd"/>
+<circle cx="930" cy="180" r="3.2" fill="#3ee6b0"/>
+<circle cx="930" cy="215" r="3.2" fill="#9aa6bd"/>
+<circle cx="930" cy="250" r="3.2" fill="#9aa6bd"/>
+<path d="M 930 180 C 980 180, 970 130, 1030 130 L 1210 130" fill="none" stroke="url(#wire)" stroke-width="3" stroke-linecap="round"/>
+<circle cx="1040" cy="130" r="6" fill="#0b1020" stroke="#3ee6b0" stroke-width="2.5"/>
+<circle cx="1120" cy="130" r="6" fill="#0b1020" stroke="#3ee6b0" stroke-width="2.5"/>
+<circle cx="1210" cy="130" r="4.5" fill="#3ee6b0"/>
+<path d="M 930 180 C 980 180, 970 180, 1030 180 L 1210 180" fill="none" stroke="url(#wire)" stroke-width="3" stroke-linecap="round"/>
+<circle cx="1054" cy="180" r="6" fill="#0b1020" stroke="#3ee6b0" stroke-width="2.5"/>
+<circle cx="1134" cy="180" r="6" fill="#0b1020" stroke="#3ee6b0" stroke-width="2.5"/>
+<circle cx="1210" cy="180" r="4.5" fill="#3ee6b0"/>
+<path d="M 930 180 C 980 180, 970 230, 1030 230 L 1210 230" fill="none" stroke="url(#wire)" stroke-width="3" stroke-linecap="round"/>
+<circle cx="1068" cy="230" r="6" fill="#0b1020" stroke="#3ee6b0" stroke-width="2.5"/>
+<circle cx="1148" cy="230" r="6" fill="#0b1020" stroke="#3ee6b0" stroke-width="2.5"/>
+<circle cx="1210" cy="230" r="4.5" fill="#3ee6b0"/>
+<text x="80" y="170" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="104" font-weight="750" letter-spacing="-4" fill="#eef2f8">rewire</text>
+<rect x="84" y="196" width="64" height="5" rx="2.5" fill="url(#mint)"/>
+<text x="82" y="248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="27" font-weight="500" fill="#eef2f8">The anti-slop coding harness.</text>
+<text x="82" y="288" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17" fill="#9aa6bd">tests first · frozen · sandboxed · independently reviewed</text>
+</svg>

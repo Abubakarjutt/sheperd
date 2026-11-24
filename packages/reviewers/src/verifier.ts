@@ -190,7 +190,10 @@ export async function verifyFindings(findings: Finding[], ctx: VerifyContext): P
     const blocks: string[] = [];
     const asked: object[] = [];
     const seenFiles = new Set<string>();
-    const task = ctx.task !== undefined ? taskBlock(ctx.task) : undefined;
+    // The task only matters for a mislabelled-criterion finding (spec_drift): sent, and
+    // budgeted, only when one of those is going to the model.
+    const needTask = findings.some((f) => !auto.has(f.id) && f.category === "spec_drift");
+    const task = ctx.task !== undefined && needTask ? taskBlock(ctx.task) : undefined;
     let used =
       PROMPT_OVERHEAD +
       (ctx.contract ? JSON.stringify(ctx.contract, null, 2).length : 0) +
