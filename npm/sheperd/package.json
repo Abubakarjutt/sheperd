@@ -1,6 +1,6 @@
 {
   "name": "sheperd",
-  "version": "0.1.0-beta.3",
+  "version": "0.1.0-beta.4",
   "description": "rewire: an anti-slop coding harness. Tests first, frozen; a sandboxed implementer; hard gates and an independent multi-model review before anything is committed.",
   "license": "Apache-2.0",
   "type": "module",
@@ -22,10 +22,10 @@
     "linux"
   ],
   "optionalDependencies": {
-    "sheperd-darwin-arm64": "0.1.0-beta.3",
-    "sheperd-darwin-x64": "0.1.0-beta.3",
-    "sheperd-linux-arm64": "0.1.0-beta.3",
-    "sheperd-linux-x64": "0.1.0-beta.3"
+    "sheperd-darwin-arm64": "0.1.0-beta.4",
+    "sheperd-darwin-x64": "0.1.0-beta.4",
+    "sheperd-linux-arm64": "0.1.0-beta.4",
+    "sheperd-linux-x64": "0.1.0-beta.4"
   },
   "repository": {
     "type": "git",
