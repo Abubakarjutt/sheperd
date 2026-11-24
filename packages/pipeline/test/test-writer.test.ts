@@ -59,8 +59,8 @@ const CONTRACT: Contract = {
   id: "c1",
   title: "math",
   criteria: [
-    { id: "AC-1", statement: "adds" },
-    { id: "AC-2", statement: "doubles" },
+    { id: "AC-1", kind: "change", statement: "adds" },
+    { id: "AC-2", kind: "change", statement: "doubles" },
   ],
   nonGoals: [],
   affectedAreas: ["src/math.ts"],
@@ -368,7 +368,7 @@ test("stage_end ok:false is emitted when the stage fails", async () => {
 test("greenfield: dynamic import of a module that does not exist yet is accepted", async () => {
   const contract: Contract = {
     ...CONTRACT,
-    criteria: [{ id: "AC-1", statement: "triple multiplies by three" }],
+    criteria: [{ id: "AC-1", kind: "change", statement: "triple multiplies by three" }],
   };
   const src = `import { expect, test } from "vitest";\ntest("AC-1: triples", async () => {\n  const mod = await import("../src/triple.js").catch(() => ({}) as Record<string, any>);\n  expect(typeof mod.triple).toBe("function");\n  expect(mod.triple?.(3)).toBe(9);\n});\n`;
   const { promise, provider } = await run([write("test/triple.test.ts", src), text("done")], {
@@ -496,4 +496,114 @@ test("the contract (title, criteria) is fenced in the test-writer prompt (M4)", 
   expect(mark).toBeGreaterThan(start);
   expect(mark).toBeLessThan(end);
   expect(prompt.indexOf("AC-1")).toBeGreaterThan(start);
+});
+
+// ---- criterion kinds: change tests must fail now, preserve tests must pass now ----
+
+const KINDS: Contract = {
+  ...CONTRACT,
+  criteria: [
+    { id: "AC-1", kind: "change", statement: "adds" },
+    { id: "AC-2", kind: "preserve", statement: "add(1, 1) is still 2" },
+  ],
+};
+const passing = (id: string, name = "keeps") =>
+  `test("${id}: ${name}", () => { expect(add(1, 1)).toBe(2); });\n`;
+
+test("a preserve test that passes now is accepted next to a red change test", async () => {
+  const { promise } = await run(
+    [write("test/ac.test.ts", `${HEAD}${failing("AC-1", "adds")}${passing("AC-2")}`), text("d")],
+    { contract: KINDS },
+  );
+  const m = await promise;
+  expect(m.criteriaToTests).toEqual({
+    "AC-1": ["test/ac.test.ts::AC-1: adds"],
+    "AC-2": ["test/ac.test.ts::AC-2: keeps"],
+  });
+});
+
+test("a preserve test that fails now is rejected: the contract says it already works", async () => {
+  const { err } = await rejected(
+    twice("test/ac.test.ts", `${HEAD}${failing("AC-1", "adds")}${failing("AC-2", "keeps")}`),
+    { contract: KINDS },
+  );
+  expect(err.message).toContain("test/ac.test.ts :: AC-2: keeps");
+  expect(err.message).toMatch(/preserve test fails now: the contract says AC-2 already works/);
+  expect(err.message).not.toContain("AC-1: adds");
+});
+
+test("a bug mislabelled as preserve fails the red check (its test is red today)", async () => {
+  // The real change ("add(2, 2) is 5") labelled preserve; a trivial change criterion beside it.
+  const mislabelled: Contract = {
+    ...CONTRACT,
+    criteria: [
+      { id: "AC-1", kind: "change", statement: "adds" },
+      { id: "AC-2", kind: "preserve", statement: "add(2, 2) is 5" },
+    ],
+  };
+  const src = `${HEAD}${failing("AC-1", "adds")}test("AC-2: the bug", () => { expect(add(2, 2)).toBe(5); });\n`;
+  const { err } = await rejected(twice("test/ac.test.ts", src), { contract: mislabelled });
+  expect(err.message).toMatch(/AC-2: the bug: preserve test fails now/);
+});
+
+test("a change test that passes now is still rejected", async () => {
+  const { err } = await rejected(
+    twice("test/ac.test.ts", `${HEAD}${passing("AC-1", "adds")}${passing("AC-2")}`),
+    { contract: KINDS },
+  );
+  expect(err.message).toContain("AC-1: adds: test passed, it must fail");
+  expect(err.message).not.toMatch(/AC-2: keeps: /);
+});
+
+test("a change criterion whose only tests pass is rejected", async () => {
+  const src = `${HEAD}${passing("AC-1", "one")}${passing("AC-1", "two")}${passing("AC-2")}`;
+  const { err } = await rejected(twice("test/ac.test.ts", src), { contract: KINDS });
+  expect(err.message).toContain(
+    "AC-1 is a change criterion with no test that fails now with an assertion error",
+  );
+});
+
+test("a test with no assertion is rejected for either kind (it would pass vacuously)", async () => {
+  const src = `${HEAD}test("AC-1: adds", () => { add(2, 2); });\ntest("AC-2: keeps", () => { add(1, 1); });\n`;
+  const { err } = await rejected(twice("test/ac.test.ts", src), { contract: KINDS });
+  expect(err.message).toContain("AC-1: adds: test makes no assertion");
+  expect(err.message).toContain("AC-2: keeps: test makes no assertion");
+});
+
+test("a test with no AC id is still held to the change rule (must fail now)", async () => {
+  const src = `${HEAD}${failing("AC-1", "adds")}${passing("AC-2")}test("helper sanity", () => { expect(add(1, 1)).toBe(2); });\n`;
+  const { err } = await rejected(twice("test/ac.test.ts", src), { contract: KINDS });
+  expect(err.message).toContain("helper sanity: test passed, it must fail");
+});
+
+test("a contract with no change criterion is refused before any model call", async () => {
+  const allPreserve: Contract = {
+    ...CONTRACT,
+    criteria: [{ id: "AC-1", kind: "preserve", statement: "adds" }],
+  };
+  const { promise, provider } = await run([text("unused")], { contract: allPreserve });
+  const err = await fails(promise);
+  expect(err.code).toBe("contract_without_change");
+  expect(provider.callCount).toBe(0);
+});
+
+test("the prompt shows each criterion's kind, and the retry states both rules", async () => {
+  const { promise, provider } = await run(
+    [
+      write("test/ac.test.ts", `${HEAD}${failing("AC-1", "adds")}${failing("AC-2", "keeps")}`),
+      text("d"),
+      write("test/ac.test.ts", `${HEAD}${failing("AC-1", "adds")}${passing("AC-2")}`),
+      text("d"),
+    ],
+    { contract: KINDS },
+  );
+  await promise;
+  const first = provider.requests[0]?.messages[0]?.content ?? "";
+  expect(first).toContain("- AC-1 (change): adds");
+  expect(first).toContain("- AC-2 (preserve): add(1, 1) is still 2");
+  const retry = provider.requests[2]?.messages[0]?.content ?? "";
+  expect(retry).toMatch(/`change` criterion must fail now with an assertion error/);
+  expect(retry).toMatch(/`preserve` criterion must pass now/);
+  const system = provider.requests[0]?.system ?? "";
+  expect(system).toMatch(/preserve/);
 });
