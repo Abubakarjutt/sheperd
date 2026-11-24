@@ -1,19 +1,107 @@
-# rewire
+<p align="center">
+  <img src="docs/assets/rewire-banner.svg" alt="rewire: the anti-slop coding harness. Tests first, frozen, sandboxed, independently reviewed." width="100%">
+</p>
 
-An anti-slop coding harness. You give it a task; it writes a contract and a set of tests first,
-freezes them, lets a model implement against them inside a sandbox, then blocks the result on
-hard gates and an independent multi-model review before it commits anything to a branch. It never
-reports "verified" on the strength of a model's say-so.
+<p align="center">
+  <a href="https://www.npmjs.com/package/sheperd"><img alt="npm" src="https://img.shields.io/npm/v/sheperd?label=npm%20%C2%B7%20sheperd&color=3ee6b0&labelColor=0b1020"></a>
+  <a href="https://github.com/Abubakarjutt/sheperd/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Abubakarjutt/sheperd/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux-7cb4ff?labelColor=0b1020">
+  <img alt="Models: Claude, OpenAI, Ollama" src="https://img.shields.io/badge/models-Claude%20%C2%B7%20OpenAI%20%C2%B7%20Ollama-f6b94c?labelColor=0b1020">
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-9aa6bd?labelColor=0b1020"></a>
+</p>
+
+<p align="center">
+  <a href="#quick-start"><b>Quick start</b></a> ·
+  <a href="#how-a-run-works"><b>How it works</b></a> ·
+  <a href="#choosing-models"><b>Models</b></a> ·
+  <a href="#usage"><b>Usage</b></a> ·
+  <a href="#known-v01-limitations"><b>Limitations</b></a>
+</p>
+
+---
+
+You give rewire a task. It writes a contract and a set of tests **first**, freezes them, lets a
+model implement against them **inside a sandbox**, then blocks the result on **hard gates** and
+an **independent multi-model review** before it commits anything to a branch. It never reports
+"verified" on the strength of a model's say-so.
 
 It works with Claude, OpenAI models and local models through [Ollama](https://ollama.com).
 
-**Status: v0.1, TypeScript only.** The 20-task anti-slop benchmark in [`bench/`](bench/README.md)
-exists and its scorer is unit-tested, but **it has not been run against real models yet**. There
-are no measured pass rates, and nothing here should be read as a claim about how often rewire
-catches slop. The release checklist ([`docs/v0.1-release-checklist.md`](docs/v0.1-release-checklist.md))
-lists what must hold on a live run before v0.1 is called released.
+> [!NOTE]
+> **Status: v0.1 beta, TypeScript repositories only.** The 20-task anti-slop benchmark in
+> [`bench/`](bench/README.md) exists and its scorer is unit-tested, but **it has not been run
+> against real models yet**. There are no measured pass rates, and nothing here should be read as
+> a claim about how often rewire catches slop. The release checklist
+> ([`docs/v0.1-release-checklist.md`](docs/v0.1-release-checklist.md)) lists what must hold on a
+> live run before v0.1 is called released.
+
+## Why rewire
+
+Coding agents are fast, and they are very good at producing work that _looks_ done: tests that
+assert nothing, a fix that special-cases the one input in the bug report, an error swallowed so
+the suite goes green, a test quietly edited until it passes. rewire is built so that none of
+those can reach your branch on the model's word alone.
+
+| The usual failure                              | What rewire does instead                                                                                                                |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| The agent edits the tests until they pass      | Tests are written before the code, checked red, then **frozen and hashed**. Changing one fails a gate.                                  |
+| "All tests pass", but the tests assert nothing | Every test must make an assertion; the harness proves the runner enforces it with its own probe test.                                   |
+| The model grades its own homework              | Reviewers and the verifier come from a **different model family** than the implementer whenever one is available.                       |
+| The agent runs anything on your machine        | Every write and command goes through **`rewire-sandbox`** (bubblewrap on Linux, `sandbox-exec` on macOS), with credential files denied. |
+| "Done!" with nothing to show for it            | A run is either `verified` (committed to `rewire/<runId>` with an evidence report) or escalated to you with the reason.                 |
+
+## Quick start
+
+**1. Install** rewire (Node.js 22 or newer) and the tools its gates use:
+
+```sh
+npm i -g sheperd                 # the package is "sheperd"; the command is "rewire"
+
+# macOS
+brew install ripgrep semgrep gitleaks
+
+# Debian / Ubuntu (gitleaks: see "Installation in detail" below)
+sudo apt-get install -y git ripgrep bubblewrap pipx && pipx install semgrep==1.186.0
+```
+
+**2. Check your setup.** Every line should be a `✓`; each `✗` comes with the fix.
+
+```sh
+rewire doctor
+```
+
+**3. Give it a model.** With nothing configured, rewire uses what it finds:
+
+```sh
+export ANTHROPIC_API_KEY=...     # → anthropic:claude-sonnet-5-5
+export OPENAI_API_KEY=...        # → openai:gpt-5   (both set = cross-family review)
+# or just have Ollama running with a model pulled: fully local, no key needed
+```
+
+**4. Run a task** from the root of a clean git repository:
+
+```sh
+cd my-typescript-project
+rewire run "add a --json flag to the export command"
+```
+
+**5. Read the result.** A verified run (exit code `0`) is committed to the branch
+`rewire/<runId>`; your current branch is never touched. The evidence report explains what was
+checked and why it passed:
+
+```sh
+git log --oneline rewire/<runId>
+cat .rewire/runs/<runId>/report.md
+```
+
+If the run escalates instead (exit code `2`), the same report says why and what it needs from
+you. Add `.rewire/runs/`, `.rewire/worktrees/` and `.rewire/cache/` to your `.gitignore`.
 
 ## How a run works
+
+<p align="center">
+  <img src="docs/assets/rewire-pipeline.svg" alt="How a run works: spec, tests first (red check, then frozen), implement in a sandbox, gates, cross-family review, verified branch; findings loop back to the implementer, and a run that stops converging escalates to you." width="100%">
+</p>
 
 1. **Spec.** The task becomes a contract (asking you clarifying questions if it is ambiguous):
    acceptance criteria, non-goals and affected areas. Each criterion has a kind: `change` (new or
@@ -27,7 +115,10 @@ lists what must hold on a live run before v0.1 is called released.
      criterion id; these problems get one retry;
    - a test for a `preserve` criterion must pass. One that fails stops the run at once, never
      retried (`preserve_fails_now`), and asks you whether the criterion is mislabelled (really a
-     `change`) or the test is wrong. A retry could only make it pass by weakening it;
+     `change`) or the test is wrong. A retry could only make it pass by weakening it. The
+     exception is a test that crashed in its own code rather than on an assertion (for example,
+     it called a function that does not exist): that is a test-writer mistake and gets the one
+     retry. An error thrown from the code under test still stops the run;
    - every test must make an assertion. The harness runs its own no-assertion probe test in the
      same run and stops (`assertion_rule_unenforced`) if the test runner does not fail it.
 
@@ -48,92 +139,6 @@ lists what must hold on a live run before v0.1 is called released.
 6. **Fix loop.** Findings go back to the implementer, with progress and oscillation detection,
    a re-plan, and escalation to you when it stops converging.
 7. **Result.** A verified run is committed to the branch `rewire/<runId>` with an evidence report.
-
-## Install
-
-### Install from npm
-
-rewire is published to npm as the package **`sheperd`** (pre-release, on the `next` tag). The
-command it installs is `rewire`:
-
-```sh
-npm i -g sheperd@next
-rewire doctor
-```
-
-The package carries the CLI as one bundled file plus a prebuilt `rewire-sandbox` for your
-platform, which npm installs automatically as an optional dependency
-(`sheperd-darwin-arm64`, `sheperd-darwin-x64`, `sheperd-linux-x64` or `sheperd-linux-arm64`).
-Supported platforms: macOS on Apple silicon or Intel, and Linux on x64 or arm64 with glibc 2.35
-or newer (Ubuntu 22.04, Debian 12 or later; musl distributions such as Alpine are not supported).
-Windows is not supported. If your npm install skips optional dependencies
-(`--omit=optional`, `--no-optional`), the sandbox binary is missing and `rewire doctor` says so.
-
-You still need these system tools on `PATH`: git,
-[ripgrep](https://github.com/BurntSushi/ripgrep), [semgrep](https://semgrep.dev),
-[gitleaks](https://github.com/gitleaks/gitleaks), and on Linux
-[bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer. macOS uses the built-in
-`sandbox-exec`. See the per-OS install commands below.
-
-### Build from source
-
-Requirements: git, Node.js 22+, pnpm, a Rust toolchain (to build the sandbox helper),
-[ripgrep](https://github.com/BurntSushi/ripgrep), [semgrep](https://semgrep.dev),
-[gitleaks](https://github.com/gitleaks/gitleaks), and on Linux
-[bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer. macOS uses the built-in
-`sandbox-exec`. Windows is not supported. CI uses semgrep 1.186.0 and gitleaks 8.30.1, the
-versions the gates were developed against.
-
-```sh
-# macOS
-brew install ripgrep semgrep gitleaks pnpm
-
-# Debian/Ubuntu
-sudo apt-get install -y git ripgrep bubblewrap pipx
-pipx install semgrep==1.186.0
-pipx ensurepath          # then restart the shell so ~/.local/bin is on PATH
-# gitleaks: download the release for your platform from
-#   https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1
-# and put the `gitleaks` binary on PATH
-# pnpm: npm install -g pnpm   (or corepack enable)
-```
-
-Then build rewire from source:
-
-```sh
-git clone <this repository> rewire && cd rewire
-cargo build --release -p rewire-sandbox
-pnpm install --frozen-lockfile
-pnpm -r build
-
-# put the CLI on PATH (or run `node "$PWD/packages/cli/dist/main.js"` directly)
-alias rewire='node '"$PWD"'/packages/cli/dist/main.js'
-```
-
-The CLI looks for the sandbox binary in this order:
-
-1. `REWIRE_SANDBOX_BIN` (a missing file is an error, never a fall-through);
-2. the newer of `target/release/` and `target/debug/` in the checkout (source builds only; the npm
-   package never looks for a checkout);
-3. the `sheperd-<os>-<arch>` package installed next to the CLI (only there: never via `NODE_PATH`
-   or other global folders). Its binary must match the sha256 recorded in the npm bundle at
-   build time; a package whose binary is missing, not executable, modified, or of a different
-   version than the CLI is an error, never a fall-through;
-4. the first absolute `PATH` entry that has `rewire-sandbox`.
-
-`rewire doctor` reports exactly this lookup, including which step found the binary, and a run
-that cannot find the binary stops in preflight, before any model call.
-
-## `rewire doctor`
-
-```sh
-rewire doctor [--models <file>]
-```
-
-Prints one line per check, `✓` or `✗` with a fix hint, and exits `0` when everything required is
-present or `1` otherwise. It checks: the sandbox binary, `git`, `rg`, `semgrep`, `gitleaks`,
-`bwrap` (Linux) or `sandbox-exec` (macOS), the model list, and, when any model is an Ollama model,
-that Ollama is reachable and at least version 0.6.4. Run it before your first `rewire run`.
 
 ## Usage
 
@@ -174,6 +179,17 @@ Every run writes into the target repo:
 Add `.rewire/runs/`, `.rewire/worktrees/` and `.rewire/cache/` to the repo's ignore file (not
 all of `.rewire/`: `.rewire/policy.toml` is the repo policy and belongs in version control). The
 result of a verified run lives on the branch `rewire/<runId>`.
+
+## `rewire doctor`
+
+```sh
+rewire doctor [--models <file>]
+```
+
+Prints one line per check, `✓` or `✗` with a fix hint, and exits `0` when everything required is
+present or `1` otherwise. It checks: the sandbox binary, `git`, `rg`, `semgrep`, `gitleaks`,
+`bwrap` (Linux) or `sandbox-exec` (macOS), the model list, and, when any model is an Ollama model,
+that Ollama is reachable and at least version 0.6.4. Run it before your first `rewire run`.
 
 ## Choosing models
 
@@ -228,6 +244,95 @@ Each Ollama reply may take up to 300 seconds. A larger local model on modest har
 more: set `REWIRE_OLLAMA_TIMEOUT_S` (whole seconds, 1 to 86400), e.g.
 `REWIRE_OLLAMA_TIMEOUT_S=900 rewire run ...`. `rewire doctor` shows the value in use.
 
+## Configuration
+
+| Variable                                        | What it does                                                                              |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`           | Enable the Anthropic and OpenAI providers (auto-detected when no `models.toml` is given). |
+| `REWIRE_ANTHROPIC_MODEL`, `REWIRE_OPENAI_MODEL` | Override the auto-detected Anthropic and OpenAI models.                                   |
+| `OLLAMA_HOST`                                   | Where Ollama is found (default `http://127.0.0.1:11434`).                                 |
+| `REWIRE_OLLAMA_TIMEOUT_S`                       | Seconds to wait for each Ollama reply: whole seconds, 1 to 86400, default 300.            |
+| `REWIRE_SANDBOX_BIN`                            | Use this sandbox binary (a missing file is an error, never a fall-through).               |
+| `XDG_CONFIG_HOME`                               | Where the default `rewire/models.toml` is looked up (default `~/.config`).                |
+
+The repository's own policy lives in `.rewire/policy.toml` and belongs in version control. Policy
+layers only ever tighten: built-in, then organisation, then repository, then run.
+
+## Installation in detail
+
+### From npm
+
+rewire is published to npm as the package **`sheperd`** (a v0.1 beta). The command it installs
+is `rewire`:
+
+```sh
+npm i -g sheperd
+rewire doctor
+```
+
+The package carries the CLI as one bundled file plus a prebuilt `rewire-sandbox` for your
+platform, which npm installs automatically as an optional dependency
+(`sheperd-darwin-arm64`, `sheperd-darwin-x64`, `sheperd-linux-x64` or `sheperd-linux-arm64`).
+Supported platforms: macOS on Apple silicon or Intel, and Linux on x64 or arm64 with glibc 2.35
+or newer (Ubuntu 22.04, Debian 12 or later; musl distributions such as Alpine are not supported).
+Windows is not supported. If your npm install skips optional dependencies
+(`--omit=optional`, `--no-optional`), the sandbox binary is missing and `rewire doctor` says so.
+
+You still need these system tools on `PATH`: git,
+[ripgrep](https://github.com/BurntSushi/ripgrep), [semgrep](https://semgrep.dev),
+[gitleaks](https://github.com/gitleaks/gitleaks), and on Linux
+[bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer. macOS uses the built-in
+`sandbox-exec`. See the per-OS install commands below.
+
+### From source
+
+Requirements: git, Node.js 22+, pnpm, a Rust toolchain (to build the sandbox helper),
+[ripgrep](https://github.com/BurntSushi/ripgrep), [semgrep](https://semgrep.dev),
+[gitleaks](https://github.com/gitleaks/gitleaks), and on Linux
+[bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer. macOS uses the built-in
+`sandbox-exec`. Windows is not supported. CI uses semgrep 1.186.0 and gitleaks 8.30.1, the
+versions the gates were developed against.
+
+```sh
+# macOS
+brew install ripgrep semgrep gitleaks pnpm
+
+# Debian/Ubuntu
+sudo apt-get install -y git ripgrep bubblewrap pipx
+pipx install semgrep==1.186.0
+pipx ensurepath          # then restart the shell so ~/.local/bin is on PATH
+# gitleaks: download the release for your platform from
+#   https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1
+# and put the `gitleaks` binary on PATH
+# pnpm: npm install -g pnpm   (or corepack enable)
+```
+
+Then build rewire from source:
+
+```sh
+git clone <this repository> rewire && cd rewire
+cargo build --release -p rewire-sandbox
+pnpm install --frozen-lockfile
+pnpm -r build
+
+# put the CLI on PATH (or run `node "$PWD/packages/cli/dist/main.js"` directly)
+alias rewire='node '"$PWD"'/packages/cli/dist/main.js'
+```
+
+The CLI looks for the sandbox binary in this order:
+
+1. `REWIRE_SANDBOX_BIN` (a missing file is an error, never a fall-through);
+2. the newer of `target/release/` and `target/debug/` in the checkout (source builds only; the npm
+   package never looks for a checkout);
+3. the `sheperd-<os>-<arch>` package installed next to the CLI (only there: never via `NODE_PATH`
+   or other global folders). Its binary must match the sha256 recorded in the npm bundle at
+   build time; a package whose binary is missing, not executable, modified, or of a different
+   version than the CLI is an error, never a fall-through;
+4. the first absolute `PATH` entry that has `rewire-sandbox`.
+
+`rewire doctor` reports exactly this lookup, including which step found the binary, and a run
+that cannot find the binary stops in preflight, before any model call.
+
 ## Benchmark
 
 ```sh
@@ -252,6 +357,11 @@ defines what a first run must show.
   set; PATH still comes from the host environment.
 
 ## Known v0.1 limitations
+
+rewire is honest about what it does not catch yet. The full list is long and specific.
+
+<details>
+<summary><b>Show all known limitations</b></summary>
 
 These are rendered into every evidence report (the first list) or are known gaps in the harness.
 
@@ -358,6 +468,8 @@ Also known:
   refuses it); the CLI prints a hint.
 - The registry-client e2e test has flaked under load on a developer machine.
 - No PR delivery, TUI, Python pack, plugin API or streaming in v0.1.
+
+</details>
 
 ## Development
 

@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="470" viewBox="0 0 1280 470" role="img" aria-labelledby="t d">
+<title id="t">How a rewire run works</title>
+<desc id="d">Spec, tests first, implement in a sandbox, hard gates, independent review, then a verified branch. Findings loop back to the implementer; a run that stops converging escalates to a human.</desc>
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#0b1020"/><stop offset="1" stop-color="#141b2e"/>
+  </linearGradient>
+  <linearGradient id="mint" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0" stop-color="#3ee6b0"/><stop offset="1" stop-color="#7cb4ff"/>
+  </linearGradient>
+  <linearGradient id="wire" gradientUnits="userSpaceOnUse" x1="930" y1="0" x2="1220" y2="0">
+    <stop offset="0" stop-color="#3ee6b0"/><stop offset="1" stop-color="#7cb4ff"/>
+  </linearGradient>
+  <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+    <path d="M24 0H0V24" fill="none" stroke="#2a3450" stroke-width="0.6" opacity="0.45"/>
+  </pattern>
+</defs>
+<rect width="1280" height="470" rx="22" fill="url(#bg)"/>
+<rect width="1280" height="470" rx="22" fill="url(#grid)"/>
+<text x="56" y="62" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="24" font-weight="700" fill="#eef2f8">How a run works</text>
+<text x="56" y="92" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" fill="#9aa6bd">Nothing reaches your branch on a model's say-so. Every arrow is a check the harness runs itself.</text>
+<rect x="45" y="150" width="180" height="158" rx="16" fill="#141b2e" stroke="#7cb4ff" stroke-opacity="0.85" stroke-width="1.8"/>
+<rect x="45" y="150" width="180" height="5" rx="2.5" fill="#7cb4ff"/>
+<circle cx="75" cy="188" r="15" fill="none" stroke="#7cb4ff" stroke-width="1.8"/>
+<text x="75" y="194" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="700" fill="#7cb4ff">1</text>
+<text x="99" y="195" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" font-weight="700" fill="#eef2f8">Spec</text>
+<text x="65" y="234" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">task → contract</text>
+<text x="65" y="258" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">change/preserve</text>
+<text x="65" y="282" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">criteria</text>
+<path d="M 229 229.0 L 236 229.0" stroke="#9aa6bd" stroke-width="2"/>
+<path d="M 234 223.0 L 243 229.0 L 234 235.0" fill="none" stroke="#9aa6bd" stroke-width="2" stroke-linejoin="round"/>
+<rect x="247" y="150" width="180" height="158" rx="16" fill="#141b2e" stroke="#f6b94c" stroke-opacity="0.85" stroke-width="1.8"/>
+<rect x="247" y="150" width="180" height="5" rx="2.5" fill="#f6b94c"/>
+<circle cx="277" cy="188" r="15" fill="none" stroke="#f6b94c" stroke-width="1.8"/>
+<text x="277" y="194" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="700" fill="#f6b94c">2</text>
+<text x="301" y="195" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" font-weight="700" fill="#eef2f8">Tests first</text>
+<text x="267" y="234" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">red check</text>
+<text x="267" y="258" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">then frozen</text>
+<text x="267" y="282" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">and hashed</text>
+<path d="M 431 229.0 L 438 229.0" stroke="#9aa6bd" stroke-width="2"/>
+<path d="M 436 223.0 L 445 229.0 L 436 235.0" fill="none" stroke="#9aa6bd" stroke-width="2" stroke-linejoin="round"/>
+<rect x="449" y="150" width="180" height="158" rx="16" fill="#141b2e" stroke="#3ee6b0" stroke-opacity="0.85" stroke-width="1.8"/>
+<rect x="449" y="150" width="180" height="5" rx="2.5" fill="#3ee6b0"/>
+<circle cx="479" cy="188" r="15" fill="none" stroke="#3ee6b0" stroke-width="1.8"/>
+<text x="479" y="194" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="700" fill="#3ee6b0">3</text>
+<text x="503" y="195" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" font-weight="700" fill="#eef2f8">Implement</text>
+<text x="469" y="234" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">git worktree</text>
+<text x="469" y="258" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">sandboxed</text>
+<text x="469" y="282" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">writes only</text>
+<path d="M 633 229.0 L 640 229.0" stroke="#9aa6bd" stroke-width="2"/>
+<path d="M 638 223.0 L 647 229.0 L 638 235.0" fill="none" stroke="#9aa6bd" stroke-width="2" stroke-linejoin="round"/>
+<rect x="651" y="150" width="180" height="158" rx="16" fill="#141b2e" stroke="#ff7a7a" stroke-opacity="0.85" stroke-width="1.8"/>
+<rect x="651" y="150" width="180" height="5" rx="2.5" fill="#ff7a7a"/>
+<circle cx="681" cy="188" r="15" fill="none" stroke="#ff7a7a" stroke-width="1.8"/>
+<text x="681" y="194" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="700" fill="#ff7a7a">4</text>
+<text x="705" y="195" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" font-weight="700" fill="#eef2f8">Gates</text>
+<text x="671" y="234" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">tests · types</text>
+<text x="671" y="258" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">lint · semgrep</text>
+<text x="671" y="282" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">gitleaks · audit</text>
+<path d="M 835 229.0 L 842 229.0" stroke="#9aa6bd" stroke-width="2"/>
+<path d="M 840 223.0 L 849 229.0 L 840 235.0" fill="none" stroke="#9aa6bd" stroke-width="2" stroke-linejoin="round"/>
+<rect x="853" y="150" width="180" height="158" rx="16" fill="#141b2e" stroke="#7cb4ff" stroke-opacity="0.85" stroke-width="1.8"/>
+<rect x="853" y="150" width="180" height="5" rx="2.5" fill="#7cb4ff"/>
+<circle cx="883" cy="188" r="15" fill="none" stroke="#7cb4ff" stroke-width="1.8"/>
+<text x="883" y="194" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="700" fill="#7cb4ff">5</text>
+<text x="907" y="195" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" font-weight="700" fill="#eef2f8">Review</text>
+<text x="873" y="234" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">security · spec</text>
+<text x="873" y="258" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">cross-family</text>
+<text x="873" y="282" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">+ verifier</text>
+<path d="M 1037 229.0 L 1044 229.0" stroke="#9aa6bd" stroke-width="2"/>
+<path d="M 1042 223.0 L 1051 229.0 L 1042 235.0" fill="none" stroke="#9aa6bd" stroke-width="2" stroke-linejoin="round"/>
+<rect x="1055" y="150" width="180" height="158" rx="16" fill="#141b2e" stroke="#3ee6b0" stroke-opacity="0.85" stroke-width="1.8"/>
+<rect x="1055" y="150" width="180" height="5" rx="2.5" fill="#3ee6b0"/>
+<circle cx="1085" cy="188" r="15" fill="none" stroke="#3ee6b0" stroke-width="1.8"/>
+<text x="1085" y="194" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="700" fill="#3ee6b0">6</text>
+<text x="1109" y="195" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" font-weight="700" fill="#eef2f8">Verified</text>
+<text x="1075" y="234" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">rewire/&lt;runId&gt;</text>
+<text x="1075" y="258" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">branch, with an</text>
+<text x="1075" y="282" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#9aa6bd">evidence report</text>
+<path d="M 399 272 v -5 a 6 6 0 0 1 12 0 v 5" fill="none" stroke="#f6b94c" stroke-width="2"/>
+<rect x="396" y="272" width="18" height="13" rx="3" fill="#f6b94c"/>
+<path d="M 943.0 312 L 943.0 356 Q 943.0 370 929.0 370 L 553.0 370 Q 539.0 370 539.0 356 L 539.0 320" fill="none" stroke="#f6b94c" stroke-width="2" stroke-dasharray="7 6"/>
+<path d="M 533.0 324 L 539.0 314 L 545.0 324" fill="none" stroke="#f6b94c" stroke-width="2" stroke-linejoin="round"/>
+<text x="741.0" y="396" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" fill="#f6b94c">fix loop: findings go back to the implementer (progress + oscillation detection)</text>
+<text x="1224" y="440" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" fill="#9aa6bd">Stops converging, or a test contradicts the contract? The run escalates to you (exit 2) with an evidence report.</text>
+</svg>
