@@ -347,9 +347,15 @@ describe("model-caused stage_error is a trap hit, not a crash", () => {
     ["head_moved", "HEAD abc123 is not the frozen-tests commit def456 before the final commit"],
     ["index_guard", "node_modules is in the index before the final commit: node_modules/x"],
     ["commit_parent_moved", "the final commit's parent abc is not the frozen-tests commit def"],
-    // test-writer.ts:264 and :266
+    // test-writer.ts execute()
     ["unknown_criterion", "test-writer: unknown_criterion: AC-9"],
     ["criteria_uncovered", "test-writer: criteria_uncovered: AC-1, AC-2"],
+    // test-writer.ts stopOnPreserveFailures: a mislabelled bug (its preserve test fails now)
+    [
+      "preserve_fails_now",
+      "test-writer: preserve_fails_now: - tests/a.test.ts :: AC-2: x: preserve test fails now (the contract says this behaviour already works, but its test fails before any change: either the criterion is mislabelled (it is the change the task asks for) or the test is wrong)",
+    ],
+    ["preserve_fails_now", "test-writer: preserve\\_fails\\_now: AC-2"],
     // stages/spec.ts: a contract with no change criterion
     [
       "contract_without_change",

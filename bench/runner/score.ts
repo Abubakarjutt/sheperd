@@ -38,30 +38,39 @@ export const isInfraReason = (reason: string | undefined): boolean =>
  * are copied from the pipeline source.
  */
 export const MODEL_STAGE_ERRORS: ReadonlyArray<{ name: string; re: RegExp }> = [
-  // packages/pipeline/src/stages/test-writer.ts:285 and :288 (RewireError codes); the
-  // orchestrator writes them as `${stage}: ${code}: ${message}` (orchestrator.ts toEscalation)
+  // Sources are cited by function and string, not line number (line numbers go stale).
+  // stages/test-writer.ts `analyze()`: RewireError codes; the orchestrator writes them as
+  // `${stage}: ${code}: ${message}` (orchestrator.ts `toEscalation`)
   { name: "test_writer_out_of_scope", re: /\btest_writer_out_of_scope\b/ },
   { name: "test_writer_modified_existing", re: /\btest_writer_modified_existing\b/ },
-  // test-writer.ts:264 `throw new RewireError("unknown_criterion", ...)`: a test names a
+  // test-writer.ts `execute()`, `RewireError("unknown_criterion", ...)`: a test names a
   // criterion the contract does not have
   { name: "unknown_criterion", re: /^test-writer: unknown_criterion: / },
-  // test-writer.ts:266 `throw new RewireError("criteria_uncovered", ...)`: a criterion with no test
+  // test-writer.ts `execute()`, `RewireError("criteria_uncovered", ...)`: a criterion with no test
   { name: "criteria_uncovered", re: /^test-writer: criteria_uncovered: / },
-  // stages/spec.ts `throw new RewireError("contract_without_change", ...)`: the spec model wrote a
-  // contract with no `change` criterion (after one corrective retry); test-writer.ts refuses one too
+  // stages/spec.ts `compileWith`, `RewireError("contract_without_change", ...)`: the spec model
+  // wrote a contract with no `change` criterion (after one corrective retry); test-writer.ts
+  // `execute()` refuses one too
   { name: "contract_without_change", re: /^(?:spec|test-writer): contract_without_change: / },
-  // packages/pipeline/src/orchestrator.ts:668 `frozen test ${path}: ${reason} before the final commit`
+  // test-writer.ts `stopOnPreserveFailures`, `PreserveFailsNowError` (code preserve_fails_now):
+  // a test for a criterion labelled preserve fails before any change, so the spec model
+  // mislabelled the change (or the test-writer wrote a wrong test). Never retried.
+  { name: "preserve_fails_now", re: /^test-writer: preserve_fails_now: / },
+  // orchestrator.ts `execute()`: `frozen test ${m.path}: ${m.reason} before the final commit`
   { name: "frozen_test_mismatch", re: /^frozen test .+ before the final commit$/ },
-  // orchestrator.ts:489 TAMPERED and :672 `${TAMPERED} before the final commit`
+  // orchestrator.ts `TAMPERED` ("node_modules link tampered"), also `${TAMPERED} before the
+  // final commit` in `execute()`
   { name: "node_modules_tampered", re: /node_modules link tampered/ },
-  // orchestrator.ts:679 `HEAD ${before} is not the frozen-tests commit ${frozenCommit} before ...`
+  // orchestrator.ts `execute()`: `HEAD ${before} is not the frozen-tests commit ${frozenCommit}
+  // before the final commit`
   {
     name: "head_moved",
     re: /^HEAD \S+ is not the frozen-tests commit \S+ before the final commit/,
   },
-  // orchestrator.ts:709 `node_modules is in the index before the final commit: ...`
+  // orchestrator.ts `execute()`: `node_modules is in the index before the final commit: ...`
   { name: "index_guard", re: /^node_modules is in the index before the final commit/ },
-  // orchestrator.ts:736 `the final commit's parent ${parent} is not the frozen-tests commit ...`
+  // orchestrator.ts `execute()`: `the final commit's parent ${parent} is not the frozen-tests
+  // commit ${frozenCommit}`
   {
     name: "commit_parent_moved",
     re: /^the final commit's parent \S+ is not the frozen-tests commit/,
