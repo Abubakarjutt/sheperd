@@ -82,3 +82,15 @@ export const FrozenTestManifest = z.object({
   criteriaToTests: z.record(z.string(), z.array(z.string())),
 });
 export type FrozenTestManifest = z.infer<typeof FrozenTestManifest>;
+
+export const CheckpointKind = z.enum(["contract", "tests", "commit"]);
+export type CheckpointKind = z.infer<typeof CheckpointKind>;
+
+const CheckpointNote = z.string().min(1).max(2000);
+
+export const CheckpointDecision = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("approve") }),
+  z.object({ action: z.literal("revise"), note: CheckpointNote }),
+  z.object({ action: z.literal("stop"), note: CheckpointNote.optional() }),
+]);
+export type CheckpointDecision = z.infer<typeof CheckpointDecision>;
