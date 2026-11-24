@@ -1,7 +1,14 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync } from "node:fs";
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import { chmod, lstat, readdir, rename, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assetRoot, fenceUntrusted, RewireError } from "@rewire/core";
 import { MAX_SKILL_MD_BYTES, materializeSkill, type Skill } from "./discover.js";
@@ -15,7 +22,20 @@ export const INDEX_BUDGET_BYTES = 12 * 1024;
 const DESC_CHARS = 300;
 const SENTENCE_CHARS = 120;
 
-export type SkillSetOptions = { home: string; xdgConfig: string };
+export type SkillSetOptions = {
+  home: string;
+  xdgConfig: string;
+  /**
+   * Base cache dir (default `$XDG_CACHE_HOME`, else `<home>/.cache`). Set roots live under
+   * `<cacheDir>/rewire/skill-sets/set-*`. Not os.tmpdir(): the Linux sandbox mounts a private
+   * tmpfs over /tmp, which would hide the copies from sandboxed readers.
+   */
+  cacheDir?: string;
+  /** Test seam: replaces `materializeSkill`. */
+  materialize?: typeof materializeSkill;
+};
+
+const STALE_MS = 24 * 60 * 60 * 1000;
 
 /** A skill after its first load. */
 export type LoadedSkill = {
@@ -67,6 +87,51 @@ async function makeReadOnly(path: string): Promise<void> {
   }
 }
 
+function makeWritableSync(path: string): void {
+  const st = lstatSync(path, { throwIfNoEntry: false });
+  if (!st) return;
+  if (st.isDirectory()) {
+    chmodSync(path, 0o755);
+    for (const name of readdirSync(path)) makeWritableSync(join(path, name));
+  } else if (st.isFile()) chmodSync(path, 0o644);
+}
+
+/** Create `<cacheDir>/rewire/skill-sets` (0700), refusing a symlink or non-dir on the way. */
+function ensureParent(cacheDir: string): string {
+  mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+  let dir = cacheDir;
+  for (const part of ["rewire", "skill-sets"]) {
+    dir = join(dir, part);
+    const st = lstatSync(dir, { throwIfNoEntry: false });
+    if (!st) mkdirSync(dir, { mode: 0o700 });
+    else if (st.isSymbolicLink() || !st.isDirectory()) {
+      throw invalid(`skill-set cache path is a symlink or not a directory: ${part}`);
+    }
+  }
+  return dir;
+}
+
+/** Best effort: remove `set-*` dirs older than 24 h (real directories under our parent only). */
+function sweepStale(parent: string): void {
+  try {
+    const cutoff = Date.now() - STALE_MS;
+    for (const name of readdirSync(parent)) {
+      if (!name.startsWith("set-")) continue;
+      const p = join(parent, name);
+      try {
+        const st = lstatSync(p);
+        if (!st.isDirectory() || st.isSymbolicLink() || st.mtimeMs >= cutoff) continue;
+        makeWritableSync(p);
+        rmSync(p, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
+    }
+  } catch {
+    // best effort
+  }
+}
+
 /** Make a read-only tree removable again. Never follows symlinks (lstat first). */
 export async function makeWritable(path: string): Promise<void> {
   const st = await lstat(path).catch(() => undefined);
@@ -112,6 +177,14 @@ async function readSkillMd(path: string): Promise<{ sha256: string; body: string
 const reason = (e: unknown): string =>
   e instanceof RewireError ? `${e.code}: ${e.message}` : "cannot read bundled files";
 
+/** Callers share one cached result: hand out an immutable copy (nothing aliases the Skill). */
+function freezeLoaded(l: LoadedSkill): LoadedSkill {
+  const files = Object.freeze(l.files.map((f) => Object.freeze({ ...f })));
+  const skill = Object.freeze({ ...l.skill, files: [...files] as Skill["files"] });
+  Object.freeze(skill.files);
+  return Object.freeze({ ...l, skill, files: files as LoadedSkill["files"] });
+}
+
 /**
  * A session's skills. Cheap: nothing is copied until a skill is first loaded, which copies it
  * (read-only) under the set's own host-only root and hashes the copy. A repo skill whose copy does
@@ -128,7 +201,12 @@ export function createSkillSet(skills: Skill[], opts: SkillSetOptions): SkillSet
       seen.add(s.name);
     }
   }
-  const root = mkdtempSync(join(tmpdir(), "rewire-skills-"));
+  const parent = ensureParent(
+    opts.cacheDir ?? join(process.env.XDG_CACHE_HOME || join(opts.home, ".cache")),
+  );
+  sweepStale(parent);
+  const root = mkdtempSync(join(parent, "set-"));
+  const doMaterialize = opts.materialize ?? materializeSkill;
   const byName = new Map(invocable(skills).map((s) => [s.name, s]));
   const cache = new Map<string, Promise<LoadedSkill>>();
 
@@ -139,7 +217,7 @@ export function createSkillSet(skills: Skill[], opts: SkillSetOptions): SkillSet
       await checkRoot(root);
       await clearLeftover(tmp);
       await clearLeftover(dest);
-      const snap = await materializeSkill(skill, tmp, opts);
+      const snap = await doMaterialize(skill, tmp, opts);
       if (skill.source === "repo" && snap.sha256 !== skill.sha256) {
         throw invalid(`repo skill ${skill.name} changed since approval; not loaded`);
       }
@@ -147,24 +225,24 @@ export function createSkillSet(skills: Skill[], opts: SkillSetOptions): SkillSet
       await rename(tmp, dest);
       await makeReadOnly(dest);
       const md = await readSkillMd(join(dest, "SKILL.md"));
-      return {
+      return freezeLoaded({
         skill: { ...skill, sha256: skill.source === "repo" ? snap.sha256 : md.sha256 },
         body: md.body,
         dir: dest,
         files: snap.files,
-      };
+      });
     } catch (e) {
       await clearLeftover(tmp).catch(() => undefined);
       await clearLeftover(dest).catch(() => undefined);
       if (skill.source === "repo") throw e;
       const guard = await UserGuard.create(opts);
       const md = await readSkillMd(await guard.resolve(join(skill.dir, "SKILL.md")));
-      return {
+      return freezeLoaded({
         skill: { ...skill, sha256: md.sha256 },
         body: md.body,
         files: skill.files,
         unavailable: reason(e),
-      };
+      });
     }
   };
 
@@ -243,7 +321,15 @@ const INDEX_TAG = "untrusted_skills_index";
 export function skillIndex(set: SkillSet): string {
   const text = template ?? readFileSync(join(PACKAGE_ROOT, "prompts", "skills-index.md"), "utf8");
   template = text;
-  const overhead = bytes(text.replace("{{INDEX}}", () => fenceUntrusted(INDEX_TAG, "")));
-  const block = fenceUntrusted(INDEX_TAG, indexList(set.skills, INDEX_BUDGET_BYTES - overhead));
-  return text.replace("{{INDEX}}", () => block);
+  const render = (budget: number): string =>
+    text.replace("{{INDEX}}", () => fenceUntrusted(INDEX_TAG, indexList(set.skills, budget)));
+  // Defanging fake closers inside descriptions grows the text, so measure the FINAL text and
+  // shrink the list budget by the excess until it fits.
+  let budget = INDEX_BUDGET_BYTES - bytes(render(0)) + bytes(indexList(set.skills, 0));
+  let out = render(budget);
+  for (let i = 0; i < 20 && bytes(out) > INDEX_BUDGET_BYTES; i++) {
+    budget = Math.max(0, budget - (bytes(out) - INDEX_BUDGET_BYTES));
+    out = render(budget);
+  }
+  return out;
 }

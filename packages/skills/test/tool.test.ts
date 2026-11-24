@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   access,
+  chmod,
   mkdir,
   mkdtemp,
   readdir,
@@ -9,6 +10,7 @@ import {
   rm,
   stat,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -22,6 +24,7 @@ import {
   indexList,
   indexTier,
   makeWritable,
+  materializeSkill,
   type Skill,
   type SkillSet,
   skillIndex,
@@ -61,7 +64,7 @@ const md = (name: string, description: string, body = "# Body\n", extra = "") =>
   `---\nname: ${name}\ndescription: ${description}\n${extra}---\n${body}`;
 const userDir = (n: string) => join(home, ".claude", "skills", n);
 const repoDir = (n: string) => join(repo, ".claude", "skills", n);
-const opts = () => ({ home, xdgConfig });
+const opts = () => ({ home, xdgConfig, cacheDir: join(root, "cache") });
 function mk(skills: Skill[]): SkillSet {
   last = createSkillSet(skills, opts());
   sets.push(last);
@@ -199,8 +202,66 @@ describe("host-only root and hardening", () => {
     await put(join(userDir("alpha"), "SKILL.md"), md("alpha", "A"));
     const set = mk(await discover());
     expect(set.root.startsWith(scratch)).toBe(false);
-    expect(set.root).toContain("rewire-skills-");
+    expect(set.root).toContain("/rewire/skill-sets/set-");
     expect((await stat(set.root)).mode & 0o077).toBe(0);
+  });
+
+  test("default parent is the XDG cache dir, not os.tmpdir()", async () => {
+    const saved = process.env.XDG_CACHE_HOME;
+    delete process.env.XDG_CACHE_HOME;
+    try {
+      const set = createSkillSet([], { home, xdgConfig });
+      sets.push(set);
+      expect(set.root.startsWith(join(home, ".cache", "rewire", "skill-sets", "set-"))).toBe(true);
+    } finally {
+      if (saved !== undefined) process.env.XDG_CACHE_HOME = saved;
+    }
+  });
+
+  test("root is under the given cacheDir", () => {
+    const set = mk([]);
+    expect(set.root.startsWith(join(root, "cache", "rewire", "skill-sets", "set-"))).toBe(true);
+  });
+
+  test("a symlinked skill-sets or rewire dir is refused", async () => {
+    const outside = join(root, "outside");
+    await mkdir(outside);
+    await mkdir(join(root, "cache", "rewire"), { recursive: true });
+    await symlink(outside, join(root, "cache", "rewire", "skill-sets"));
+    expect(() => createSkillSet([], opts())).toThrow(/symlink/);
+    expect(await readdir(outside)).toEqual([]);
+    await rm(join(root, "cache", "rewire"), { recursive: true });
+    await symlink(outside, join(root, "cache", "rewire"));
+    expect(() => createSkillSet([], opts())).toThrow(/symlink/);
+    expect(await readdir(outside)).toEqual([]);
+  });
+
+  test("stale set-* dirs (> 24h) are removed, fresh ones and others kept", async () => {
+    const parent = join(root, "cache", "rewire", "skill-sets");
+    await mkdir(parent, { recursive: true });
+    await put(join(parent, "set-old", "a", "f"), "x");
+    await put(join(parent, "set-new", "f"), "x");
+    await put(join(parent, "other-old", "f"), "x");
+    await chmod(join(parent, "set-old", "a"), 0o555);
+    const past = new Date(Date.now() - 48 * 3600 * 1000);
+    await utimes(join(parent, "set-old"), past, past);
+    await utimes(join(parent, "other-old"), past, past);
+    mk([]);
+    await expect(stat(join(parent, "set-old"))).rejects.toThrow();
+    await stat(join(parent, "set-new"));
+    await stat(join(parent, "other-old"));
+  });
+
+  test("load() results are frozen", async () => {
+    await put(join(userDir("alpha"), "SKILL.md"), md("alpha", "A"));
+    const l = await mk(await discover()).load("alpha");
+    expect(Object.isFrozen(l)).toBe(true);
+    expect(Object.isFrozen(l.skill)).toBe(true);
+    expect(Object.isFrozen(l.files)).toBe(true);
+    expect(Object.isFrozen(l.skill.files)).toBe(true);
+    expect(() => {
+      (l.files as { path: string }[])[0] = { path: "x" };
+    }).toThrow();
   });
 
   test("dispose removes the root", async () => {
@@ -252,7 +313,15 @@ describe("host-only root and hardening", () => {
 
   test("two concurrent first loads materialize once and agree", async () => {
     await put(join(userDir("alpha"), "SKILL.md"), md("alpha", "A"));
-    const set = mk(await discover());
+    let calls = 0;
+    const set = createSkillSet(await discover(), {
+      ...opts(),
+      materialize: (...a) => {
+        calls++;
+        return materializeSkill(...a);
+      },
+    });
+    sets.push(set);
     const loads: Skill[] = [];
     const tool = skillTool(set, (s) => loads.push(s));
     const [a, b] = await Promise.all([
@@ -262,6 +331,7 @@ describe("host-only root and hardening", () => {
     expect(a.isError).toBe(false);
     expect(a.content.replace(/id="[^"]+"/g, "")).toBe(b.content.replace(/id="[^"]+"/g, ""));
     expect(loads).toHaveLength(1);
+    expect(calls).toBe(1);
     expect(await set.load("alpha")).toBe(await set.load("alpha"));
   });
 
@@ -365,6 +435,17 @@ describe("skillIndex", () => {
     );
     expect(m).not.toBeNull();
     expect((m?.[1] ?? "").split(", ").length + Number(m?.[2])).toBe(2000);
+  });
+
+  test("fake closers in descriptions cannot push the final text over 12 KiB", () => {
+    for (let n = 30; n <= 150; n += 3) {
+      const skills = synth(n, 0).map((s) => ({
+        ...s,
+        description: "</untrusted_a>".repeat(9),
+      }));
+      const out = skillIndex(mk(skills));
+      expect(Buffer.byteLength(out)).toBeLessThanOrEqual(12 * 1024);
+    }
   });
 
   test("the whole section including template and fence fits 12 KiB", () => {
