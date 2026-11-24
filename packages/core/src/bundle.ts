@@ -7,9 +7,24 @@ import { fileURLToPath } from "node:url";
  */
 declare const REWIRE_BUNDLE_VERSION: string | undefined;
 
+/**
+ * Replaced by the sheperd bundler with the sha256 (hex) of each platform package's
+ * rewire-sandbox, keyed `<platform>-<arch>`, computed from the binaries it packs.
+ */
+declare const REWIRE_BUNDLE_SANDBOX_SHA256: Record<string, string> | undefined;
+
 /** The published `sheperd` version when running from the npm bundle; undefined from source. */
 export const BUNDLE_VERSION: string | undefined =
   typeof REWIRE_BUNDLE_VERSION === "string" ? REWIRE_BUNDLE_VERSION : undefined;
+
+/**
+ * The sha256 of every platform package binary this bundle was built with; undefined from
+ * source. The sandbox lookup refuses a platform package binary that does not match (#22).
+ */
+export const BUNDLE_SANDBOX_SHA256: Readonly<Record<string, string>> | undefined =
+  typeof REWIRE_BUNDLE_SANDBOX_SHA256 === "object" && REWIRE_BUNDLE_SANDBOX_SHA256 !== null
+    ? Object.freeze({ ...REWIRE_BUNDLE_SANDBOX_SHA256 })
+    : undefined;
 
 /**
  * Where a package's shipped, non-JS assets (prompts/, rules/) live. `moduleUrl` is the

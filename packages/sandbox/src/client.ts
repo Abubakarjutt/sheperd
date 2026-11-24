@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   accessSync,
   constants,
   existsSync,
+  lstatSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -10,11 +12,10 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { BUNDLE_VERSION, RewireError } from "@rewire/core";
+import { BUNDLE_SANDBOX_SHA256, BUNDLE_VERSION, RewireError } from "@rewire/core";
 import type { CapabilityProfile } from "./profiles.js";
 
 export type CheckResult = { allowed: true } | { allowed: false; canonical: string; rule: string };
@@ -72,61 +73,95 @@ export type FindBinaryOptions = {
   /** The rewire source checkout to look in; `null` skips it. Default: found from this module. */
   sourceRoot?: string | null;
   /**
-   * Resolves `<name>/package.json` to an absolute path, or throws when it is not installed.
-   * Default: `require.resolve` from this module, i.e. from the installed sheperd package. `null`
-   * skips the platform package.
+   * The installed sheperd package's root. Its platform package is looked for only in
+   * `<root>/node_modules/<name>` and, when the root sits in a node_modules directory, in the
+   * hoisted sibling `<that node_modules>/<name>`; never via NODE_PATH or other global folders.
+   * Default: the directory above this module's (dist/main.js in the bundle). `null` skips it.
    */
-  resolvePackage?: ((specifier: string) => string) | null;
+  packageRoot?: string | null;
   /** Default `process.platform` / `process.arch`. */
   platform?: string;
   arch?: string;
   /** The version the platform package must have. Default: the bundle's own version, if any. */
   expectedVersion?: string;
+  /**
+   * sha256 (hex) of each platform package binary, keyed `<platform>-<arch>`. When set, a
+   * platform package binary must match its entry. Default: the hashes recorded in the bundle
+   * at build time; undefined from source.
+   */
+  expectedSha256?: Readonly<Record<string, string>>;
 };
 
 export type SandboxBinarySource = "env" | "checkout" | "platform-package" | "path";
 export type SandboxBinary = { path: string; source: SandboxBinarySource; detail?: string };
 
-const notInstalled = (e: unknown): boolean =>
-  e instanceof Error && (e as NodeJS.ErrnoException).code === "MODULE_NOT_FOUND";
+const defaultPackageRoot = (): string => dirname(dirname(fileURLToPath(import.meta.url)));
+
+/** Where the platform package may be installed relative to the sheperd package root. */
+function platformPackageDirs(packageRoot: string, name: string): string[] {
+  const dirs = [join(packageRoot, "node_modules", name)];
+  const parent = dirname(packageRoot);
+  if (basename(parent) === "node_modules") dirs.push(join(parent, name));
+  return dirs;
+}
+
+const exists = (p: string): boolean => {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 /**
  * The installed `sheperd-<platform>-<arch>` package's binary, or undefined when that package is
- * not installed. An installed package that cannot supply a usable binary throws (#22): a broken
- * or mismatched install never falls through to whatever is on PATH.
+ * not installed. An installed package that cannot supply a usable binary throws (#22): a broken,
+ * mismatched or substituted install never falls through to whatever is on PATH.
  */
 function platformPackageBinary(
   name: string,
-  resolvePackage: (specifier: string) => string,
+  target: string,
+  packageRoot: string,
   expectedVersion: string | undefined,
+  expectedSha256: Readonly<Record<string, string>> | undefined,
 ): string | undefined {
+  const dir = platformPackageDirs(packageRoot, name).find(exists);
+  if (dir === undefined) return undefined;
   const broken = (why: string) =>
     new RewireError(
       "binary_missing",
       `the installed ${name} package ${why}`,
       `reinstall sheperd (npm i -g sheperd@${expectedVersion ?? "next"}) or set REWIRE_SANDBOX_BIN`,
     );
-  let manifest: string;
+  let real: string;
   try {
-    manifest = resolvePackage(`${name}/package.json`);
+    real = realpathSync(dir);
   } catch (e) {
-    if (notInstalled(e)) return undefined;
     throw broken(`cannot be resolved: ${e instanceof Error ? e.message : String(e)}`);
   }
-  if (!isAbsolute(manifest)) throw broken(`resolved to a relative path: ${manifest}`);
-  if (expectedVersion !== undefined) {
-    let version: unknown;
-    try {
-      version = (JSON.parse(readFileSync(manifest, "utf8")) as { version?: unknown }).version;
-    } catch (e) {
-      throw broken(`has an unreadable package.json: ${e instanceof Error ? e.message : String(e)}`);
-    }
-    if (version !== expectedVersion) {
-      throw broken(`is version ${String(version)}, but sheperd is ${expectedVersion}`);
+  let version: unknown;
+  try {
+    version = (
+      JSON.parse(readFileSync(join(real, "package.json"), "utf8")) as { version?: unknown }
+    ).version;
+  } catch (e) {
+    throw broken(`has no readable package.json: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (expectedVersion !== undefined && version !== expectedVersion) {
+    throw broken(`is version ${String(version)}, but sheperd is ${expectedVersion}`);
+  }
+  const bin = join(real, "rewire-sandbox");
+  if (!executableFile(bin)) throw broken(`has no executable regular file at ${bin}`);
+  if (expectedSha256 !== undefined) {
+    const want = expectedSha256[target];
+    if (!want)
+      throw broken(`cannot be verified: this sheperd has no recorded sha256 for ${target}`);
+    const got = createHash("sha256").update(readFileSync(bin)).digest("hex");
+    if (got !== want) {
+      throw broken(`binary's sha256 does not match the one sheperd was built with (${got})`);
     }
   }
-  const bin = join(dirname(manifest), "rewire-sandbox");
-  if (!executableFile(bin)) throw broken(`has no executable regular file at ${bin}`);
   return bin;
 }
 
@@ -134,7 +169,7 @@ function platformPackageBinary(
  * Where the rewire-sandbox binary is, in this order: `REWIRE_SANDBOX_BIN` (a missing file is an
  * error, never a fall-through); the newer of `target/release` and `target/debug` in the rewire
  * source checkout (never from the npm bundle); the installed `sheperd-<platform>-<arch>`
- * package; the first absolute PATH entry that has it (relative entries are skipped, #25).
+ * package next to the installed sheperd (version and, in the bundle, sha256 checked); the first absolute PATH entry that has it (relative entries are skipped, #25).
  * The run (preflight and every SandboxClient) and `rewire doctor` both use exactly this (I1).
  */
 export function locateSandboxBinary(opts: FindBinaryOptions = {}): SandboxBinary {
@@ -159,14 +194,13 @@ export function locateSandboxBinary(opts: FindBinaryOptions = {}): SandboxBinary
     }
     if (best) return { path: best.p, source: "checkout" };
   }
+  const target = `${opts.platform ?? process.platform}-${opts.arch ?? process.arch}`;
   const name = platformPackageName(opts.platform ?? process.platform, opts.arch ?? process.arch);
-  const resolvePackage =
-    opts.resolvePackage === undefined
-      ? createRequire(import.meta.url).resolve
-      : opts.resolvePackage;
-  if (name && resolvePackage) {
-    const expected = "expectedVersion" in opts ? opts.expectedVersion : BUNDLE_VERSION;
-    const bin = platformPackageBinary(name, resolvePackage, expected);
+  const packageRoot = opts.packageRoot === undefined ? defaultPackageRoot() : opts.packageRoot;
+  if (name && packageRoot) {
+    const version = "expectedVersion" in opts ? opts.expectedVersion : BUNDLE_VERSION;
+    const sha = "expectedSha256" in opts ? opts.expectedSha256 : BUNDLE_SANDBOX_SHA256;
+    const bin = platformPackageBinary(name, target, packageRoot, version, sha);
     if (bin) return { path: bin, source: "platform-package", detail: name };
   }
   for (const dir of (env.PATH ?? "").split(delimiter)) {

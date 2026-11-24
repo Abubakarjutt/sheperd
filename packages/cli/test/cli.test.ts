@@ -10,7 +10,6 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -431,7 +430,7 @@ describe("process", () => {
   });
 
   test("doctor reports a binary from the installed platform package", async () => {
-    const root = tmp();
+    const root = join(tmp(), "node_modules", "sheperd");
     const name = platformPackageName(process.platform, process.arch) ?? "sheperd-linux-x64";
     const pkg = join(root, "node_modules", name);
     mkdirSync(pkg, { recursive: true });
@@ -444,7 +443,7 @@ describe("process", () => {
       cwd: root,
       sandboxLookup: {
         sourceRoot: null,
-        resolvePackage: createRequire(join(root, "cli.js")).resolve,
+        packageRoot: root,
         platform: process.platform === "linux" ? "linux" : "darwin",
         arch: name.endsWith("arm64") ? "arm64" : "x64",
       },
