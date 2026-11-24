@@ -482,6 +482,18 @@ describe("process", () => {
     expect(r.stdout).not.toContain("\x1b");
   });
 
+  test("doctor refuses an invalid REWIRE_OLLAMA_TIMEOUT_S on the ollama line", async () => {
+    const d = tmp();
+    const f = join(d, "models.toml");
+    writeFileSync(f, 'available = ["ollama:m"]\n');
+    const r = await exec(
+      ["doctor", "--models", f],
+      cleanEnv({ PATH: d, REWIRE_OLLAMA_TIMEOUT_S: "15m" }),
+    );
+    expect(r.code).not.toBe(0);
+    expect(r.stdout).toMatch(/ollama.*REWIRE_OLLAMA_TIMEOUT_S="15m" is not a whole number/);
+  });
+
   test("a FIFO --task-file is refused without blocking (row 108)", async () => {
     const d = tmp();
     const fifo = join(d, "task.fifo");

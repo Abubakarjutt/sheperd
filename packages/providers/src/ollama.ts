@@ -22,6 +22,25 @@ export const MIN_OLLAMA_VERSION = "0.6.4";
 export const DEFAULT_OLLAMA_HOST = "http://localhost:11434";
 const HTTP_TIMEOUT_MS = 5_000;
 const DEFAULT_CHAT_TIMEOUT_MS = 300_000;
+const MAX_CHAT_TIMEOUT_S = 86_400;
+
+/** Seconds one Ollama reply may take. Local models on modest hardware can need well over 300s. */
+export const OLLAMA_TIMEOUT_ENV = "REWIRE_OLLAMA_TIMEOUT_S";
+
+/** The per-reply Ollama timeout from REWIRE_OLLAMA_TIMEOUT_S: whole seconds, 1 to 86400; default 300. */
+export function ollamaChatTimeoutMs(env: Record<string, string | undefined>): number {
+  const raw = (env[OLLAMA_TIMEOUT_ENV] ?? "").trim();
+  if (raw === "") return DEFAULT_CHAT_TIMEOUT_MS;
+  const s = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isSafeInteger(s) || s < 1 || s > MAX_CHAT_TIMEOUT_S) {
+    throw new RewireError(
+      "ollama_timeout_invalid",
+      `${OLLAMA_TIMEOUT_ENV}="${raw}" is not a whole number of seconds from 1 to ${MAX_CHAT_TIMEOUT_S}`,
+      `e.g. ${OLLAMA_TIMEOUT_ENV}=900 for 15 minutes per reply`,
+    );
+  }
+  return s * 1000;
+}
 
 /** `host:port`, `0.0.0.0` and `http://host/` style OLLAMA_HOST values -> `http://host[:port]`. */
 export function normalizeOllamaHost(raw: string | undefined): string {
@@ -48,6 +67,18 @@ function unreachable(baseUrl: string, detail?: string): RewireError {
     `Ollama is not reachable at ${baseUrl}${detail ? ` (${detail})` : ""}`,
     "Start it with: ollama serve",
   );
+}
+
+/** Whether the Ollama server still answers (after a chat request's connection broke). */
+async function answers(baseUrl: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${baseUrl}/api/version`, {
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 async function ollamaRequest(baseUrl: string, path: string, init?: RequestInit): Promise<unknown> {
@@ -165,13 +196,17 @@ function isConnectionError(err: unknown): boolean {
 
 export class OllamaProvider implements Provider {
   private readonly client: OpenAI;
-  constructor(private readonly baseUrl: string = DEFAULT_OLLAMA_HOST) {
+  constructor(
+    private readonly baseUrl: string = DEFAULT_OLLAMA_HOST,
+    private readonly chatTimeoutMs: number = DEFAULT_CHAT_TIMEOUT_MS,
+  ) {
     this.client = new OpenAI({ baseURL: `${baseUrl}/v1`, apiKey: "ollama", maxRetries: 0 });
   }
   async chat(req: ChatRequest): Promise<ChatResponse> {
-    const timeoutMs = req.timeoutMs ?? DEFAULT_CHAT_TIMEOUT_MS;
+    const timeoutMs = req.timeoutMs ?? this.chatTimeoutMs;
     const timeout = AbortSignal.timeout(timeoutMs);
     const signal = req.signal ? AbortSignal.any([req.signal, timeout]) : timeout;
+    const started = Date.now();
     let resp: unknown;
     try {
       resp = await this.client.chat.completions.create(
@@ -188,10 +223,18 @@ export class OllamaProvider implements Provider {
         throw new RewireError(
           "ollama_timeout",
           `Ollama chat request to ${this.baseUrl} timed out after ${Math.round(timeoutMs / 1000)}s`,
-          "The model may still be loading; retry, or raise the timeout",
+          `The model may still be loading, or replies slowly on this machine: retry, or set ${OLLAMA_TIMEOUT_ENV} (seconds, e.g. 900)`,
         );
       }
-      if (isConnectionError(err)) throw unreachable(this.baseUrl);
+      if (isConnectionError(err)) {
+        // A broken connection to a server that still answers is a dropped request, not an outage.
+        if (!(await answers(this.baseUrl))) throw unreachable(this.baseUrl);
+        throw new RewireError(
+          "ollama_request_dropped",
+          `Ollama at ${this.baseUrl} dropped the chat request after ${Math.round((Date.now() - started) / 1000)}s`,
+          "Ollama is running. It serves one request at a time per model, so another client using the same model (or a model reload) can make it give up on this one: retry when it is idle",
+        );
+      }
       throw providerError("ollama", err);
     }
     return fromOpenAIResponse(resp as Parameters<typeof fromOpenAIResponse>[0], "ollama");
