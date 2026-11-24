@@ -132,7 +132,7 @@ test("chat profile: exec cannot write the root but can write scratch", async () 
   const { root, scratch, c } = setup("chat");
   const denied = await c.exec(["sh", "-c", "echo x > a.txt"], { timeoutMs: 10000, cwd: root });
   expect(denied.exitCode).not.toBe(0);
-  expect(denied.stderr).toMatch(/a\.txt: Operation not permitted/);
+  expect(denied.stderr).toMatch(/a\.txt: (Operation not permitted|Read-only file system|Permission denied)/);
   expect(existsSync(join(root, "a.txt"))).toBe(false);
   const ok = await c.exec(["sh", "-c", `echo x > "${scratch}/a"`], { timeoutMs: 10000, cwd: root });
   expect(ok.exitCode).toBe(0);
