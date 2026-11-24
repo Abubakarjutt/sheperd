@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, normalize, relative } from "node:path";
 import { z } from "zod";
 import type { Gate, GateContext, GateOutput } from "../types.js";
@@ -7,6 +7,7 @@ import {
   baseFileList,
   baseText,
   changedTestFiles,
+  ENV_BIN,
   GateExec,
   inNodeModules,
   matchesAnyGlob,
@@ -174,9 +175,18 @@ export async function runTestFiles(
   try {
     await chmod(gateDir, 0o700);
     const outFile = join(gateDir, `tests-${randomUUID()}.json`);
-    const argv = [...ctx.pack.testCommand, ...ctx.pack.testJsonArgs].map((a) =>
-      a.replaceAll("<path>", outFile),
-    );
+    // A TMPDIR the runner may write: the sandbox drops one outside its write space, and
+    // os.tmpdir()'s /tmp fallback is not writable under the macOS profile (vitest keeps its
+    // module transform cache there, so runs failed with EPERM depending on cache state).
+    const runnerTmp = join(gateDir, "tmp");
+    await mkdir(runnerTmp, { mode: 0o700 });
+    const argv = [
+      ENV_BIN,
+      `TMPDIR=${runnerTmp}`,
+      ...[...ctx.pack.testCommand, ...ctx.pack.testJsonArgs].map((a) =>
+        a.replaceAll("<path>", outFile),
+      ),
+    ];
     if (ctx.pack.testRunner === "vitest") {
       const cfg = join(gateDir, "vitest.harness.config.mjs");
       const include = runFiles.map(escapeGlob);

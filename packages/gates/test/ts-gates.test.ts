@@ -859,6 +859,21 @@ test("AC-2: doubles", () => { expect(2).toBe(2); });
     }
   });
 
+  // The sandbox drops a TMPDIR outside its write space, so os.tmpdir() fell back to /tmp, which
+  // the macOS profile does not let the runner write: vitest 5's module transform cache
+  // (<tmpdir>/<id>/ssr) then failed with EPERM on some runs, and the red check retried (M2).
+  test("the test runner gets a writable TMPDIR inside the gate's scratch", async () => {
+    const { ctx } = await makeRepo();
+    const manifest = await freezeAc(ctx.worktree);
+    const out = join(ctx.scratch, "tmpdir.json");
+    const script = `const fs=require('fs'),os=require('os'),p=require('path');const t=os.tmpdir();let w=false;try{fs.mkdirSync(p.join(t,'probe','ssr'),{recursive:true});w=true}catch{}fs.writeFileSync(${JSON.stringify(out)},JSON.stringify({t,w}));`;
+    const pack: TsPack = { ...ctx.pack, testCommand: ["node", "-e", script, "--"] };
+    await testsGate.run({ ...ctx, manifest, pack });
+    const { t, w } = JSON.parse(readFileSync(out, "utf8")) as { t: string; w: boolean };
+    expect(t.startsWith(`${ctx.scratch}/`)).toBe(true);
+    expect(w).toBe(true);
+  });
+
   async function committed(files: Record<string, string>) {
     const repo = await makeRepo();
     for (const [p, t] of Object.entries(files)) write(repo.root, p, t);
