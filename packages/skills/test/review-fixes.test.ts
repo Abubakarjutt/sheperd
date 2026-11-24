@@ -224,3 +224,21 @@ test("M8: filenames in problem messages are stripped of control chars and capped
   expect(msg).not.toContain("\u001b");
   expect(msg.length).toBeLessThanOrEqual(300);
 });
+
+test("N2: a HOME path containing braces still denies ~/ credential globs", async () => {
+  const braceHome = join(root, "h{a,b}*");
+  const braceXdg = join(braceHome, ".config");
+  await put(join(braceHome, ".aws", "credentials"), "SECRET_KEY\n");
+  await put(join(braceHome, ".claude", "skills", "s", "SKILL.md"), md("s", "S."));
+  await symlink(
+    join(braceHome, ".aws", "credentials"),
+    join(braceHome, ".claude", "skills", "s", "notes.md"),
+  );
+  const o = { home: braceHome, xdgConfig: braceXdg };
+  const result = await discoverSkills({ ...o, repo });
+  const s = result.skills[0];
+  if (!s) throw new Error("missing");
+  const dest = join(root, "scratch", "s");
+  await expect(materializeSkill(s, dest, o)).rejects.toMatchObject({ code: "skill_invalid" });
+  expect(await allFileText(dest)).not.toContain("SECRET");
+});

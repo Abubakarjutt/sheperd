@@ -74,6 +74,8 @@ export function globToRegExp(glob: string): RegExp {
   return new RegExp(`${re}$`);
 }
 
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 /** `a{b,c}d` -> `abd`, `acd` (no nesting across braces). */
 export function expandBraces(glob: string): string[] {
   const m = /\{([^{}]*)\}/.exec(glob);
@@ -260,12 +262,15 @@ export class UserGuard {
     }
     const globs: RegExp[] = [];
     for (const g of DEFAULT_POLICY.credentialDenyGlobs) {
-      let abs: string | undefined;
-      if (g === "~") abs = home;
-      else if (g.startsWith("~/")) abs = home + g.slice(1);
-      else if (!g.startsWith("~")) abs = g;
-      if (abs !== undefined) globs.push(...expandBraces(abs).map(globToRegExp));
-      // `~user/...` cannot be expanded here; the sandbox layer rejects it as policy_invalid.
+      // Expand braces BEFORE substituting HOME, and splice HOME in as an escaped literal, so a
+      // HOME containing `{`, `*` or `?` cannot change what the deny globs match.
+      for (const alt of expandBraces(g)) {
+        if (alt === "~") globs.push(new RegExp(`^${escapeRe(home)}$`));
+        else if (alt.startsWith("~/")) {
+          globs.push(new RegExp(`^${escapeRe(home)}${globToRegExp(alt.slice(1)).source.slice(1)}`));
+        } else if (!alt.startsWith("~")) globs.push(globToRegExp(alt));
+        // `~user/...` cannot be expanded here; the sandbox layer rejects it as policy_invalid.
+      }
     }
     return new UserGuard(home, roots, globs);
   }
