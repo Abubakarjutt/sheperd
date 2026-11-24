@@ -391,3 +391,15 @@ test("a finding on deleted code shows the verifier the removed lines (I2)", asyn
   await verifyFindings([f], ctx(root, diff, p));
   expect(JSON.stringify(p.requests[0]?.messages)).toContain("-2| if (!u.admin) throw denied();");
 });
+
+test("the task text reaches the verifier fenced and redacted", async () => {
+  const { root, diff } = await setup();
+  const p = new FauxProvider([reply([{ findingId: "a", verdict: "upheld" }])]);
+  const task = "Fix sum: a negative addend is ignored. token sk-abc123DEF456ghi789";
+  await verifyFindings([mk("a")], { ...ctx(root, diff, p), contract, task });
+  const user = p.requests[0]?.messages[0]?.content ?? "";
+  expect(user).toMatch(
+    /<task id="([^"]+)">[\s\S]*negative addend is ignored[\s\S]*<\/task id="\1">/,
+  );
+  expect(user).not.toContain("sk-abc123DEF456ghi789");
+});

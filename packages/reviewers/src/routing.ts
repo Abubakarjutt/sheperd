@@ -39,6 +39,8 @@ export const REVIEWERS: ReviewerDef[] = [
     name: "spec-compliance",
     categories: ["spec_drift"],
     promptFile: "spec-compliance.md",
+    // The task text lets it check the contract's criterion kinds (a bug labelled preserve).
+    seesTask: true,
     appliesTo: () => true,
   },
   {
