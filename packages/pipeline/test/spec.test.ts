@@ -336,3 +336,29 @@ test("the spec prompt explains both kinds and that the bug is always change", ()
   expect(prompt).toMatch(/`preserve`: behaviour that already works today/);
   expect(prompt).toMatch(/The bug being fixed, or the feature being added, is always `change`/);
 });
+
+test("an ambiguous all-preserve compile asks for clarification instead of failing the rule", async () => {
+  const ambiguous = contractJson({
+    criteria: [{ id: "x", kind: "preserve", statement: "wrap still works" }],
+    openQuestions: ["Which behaviour is broken today?"],
+  });
+  const { run, provider } = setup([text("explored"), text(ambiguous)]);
+  const err = await run().catch((e: unknown) => e);
+  expect((err as RewireError).code).toBe("clarification_required");
+  expect((err as RewireError).message).toBe("Which behaviour is broken today?");
+  expect(provider.callCount).toBe(2); // no corrective retry for a contract that is not final
+});
+
+test("after clarification answers, the final contract is held to the change rule", async () => {
+  const ambiguous = contractJson({
+    criteria: [{ id: "x", kind: "preserve", statement: "wrap still works" }],
+    openQuestions: ["Which behaviour is broken today?"],
+  });
+  const { run, provider } = setup(
+    [text("x"), text(ambiguous), text(allPreserve), text(contractJson())],
+    async () => ["negative widths"],
+  );
+  const c = await run();
+  expect(provider.callCount).toBe(4); // exploration, compile, recompile, one corrective retry
+  expect(c.criteria.map((x) => x.kind)).toEqual(["change", "preserve"]);
+});

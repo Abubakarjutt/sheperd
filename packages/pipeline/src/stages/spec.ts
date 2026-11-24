@@ -210,20 +210,21 @@ async function explore(
     });
   // A contract with no `change` criterion asks for nothing new: its tests would all pass before
   // the fix, so nothing could ever be red-checked. Same pattern as an invalid structured reply:
-  // one corrective retry, then a stage error.
+  // one corrective retry, then a stage error. A contract with open questions is not final (it is
+  // recompiled after answers, or ends as clarification_required), so the rule waits for that.
   const compileWith = async (content: string): Promise<Contract> => {
     const first = await structuredContract([{ role: "user", content }]);
-    if (hasChange(first)) return first;
+    if (hasChange(first) || first.openQuestions.length > 0) return first;
     const second = await structuredContract([
       { role: "user", content },
       { role: "assistant", content: JSON.stringify(first) },
       { role: "user", content: NO_CHANGE_FEEDBACK },
     ]);
-    if (hasChange(second)) return second;
+    if (hasChange(second) || second.openQuestions.length > 0) return second;
     throw new RewireError(
       "contract_without_change",
       'the compiled contract has no criterion of kind "change": every criterion is "preserve" (behaviour that already works), so there is nothing to build or red-check',
-      "the task must ask for new or corrected behaviour; if it does, the spec model mislabelled it as preserve",
+      "the task must ask for new or corrected behaviour; if it does, the spec model mislabelled it as preserve. Refactor-only tasks (no behaviour change) are not supported in v0.1",
     );
   };
 
