@@ -200,7 +200,7 @@ const fenced = fenceUntrusted;
 
 function buildPrompt(input: ImplementerInput): string {
   const { contract, manifest, feedback } = input;
-  const criteria = contract.criteria.map((c) => `- ${c.id}: ${c.statement}`).join("\n");
+  const criteria = contract.criteria.map((c) => `- ${c.id} (${c.kind}): ${c.statement}`).join("\n");
   const tests = manifest.files.map((f) => f.path).join("\n") || "(none)";
   const titles =
     Object.entries(manifest.criteriaToTests)

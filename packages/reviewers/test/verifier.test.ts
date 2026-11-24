@@ -203,7 +203,7 @@ test("unreadable or outside file is auto-upheld without the model", async () => 
 const contract = {
   id: "c1",
   title: "t",
-  criteria: [{ id: "AC-1", statement: "does a thing" }],
+  criteria: [{ id: "AC-1", kind: "change" as const, statement: "does a thing" }],
   nonGoals: [],
   affectedAreas: [],
   openQuestions: [],
@@ -262,6 +262,7 @@ test("contract is fenced in the prompt and findings use the findings fence", asy
   await verifyFindings([mk("a")], { ...ctx(root, diff, p), contract });
   const user = p.requests[0]?.messages[0]?.content ?? "";
   expect(user).toMatch(/<contract id="([^"]+)">[\s\S]*does a thing[\s\S]*<\/contract id="\1">/);
+  expect(user).toContain('"kind": "change"');
   expect(user).toMatch(
     /<findings id="([^"]+)">[\s\S]*empty list then NaN[\s\S]*<\/findings id="\1">/,
   );

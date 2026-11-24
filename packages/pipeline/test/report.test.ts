@@ -39,7 +39,10 @@ const base = (over: Partial<ReportData> = {}): ReportData => ({
   contract: {
     id: "c",
     title: "sum",
-    criteria: [{ id: "AC-1", statement: "adds" }],
+    criteria: [
+      { id: "AC-1", kind: "change", statement: "adds" },
+      { id: "AC-2", kind: "preserve", statement: "keeps" },
+    ],
     nonGoals: [],
     affectedAreas: [],
     openQuestions: [],
@@ -85,6 +88,9 @@ test("sections in the brief's order; Escalation only when escalated", () => {
   expect(ok).toMatch(/## Gates[\s\S]*\| tsc \| broken \| pass/);
   expect(ok).toContain("AC-1");
   expect(ok).toContain("tests/sum.test.ts::AC-1: adds");
+  // Each criterion's kind is shown, so a mislabel is visible in the evidence.
+  expect(ok).toMatch(/^- AC\\?-1 \(change\): adds$/m);
+  expect(ok).toMatch(/^- AC\\?-2 \(preserve\): keeps$/m);
 
   const esc = renderReport(
     base({
@@ -121,7 +127,7 @@ test("model-derived text renders inert and redacted", () => {
       contract: {
         id: "c",
         title: evil,
-        criteria: [{ id: "AC-1", statement: evil }],
+        criteria: [{ id: "AC-1", kind: "change", statement: evil }],
         nonGoals: [],
         affectedAreas: [],
         openQuestions: [],
