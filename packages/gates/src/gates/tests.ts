@@ -175,14 +175,18 @@ export async function runTestFiles(
   try {
     await chmod(gateDir, 0o700);
     const outFile = join(gateDir, `tests-${randomUUID()}.json`);
-    // A TMPDIR the runner may write: the sandbox drops one outside its write space, and
+    // macOS: a TMPDIR the runner may write. The sandbox drops one outside its write space, and
     // os.tmpdir()'s /tmp fallback is not writable under the macOS profile (vitest keeps its
-    // module transform cache there, so runs failed with EPERM depending on cache state).
-    const runnerTmp = join(gateDir, "tmp");
-    await mkdir(runnerTmp, { mode: 0o700 });
+    // module transform cache there, so runs failed with EPERM depending on cache state). Linux
+    // needs none: bwrap gives every command a private, writable /tmp.
+    let tmpEnv: string[] = [];
+    if (process.platform === "darwin") {
+      const runnerTmp = join(gateDir, "tmp");
+      await mkdir(runnerTmp, { mode: 0o700 });
+      tmpEnv = [ENV_BIN, `TMPDIR=${runnerTmp}`];
+    }
     const argv = [
-      ENV_BIN,
-      `TMPDIR=${runnerTmp}`,
+      ...tmpEnv,
       ...[...ctx.pack.testCommand, ...ctx.pack.testJsonArgs].map((a) =>
         a.replaceAll("<path>", outFile),
       ),

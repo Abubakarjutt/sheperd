@@ -862,7 +862,7 @@ test("AC-2: doubles", () => { expect(2).toBe(2); });
   // The sandbox drops a TMPDIR outside its write space, so os.tmpdir() fell back to /tmp, which
   // the macOS profile does not let the runner write: vitest 5's module transform cache
   // (<tmpdir>/<id>/ssr) then failed with EPERM on some runs, and the red check retried (M2).
-  test("the test runner gets a writable TMPDIR inside the gate's scratch", async () => {
+  test("the test runner gets a writable TMPDIR (inside the gate's scratch on macOS)", async () => {
     const { ctx } = await makeRepo();
     const manifest = await freezeAc(ctx.worktree);
     const out = join(ctx.scratch, "tmpdir.json");
@@ -870,7 +870,8 @@ test("AC-2: doubles", () => { expect(2).toBe(2); });
     const pack: TsPack = { ...ctx.pack, testCommand: ["node", "-e", script, "--"] };
     await testsGate.run({ ...ctx, manifest, pack });
     const { t, w } = JSON.parse(readFileSync(out, "utf8")) as { t: string; w: boolean };
-    expect(t.startsWith(`${ctx.scratch}/`)).toBe(true);
+    // Linux: bwrap's private /tmp is the writable tmpdir.
+    if (process.platform === "darwin") expect(t.startsWith(`${ctx.scratch}/`)).toBe(true);
     expect(w).toBe(true);
   });
 
