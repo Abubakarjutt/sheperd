@@ -15,9 +15,18 @@ lists what must hold on a live run before v0.1 is called released.
 
 ## How a run works
 
-1. **Spec.** The task becomes a contract (asking you clarifying questions if it is ambiguous).
-2. **Tests first.** A test-writer model writes tests that must fail against the unchanged repo
-   (the red check); they are then frozen and hashed.
+1. **Spec.** The task becomes a contract (asking you clarifying questions if it is ambiguous):
+   acceptance criteria, non-goals and affected areas. Each criterion has a kind: `change` (new or
+   corrected behaviour) or `preserve` (behaviour that works today and the task says must keep
+   working, e.g. "everything else keeps working"). A contract needs at least one `change`
+   criterion; one with none is retried once, then refused (`contract_without_change`).
+2. **Tests first.** A test-writer model writes at least one test per criterion, each titled with
+   its criterion id, and the harness runs them against the unchanged repo (the red check): a test
+   for a `change` criterion must fail with an assertion error, a test for a `preserve` criterion
+   must pass (one that fails means the behaviour does not work today, so the criterion is
+   mislabelled), a test with no criterion id is held to the `change` rule, and every test must make
+   an assertion. The tests are then frozen and hashed. After implementation, every frozen test, of
+   either kind, must pass. The report lists each criterion with its kind.
 3. **Implement.** An implementer model works in a git worktree. Writes happen only through a
    sandboxed helper (`rewire-sandbox`), and frozen tests cannot be edited.
 4. **Gates.** Hard-block checks: tests, types, lint, semgrep, gitleaks, dependency audit, frozen
@@ -273,8 +282,10 @@ Stated in every report (this list is checked against the pipeline's `KNOWN_LIMIT
 - On macOS, a process that detaches from the sandbox faster than one poll interval can outlive its
   stage; a worktree change it makes after the last gate run fails the final tree-equality check, but
   the process itself may keep running.
-- Fake-verification residuals: the red check and the tests gate do not detect every vacuous test (no
-  expect call, a snapshot alias, a hand-thrown AssertionError); mutation testing is deferred.
+- Fake-verification residuals: the red check and the tests gate do not detect every vacuous test (a
+  snapshot alias, a hand-thrown AssertionError; the tests gate also accepts a test with no expect
+  call, which the red check rejects); a preserve criterion's test passes before and after the
+  change, so it is only as strong as what it asserts; mutation testing is deferred.
 - The console-summary cross-check reads the last summary in the runner output, so in-process code
   that prints a forged summary after the real one is not detected.
 - `__mocks__` directories are protected config: mocks cannot be added or changed during a run.
