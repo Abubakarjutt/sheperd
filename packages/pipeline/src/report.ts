@@ -1,4 +1,5 @@
 import {
+  type CheckpointKind,
   type Contract,
   type Finding,
   type FrozenTestManifest,
@@ -19,6 +20,13 @@ export type ReviewData = {
   verdicts: Verdict[];
   dropped: Dropped[];
   escalationReasons: string[];
+};
+
+/** One approval-checkpoint decision, in the order it was made. */
+export type CheckpointRecord = {
+  kind: CheckpointKind;
+  action: "approve" | "revise" | "stop";
+  note?: string;
 };
 
 export type SkillUse = { name: string; source: "user" | "repo"; sha256: string; stages: string[] };
@@ -47,6 +55,8 @@ export type ReportData = {
   escalation?: EscalationReport;
   /** Skills the author stages loaded; the section is omitted when empty or absent. */
   skillsUsed?: SkillUse[];
+  /** Approval-checkpoint decisions; the section is omitted when empty or absent. */
+  checkpoints?: CheckpointRecord[];
   eventLogIncomplete: boolean;
 };
 
@@ -274,6 +284,15 @@ function skillsSection(skills: SkillUse[]): string {
     .join("\n");
 }
 
+function checkpointsSection(cps: CheckpointRecord[]): string {
+  return cps
+    .map(
+      (c) =>
+        `- ${inline(c.kind)}: ${inline(c.action)}${c.note ? ` (note: ${inline(c.note)})` : ""}`,
+    )
+    .join("\n");
+}
+
 export function renderReport(d: ReportData): string {
   const sections: Array<[string, string]> = [
     ["Status", statusSection(d)],
@@ -283,6 +302,9 @@ export function renderReport(d: ReportData): string {
       ? ([["Ignored files removed", removedSection(d.removedIgnored)]] as Array<[string, string]>)
       : []),
     ["Review", reviewSection(d)],
+    ...(d.checkpoints && d.checkpoints.length > 0
+      ? ([["Checkpoints", checkpointsSection(d.checkpoints)]] as Array<[string, string]>)
+      : []),
     ...(d.skillsUsed && d.skillsUsed.length > 0
       ? ([["Skills used", skillsSection(d.skillsUsed)]] as Array<[string, string]>)
       : []),
