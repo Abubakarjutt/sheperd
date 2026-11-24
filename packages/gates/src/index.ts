@@ -13,7 +13,9 @@ export {
   pathspecs,
 } from "./gates/shared.js";
 export {
+  type AssertionProbe,
   isRunnable,
+  NO_ASSERTION_RE,
   ONLY_PATTERNS,
   type ParsedRun,
   type RanTest,

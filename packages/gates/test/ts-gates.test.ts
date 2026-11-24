@@ -27,6 +27,7 @@ import {
   type GateContext,
   hashFiles,
   lintGate,
+  NO_ASSERTION_RE,
   runGates,
   runTestFiles,
   testsGate,
@@ -884,7 +885,7 @@ test("AC-2: doubles", () => { expect(2).toBe(2); });
     const { ctx } = await makeRepo();
     write(ctx.worktree, "test/ac.test.ts", AC_TEST);
     const out = join(ctx.scratch, "jest-setup.json");
-    const script = `const fs=require('fs');const c=JSON.parse(fs.readFileSync(process.argv.find(a=>a.startsWith('--config=')).slice(9),'utf8'));fs.writeFileSync(${JSON.stringify(out)},JSON.stringify({c,setup:(c.setupFilesAfterEnv||[]).map(f=>fs.readFileSync(f,'utf8'))}));`;
+    const script = `const fs=require('fs');const c=JSON.parse(fs.readFileSync(process.argv.find(a=>a.startsWith('--config=')).slice(9),'utf8'));const probe=c.testMatch.find(m=>m.includes('rewire-assertion-probe'));fs.writeFileSync(${JSON.stringify(out)},JSON.stringify({c,probe:probe&&fs.readFileSync(probe.replace(/\\\\(.)/g,'$1'),'utf8'),setup:(c.setupFilesAfterEnv||[]).map(f=>fs.readFileSync(f,'utf8'))}));`;
     const pack: TsPack = {
       ...ctx.pack,
       testRunner: "jest",
@@ -895,7 +896,11 @@ test("AC-2: doubles", () => { expect(2).toBe(2); });
     await expect(
       runTestFiles({ ...ctx, pack }, ["test/ac.test.ts"], { requireAssertions: true }),
     ).rejects.toThrow(/no JSON report/);
-    const { c, setup } = JSON.parse(readFileSync(out, "utf8"));
+    const { c, setup, probe } = JSON.parse(readFileSync(out, "utf8"));
+    // The no-assertion probe runs in the same invocation, from the private gate dir.
+    expect(probe).toBe('test("rewire assertion probe: makes no assertion", () => {});\n');
+    expect(c.testMatch).toHaveLength(2);
+    expect(c.roots).toHaveLength(2);
     expect(c.setupFilesAfterEnv).toHaveLength(1);
     expect(c.setupFilesAfterEnv[0].startsWith(ctx.scratch)).toBe(true);
     expect(setup).toEqual(["beforeEach(() => {\n  expect.hasAssertions();\n});\n"]);
@@ -913,9 +918,47 @@ test("AC-2: doubles", () => { expect(2).toBe(2); });
     );
     const plain = await runTestFiles(ctx, ["test/ac.test.ts"]);
     expect(plain.tests.map((t) => t.status)).toEqual(["passed"]);
+    expect(plain.assertionProbe).toBeUndefined();
     const strict = await runTestFiles(ctx, ["test/ac.test.ts"], { requireAssertions: true });
+    // The probe is reported separately, never as one of the run's tests.
     expect(strict.tests.map((t) => t.status)).toEqual(["failed"]);
+    expect([...strict.ranFiles.keys()]).toEqual(["test/ac.test.ts"]);
     expect(strict.tests[0]?.failureMessages.join("\n")).toMatch(/expected any number of assertion/);
+    expect(strict.assertionProbe).toEqual({
+      enforced: true,
+      detail: "the probe test failed with the no-assertion error",
+    });
+  });
+
+  test("a runner that ignores requireAssertions is detected by the probe (fails closed)", async () => {
+    const { ctx } = await makeRepo();
+    write(ctx.worktree, "test/ac.test.ts", AC_TEST);
+    // Stands in for a vitest that drops the unknown config key: the CLI flag overrides it.
+    const pack: TsPack = {
+      ...ctx.pack,
+      testCommand: [...ctx.pack.testCommand, "--expect.requireAssertions=false"],
+    };
+    const r = await runTestFiles({ ...ctx, pack }, ["test/ac.test.ts"], {
+      requireAssertions: true,
+    });
+    expect(r.tests.map((t) => t.status)).toEqual(["passed", "passed"]);
+    expect(r.assertionProbe?.enforced).toBe(false);
+    expect(r.assertionProbe?.detail).toMatch(/the probe test ended passed/);
+  });
+
+  test("NO_ASSERTION_RE matches both runners' messages, including jest's bare Error header", () => {
+    expect(NO_ASSERTION_RE.test("Error: expected any number of assertion, but got none")).toBe(
+      true,
+    );
+    expect(
+      NO_ASSERTION_RE.test(
+        "Error: \n\nExpected at least one assertion to be called but received none.",
+      ),
+    ).toBe(true);
+    expect(NO_ASSERTION_RE.test("Error: expect.hasAssertions()\n\nExpected at least one")).toBe(
+      true,
+    );
+    expect(NO_ASSERTION_RE.test("AssertionError: expected 4 to be 5")).toBe(false);
   });
 
   // The sandbox drops a TMPDIR outside its write space, so os.tmpdir() fell back to /tmp, which
