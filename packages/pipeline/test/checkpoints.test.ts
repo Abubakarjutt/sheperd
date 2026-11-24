@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -135,6 +136,8 @@ async function run(
     onEvent?: (e: RunEvent, repo: string) => void;
     /** Counts implementer-model calls that ask for an escalation hypothesis. */
     hypothesisCalls?: { n: number };
+    /** Replaces the default implementer model. */
+    implProvider?: Provider;
     /** Runs in the fixture copy before the base commit. */
     setup?: (root: string) => void;
   } = {},
@@ -143,7 +146,7 @@ async function run(
   const byModel: Record<string, Provider> = {
     spec: recordingSpec(over.specSeen ?? []),
     tw: tw(),
-    impl: counting(impl(), over.hypothesisCalls),
+    impl: counting(over.implProvider ?? impl(), over.hypothesisCalls),
     rev: noFindings(),
     ver: noFindings(),
   };
@@ -202,6 +205,11 @@ const BASELINE_TYPES: string[] = [
   "fix_round",
   "run_end",
 ];
+
+const worktreeOf = (repo: string): string => {
+  const base = join(repo, ".rewire", "worktrees");
+  return join(base, readdirSync(base)[0] ?? "");
+};
 
 const approve = async (): Promise<CheckpointDecision> => ({ action: "approve" });
 
@@ -393,11 +401,12 @@ describe.skipIf(!sandboxAvailable)(
       const secret = join(outside, "id_ed25519");
       writeFileSync(secret, "PRIVATE KEY MATERIAL\n");
       let called = 0;
+      const hyp = { n: 0 };
       const { outcome } = await run({
+        hypothesisCalls: hyp,
         onEvent: (e, repo) => {
           if (e.type === "stage_end" && e.stage === "test-writer") {
-            const base = join(repo, ".rewire", "worktrees");
-            const wt = join(base, readdirSync(base)[0] ?? "");
+            const wt = worktreeOf(repo);
             rmSync(join(wt, TEST_FILE));
             symlinkSync(secret, join(wt, TEST_FILE));
           }
@@ -413,6 +422,37 @@ describe.skipIf(!sandboxAvailable)(
       // Only the contract checkpoint was asked; the tests checkpoint never saw the target.
       expect(called).toBe(1);
       expect(JSON.stringify(outcome.escalation)).not.toContain("PRIVATE KEY");
+      // A deterministic refusal: fixed text, no model call to explain it.
+      expect(hyp.n).toBe(0);
+      expect(outcome.escalation?.hypothesis).toContain("tests checkpoint");
+    });
+
+    test("a frozen test under a symlinked directory is never read for the tests checkpoint", async () => {
+      const outside = realpathSync(mkdtempSync(join(tmpdir(), "rewire-cp-dir-")));
+      dirs.push(outside);
+      writeFileSync(join(outside, "sum.test.ts"), "// PRIVATE OUTSIDE CONTENT\n");
+      let called = 0;
+      const hyp = { n: 0 };
+      const { outcome } = await run({
+        hypothesisCalls: hyp,
+        onEvent: (e, repo) => {
+          if (e.type === "stage_end" && e.stage === "test-writer") {
+            const wt = worktreeOf(repo);
+            rmSync(join(wt, "tests"), { recursive: true, force: true });
+            symlinkSync(outside, join(wt, "tests"));
+          }
+        },
+        checkpoint: async () => {
+          called++;
+          return { action: "approve" };
+        },
+      });
+      expect(outcome.status).toBe("escalated");
+      expect(outcome.escalation?.reason).toBe("stage_error");
+      expect(outcome.escalation?.details?.join("\n")).toContain("outside the worktree");
+      expect(called).toBe(1);
+      expect(JSON.stringify(outcome.escalation)).not.toContain("PRIVATE OUTSIDE");
+      expect(hyp.n).toBe(0);
     });
 
     test("stop at tests escalates stopped_by_user with no frozen-tests commit", async () => {
@@ -467,6 +507,42 @@ describe.skipIf(!sandboxAvailable)(
       if (c?.kind !== "commit") throw new Error("no commit checkpoint");
       expect(c.diff).toContain("+++ b/src/sum.ts");
       expect(c.reportPreview).toContain("# rewire run");
+    });
+
+    test("a changed text-valued asset is shown on the commit checkpoint", async () => {
+      const plantingImpl = responder((req) => {
+        if (lastIsTool(req)) return text("done");
+        const wt = worktreeOf(implRepo.path);
+        mkdirSync(join(wt, "assets"), { recursive: true });
+        writeFileSync(join(wt, "assets", "fake.png"), "export const hidden = 1;\n");
+        return {
+          toolCalls: [
+            { id: "", name: "write", arguments: { path: "src/sum.ts", content: GOOD_SUM } },
+          ],
+        };
+      });
+      const implRepo = { path: "" };
+      const seen: Checkpoint[] = [];
+      const { outcome } = await run({
+        implProvider: plantingImpl,
+        onEvent: (_e, repo) => {
+          implRepo.path = repo;
+        },
+        checkpointKinds: ["commit"],
+        checkpoint: async (cp) => {
+          seen.push(cp);
+          return approve();
+        },
+      });
+      expect(outcome.escalation).toBeUndefined();
+      expect(outcome.status).toBe("verified");
+      const c = seen[0];
+      if (c?.kind !== "commit") throw new Error("no commit checkpoint");
+      // A text-valued asset is shown as text (a real binary escalates in review before this;
+      // commit-diff.test.ts covers the omitted listing).
+      expect(c.diff).toContain("+++ b/assets/fake.png");
+      expect(c.diff).toContain("+export const hidden = 1;");
+      expect(c.diff).toContain("+++ b/src/sum.ts");
     });
 
     test("the commit diff shows text even when attributes mark it binary", async () => {

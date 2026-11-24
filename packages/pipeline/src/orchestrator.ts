@@ -9,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import {
   CheckpointDecision,
   type CheckpointKind,
@@ -47,7 +47,6 @@ import {
   type Usage,
 } from "@rewire/providers";
 import {
-  BINARY_ASSET_EXTS,
   blockingFindings,
   buildDiffSummary,
   type DiffSummary,
@@ -68,6 +67,7 @@ import {
 } from "@rewire/sandbox";
 import type { SkillSet } from "@rewire/skills";
 import { z } from "zod";
+import { commitDiff } from "./commit-diff.js";
 import { type EscalationReport, FixLoopController, type RoundState, score } from "./fix-loop.js";
 import {
   linkNodeModules,
@@ -660,56 +660,28 @@ async function frozenFiles(
   worktree: string,
   manifest: FrozenTestManifest,
 ): Promise<Array<{ path: string; content: string }>> {
+  const refuse = (detail: string): Escalation =>
+    new Escalation("stage_error", [], [detail], {
+      hypothesis:
+        "A frozen test file is not a regular file inside the worktree at the tests checkpoint (a symlink or a symlinked directory), so the harness refused to read it.",
+      question: "Inspect the kept worktree for the link, then re-run the task?",
+    });
+  const root = await realpath(worktree);
   const out: Array<{ path: string; content: string }> = [];
   for (const f of manifest.files) {
     const abs = join(worktree, f.path);
     const st = await lstat(abs).catch(() => undefined);
     if (!st?.isFile()) {
-      throw new Escalation(
-        "stage_error",
-        [],
-        [`frozen test ${f.path} is not a regular file at the tests checkpoint`],
-      );
+      throw refuse(`frozen test ${f.path} is not a regular file at the tests checkpoint`);
     }
-    out.push({ path: f.path, content: await readFile(abs, "utf8") });
+    // A symlinked parent directory passes lstat: the real path must stay under the worktree.
+    const real = await realpath(abs).catch(() => "");
+    if (!real.startsWith(`${root}${sep}`)) {
+      throw refuse(`frozen test ${f.path} resolves outside the worktree at the tests checkpoint`);
+    }
+    out.push({ path: f.path, content: await readFile(real, "utf8") });
   }
   return out;
-}
-
-/**
- * The staged change against the frozen-tests commit for the commit checkpoint, hardened like the
- * reviewers' diff: attributes from the frozen commit only (never the worktree or the user's global
- * file), no external diff or textconv driver, text forced, binary assets left out.
- */
-async function commitDiff(
-  worktree: string,
-  frozenCommit: string,
-  sig: { signal?: AbortSignal },
-): Promise<string> {
-  return trustedGitOk(
-    worktree,
-    [
-      `--attr-source=${frozenCommit}`,
-      "-c",
-      "core.quotepath=off",
-      "-c",
-      "core.attributesFile=/dev/null",
-      "diff",
-      "--cached",
-      "--no-color",
-      "--no-ext-diff",
-      "--no-textconv",
-      "--no-renames",
-      "--text",
-      "--src-prefix=a/",
-      "--dst-prefix=b/",
-      frozenCommit,
-      "--",
-      ".",
-      ...BINARY_ASSET_EXTS.map((e) => `:(exclude,icase,glob)**/*.${e}`),
-    ],
-    sig,
-  );
 }
 
 /** `stop` (or a revision past the limit): hand the run back to the user, exit 2 semantics. */
