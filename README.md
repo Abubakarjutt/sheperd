@@ -119,35 +119,99 @@ The change then goes through the same gated pipeline as `rewire run`, shown as a
 The chat model is the author model (`routing.spec`). Chats are saved to `.rewire/sessions/` and
 can be resumed with `/resume`.
 
-A sample session:
+A sample session (colours left out):
 
 ```
-> why does export ignore the --limit flag?
-  (the agent reads src/export.ts and explains)
-> add a --json flag to the export command
-╭───────────────────────────────────────────╮
-│ add a --json flag to the export command   │
-│ Run this as a gated task? [y/n]           │
-╰───────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────╮
+│ ✻ Welcome to rewire                                          │
+│ cwd: ~/src/shop                                              │
+│ chat: <author model>                                         │
+│ run: spec <author model> · impl <implementer> · review <rev> │
+│                                                              │
+│ /help for commands · /run <task> for a gated change · @ to   │
+│ mention a file · esc to interrupt                            │
+╰──────────────────────────────────────────────────────────────╯
+> why does export ignore the --limit flag? @src/export.ts
+● Read(src/export.ts)
+  ⎿  import { parseArgs } from "node:util";
+     … +118 lines
+✶ Pondering… (4s · ↓ ~310 tokens · esc to interrupt)
+  (the reply streams in as Markdown; code blocks are syntax-highlighted)
+╭──────────────────────────────────────────────────────────────╮
+│ > add a --json flag to the export command                    │
+╰──────────────────────────────────────────────────────────────╯
+<author model> · ctx 12.4k · checkpoints: contract,tests · chat           ? for shortcuts
+  (Enter; the agent proposes the task)
+╭──────────────────────────────────────────╮
+│ add a --json flag to the export command  │
+│ Run this as a gated task? [y/n]          │
+╰──────────────────────────────────────────╯
   (press y)
-✓ Spec        contract ready
-Contract checkpoint: add a --json flag to the export command
-  AC-1 [change] export --json prints the rows as JSON
-[a]pprove [e] revise [s]top
-  (press a; the tests checkpoint shows [a]pprove [v]iew [s]top)
+╭──────────────────────────────────────────────────────────────╮
+│ ✓ Spec       contract ready                                  │
+│ ○ Tests                                                      │
+│ ...                                                          │
+╰──────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────╮
+│ Contract checkpoint: add a --json flag to the export command │
+│ AC-1 [change] export --json prints the rows as JSON          │
+│ a approve · e revise · s stop                                │
+╰──────────────────────────────────────────────────────────────╯
+  (press a; the tests checkpoint shows a approve · v view · s stop)
   ... tests, implement, gates, review ...
 Run <runId> verified.
 Branch: rewire/<runId>
 ```
 
+The header box shows the working directory and the models the chat and a run use. A tool call
+shows as `● Name(args)` with the first lines of its result under `⎿`; a failed one is red with
+`✗`. While a reply is in flight, the spinner line shows the elapsed time and the output tokens
+so far (`~` while part of the count is estimated from streamed text). The status line under the
+input shows the chat model, `ctx` (the size of the chat's context: the last chat model call's
+input plus output tokens), the checkpoints, and what the session is doing (`chat`, `thinking`,
+`run: <stage>` or `checkpoint: <kind>`). Only the chat streams; a gated run's stages do not.
+
 By default a run pauses for your approval after the contract and after the tests. It does not
 pause before the commit. Checkpoints and proposal cards take single keys, not typed lines. A
 contract checkpoint takes `a` (approve), `e` (revise: type a note in the box that opens, Enter
-sends it; at most 3 revisions, a 4th is treated as stop) or `s` (stop). The tests checkpoint
-takes `a`, `v` (view the frozen tests) or `s`. The commit checkpoint, when on, takes `a`, `v`
-(view the diff) or `s`.
+sends it, Esc cancels it; at most 3 revisions, a 4th is treated as stop), `s` (stop) or `v`
+(view every criterion, when there are more than fit on the card). The tests checkpoint takes
+`a`, `v` (view the frozen tests) or `s`. The commit checkpoint, when on, takes `a`, `v` (view
+the diff, coloured, with `+N −M` per file on the card) or `s`. In a view, ↑/↓ scroll a line,
+PgUp/PgDn (or `b`/space) a page, `g`/`G` jump to the top or bottom, and `v` or Esc closes it.
 Stopping ends the run with reason `stopped_by_user` (exit 2 semantics). Every decision is
 recorded in `events.jsonl` and `report.md`. `rewire run` and `--headless` never pause.
+
+### Keys
+
+| Key                        | What it does                                                             |
+| -------------------------- | ------------------------------------------------------------------------ |
+| Enter                      | Send the input.                                                          |
+| Shift+Enter or `\` + Enter | Insert a newline.                                                        |
+| ↑/↓                        | Walk the input history.                                                  |
+| Esc                        | Interrupt the chat reply in flight, or close the `/` menu or `@` picker. |
+| Ctrl-C                     | Abort a run or a chat turn, or quit (see "Ctrl-C" below).                |
+| `?` (on an empty input)    | Show or hide the shortcuts panel; any other key closes it.               |
+| `/`                        | Open the command menu.                                                   |
+| `@`                        | Open the file picker.                                                    |
+
+**Esc** stops the chat reply that is streaming. What already streamed stays on screen, followed
+by `⎿ Interrupted by user`, and you can send again at once. The interrupted turn is not stored
+in the session. Esc does not abort a gated run; Ctrl-C does that.
+
+**The `/` menu** opens when the input starts with `/` (until the first space; `//` never
+opens it). It lists the commands that match what
+you typed (only the ones allowed during a run, while one is active). ↑/↓ move the selection.
+Tab completes the selected name. Enter completes it too, or runs it when the name is already
+complete and the command needs no arguments. Esc closes the menu and leaves the text as typed.
+
+**The `@` picker** opens on an `@` at the start of the input or after a space. It lists the
+repo's files (`git ls-files`, up to 5,000 paths) that match what follows the `@`. ↑/↓ move the
+selection, Tab or Enter inserts the path (quoted when it holds a space, a quote or a
+backslash), and Esc closes the picker. It only inserts the path text: the chat agent reads the
+file with its own sandboxed tools. The `/` menu and the `@` picker stay closed while the input
+takes a run's clarification answers, where `/` and `@` are typed literally (`/skip` still
+works).
 
 ### Slash commands
 
@@ -173,7 +237,7 @@ decline); checkpoints and proposals take single keys.
 | When                                   | What happens                                                   |
 | -------------------------------------- | -------------------------------------------------------------- |
 | during a run                           | aborts the run (an interrupted report); the session stays open |
-| during a chat turn                     | aborts the turn                                                |
+| during a chat turn                     | stops the turn, like Esc                                       |
 | idle at the prompt                     | exits 0                                                        |
 | a second press within 1 second         | exits 130                                                      |
 | at a proposal card or the trust prompt | exits 0 (the chat is saved and can be resumed)                 |
@@ -276,20 +340,21 @@ interactive session); `rewire --help` prints it and exits 0.
 
 Errors carry a stable code. The ones added with interactive mode and skills:
 
-| code                     | meaning                                                                             |
-| ------------------------ | ----------------------------------------------------------------------------------- |
-| `tui_requires_tty`       | `rewire chat` needs a terminal. Exit 1.                                             |
-| `tui_render_failed`      | The terminal UI failed to render.                                                   |
-| `skill_invalid`          | A skill is malformed or over a limit (name, description, size, symlink).            |
-| `trust_store_unreadable` | `trusted-skills.json` is unreadable: repo skills are not loaded; the session opens. |
-| `trust_store_locked`     | Another rewire process holds the trust store lock.                                  |
-| `session_corrupt`        | A stored session file is damaged.                                                   |
-| `session_not_found`      | `/resume` named a session that is not stored.                                       |
-| `session_disposed`       | The session was closed and can't take more turns.                                   |
-| `session_store_unsafe`   | `.rewire/sessions/` is not a plain directory owned by you (for example a symlink).  |
-| `run_in_progress`        | A gated run is already active; only one runs at a time.                             |
-| `stopped_by_user`        | You chose stop at a checkpoint. The run escalates (exit 2).                         |
-| `aborted`                | You pressed Ctrl-C during a chat turn; the turn was dropped.                        |
+| code                              | meaning                                                                             |
+| --------------------------------- | ----------------------------------------------------------------------------------- |
+| `tui_requires_tty`                | `rewire chat` needs a terminal. Exit 1.                                             |
+| `tui_render_failed`               | The terminal UI failed to render.                                                   |
+| `skill_invalid`                   | A skill is malformed or over a limit (name, description, size, symlink).            |
+| `trust_store_unreadable`          | `trusted-skills.json` is unreadable: repo skills are not loaded; the session opens. |
+| `trust_store_locked`              | Another rewire process holds the trust store lock.                                  |
+| `session_corrupt`                 | A stored session file is damaged.                                                   |
+| `session_not_found`               | `/resume` named a session that is not stored.                                       |
+| `session_disposed`                | The session was closed and can't take more turns.                                   |
+| `session_store_unsafe`            | `.rewire/sessions/` is not a plain directory owned by you (for example a symlink).  |
+| `run_in_progress`                 | A gated run is already active; only one runs at a time.                             |
+| `stopped_by_user`                 | You chose stop at a checkpoint. The run escalates (exit 2).                         |
+| `aborted`                         | You pressed Esc or Ctrl-C during a chat turn; the turn is not stored.               |
+| `provider_stream_callback_failed` | A streaming reply's display callback threw; the chat call fails.                    |
 
 ### Run directory
 

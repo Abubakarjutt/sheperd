@@ -66,6 +66,7 @@ Package dependency direction, from bottom to top: `core`, then `policy` and `pro
   - `family.ts` decides model families. Reviewer and verifier are chosen cross-family from the implementer when possible.
   - `fitness.ts` probes models.
   - Ollama serves one request at a time per model, and the reply timeout is `REWIRE_OLLAMA_TIMEOUT_S`.
+  - Streaming is opt-in via `onDelta`. Without it a provider sends the same non-streamed request as before; only the TUI chat passes it (design decision #33).
 - **`sandbox`** (TS) wraps **`crates/rewire-sandbox`** (Rust). All agent writes and command execution go through it: bubblewrap on Linux, `sandbox-exec` profiles on macOS.
   - The CLI's binary lookup order (`REWIRE_SANDBOX_BIN`, then the checkout's `target/`, then the sha256-pinned `sheperd-<os>-<arch>` package, then `PATH`) is security-relevant and documented in the README. Keep the two in sync.
 - **`gates`**: hard blocks, never advisory. They are tests (including `requireAssertions`), types, lint, semgrep, gitleaks, dependency audit and frozen-test integrity. Language specifics come from **`pack-typescript`**, the only language pack in v0.1.
@@ -78,6 +79,7 @@ Package dependency direction, from bottom to top: `core`, then `policy` and `pro
 - **`session`**: the chat agent (`read`, `grep`, `find`, `bash` under the sandbox `chat` profile, no writes), session persistence in `.rewire/sessions/`, and the controller that runs one gated pipeline at a time.
   - The chat model is the author model (`routing.spec`).
 - **`tui`**: the Ink app: transcript, run board, checkpoints and slash commands, rendered from the `RunEvent` stream. All displayed text goes through `sanitize`.
+  - Streaming is opt-in via `onDelta`, and only the chat uses it; the pipeline never streams. Streamed text is sanitized and redacted over the whole buffer on every render, never per delta (design decision #33).
   - `REWIRE_TUI_SELFCHECK=1` is an internal smoke-test switch.
   - Faux-provider caveat: chat and spec share one faux turn queue when they use the same model name, so a script must list the chat turns and spec turns in the order they are consumed.
 - **`cli`**: the `run`, `doctor` and `chat` commands (bare `rewire` on a TTY opens the TUI), plus wiring.
