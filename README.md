@@ -125,17 +125,27 @@ A sample session:
 > why does export ignore the --limit flag?
   (the agent reads src/export.ts and explains)
 > add a --json flag to the export command
-  proposed task: add a --json flag to the export command
-  spec        contract ready
-  checkpoint  contract: approve / revise <note> / stop
-> approve
+╭───────────────────────────────────────────╮
+│ add a --json flag to the export command   │
+│ Run this as a gated task? [y/n]           │
+╰───────────────────────────────────────────╯
+  (press y)
+✓ Spec        contract ready
+Contract checkpoint: add a --json flag to the export command
+  AC-1 [change] export --json prints the rows as JSON
+[a]pprove [e] revise [s]top
+  (press a; the tests checkpoint shows [a]pprove [v]iew [s]top)
   ... tests, implement, gates, review ...
-  verified: branch rewire/<runId>
+Run <runId> verified.
+Branch: rewire/<runId>
 ```
 
 By default a run pauses for your approval after the contract and after the tests. It does not
-pause before the commit. A contract checkpoint accepts approve, revise with a note (at most 3
-revisions; a 4th is treated as stop) or stop. The tests checkpoint accepts approve or stop.
+pause before the commit. Checkpoints and proposal cards take single keys, not typed lines. A
+contract checkpoint takes `a` (approve), `e` (revise: type a note in the box that opens, Enter
+sends it; at most 3 revisions, a 4th is treated as stop) or `s` (stop). The tests checkpoint
+takes `a`, `v` (view the frozen tests) or `s`. The commit checkpoint, when on, takes `a`, `v`
+(view the diff) or `s`.
 Stopping ends the run with reason `stopped_by_user` (exit 2 semantics). Every decision is
 recorded in `events.jsonl` and `report.md`. `rewire run` and `--headless` never pause.
 
@@ -155,7 +165,8 @@ recorded in `events.jsonl` and `report.md`. `rewire run` and `--headless` never 
 | `/exit`                                    | Quit.                                                            | no           |
 | `//text`                                   | Send `/text` as chat text (a literal leading slash).             | -            |
 
-While a run is active, the input box answers that run's checkpoint or clarification.
+While a run is active, the input box answers clarifications (one answer per line, `/skip` to
+decline); checkpoints and proposals take single keys.
 
 ### Ctrl-C
 
@@ -181,6 +192,8 @@ Interactive mode can use Claude-style skills (`<name>/SKILL.md`).
   `$XDG_CONFIG_HOME/rewire/trusted-skills.json`. If any file changes, rewire asks again. The
   prompt also lists repo skills shadowed by a user skill, because they are part of the hash.
 - Skills are read once per session. A skill you trust mid-session takes effect after `/clear`.
+- A skill that is rejected (malformed, over a limit, or a repo skill with a symlink) is skipped
+  and shown as a warning line when the session starts.
 - Skills are given to the chat, the spec stage, the test writer and the implementer. The
   reviewers and the verifier never get them. Skill text can still reach a reviewer indirectly if
   an author stage copies it into the contract or the diff.
@@ -256,7 +269,8 @@ stderr.
 | 2    | the run escalated to a human (see the evidence report for the reason)                          |
 | 130  | a second Ctrl-C: forced quit (the first Ctrl-C stops the run and writes an interrupted report) |
 
-Running `rewire` with no arguments prints the usage and exits 1; `rewire --help` prints it and exits 0.
+Running `rewire` with no arguments and no TTY prints the usage and exits 1 (on a TTY it opens the
+interactive session); `rewire --help` prints it and exits 0.
 
 ### Error codes
 
@@ -267,7 +281,7 @@ Errors carry a stable code. The ones added with interactive mode and skills:
 | `tui_requires_tty`       | `rewire chat` needs a terminal. Exit 1.                                            |
 | `tui_render_failed`      | The terminal UI failed to render.                                                  |
 | `skill_invalid`          | A skill is malformed or over a limit (name, description, size, symlink).           |
-| `trust_store_unreadable` | `trusted-skills.json` could not be read or parsed, so repo skills are not loaded.  |
+| `trust_store_unreadable` | `trusted-skills.json` could not be read, so repo skills are not loaded (a warning line; the session still opens). |
 | `trust_store_locked`     | Another rewire process holds the trust store lock.                                 |
 | `session_corrupt`        | A stored session file is damaged.                                                  |
 | `session_not_found`      | `/resume` named a session that is not stored.                                      |
@@ -275,7 +289,7 @@ Errors carry a stable code. The ones added with interactive mode and skills:
 | `session_store_unsafe`   | `.rewire/sessions/` is not a plain directory owned by you (for example a symlink). |
 | `run_in_progress`        | A gated run is already active; only one runs at a time.                            |
 | `stopped_by_user`        | You chose stop at a checkpoint. The run escalates (exit 2).                        |
-| `loop_history_invalid`   | The chat history handed to the agent loop is not valid.                            |
+| `aborted`                | You pressed Ctrl-C during a chat turn; the turn was dropped.                       |
 
 ### Run directory
 
