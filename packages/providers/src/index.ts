@@ -7,3 +7,4 @@ export * from "./openai.js";
 export * from "./registry.js";
 export * from "./structured.js";
 export * from "./types.js";
+export * from "./window.js";
