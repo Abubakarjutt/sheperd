@@ -51,6 +51,8 @@ export type ChatRequest = {
    * Optional token streaming. When set, providers request a streamed reply and call this with
    * each text delta, in order; the resolved ChatResponse is the same as without it. When unset,
    * the request is exactly the non-streamed one.
+   * OpenAI and Anthropic streams have no wall-clock bound once headers arrive: callers that
+   * stream must pass a `signal` (Ollama's REWIRE_OLLAMA_TIMEOUT_S still covers the whole call).
    */
   onDelta?: (text: string) => void;
 };

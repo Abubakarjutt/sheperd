@@ -255,4 +255,33 @@ describe("anthropic streaming (onDelta)", () => {
     expect(err).toMatchObject({ code: "provider_aborted" });
     expect(deltas).toEqual(["part"]);
   });
+  test("a stream that ends without message_stop throws the provider error", async () => {
+    const events = anthropicEvents({
+      blocks: [{ type: "text", pieces: ["par", "tial"] }],
+      stop: "end_turn",
+      usage,
+    });
+    const { provider } = mk(() => ({ sse: anthropicSSE(events.slice(0, -2)) }));
+    const err = await provider.chat({ ...req, onDelta: () => {} }).catch((e) => e);
+    expect(err).toMatchObject({ code: "provider_error" });
+    expect(err.message).toMatch(/stream ended/);
+  });
+  test("an onDelta throw propagates as provider_stream_callback_failed", async () => {
+    const events = anthropicEvents({
+      blocks: [{ type: "text", pieces: ["x"] }],
+      stop: "end_turn",
+      usage,
+    });
+    const { provider } = mk(() => ({ sse: anthropicSSE(events) }));
+    const err = await provider
+      .chat({
+        ...req,
+        onDelta: () => {
+          throw new Error("render blew up");
+        },
+      })
+      .catch((e) => e);
+    expect(err).toMatchObject({ code: "provider_stream_callback_failed" });
+    expect(err.message).toMatch(/render blew up/);
+  });
 });

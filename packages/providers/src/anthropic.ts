@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { RewireError } from "@rewire/core";
 import { providerError } from "./errors.js";
+import { streamCallbackFailed } from "./openai.js";
 import type { ChatRequest, ChatResponse, Provider, StopReason, ToolCall } from "./types.js";
 
 type Block =
@@ -125,8 +126,30 @@ export class AnthropicProvider implements Provider {
           req.signal ? { signal: req.signal } : undefined,
         );
         const onDelta = req.onDelta;
-        stream.on("text", (delta) => onDelta(delta));
-        resp = await stream.finalMessage();
+        let callbackError: RewireError | undefined;
+        let stopped = false;
+        stream.on("streamEvent", (event) => {
+          if (event.type === "message_stop") stopped = true;
+        });
+        stream.on("text", (delta) => {
+          if (callbackError) return;
+          try {
+            onDelta(delta);
+          } catch (err) {
+            // Surface the caller's throw as-is: stop the request and rethrow it below.
+            callbackError = streamCallbackFailed(err);
+            stream.abort();
+          }
+        });
+        try {
+          resp = await stream.finalMessage();
+        } catch (err) {
+          if (callbackError) throw callbackError;
+          throw err;
+        }
+        if (callbackError) throw callbackError;
+        // A stream that closes before message_stop is a failed request, never a partial reply.
+        if (!stopped) throw new Error("stream ended before message_stop");
       } else
         resp = await this.client.messages.create(
           toAnthropicParams(req) as unknown as Anthropic.MessageCreateParamsNonStreaming,

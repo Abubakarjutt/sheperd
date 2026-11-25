@@ -281,4 +281,29 @@ describe("openai streaming (onDelta)", () => {
       code: "provider_bad_tool_args",
     });
   });
+  test("a stream that closes cleanly without a finish reason throws, never resolves", async () => {
+    const { provider } = mk(() => ({
+      sse: openaiSSE(openaiChunks({ text: ["par", "tial"], finish: "stop" }).slice(0, 3), false),
+    }));
+    const deltas: string[] = [];
+    const err = await provider.chat({ ...req, onDelta: (d) => deltas.push(d) }).catch((e) => e);
+    expect(err).toMatchObject({ code: "provider_error" });
+    expect(err.message).toMatch(/stream ended before a finish reason/);
+    expect(deltas).toEqual(["par", "tial"]);
+  });
+  test("an onDelta throw propagates as provider_stream_callback_failed", async () => {
+    const { provider } = mk(() => ({
+      sse: openaiSSE(openaiChunks({ text: ["x"], finish: "stop" })),
+    }));
+    const err = await provider
+      .chat({
+        ...req,
+        onDelta: () => {
+          throw new Error("render blew up");
+        },
+      })
+      .catch((e) => e);
+    expect(err).toMatchObject({ code: "provider_stream_callback_failed" });
+    expect(err.message).toMatch(/render blew up/);
+  });
 });

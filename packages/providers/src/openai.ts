@@ -167,10 +167,38 @@ export function toOpenAIStreamParams(req: ChatRequest, opts: OpenAIParamOptions 
 }
 
 /**
+ * A streamed reply whose connection closed cleanly before the server sent a finish reason.
+ * It is a transport failure, never a partial success: Ollama maps it like a dropped request.
+ */
+export class StreamTruncatedError extends Error {
+  constructor() {
+    super("stream ended before a finish reason");
+    this.name = "StreamTruncatedError";
+  }
+}
+
+/** Call the caller's stream callback; its throw surfaces as-is, never as a transport error. */
+export function callOnDelta(onDelta: (text: string) => void, text: string): void {
+  try {
+    onDelta(text);
+  } catch (err) {
+    throw streamCallbackFailed(err);
+  }
+}
+
+export function streamCallbackFailed(err: unknown): RewireError {
+  return new RewireError(
+    "provider_stream_callback_failed",
+    `the onDelta stream callback threw: ${err instanceof Error ? err.message : String(err)}`,
+  );
+}
+
+/**
  * Consume a chat-completions chunk stream: call `onDelta` per text delta and rebuild the
  * response a non-streamed call would have returned, for `fromOpenAIResponse` to parse.
  * Tool calls arrive as indexed deltas: id/name are set when present, argument fragments joined.
- * The SDK ends iteration quietly when the request is aborted, so an aborted signal is rethrown.
+ * The SDK ends iteration quietly when the request is aborted, so an aborted signal is rethrown;
+ * a stream that ends without a finish reason throws StreamTruncatedError.
  */
 export async function collectOpenAIStream(
   stream: AsyncIterable<unknown>,
@@ -178,7 +206,6 @@ export async function collectOpenAIStream(
   signal?: AbortSignal,
 ): Promise<OResponse> {
   let text = "";
-  let sawChoice = false;
   let finish: string | null = null;
   let usage: OResponse["usage"] = null;
   const calls = new Map<number, { id: string; name: string; arguments: string }>();
@@ -188,12 +215,11 @@ export async function collectOpenAIStream(
     if (chunk.usage) usage = chunk.usage;
     const choice = chunk.choices?.find((c) => (c.index ?? 0) === 0);
     if (!choice) continue;
-    sawChoice = true;
     if (choice.finish_reason) finish = choice.finish_reason;
     const delta = choice.delta;
     if (typeof delta?.content === "string" && delta.content !== "") {
       text += delta.content;
-      onDelta(delta.content);
+      callOnDelta(onDelta, delta.content);
     }
     for (const tc of delta?.tool_calls ?? []) {
       const cur = calls.get(tc.index) ?? { id: "", name: "", arguments: "" };
@@ -204,7 +230,7 @@ export async function collectOpenAIStream(
     }
   }
   signal?.throwIfAborted();
-  if (!sawChoice) return { choices: [], usage };
+  if (finish === null) throw new StreamTruncatedError();
   const toolCalls = [...calls.entries()]
     .sort(([a], [b]) => a - b)
     .map(([, c]) => ({

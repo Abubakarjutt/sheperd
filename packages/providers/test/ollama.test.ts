@@ -408,6 +408,36 @@ describe("OllamaProvider streaming (onDelta)", () => {
     const err = await p.chat({ ...req, onDelta: () => {} }).catch((e) => e);
     expect(err).toMatchObject({ code: "ollama_request_dropped" });
   });
+  test("a clean close without a finish reason is ollama_request_dropped, not a partial reply", async () => {
+    mock.chat = () => ({ __sse: partial(), after: "end" });
+    const p = new OllamaProvider(base);
+    const err = await p.chat({ ...req, onDelta: () => {} }).catch((e) => e);
+    expect(err).toMatchObject({ code: "ollama_request_dropped" });
+  });
+  test("a malformed SSE JSON line is provider_error, not a dropped request", async () => {
+    mock.chat = () => ({ __sse: `${partial()}data: {not json\n\n`, after: "end" });
+    const p = new OllamaProvider(base);
+    const err = await p.chat({ ...req, onDelta: () => {} }).catch((e) => e);
+    expect(err).toMatchObject({ code: "provider_error" });
+    expect(err.message).toMatch(/ollama/);
+    expect(hits["/api/version"] ?? 0).toBe(0);
+  });
+  test("an onDelta throw propagates as provider_stream_callback_failed, not dropped", async () => {
+    mock.chat = (b) =>
+      b.stream ? { __sse: openaiSSE(openaiChunks({ text: ["x"], finish: "stop" })) } : {};
+    const p = new OllamaProvider(base);
+    const err = await p
+      .chat({
+        ...req,
+        onDelta: () => {
+          throw new Error("render blew up");
+        },
+      })
+      .catch((e) => e);
+    expect(err).toMatchObject({ code: "provider_stream_callback_failed" });
+    expect(err.message).toMatch(/render blew up/);
+    expect(hits["/api/version"] ?? 0).toBe(0);
+  });
 });
 
 describe("assertRoleFit", () => {

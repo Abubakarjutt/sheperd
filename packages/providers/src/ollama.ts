@@ -5,6 +5,7 @@ import { providerError } from "./errors.js";
 import {
   collectOpenAIStream,
   fromOpenAIResponse,
+  StreamTruncatedError,
   toOpenAIParams,
   toOpenAIStreamParams,
 } from "./openai.js";
@@ -194,6 +195,32 @@ export async function getModelInfo(baseUrl: string, model: string): Promise<Olla
   return { capabilities: show.data.capabilities ?? [], contextLength, digest: entry.digest };
 }
 
+const TRANSPORT_CODES = new Set([
+  "ECONNRESET",
+  "ECONNABORTED",
+  "EPIPE",
+  "ETIMEDOUT",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CLOSED",
+]);
+
+/**
+ * Whether an error thrown while reading a started stream is the connection breaking: a clean
+ * close before the finish reason, or undici's body-read failure (`TypeError: terminated`, with
+ * a socket error code on its cause). Malformed SSE, API error events and callback throws are not.
+ */
+function isStreamTransportError(err: unknown): boolean {
+  if (err instanceof StreamTruncatedError) return true;
+  let e: unknown = err;
+  for (let depth = 0; depth < 4 && typeof e === "object" && e !== null; depth++) {
+    const o = e as { code?: unknown; message?: unknown; name?: unknown; cause?: unknown };
+    if (typeof o.code === "string" && TRANSPORT_CODES.has(o.code)) return true;
+    if (o.name === "TypeError" && o.message === "terminated") return true;
+    e = o.cause;
+  }
+  return false;
+}
+
 function isConnectionError(err: unknown): boolean {
   const name = err instanceof Error ? err.constructor.name : "";
   return name === "APIConnectionError" || name === "APIConnectionTimeoutError";
@@ -243,8 +270,7 @@ export class OllamaProvider implements Provider {
           `The model may still be loading, or replies slowly on this machine: retry, or set ${OLLAMA_TIMEOUT_ENV} (seconds, e.g. 900)`,
         );
       }
-      const midStreamDrop =
-        streaming && !(err instanceof OpenAI.APIError) && !(err instanceof RewireError);
+      const midStreamDrop = streaming && isStreamTransportError(err);
       if (isConnectionError(err) || midStreamDrop) {
         // A broken connection to a server that still answers is a dropped request, not an outage.
         if (!(await answers(this.baseUrl))) throw unreachable(this.baseUrl);
