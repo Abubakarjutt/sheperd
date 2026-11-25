@@ -29,7 +29,7 @@ import {
   type SkillSet,
 } from "@rewire/skills";
 import { afterAll, describe, expect, test } from "vitest";
-import { type ChatEvent, ChatSession, SessionStore } from "../src/index.js";
+import { type ChatEvent, ChatSession, SessionStore, TURN_LIMIT_NOTE } from "../src/index.js";
 
 const dirs: string[] = [];
 const sets: SkillSet[] = [];
@@ -80,13 +80,20 @@ async function makeSet(): Promise<SkillSet> {
 
 async function setup(
   provider: Provider,
-  o: { repo?: string; store?: SessionStore; sessionId?: string } = {},
+  o: {
+    repo?: string;
+    store?: SessionStore;
+    sessionId?: string;
+    maxTurns?: number;
+    skills?: SkillSet;
+    resume?: boolean;
+  } = {},
 ) {
   const repo = o.repo ?? makeRepo();
   const events: ChatEvent[] = [];
   const store = o.store ?? new SessionStore();
-  const skills = await makeSet();
-  const session = new ChatSession({
+  const skills = o.skills ?? (await makeSet());
+  const opts = {
     repo,
     model: { provider: "faux", model: "chat" },
     provider,
@@ -95,7 +102,12 @@ async function setup(
     store,
     emit: (e) => events.push(e),
     ...(o.sessionId !== undefined ? { sessionId: o.sessionId } : {}),
-  });
+    ...(o.maxTurns !== undefined ? { maxTurns: o.maxTurns } : {}),
+  };
+  const session =
+    o.resume && o.sessionId !== undefined
+      ? await ChatSession.resume({ ...opts, sessionId: o.sessionId })
+      : new ChatSession(opts);
   sessions.push(session);
   return { repo, events, store, session, skills };
 }
@@ -138,6 +150,10 @@ describe.skipIf(!sandboxAvailable())("ChatSession", () => {
     await set.load("tdd");
     const root = set.root as string;
     expect(root).toBeDefined();
+    // Not vacuous: make the host copy writable, so only the sandbox can refuse the write.
+    await makeWritable(root);
+    writeFileSync(join(root, "tdd", "probe"), "host can write");
+    rmSync(join(root, "tdd", "probe"));
     const q = new FauxProvider([
       call("bash", { command: `cat "${root}/tdd/SKILL.md" && echo x > "${root}/tdd/evil"` }),
       text("ok"),
@@ -162,13 +178,37 @@ describe.skipIf(!sandboxAvailable())("ChatSession", () => {
     const turn = await session.send("please fix wrap");
     expect(turn.proposal?.task).toBe("fix wrap");
     expect(turn.text).toBe("I suggest a run.");
+    expect(turn.endedBy).toBe("proposal");
     expect(p.callCount).toBe(1);
     const h = session.history();
     expect(h[h.length - 1]?.role).toBe("assistant");
     expect(h[h.length - 1]?.toolCalls).toBeUndefined();
     const next = await session.send("thanks");
     expect(next.proposal).toBeUndefined();
+    expect(next.endedBy).toBeUndefined();
     expect(next.text).toBe("next");
+  });
+
+  test("a turn cut by the turn limit says so and is stored with the limit note", async () => {
+    const p = new FauxProvider([{ text: "looking", ...call("find", { pattern: "*.ts" }) }]);
+    const { session } = await setup(p, { maxTurns: 1 });
+    const turn = await session.send("look around");
+    expect(turn.endedBy).toBe("turn_limit");
+    expect(turn.proposal).toBeUndefined();
+    const h = session.history();
+    expect(h[h.length - 1]).toEqual({ role: "assistant", content: TURN_LIMIT_NOTE });
+  });
+
+  test("model text with a secret is redacted in events and in the turn text", async () => {
+    const p = new FauxProvider([text("your key is sk-ant-SECRET123abc, keep it safe")]);
+    const { session, events } = await setup(p);
+    const turn = await session.send("what is the key?");
+    expect(turn.text).toBe("your key is [redacted], keep it safe");
+    expect(events).toContainEqual({
+      type: "assistant_text",
+      text: "your key is [redacted], keep it safe",
+    });
+    expect(JSON.stringify(events)).not.toContain("SECRET123");
   });
 
   test("propose_run with an empty task is a tool error, not a proposal", async () => {
@@ -293,7 +333,8 @@ describe.skipIf(!sandboxAvailable())("ChatSession", () => {
       { role: "assistant", content: "earlier answer" },
     ]);
     const p = new FauxProvider([text("resumed")]);
-    const { session } = await setup(p, { repo, store, sessionId: id });
+    const { session } = await setup(p, { repo, store, sessionId: id, resume: true });
+    expect(session.history().map((m) => m.content)).toEqual(["earlier", "earlier answer"]);
     await session.send("now");
     expect(p.requests[0]?.messages.map((m) => m.content)).toEqual([
       "earlier",
@@ -327,5 +368,62 @@ describe.skipIf(!sandboxAvailable())("ChatSession", () => {
     expect(err).toMatchObject({ code: "session_corrupt" });
     expect((err as Error).message).toMatch(/tool call/);
     expect(p.callCount).toBe(0);
+  });
+
+  test("dispose during an in-flight send rejects it cleanly and stores nothing", async () => {
+    const p: Provider = {
+      chat(req: ChatRequest): Promise<ChatResponse> {
+        return new Promise((_, reject) => {
+          req.signal?.addEventListener("abort", () =>
+            reject(new RewireError("provider_aborted", "aborted")),
+          );
+        });
+      },
+    };
+    const { session } = await setup(p);
+    const pending = session.send("hang");
+    await new Promise((r) => setTimeout(r, 50));
+    const disposed = session.dispose();
+    await expect(pending).rejects.toMatchObject({ code: "session_disposed" });
+    await disposed;
+    expect(session.id()).toBeUndefined();
+    expect(session.history()).toEqual([]);
+    await expect(session.send("after")).rejects.toMatchObject({ code: "session_disposed" });
+  });
+
+  test("a skill load finishing after its turn was aborted is not reported", async () => {
+    const set = await makeSet();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let gated = true;
+    const slow: SkillSet = {
+      skills: set.skills,
+      root: set.root,
+      load: async (name) => {
+        if (gated) await gate;
+        return set.load(name);
+      },
+    };
+    const p = new FauxProvider([
+      call("skill", { name: "tdd" }),
+      call("skill", { name: "tdd" }),
+      text("ok"),
+    ]);
+    const { session, events } = await setup(p, { skills: slow });
+    const ac = new AbortController();
+    const pending = session.send("load it", ac.signal);
+    await new Promise((r) => setTimeout(r, 50));
+    ac.abort();
+    await expect(pending).rejects.toMatchObject({ code: "aborted" });
+    gated = false;
+    release();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(events.filter((e) => e.type === "skill_loaded")).toEqual([]);
+    await session.send("load it again");
+    expect(events.filter((e) => e.type === "skill_loaded")).toEqual([
+      { type: "skill_loaded", name: "tdd" },
+    ]);
   });
 });

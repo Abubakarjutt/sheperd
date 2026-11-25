@@ -26,7 +26,16 @@ export type ChatEvent =
   | { type: "skill_loaded"; name: string }
   | { type: "assistant_text"; text: string };
 
-export type ChatTurn = { text: string; proposal?: { task: string } };
+export type ChatTurn = {
+  /** The model's final text for the turn, redacted. */
+  text: string;
+  proposal?: { task: string };
+  /**
+   * Set when the turn did not end with a plain model answer: `proposal` (propose_run ended it;
+   * stored with PROPOSAL_NOTE) or `turn_limit` (the per-turn model-call cap; TURN_LIMIT_NOTE).
+   */
+  endedBy?: "proposal" | "turn_limit";
+};
 
 export type ChatSessionOptions = {
   repo: string;
@@ -39,9 +48,15 @@ export type ChatSessionOptions = {
    */
   skills: SkillSet;
   store: SessionStore;
-  /** Model text is passed through unsanitized; the UI sanitizes before rendering. */
+  /**
+   * Model text (`assistant_text`, tool summaries) is redacted here but NOT sanitized: the UI
+   * strips control sequences before rendering.
+   */
   emit: (e: ChatEvent) => void;
-  /** Resume this stored session (it must be known to `store`: created or listed by it). */
+  /**
+   * Resume this stored session (it must be known to `store`: created or listed by it). Prefer
+   * `ChatSession.resume`, which loads it eagerly so `history()` is filled before the first send.
+   */
   sessionId?: string;
   /** Model calls per `send` (default 40). */
   maxTurns?: number;
@@ -54,15 +69,20 @@ function chatPrompt(): string {
 }
 
 const aborted = (): RewireError => new RewireError("aborted", "the chat turn was aborted");
+const disposedError = (): RewireError =>
+  new RewireError("session_disposed", "the chat session was disposed");
 
 /**
  * Settle as soon as `signal` aborts, even while a tool ignores it (bash runs to its own timeout).
  * The abandoned loop stops at its next abort check and its result is discarded.
  */
-function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-  if (signal === undefined) return work;
+function untilAborted<T>(
+  work: Promise<T>,
+  signal: AbortSignal,
+  reason: () => RewireError,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => reject(aborted());
+    const onAbort = (): void => reject(reason());
     if (signal.aborted) return onAbort();
     signal.addEventListener("abort", onAbort, { once: true });
     work.then(
@@ -88,7 +108,8 @@ function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Pro
  * after the turn ends normally. An aborted or failed turn stores nothing (not even its user
  * message) and leaves `history()` as it was, so the next `send` continues cleanly.
  *
- * `send` calls are serialized. Call `dispose()` when done (sandbox client and scratch dir).
+ * `send` calls are serialized. Call `dispose()` when done (sandbox client and scratch dir): an
+ * in-flight send then rejects with `session_disposed` and nothing more is stored.
  */
 export class ChatSession {
   private readonly opts: ChatSessionOptions;
@@ -98,13 +119,32 @@ export class ChatSession {
   private resumed = false;
   private sandbox: { client: SandboxClient; scratch: string } | undefined;
   private queue: Promise<unknown> = Promise.resolve();
-  private disposed = false;
+  private readonly life = new AbortController();
+  /** Skills already reported by a live turn (a load in an abandoned turn is not reported). */
+  private readonly reportedSkills = new Set<string>();
 
   constructor(opts: ChatSessionOptions) {
     this.opts = opts;
     this.sid = opts.sessionId;
     this.resumed = opts.sessionId === undefined;
-    this.skill = skillTool(opts.skills, (s) => this.emit({ type: "skill_loaded", name: s.name }));
+    // One skill tool per session. Its loads are reported per turn by the wrapper in `turn`, so
+    // a load that finishes after its turn was aborted or superseded stays silent.
+    this.skill = skillTool(opts.skills, () => {});
+  }
+
+  /** A session resumed from `store`, its history loaded (session_corrupt on a bad file). */
+  static async resume(opts: ChatSessionOptions & { sessionId: string }): Promise<ChatSession> {
+    const s = new ChatSession(opts);
+    await s.open();
+    return s;
+  }
+
+  /** Load a resumed session's history now (idempotent). `send` does it on demand otherwise. */
+  async open(): Promise<void> {
+    if (this.resumed || this.sid === undefined) return;
+    if (this.life.signal.aborted) throw disposedError();
+    this.messages = await this.opts.store.load(this.sid);
+    this.resumed = true;
   }
 
   /** The stored session id; undefined until the first completed turn of a new session. */
@@ -124,7 +164,10 @@ export class ChatSession {
   }
 
   async dispose(): Promise<void> {
-    this.disposed = true;
+    this.life.abort();
+    // The in-flight send rejects promptly (session_disposed); wait so it cannot create a client
+    // or store anything after the cleanup below.
+    await this.queue;
     const s = this.sandbox;
     this.sandbox = undefined;
     if (s === undefined) return;
@@ -158,14 +201,22 @@ export class ChatSession {
   }
 
   private async turn(text: string, signal: AbortSignal | undefined): Promise<ChatTurn> {
-    if (this.disposed) throw new RewireError("session_disposed", "the chat session was disposed");
-    if (signal?.aborted) throw aborted();
-    if (!this.resumed && this.sid !== undefined) {
-      this.messages = await this.opts.store.load(this.sid);
-      this.resumed = true;
-    }
+    const life = this.life.signal;
+    const check = (): void => {
+      if (life.aborted) throw disposedError();
+      if (signal?.aborted) throw aborted();
+    };
+    check();
+    await this.open();
+    check();
     const client = await this.client();
-    if (signal?.aborted) throw aborted();
+    check();
+    // The turn is live until it is aborted or the session is disposed; an abandoned turn's
+    // loop may still finish a tool, and then stays silent.
+    const live = (): boolean => !life.aborted && !signal?.aborted;
+    const emitLive = (e: ChatEvent): void => {
+      if (live()) this.emit(e);
+    };
 
     let proposal: { task: string } | undefined;
     const end = new AbortController();
@@ -197,21 +248,32 @@ export class ChatSession {
         };
       },
     };
+    const shared = this.skill;
+    const skill: AgentTool = {
+      spec: shared.spec,
+      execute: async (args, sig) => {
+        const r = await shared.execute(args, sig);
+        const name = typeof args.name === "string" ? args.name : "";
+        if (!r.isError && live() && !this.reportedSkills.has(name)) {
+          this.reportedSkills.add(name);
+          this.emit({ type: "skill_loaded", name });
+        }
+        return r;
+      },
+    };
     const { policy } = this.opts;
     const tools = [
       ...createTools(client, { policy, stage: STAGE, allow: ["read", "grep", "find", "bash"] }),
-      this.skill,
+      skill,
       propose,
     ];
-    // An aborted turn is abandoned while its loop may still be finishing a tool: stay silent.
-    const emitLive = (e: ChatEvent): void => {
-      if (!signal?.aborted) this.emit(e);
-    };
     const inner = this.opts.provider;
     const provider: Provider = {
       chat: async (req: ChatRequest) => {
         const res = await inner.chat(req);
-        if (res.message.text !== "") emitLive({ type: "assistant_text", text: res.message.text });
+        if (res.message.text !== "") {
+          emitLive({ type: "assistant_text", text: redact(res.message.text) });
+        }
         return res;
       },
     };
@@ -239,9 +301,10 @@ export class ChatSession {
           },
           runId: this.sid ?? "chat",
           stage: STAGE,
-          signal: signal ? AbortSignal.any([signal, end.signal]) : end.signal,
+          signal: AbortSignal.any([life, end.signal, ...(signal ? [signal] : [])]),
         }),
-        signal,
+        signal ? AbortSignal.any([life, signal]) : life,
+        () => (life.aborted ? disposedError() : aborted()),
       );
     } catch (e) {
       if (e instanceof RewireError && e.code === "loop_history_invalid") {
@@ -254,7 +317,7 @@ export class ChatSession {
       throw e;
     }
 
-    if (signal?.aborted) throw aborted();
+    check();
     if (result.endedBy === "error") {
       throw result.error ?? new RewireError("loop_provider_error", "the chat turn failed");
     }
@@ -262,13 +325,22 @@ export class ChatSession {
 
     const added = result.messages.slice(prior.length);
     const last = added[added.length - 1];
-    if (proposal !== undefined) added.push({ role: "assistant", content: PROPOSAL_NOTE });
-    else if (last?.role !== "assistant" || (last.toolCalls?.length ?? 0) > 0) {
+    let endedBy: ChatTurn["endedBy"];
+    if (proposal !== undefined) {
+      added.push({ role: "assistant", content: PROPOSAL_NOTE });
+      endedBy = "proposal";
+    } else if (last?.role !== "assistant" || (last.toolCalls?.length ?? 0) > 0) {
       added.push({ role: "assistant", content: TURN_LIMIT_NOTE });
+      endedBy = "turn_limit";
     }
     this.sid ??= await this.opts.store.create(this.opts.repo);
+    check(); // disposed (or aborted) while the file was created: store nothing
     await this.opts.store.append(this.sid, added);
     this.messages = [...prior, ...added];
-    return proposal ? { text: result.lastText, proposal } : { text: result.lastText };
+    return {
+      text: redact(result.lastText),
+      ...(proposal ? { proposal } : {}),
+      ...(endedBy ? { endedBy } : {}),
+    };
   }
 }

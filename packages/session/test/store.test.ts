@@ -1,11 +1,16 @@
 import {
   appendFileSync,
+  chmodSync,
+  mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   utimesSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -133,4 +138,65 @@ test("an unknown or malformed id is refused, never resolved as a path", async ()
   await expect(store.load("20260101-000000-abcdef")).rejects.toMatchObject({
     code: "session_not_found",
   });
+});
+
+function outside(): string {
+  const d = realpathSync(mkdtempSync(join(tmpdir(), "rewire-session-victim-")));
+  dirs.push(d);
+  chmodSync(d, 0o755);
+  return d;
+}
+
+test("a symlinked .rewire/sessions dir is refused; the target is untouched", async () => {
+  const repo = tempRepo();
+  const victim = outside();
+  mkdirSync(join(repo, ".rewire"));
+  symlinkSync(victim, join(repo, ".rewire", "sessions"));
+  const store = new SessionStore();
+  await expect(store.create(repo)).rejects.toMatchObject({ code: "session_store_unsafe" });
+  await expect(store.list(repo)).rejects.toMatchObject({ code: "session_store_unsafe" });
+  expect(statSync(victim).mode & 0o777).toBe(0o755);
+  expect(readdirSync(victim)).toEqual([]);
+});
+
+test("a symlinked .rewire dir is refused; the target is untouched", async () => {
+  const repo = tempRepo();
+  const victim = outside();
+  symlinkSync(victim, join(repo, ".rewire"));
+  await expect(new SessionStore().create(repo)).rejects.toMatchObject({
+    code: "session_store_unsafe",
+  });
+  expect(readdirSync(victim)).toEqual([]);
+  expect(statSync(victim).mode & 0o777).toBe(0o755);
+});
+
+test("a symlinked session file is not listed, loaded or appended to", async () => {
+  const repo = tempRepo();
+  const victim = outside();
+  const target = join(victim, "target.jsonl");
+  writeFileSync(target, "");
+  const store = new SessionStore();
+  const real = await store.create(repo);
+  const planted = "20260101-000000-aaaaaa";
+  symlinkSync(target, sessionFile(repo, planted));
+  const listed = await store.list(repo);
+  expect(listed.map((s) => s.id)).toEqual([real]);
+  await expect(store.load(planted)).rejects.toMatchObject({ code: "session_not_found" });
+
+  // A session file swapped for a symlink after it was created is refused too.
+  rmSync(sessionFile(repo, real));
+  symlinkSync(target, sessionFile(repo, real));
+  await expect(store.append(real, { role: "user", content: "leak" })).rejects.toMatchObject({
+    code: "session_store_unsafe",
+  });
+  await expect(store.load(real)).rejects.toMatchObject({ code: "session_store_unsafe" });
+  expect(readFileSync(target, "utf8")).toBe("");
+});
+
+test("an existing .rewire dir is used as is, never chmodded", async () => {
+  const repo = tempRepo();
+  mkdirSync(join(repo, ".rewire"), { mode: 0o755 });
+  chmodSync(join(repo, ".rewire"), 0o755);
+  await new SessionStore().create(repo);
+  expect(statSync(join(repo, ".rewire")).mode & 0o777).toBe(0o755);
 });

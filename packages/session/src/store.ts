@@ -1,5 +1,6 @@
-import { appendFile, chmod, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, open, readdir, realpath } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { newRunId, RewireError, redact } from "@rewire/core";
 import type { ChatMessage } from "@rewire/providers";
 import { z } from "zod";
@@ -10,6 +11,10 @@ export const SESSIONS_DIR = join(".rewire", "sessions");
 /** Session ids are run-id shaped (`YYYYMMDD-HHMMSS-<6 hex>`); nothing else is ever a path. */
 const ID = /^\d{8}-\d{6}-[0-9a-f]{6}$/;
 const TITLE_MAX = 80;
+
+const { O_RDONLY, O_WRONLY, O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK } = constants;
+/** Never follow a final symlink; never block on a FIFO planted under a session name. */
+const READ_FLAGS = O_RDONLY | O_NOFOLLOW | O_NONBLOCK;
 
 const Message = z
   .object({
@@ -60,40 +65,93 @@ const notFound = (id: string): RewireError =>
     "list the repo's sessions first, or create one",
   );
 
+const unsafe = (what: string): RewireError =>
+  new RewireError(
+    "session_store_unsafe",
+    `refusing to use the session store: ${what}`,
+    ".rewire/ and .rewire/sessions/ must be real directories inside the repo and each session a regular file; remove the symlink or file in the way",
+  );
+
+const errno = (e: unknown): string | undefined => (e as NodeJS.ErrnoException | null)?.code;
+
+/**
+ * Make sure `path` is a real directory (never a symlink). Creates it when missing (with `mode`,
+ * then chmod: only a directory this call created is ever chmodded). Returns false when missing
+ * and `create` is false.
+ */
+async function realDir(path: string, create: boolean, mode?: number): Promise<boolean> {
+  for (;;) {
+    try {
+      const st = await lstat(path);
+      if (st.isSymbolicLink()) throw unsafe(`${path} is a symlink`);
+      if (!st.isDirectory()) throw unsafe(`${path} is not a directory`);
+      return true;
+    } catch (e) {
+      if (errno(e) !== "ENOENT") throw e;
+    }
+    if (!create) return false;
+    try {
+      await mkdir(path, mode === undefined ? {} : { mode });
+    } catch (e) {
+      if (errno(e) === "EEXIST") continue; // raced: inspect what is there now
+      throw e;
+    }
+    if (mode !== undefined) await chmod(path, mode);
+    return true;
+  }
+}
+
 /**
  * Chat sessions as JSONL under `<repo>/.rewire/sessions/<id>.jsonl` (dir 0700, files 0600). Every
  * string is redacted with `redact()` before it is written. A store knows the ids it created or
  * listed; any other id is refused (`session_not_found`), so an id is never resolved as a path.
+ *
+ * A cloned repo controls `.rewire/` (git stores symlinks), so nothing here follows one:
+ * `.rewire` and `.rewire/sessions` must be real directories whose realpath stays under the
+ * repo's, and every session file is opened with O_NOFOLLOW. Otherwise `session_store_unsafe`.
  */
 export class SessionStore {
-  private readonly paths = new Map<string, string>();
+  private readonly repos = new Map<string, string>();
 
-  private async dir(repo: string): Promise<string> {
-    const dir = join(repo, SESSIONS_DIR);
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-    await chmod(dir, 0o700);
-    return dir;
+  /** The checked sessions dir, or undefined when it does not exist and `create` is false. */
+  private async dir(repo: string, create: boolean): Promise<string | undefined> {
+    const root = await realpath(resolve(repo));
+    const rewire = join(root, ".rewire");
+    const sessions = join(rewire, "sessions");
+    if (!(await realDir(rewire, create))) return undefined;
+    if (!(await realDir(sessions, create, 0o700))) return undefined;
+    if ((await realpath(sessions)) !== sessions) {
+      throw unsafe(`${sessions} resolves outside the repo`);
+    }
+    return sessions;
   }
 
-  private path(id: string): string {
-    const p = ID.test(id) ? this.paths.get(id) : undefined;
-    if (p === undefined) throw notFound(id);
-    return p;
+  /** The checked path of a known session. */
+  private async path(id: string): Promise<string> {
+    const repo = ID.test(id) ? this.repos.get(id) : undefined;
+    if (repo === undefined) throw notFound(id);
+    const dir = await this.dir(repo, false);
+    if (dir === undefined) throw notFound(id);
+    return join(dir, `${id}.jsonl`);
   }
 
   /** Create an empty session file and return its id. */
   async create(repo: string): Promise<string> {
-    const dir = await this.dir(repo);
+    const dir = (await this.dir(repo, true)) as string;
     for (;;) {
       const id = newRunId();
-      const path = join(dir, `${id}.jsonl`);
       try {
-        await writeFile(path, "", { mode: 0o600, flag: "wx" });
+        const fh = await open(
+          join(dir, `${id}.jsonl`),
+          O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+          0o600,
+        );
+        await fh.close();
       } catch (e) {
-        if ((e as NodeJS.ErrnoException).code === "EEXIST") continue;
+        if (errno(e) === "EEXIST") continue;
         throw e;
       }
-      this.paths.set(id, path);
+      this.repos.set(id, repo);
       return id;
     }
   }
@@ -103,37 +161,41 @@ export class SessionStore {
    * on disk entirely or (on a failed write) not at all.
    */
   async append(id: string, msgs: ChatMessage | ChatMessage[]): Promise<void> {
-    const path = this.path(id);
+    const path = await this.path(id);
     const list = Array.isArray(msgs) ? msgs : [msgs];
     if (list.length === 0) return;
     const lines = list.map((m) => `${JSON.stringify(redactDeep(m))}\n`).join("");
-    await appendFile(path, lines, { mode: 0o600 });
+    const fh = await openFile(path, O_WRONLY | O_APPEND | O_NOFOLLOW | O_NONBLOCK);
+    try {
+      if (!(await fh.stat()).isFile()) throw unsafe(`${path} is not a regular file`);
+      await fh.appendFile(lines, "utf8");
+    } finally {
+      await fh.close();
+    }
   }
 
-  /** The repo's sessions, newest (last written) first. */
+  /**
+   * The repo's sessions, newest (last written) first. Entries that are not regular files
+   * (symlinks, directories, FIFOs) or not named `<id>.jsonl` are skipped by design: they are
+   * never sessions this store wrote, and following them could read outside the repo.
+   */
   async list(repo: string): Promise<SessionSummary[]> {
-    const dir = join(repo, SESSIONS_DIR);
-    let names: string[];
-    try {
-      names = await readdir(dir);
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
-      throw e;
-    }
+    const dir = await this.dir(repo, false);
+    if (dir === undefined) return [];
     const out: SessionSummary[] = [];
-    for (const name of names) {
+    for (const name of await readdir(dir)) {
       if (!name.endsWith(".jsonl")) continue;
       const id = name.slice(0, -".jsonl".length);
       if (!ID.test(id)) continue;
       const path = join(dir, name);
-      let st: Awaited<ReturnType<typeof stat>>;
+      let st: Awaited<ReturnType<typeof lstat>>;
       try {
-        st = await stat(path);
+        st = await lstat(path);
       } catch {
-        continue; // removed between readdir and stat
+        continue; // removed between readdir and lstat
       }
-      if (!st.isFile()) continue;
-      this.paths.set(id, path);
+      if (!st.isFile()) continue; // see the doc comment: skipped, never followed
+      this.repos.set(id, repo);
       out.push({ id, title: await titleOf(path), updatedAt: st.mtime });
     }
     return out.sort(
@@ -143,7 +205,7 @@ export class SessionStore {
 
   /** Every message of a session. A malformed or truncated line throws `session_corrupt`. */
   async load(id: string): Promise<ChatMessage[]> {
-    const raw = await readFile(this.path(id), "utf8");
+    const raw = await readSession(await this.path(id));
     if (raw === "") return [];
     if (!raw.endsWith("\n")) throw corrupt(id, "the last line is truncated");
     const lines = raw.slice(0, -1).split("\n");
@@ -161,10 +223,30 @@ export class SessionStore {
   }
 }
 
+async function openFile(path: string, flags: number) {
+  try {
+    return await open(path, flags);
+  } catch (e) {
+    if (errno(e) === "ELOOP") throw unsafe(`${path} is a symlink`);
+    if (errno(e) === "ENXIO") throw unsafe(`${path} is not a regular file`);
+    throw e;
+  }
+}
+
+async function readSession(path: string): Promise<string> {
+  const fh = await openFile(path, READ_FLAGS);
+  try {
+    if (!(await fh.stat()).isFile()) throw unsafe(`${path} is not a regular file`);
+    return await fh.readFile("utf8");
+  } finally {
+    await fh.close();
+  }
+}
+
 async function titleOf(path: string): Promise<string> {
   let raw: string;
   try {
-    raw = await readFile(path, "utf8");
+    raw = await readSession(path);
   } catch {
     return "(unreadable)";
   }
