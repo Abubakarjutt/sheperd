@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { RewireError } from "@rewire/core";
+import { RewireError, redact, sanitizeTerminal } from "@rewire/core";
 import { DEFAULT_POLICY } from "@rewire/policy";
 import {
   type ChatRequest,
@@ -221,7 +221,9 @@ describe.skipIf(!sandboxAvailable())("ChatSession", () => {
       type: "assistant_text",
       text: "your key is [redacted], keep it safe",
     });
-    expect(JSON.stringify(events)).not.toContain("SECRET123");
+    // assistant_delta is raw by contract (the TUI redacts the joined buffer); all else is redacted.
+    const rest = events.filter((e) => e.type !== "assistant_delta");
+    expect(JSON.stringify(rest)).not.toContain("SECRET123");
   });
 
   test("propose_run with an empty task is a tool error, not a proposal", async () => {
@@ -474,5 +476,188 @@ describe.skipIf(!sandboxAvailable())("ChatSession", () => {
     expect(events.filter((e) => e.type === "skill_loaded")).toEqual([
       { type: "skill_loaded", name: "tdd" },
     ]);
+  });
+});
+
+type StreamTurn = {
+  chunks?: string[];
+  toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[];
+  usage?: { inputTokens: number; outputTokens: number };
+};
+
+/** Streams each turn's chunks through onDelta (when set); the final text is their join. */
+function streaming(turns: StreamTurn[], stream = true): Provider & { requests: ChatRequest[] } {
+  let i = 0;
+  return {
+    requests: [],
+    async chat(req: ChatRequest): Promise<ChatResponse> {
+      this.requests.push({ ...req, messages: [...req.messages] });
+      const t = turns[i++];
+      if (t === undefined) throw new RewireError("faux_script_exhausted", "exhausted");
+      const chunks = t.chunks ?? [];
+      if (stream) for (const c of chunks) req.onDelta?.(c);
+      const toolCalls = t.toolCalls ?? [];
+      return {
+        message: { text: chunks.join(""), toolCalls },
+        stopReason: toolCalls.length > 0 ? "tool_use" : "end",
+        usage: t.usage ?? { inputTokens: 0, outputTokens: 0 },
+      };
+    },
+  };
+}
+
+const deltas = (events: ChatEvent[]): string[] =>
+  events.flatMap((e) => (e.type === "assistant_delta" ? [e.text] : []));
+
+describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
+  test("assistant deltas concatenate to the final text", async () => {
+    const p = streaming([{ chunks: ["The ans", "wer is ", "42."] }]);
+    const { session, events } = await setup(p);
+    const turn = await session.send("q");
+    expect(typeof p.requests[0]?.onDelta).toBe("function");
+    expect(deltas(events)).toEqual(["The ans", "wer is ", "42."]);
+    expect(deltas(events).join("")).toBe(turn.text);
+  });
+
+  test("deltas are raw: an OSC 52 and a key split across deltas reach the observer as-is, and the documented render path makes them inert (Review Focus 1)", async () => {
+    const p = streaming([
+      { chunks: ["copy \x1b]5", "2;c;aGk=\x07 key sk-ant-SEC", "RET123abc done"] },
+    ]);
+    const { session, events } = await setup(p);
+    const turn = await session.send("q");
+    const buffer = deltas(events).join("");
+    // Raw by contract: the session does not redact or sanitize per delta.
+    expect(buffer).toBe("copy \x1b]52;c;aGk=\x07 key sk-ant-SECRET123abc done");
+    // The contract the TUI follows: render only redact(sanitizeTerminal(buffer)).
+    const rendered = redact(sanitizeTerminal(buffer));
+    expect(rendered).not.toContain("\x1b");
+    expect(rendered).not.toContain("\x07");
+    expect(rendered).not.toContain("SECRET123");
+    expect(rendered).toContain("[redacted]");
+    // The finished text is still redacted for the transcript.
+    expect(turn.text).not.toContain("SECRET123");
+    // The TUI-facing contract is documented on the event type.
+    const src = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), "../src/chat.ts"),
+      "utf8",
+    );
+    expect(src).toContain("raw; render only via redact(sanitizeTerminal(buffer))");
+  });
+
+  test("a tool result preview is redacted, sanitized, capped at 4 lines of 300 chars and paired by callId", async () => {
+    const long = "x".repeat(500);
+    const cmd = `printf 'a sk-ant-SECRET123abc\\n\\033]52;c;aGk=\\007b\\n${long}\\n\\nd\\ne\\nf\\n'`;
+    const p = streaming([
+      { toolCalls: [{ id: "call_7", name: "bash", arguments: { command: cmd } }] },
+      { chunks: ["ok"] },
+    ]);
+    const { session, events } = await setup(p);
+    await session.send("run");
+    const callEv = events.find((e) => e.type === "tool_call");
+    const resEv = events.find((e) => e.type === "tool_result");
+    expect(callEv).toMatchObject({ type: "tool_call", tool: "bash", callId: "call_7" });
+    expect(resEv).toEqual({
+      type: "tool_result",
+      callId: "call_7",
+      tool: "bash",
+      preview: ["stdout:", "a [redacted]", "b", "x".repeat(300)],
+      // d, e, f and "exit code 0" are left out (empty lines are not counted).
+      more: 4,
+      isError: false,
+    });
+    expect(events.indexOf(callEv as ChatEvent)).toBeLessThan(events.indexOf(resEv as ChatEvent));
+    expect(JSON.stringify(events)).not.toContain("SECRET123");
+    expect(JSON.stringify(events)).not.toContain("\\u001b");
+  });
+
+  test("a failed tool's preview carries isError", async () => {
+    const p = streaming([
+      { toolCalls: [{ id: "c1", name: "no_such_tool", arguments: {} }] },
+      { chunks: ["ok"] },
+    ]);
+    const { session, events } = await setup(p);
+    await session.send("run");
+    const resEv = events.find((e) => e.type === "tool_result");
+    expect(resEv).toMatchObject({ callId: "c1", tool: "no_such_tool", isError: true, more: 0 });
+    expect(resEv?.type === "tool_result" && resEv.preview[0]).toContain("Unknown tool");
+  });
+
+  test("usage is emitted once per model call", async () => {
+    const p = streaming([
+      {
+        toolCalls: [{ id: "c1", name: "find", arguments: { pattern: "*.ts" } }],
+        usage: { inputTokens: 100, outputTokens: 7 },
+      },
+      { chunks: ["done"], usage: { inputTokens: 150, outputTokens: 9 } },
+    ]);
+    const { session, events } = await setup(p);
+    await session.send("q");
+    expect(events.filter((e) => e.type === "usage")).toEqual([
+      { type: "usage", inputTokens: 100, outputTokens: 7 },
+      { type: "usage", inputTokens: 150, outputTokens: 9 },
+    ]);
+  });
+
+  test("deltas and previews never touch persistence: the session file matches a non-streamed turn byte for byte", async () => {
+    const script = (): StreamTurn[] => [
+      {
+        chunks: ["let me ", "look"],
+        toolCalls: [{ id: "c1", name: "bash", arguments: { command: "printf 'l1\\nl2\\n'" } }],
+      },
+      { chunks: ["it is ", "fine"] },
+    ];
+    const a = await setup(streaming(script(), true));
+    const b = await setup(streaming(script(), false));
+    await a.session.send("check");
+    await b.session.send("check");
+    expect(deltas(a.events).length).toBeGreaterThan(0);
+    expect(deltas(b.events)).toEqual([]);
+    const fa = readFileSync(sessionFile(a.repo, a.session.id() as string), "utf8");
+    const fb = readFileSync(sessionFile(b.repo, b.session.id() as string), "utf8");
+    expect(fa).toBe(fb);
+    expect(a.session.history()).toEqual(b.session.history());
+    expect(a.session.history().map((m) => [m.role, m.content])).toEqual([
+      ["user", "check"],
+      ["assistant", "let me look"],
+      ["tool", "stdout:\nl1\nl2\nexit code 0"],
+      ["assistant", "it is fine"],
+    ]);
+  });
+
+  test("an aborted turn emits no deltas after the abort", async () => {
+    let n = 0;
+    const p: Provider = {
+      chat(req: ChatRequest): Promise<ChatResponse> {
+        n++;
+        if (n > 1) {
+          req.onDelta?.("after");
+          return Promise.resolve({
+            message: { text: "after", toolCalls: [] },
+            stopReason: "end",
+            usage: { inputTokens: 1, outputTokens: 1 },
+          });
+        }
+        req.onDelta?.("early ");
+        return new Promise((_, reject) => {
+          req.signal?.addEventListener("abort", () => {
+            // A provider that keeps calling back after the abort must stay silent.
+            setTimeout(() => {
+              req.onDelta?.("late");
+              reject(new RewireError("provider_aborted", "aborted"));
+            }, 10);
+          });
+        });
+      },
+    };
+    const { session, events } = await setup(p);
+    const ac = new AbortController();
+    const pending = session.send("slow", ac.signal);
+    setTimeout(() => ac.abort(), 20);
+    await expect(pending).rejects.toMatchObject({ code: "aborted" });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(deltas(events)).toEqual(["early "]);
+    expect(events.filter((e) => e.type === "usage")).toEqual([]);
+    await session.send("again");
+    expect(deltas(events)).toEqual(["early ", "after"]);
   });
 });

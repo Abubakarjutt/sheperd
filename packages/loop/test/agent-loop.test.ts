@@ -404,3 +404,83 @@ describe("runAgent", () => {
     });
   });
 });
+
+describe("runAgent streaming and usage", () => {
+  test("onText is passed to the provider as onDelta and sees each delta", async () => {
+    const deltas: string[] = [];
+    const seen: Array<ChatRequest["onDelta"]> = [];
+    const provider: Provider = {
+      async chat(req: ChatRequest): Promise<ChatResponse> {
+        seen.push(req.onDelta);
+        req.onDelta?.("hel");
+        req.onDelta?.("lo");
+        return {
+          message: { text: "hello", toolCalls: [] },
+          stopReason: "end",
+          usage: { inputTokens: 1, outputTokens: 2 },
+        };
+      },
+    };
+    const res = await runAgent(base(provider, [], { onText: (d: string) => deltas.push(d) }));
+    expect(typeof seen[0]).toBe("function");
+    expect(deltas.join("")).toBe(res.lastText);
+  });
+
+  test("without onText the request carries no onDelta key", async () => {
+    const keys: string[][] = [];
+    const provider: Provider = {
+      async chat(req: ChatRequest): Promise<ChatResponse> {
+        keys.push(Object.keys(req));
+        return {
+          message: { text: "ok", toolCalls: [] },
+          stopReason: "end",
+          usage: { inputTokens: 0, outputTokens: 0 },
+        };
+      },
+    };
+    await runAgent(base(provider, []));
+    expect(keys[0]).not.toContain("onDelta");
+  });
+
+  test("onUsage is called once per model call with that call's usage", async () => {
+    let n = 0;
+    const provider: Provider = {
+      async chat(): Promise<ChatResponse> {
+        n++;
+        if (n === 1) {
+          return {
+            message: { text: "", toolCalls: [{ id: "c1", name: "noop", arguments: {} }] },
+            stopReason: "tool_use",
+            usage: { inputTokens: 10, outputTokens: 3 },
+          };
+        }
+        return {
+          message: { text: "done", toolCalls: [] },
+          stopReason: "end",
+          usage: { inputTokens: 20, outputTokens: 5 },
+        };
+      },
+    };
+    const usages: Array<{ inputTokens: number; outputTokens: number }> = [];
+    const res = await runAgent(
+      base(provider, [mkTool("noop").tool], { onUsage: (u: (typeof usages)[0]) => usages.push(u) }),
+    );
+    expect(usages).toEqual([
+      { inputTokens: 10, outputTokens: 3 },
+      { inputTokens: 20, outputTokens: 5 },
+    ]);
+    expect(res.usage).toEqual({ inputTokens: 30, outputTokens: 8 });
+  });
+
+  test("a throwing onUsage observer does not break the loop", async () => {
+    const faux = new FauxProvider([text("ok")]);
+    const res = await runAgent(
+      base(faux, [], {
+        onUsage: () => {
+          throw new Error("observer");
+        },
+      }),
+    );
+    expect(res.endedBy).toBe("model");
+  });
+});

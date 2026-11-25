@@ -3,9 +3,9 @@ import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { assetRoot, RewireError, type RunEvent, redact, sanitizeTerminal } from "@rewire/core";
-import { type AgentTool, type RunAgentResult, runAgent } from "@rewire/loop";
+import { type AgentTool, type RunAgentResult, runAgent, type ToolResult } from "@rewire/loop";
 import type { Policy } from "@rewire/policy";
-import type { ChatMessage, ChatRequest, ModelRef, Provider } from "@rewire/providers";
+import type { ChatMessage, ChatRequest, ModelRef, Provider, ToolCall } from "@rewire/providers";
 import { profileFor, SandboxClient } from "@rewire/sandbox";
 import { type SkillSet, skillIndex, skillTool } from "@rewire/skills";
 import { createTools } from "@rewire/tools";
@@ -16,15 +16,57 @@ const STAGE = "chat";
 const DEFAULT_MAX_TURNS = 40;
 const SUMMARY_ARG_CAP = 200;
 const TASK_MAX = 20_000;
+const PREVIEW_LINES = 4;
+const PREVIEW_LINE_CAP = 300;
 
 /** Stand-ins appended so a stored turn always ends in a plain assistant message. */
 export const PROPOSAL_NOTE = "[propose_run recorded: the user was asked to confirm the run]";
 export const TURN_LIMIT_NOTE = "[turn ended: the tool-call limit for one turn was reached]";
 
 export type ChatEvent =
-  | { type: "tool_call"; tool: string; summary: string; isError: boolean }
+  /** `callId` pairs it with the `tool_result` that follows it (when the tool ran). */
+  | { type: "tool_call"; callId: string; tool: string; summary: string; isError: boolean }
+  /**
+   * The start of a tool's result, emitted right after its `tool_call` (same `callId` and `tool`).
+   * Redacted, then sanitized: the first 4 non-empty lines, each capped at 300 characters; `more`
+   * counts the non-empty lines left out. A tool that threw, or a call the loop did not run, has
+   * no `tool_result`.
+   */
+  | {
+      type: "tool_result";
+      callId: string;
+      tool: string;
+      preview: string[];
+      more: number;
+      isError: boolean;
+    }
   | { type: "skill_loaded"; name: string }
-  | { type: "assistant_text"; text: string };
+  /**
+   * A streamed piece of the assistant's text, NOT redacted or sanitized: a secret or an escape
+   * sequence may be split across deltas, so it is only safe on the joined buffer.
+   * Contract: raw; render only via redact(sanitizeTerminal(buffer)).
+   */
+  | { type: "assistant_delta"; text: string }
+  /** The finished text of one model call, redacted. */
+  | { type: "assistant_text"; text: string }
+  /** Token usage of one model call (one event per call). */
+  | { type: "usage"; inputTokens: number; outputTokens: number };
+
+/**
+ * A tool result as a short preview: redacted, then sanitized (and redacted again, in case
+ * sanitizing joined a secret that an escape sequence had split), then the first non-empty lines,
+ * each capped by code point.
+ */
+export function toolPreview(content: string): { preview: string[]; more: number } {
+  const lines = redact(sanitizeTerminal(redact(content)))
+    .split("\n")
+    .filter((l) => l.trim() !== "");
+  const preview = lines.slice(0, PREVIEW_LINES).map((l) => {
+    const cps = Array.from(l);
+    return cps.length > PREVIEW_LINE_CAP ? cps.slice(0, PREVIEW_LINE_CAP).join("") : l;
+  });
+  return { preview, more: Math.max(0, lines.length - PREVIEW_LINES) };
+}
 
 export type ChatTurn = {
   /** The model's final text for the turn, redacted. */
@@ -276,10 +318,16 @@ export class ChatSession {
       skill,
       propose,
     ];
+    // Tool calls of the latest model response, in the order the loop runs (and reports) them,
+    // so each loop `tool_call` event gets its call id; results arrive via afterToolCall.
+    const pendingCalls: ToolCall[] = [];
+    const results = new Map<string, ToolResult>();
+    let unnamed = 0;
     const inner = this.opts.provider;
     const provider: Provider = {
       chat: async (req: ChatRequest) => {
         const res = await inner.chat(req);
+        pendingCalls.push(...res.message.toolCalls);
         if (res.message.text !== "") {
           emitLive({ type: "assistant_text", text: redact(res.message.text) });
         }
@@ -297,16 +345,40 @@ export class ChatSession {
           prompt: text,
           history: prior,
           tools,
+          hooks: {
+            afterToolCall: async (call, r) => {
+              results.set(call.id, r);
+              return undefined;
+            },
+          },
           maxTurns: this.opts.maxTurns ?? DEFAULT_MAX_TURNS,
+          // Deltas and usage are events only: persistence still sees just the finished turn.
+          onText: (delta) => emitLive({ type: "assistant_delta", text: delta }),
+          onUsage: (u) =>
+            emitLive({ type: "usage", inputTokens: u.inputTokens, outputTokens: u.outputTokens }),
           emit: (e: RunEvent) => {
             if (e.type !== "tool_call") return;
+            const call = pendingCalls.shift();
+            const callId = call?.id || `tool-${++unnamed}`;
+            const result = call ? results.get(call.id) : undefined;
+            if (call) results.delete(call.id);
             const [tool = e.tool, ...rest] = redact(e.summary).split(" ");
             emitLive({
               type: "tool_call",
+              callId,
               tool: e.tool,
               summary: `${tool} ${rest.join(" ").slice(0, SUMMARY_ARG_CAP)}`,
               isError: e.isError,
             });
+            if (result !== undefined) {
+              emitLive({
+                type: "tool_result",
+                callId,
+                tool: e.tool,
+                ...toolPreview(result.content),
+                isError: result.isError,
+              });
+            }
           },
           runId: this.sid ?? "chat",
           stage: STAGE,

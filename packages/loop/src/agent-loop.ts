@@ -128,6 +128,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
         tools: tools.map((t) => t.spec),
         maxTokens: opts.maxTokens ?? 8192,
         ...(signal ? { signal } : {}),
+        ...(opts.onText ? { onDelta: opts.onText } : {}),
       });
     } catch (e) {
       if (signal?.aborted || (e instanceof RewireError && e.code === "provider_aborted")) {
@@ -139,6 +140,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
 
     usage.inputTokens += res.usage.inputTokens;
     usage.outputTokens += res.usage.outputTokens;
+    if (opts.onUsage) {
+      try {
+        opts.onUsage({ inputTokens: res.usage.inputTokens, outputTokens: res.usage.outputTokens });
+      } catch {
+        // an observer must not break the loop
+      }
+    }
     if (res.stopReason === "error") {
       return finish(
         "error",

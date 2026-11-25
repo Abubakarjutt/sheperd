@@ -35,6 +35,14 @@ export type RunAgentOptions = {
   runId: string;
   stage: string;
   signal?: AbortSignal;
+  /**
+   * Streamed assistant text: passed to each model call as `ChatRequest.onDelta`, so the provider
+   * streams. Raw model text (not redacted or sanitized). When unset, requests carry no `onDelta`
+   * and are sent exactly as before. A throw from it fails the call (`provider_stream_callback_failed`).
+   */
+  onText?: (delta: string) => void;
+  /** Called after each successful model call with that call's usage. A throw is ignored. */
+  onUsage?: (usage: Usage) => void;
 };
 
 export type RunAgentResult = {
