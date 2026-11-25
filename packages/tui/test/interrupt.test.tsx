@@ -180,9 +180,9 @@ describe("renderTui Ctrl-C key", () => {
     expect(await p).toBe(0);
   });
 
-  it("an exit during the first render (render error) settles 1 and still unmounts", async () => {
+  it("an exit during the first render (render error) rejects (M2) and still unmounts", async () => {
     const s = streams();
-    const code = await renderTui({
+    const p = renderTui({
       session: {
         history: () => {
           throw new Error("boom");
@@ -193,7 +193,7 @@ describe("renderTui Ctrl-C key", () => {
       onInterrupt: () => {},
       renderOptions: { ...s.opts, patchConsole: false },
     });
-    expect(code).toBe(1);
+    await expect(p).rejects.toMatchObject({ code: "tui_render_failed" });
     await tick();
     // Unmounted: the key listener let go of stdin.
     expect((s.opts.stdin as unknown as EventEmitter).listenerCount("readable")).toBe(0);
