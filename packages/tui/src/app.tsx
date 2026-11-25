@@ -4,10 +4,12 @@ import {
   type ChatSession,
   PROPOSAL_NOTE,
   type RunController,
+  type RunHandle,
   TURN_LIMIT_NOTE,
 } from "@rewire/session";
 import { Box } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { RunView } from "./board-view.js";
 import { InputBox } from "./input.js";
 import { Transcript, type TranscriptEntry } from "./transcript.js";
 
@@ -18,6 +20,8 @@ export type AppProps = {
   /** Used by the run board in Task 12; the shell only carries it. */
   runController: RunController;
   config: AppConfig;
+  /** The active run, if any: shows its board and checkpoint panel (Task 13 supplies it from `/run`). */
+  run?: RunHandle;
   /** Receives the chat events: wire `emit` of the ChatSession to the function it hands out. */
   subscribe?: (listener: (e: ChatEvent) => void) => () => void;
   /** Resolves the exit code of `renderTui` (`/exit`, Ctrl-C: wired in Tasks 13 and 14; Ink runs with exitOnCtrlC false, so Task 14 owns Ctrl-C). */
@@ -44,10 +48,16 @@ function eventEntry(e: ChatEvent): TranscriptEntry | undefined {
   return undefined; // assistant_text: the turn's final text is appended from ChatTurn.text
 }
 
-export function App({ session, subscribe }: AppProps) {
+export function App({ session, subscribe, run }: AppProps) {
   const [entries, setEntries] = useState<TranscriptEntry[]>(() => historyEntries(session));
   const [busy, setBusy] = useState(false);
   const inFlight = useRef(false);
+  const [runDone, setRunDone] = useState(false);
+  const runActive = run !== undefined && !runDone;
+  // A new run handle starts active again.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset when the handle changes
+  useEffect(() => setRunDone(false), [run]);
+  const onRunDone = useCallback(() => setRunDone(true), []);
 
   const add = useCallback((...e: TranscriptEntry[]) => setEntries((cur) => [...cur, ...e]), []);
 
@@ -86,7 +96,8 @@ export function App({ session, subscribe }: AppProps) {
   return (
     <Box flexDirection="column">
       <Transcript entries={entries} />
-      <InputBox busy={busy} onSubmit={submit} />
+      {runActive ? <RunView run={run} onDone={onRunDone} /> : null}
+      <InputBox busy={busy || runActive} onSubmit={submit} />
     </Box>
   );
 }

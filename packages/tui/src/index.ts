@@ -73,3 +73,7 @@ export async function renderTui(deps: TuiDeps): Promise<number> {
     );
   });
 }
+export { type BoardState, initialBoard, reduceBoard, STAGES, withCheckpoint } from "./board.js";
+export { Board, RunView } from "./board-view.js";
+export { CheckpointPanel, type CheckpointPrompt, diffStat } from "./checkpoint.js";
+export { fit } from "./fit.js";
