@@ -135,14 +135,18 @@ export type TuiDeps = Omit<AppProps, "onExit" | "subscribe"> & {
   renderOptions?: TuiRenderOptions;
 };
 
-/** Renders the app and resolves with the exit code once `onExit(code)` is called. */
+/**
+ * Renders the app and resolves with the exit code once `onExit(code)` is called. A render error
+ * rejects with `tui_render_failed` (never a silent exit 1), as the trust prompt does.
+ */
 export async function renderTui(deps: TuiDeps): Promise<number> {
   const listeners = new Set<(e: ChatEvent) => void>();
   deps.bindEmit?.((e) => {
     for (const l of listeners) l(e);
   });
   const { renderOptions, bindEmit: _bind, bindExit, onInterrupt, ...appDeps } = deps;
-  return await mount(
+  let failure: { error: unknown } | undefined;
+  const code = await mount(
     (exit) =>
       createElement(App, {
         ...appDeps,
@@ -152,8 +156,23 @@ export async function renderTui(deps: TuiDeps): Promise<number> {
         },
         onExit: exit,
       }),
-    { onInterrupt, bindExit, renderOptions },
+    {
+      onInterrupt,
+      bindExit,
+      renderOptions,
+      onError: (error) => {
+        failure = { error };
+      },
+    },
   );
+  if (failure) {
+    const e = failure.error;
+    throw new RewireError(
+      "tui_render_failed",
+      `the interactive session failed: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+  return code;
 }
 
 export type TrustPromptRenderDeps = {

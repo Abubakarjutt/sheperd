@@ -43,13 +43,17 @@ describe("renderTui", () => {
     expect(await p).toBe(130);
   });
 
-  it("settles with 1 when rendering throws", async () => {
-    const code = await renderTui({
-      ...deps(() => {
-        throw new Error("render boom");
+  it("rejects with tui_render_failed when rendering throws (M2), like the trust prompt", async () => {
+    await expect(
+      renderTui({
+        ...deps(() => {
+          throw new Error("render boom");
+        }),
+        renderOptions: { ...streams(), patchConsole: false },
       }),
-      renderOptions: { ...streams(), patchConsole: false },
+    ).rejects.toMatchObject({
+      code: "tui_render_failed",
+      message: expect.stringContaining("render boom"),
     });
-    expect(code).toBe(1);
   });
 });
