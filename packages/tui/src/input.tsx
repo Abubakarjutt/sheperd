@@ -1,5 +1,5 @@
 import { Box, Text, useInput } from "ink";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { fit } from "./fit.js";
 import { type InputAction, initialInput, reduceInput } from "./input-state.js";
 import { Safe } from "./safe.js";
@@ -23,6 +23,8 @@ export type InputBoxProps = {
   busy: boolean;
   /** Hidden and deaf (a panel owns the keys), keeping its text and history. */
   disabled?: boolean;
+  /** Whether `?` on an empty input toggles the shortcuts panel (default); false types it. */
+  helpKey?: boolean;
   onSubmit: (text: string) => void;
 };
 
@@ -44,7 +46,7 @@ function ShortcutsPanel() {
  * Multi-line input in a round border. Shift+Enter (where Ink reports it) or a trailing `\` +
  * Enter adds a line. `?` on an empty input toggles the shortcuts panel; any other key closes it.
  */
-export function InputBox({ busy, disabled = false, onSubmit }: InputBoxProps) {
+export function InputBox({ busy, disabled = false, helpKey = true, onSubmit }: InputBoxProps) {
   const [state, setState] = useState(initialInput);
   const ref = useRef(state);
   const [help, setHelpState] = useState(false);
@@ -54,6 +56,13 @@ export function InputBox({ busy, disabled = false, onSubmit }: InputBoxProps) {
     setHelpState(on);
   };
   const cols = useColumns();
+  // A panel left open when the input is hidden or busy must not come back with it.
+  useEffect(() => {
+    if (busy || disabled || !helpKey) {
+      helpRef.current = false;
+      setHelpState(false);
+    }
+  }, [busy, disabled, helpKey]);
 
   const apply = (action: InputAction): void => {
     const r = reduceInput(ref.current, action);
@@ -64,7 +73,7 @@ export function InputBox({ busy, disabled = false, onSubmit }: InputBoxProps) {
 
   useInput((input, key) => {
     if (busy || disabled) return; // one send at a time: typing is ignored while a turn is in flight
-    if (input === "?" && ref.current.value === "" && !key.ctrl && !key.meta) {
+    if (helpKey && input === "?" && ref.current.value === "" && !key.ctrl && !key.meta) {
       setHelp(!helpRef.current);
       return;
     }

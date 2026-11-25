@@ -174,6 +174,18 @@ describe("header", () => {
     expect(shortPath("/srv/x", undefined)).toBe("/srv/x");
   });
 
+  it("cuts a long cwd from the left so the repo name stays visible", async () => {
+    const info: HeaderInfo = {
+      cwd: `/home/dev/${"deep/".repeat(20)}projects/rewire`,
+      home: "/home/dev",
+    };
+    const v = track(render(<Header info={info} />));
+    setColumns(v.stdout, 40);
+    v.stdout.emit("resize");
+    const f = await waitFor(v, (x) => maxWidth(x) <= 40, "the header to fit 40 columns");
+    expect(f).toMatch(/cwd: …\/[\w/]*projects\/rewire/);
+  });
+
   it("fits in 40 columns and sanitizes config values", async () => {
     const info: HeaderInfo = {
       cwd: `/home/dev/${"very-long-directory/".repeat(8)}`,
@@ -199,21 +211,24 @@ describe("header", () => {
 });
 
 describe("status line", () => {
-  it("fits 40 columns, dropping the shortcuts hint, then checkpoints, then tokens", () => {
+  it("fits 40 columns, dropping the shortcuts hint, then checkpoints, then the context size", () => {
     const parts = {
       model: "claude-chat",
-      tokens: 12_345,
+      context: 12_345,
       checkpoints: "contract,tests",
       mode: "chat",
     };
     const wide = statusText(parts, 120);
     expect(wide).toMatch(
-      /^claude-chat · 12\.3k tokens · checkpoints: contract,tests · chat +\? for shortcuts$/,
+      /^claude-chat · ctx 12\.3k · checkpoints: contract,tests · chat +\? for shortcuts$/,
     );
     expect(stringWidth(wide)).toBe(120);
     const mid = statusText(parts, 70);
-    expect(mid).toBe("claude-chat · 12.3k tokens · checkpoints: contract,tests · chat");
-    expect(statusText(parts, 40)).toBe("claude-chat · 12.3k tokens · chat");
+    expect(mid).toBe("claude-chat · ctx 12.3k · checkpoints: contract,tests · chat");
+    expect(statusText(parts, 40)).toBe("claude-chat · ctx 12.3k · chat");
+    expect(statusText({ ...parts, context: undefined }, 60)).toBe(
+      "claude-chat · checkpoints: contract,tests · chat",
+    );
     expect(statusText(parts, 25)).toBe("claude-chat · chat");
     expect(stringWidth(statusText(parts, 10))).toBeLessThanOrEqual(10);
     expect(statusText(parts, 0)).toBe("");
@@ -221,7 +236,7 @@ describe("status line", () => {
 
   it("renders within 40 columns", () => {
     const el = (
-      <StatusLine model={"x".repeat(60)} tokens={1} checkpoints="contract,tests" mode="chat" />
+      <StatusLine model={"x".repeat(60)} context={1} checkpoints="contract,tests" mode="chat" />
     );
     const v = track(render(el));
     setColumns(v.stdout, 40);
@@ -231,7 +246,7 @@ describe("status line", () => {
     expect(plain(v.lastFrame())).toContain("· chat");
   });
 
-  it("goes chat -> thinking -> run: implement -> checkpoint: contract, and counts tokens", async () => {
+  it("goes chat -> thinking -> run: implement -> checkpoint: contract, and shows the last call's context size", async () => {
     let release: (t: ChatTurn) => void = () => {};
     const s = session(
       () =>
@@ -242,16 +257,15 @@ describe("status line", () => {
     const m = mountApp({ session: s });
     const v = m.v;
     await waitText(v, "· chat");
-    expect(plain(v.lastFrame())).toContain(
-      "claude-chat · 0 tokens · checkpoints: contract,tests · chat",
-    );
+    expect(plain(v.lastFrame())).toContain("claude-chat · checkpoints: contract,tests · chat");
     v.stdin.write("hi");
     await waitText(v, "> hi");
     v.stdin.write("\r");
     await waitText(v, "· thinking");
     m.emit({ type: "usage", inputTokens: 1000, outputTokens: 500 });
+    m.emit({ type: "usage", inputTokens: 2000, outputTokens: 300 });
     release({ text: "done" });
-    await waitText(v, "1.5k tokens");
+    await waitText(v, "ctx 2.3k"); // the last call, not a sum
     await waitText(v, "· chat");
 
     let pending: PendingPrompt | undefined;
@@ -329,6 +343,53 @@ describe("input box and shortcuts", () => {
     v.stdin.write("x");
     const g = await waitFor(v, (x) => !x.includes("Shift+Enter"), "the panel to close");
     expect(g).toContain("> x");
+  });
+
+  it("? is typed as a clarification answer", async () => {
+    let pending: PendingPrompt | undefined = { kind: "clarify", questions: ["Which file?"] };
+    const answers: unknown[] = [];
+    const { run } = fakeRun([], () => pending);
+    (run as unknown as { answer: (p: unknown, v: unknown) => boolean }).answer = (_p, a) => {
+      answers.push(a);
+      pending = undefined;
+      return true;
+    };
+    const { v } = mountApp({ run });
+    await waitText(v, "Which file?");
+    v.stdin.write("?");
+    const f = await waitText(v, "> ?");
+    expect(f).not.toContain("Shift+Enter");
+  });
+
+  it("the shortcuts panel does not come back after the input was disabled", async () => {
+    const m = mountApp();
+    const v = m.v;
+    await waitText(v, "Ask about the code");
+    v.stdin.write("?");
+    await waitText(v, "Shift+Enter");
+    // A run hands in a checkpoint: the input is hidden and deaf while the panel owns the keys.
+    let pending: PendingPrompt | undefined = {
+      kind: "checkpoint",
+      checkpoint: {
+        kind: "contract",
+        contract: {
+          id: "C-1",
+          title: "t",
+          criteria: [],
+          nonGoals: [],
+          affectedAreas: [],
+          openQuestions: [],
+        },
+      },
+    } as unknown as PendingPrompt;
+    const { run, finish } = fakeRun([], () => pending);
+    m.rerender({ run });
+    await waitText(v, "· checkpoint: contract");
+    expect(plain(v.lastFrame())).not.toContain("Shift+Enter");
+    pending = undefined;
+    finish({ status: "verified", runId: "r1", branch: "b", reportPath: "/r" });
+    const f = await waitText(v, "Ask about the code");
+    expect(f).not.toContain("Shift+Enter");
   });
 
   it("? in non-empty input is typed", async () => {

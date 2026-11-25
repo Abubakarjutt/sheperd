@@ -232,8 +232,8 @@ export function App(props: AppProps) {
     () => props.checkpoints ?? DEFAULT_CHECKPOINTS,
   );
   const [trustOpen, setTrustOpen] = useState(false);
-  /** Input plus output tokens of this session's model calls (`usage` events). */
-  const [tokens, setTokens] = useState(0);
+  /** Context size: the last chat model call's input plus output tokens; none before the first. */
+  const [context, setContext] = useState<number | undefined>(undefined);
   /** The active run's stage, from its board (status line). */
   const [stage, setStage] = useState<string | undefined>(undefined);
   const [trustedLater, setTrustedLater] = useState(false);
@@ -306,7 +306,7 @@ export function App(props: AppProps) {
     return subscribe((e) => {
       if (e.type === "usage") {
         const n = (x: number): number => (Number.isFinite(x) && x > 0 ? x : 0);
-        setTokens((t) => t + n(e.inputTokens) + n(e.outputTokens));
+        setContext(n(e.inputTokens) + n(e.outputTokens));
       }
       if (liveRef.current) {
         liveRef.current = applyEvent(liveRef.current, e);
@@ -396,7 +396,7 @@ export function App(props: AppProps) {
             ...entriesOf(next),
           ]);
           setRegion((r) => r + 1);
-          setTokens(0);
+          setContext(undefined);
           // The new session re-resolved the skills: a trust given earlier is now in effect.
           setTrustedLater(false);
           await old.dispose();
@@ -605,10 +605,16 @@ export function App(props: AppProps) {
           interruptible={run === undefined && proposal === undefined && !trustOpen}
         />
       ) : null}
-      <InputBox busy={busy} disabled={inputOff || live !== undefined} onSubmit={submit} />
+      <InputBox
+        busy={busy}
+        disabled={inputOff || live !== undefined}
+        // A clarification answer is free text: `?` types there.
+        helpKey={clarify === undefined}
+        onSubmit={submit}
+      />
       <StatusLine
         model={models?.chat}
-        tokens={tokens}
+        context={context}
         checkpoints={checkpointsShort(checkpoints)}
         mode={mode}
       />

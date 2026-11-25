@@ -1,3 +1,4 @@
+import { redact } from "@rewire/core";
 import { Text } from "ink";
 import { fit, width } from "./fit.js";
 import { Safe } from "./safe.js";
@@ -10,8 +11,11 @@ export const SHORTCUTS_HINT = "? for shortcuts";
 export type StatusParts = {
   /** The chat model; omitted when unknown. */
   model?: string | undefined;
-  /** Session token total (input and output). */
-  tokens: number;
+  /**
+   * Context size: the last model call's input plus output tokens (as Claude Code and Codex
+   * show it). Omitted until the session's first call.
+   */
+  context?: number | undefined;
   /** `contract,tests`, or `off`. */
   checkpoints: string;
   /** `chat`, `thinking`, `run: <stage>` or `checkpoint: <kind>`. */
@@ -19,20 +23,22 @@ export type StatusParts = {
 };
 
 /**
- * The status line's text at `cols`: `<model> · <N> tokens · checkpoints: <set> · <mode>`, with
+ * The status line's text at `cols`: `<model> · ctx <N> · checkpoints: <set> · <mode>`, with
  * `? for shortcuts` right-aligned. When it does not fit, pieces are dropped in this order: the
- * shortcuts hint, the checkpoints, the tokens; what is left is cut with `fit` (which sanitizes).
+ * shortcuts hint, the checkpoints, the context size; what is left is cut with `fit` (which
+ * sanitizes). Values are redacted before they are cut.
  */
 export function statusText(p: StatusParts, cols: number): string {
   const max = Math.floor(cols);
   if (!(max >= 1)) return "";
-  const model = p.model ? fit(p.model, max) : undefined;
-  const left = (tokens: boolean, checkpoints: boolean): string =>
+  const model = p.model ? fit(redact(p.model), max) : undefined;
+  const mode = fit(redact(p.mode), max);
+  const left = (context: boolean, checkpoints: boolean): string =>
     [
       model,
-      tokens ? `${formatTokens(p.tokens)} tokens` : undefined,
+      context && p.context !== undefined ? `ctx ${formatTokens(p.context)}` : undefined,
       checkpoints ? `checkpoints: ${p.checkpoints}` : undefined,
-      fit(p.mode, max),
+      mode,
     ]
       .filter((x): x is string => x !== undefined && x !== "")
       .join(" · ");
@@ -43,7 +49,6 @@ export function statusText(p: StatusParts, cols: number): string {
     if (width(candidate) <= max) return candidate;
   }
   // Still too wide: shorten the model so the mode stays visible.
-  const mode = fit(p.mode, max);
   const room = max - width(mode) - 3;
   if (model && room >= 2) return `${fit(model, room)} · ${mode}`;
   return fit(left(false, false), max);
