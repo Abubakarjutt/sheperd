@@ -6,9 +6,11 @@ import { z } from "zod";
  * The structured session record: what a compacted chat keeps instead of a lossy summary.
  *
  * Items are written by the compactor (Task 4), which cleans every string (sanitize, then redact)
- * when it applies an operation; `renderRecord` therefore renders item text as-is. `observed` is
- * computed by code (`observe`), never by the model, and cleans its own entries. The rendered
- * text is untrusted: the caller fences it (`untrusted_session_record`).
+ * when it applies an operation; `renderRecord` does not sanitize or redact item text again, but
+ * it does collapse every whitespace run (newlines included) to one space, so no value can start
+ * a line and forge a section header or a `[user mN]` line. `observed` is computed by code
+ * (`observe`), never by the model, and cleans and flattens its own entries. The rendered text is
+ * untrusted: the caller fences it (`untrusted_session_record`).
  */
 
 export const TEXT_MAX = 500;
@@ -21,6 +23,8 @@ export const ERRORS_MAX = 50;
 export const CMD_MAX = 200;
 export const PATH_MAX = 500;
 export const ERROR_MESSAGE_MAX = 300;
+export const RUNS_MAX = 50;
+export const RUN_FIELD_MAX = 200;
 
 /** A stored message's stable id (`m<n>`, assigned by `SessionStore`). */
 export const MessageId = z.string().regex(/^m(?:0|[1-9]\d*)$/);
@@ -81,9 +85,17 @@ export const Observed = z
           .strict(),
       )
       .max(COMMANDS_MAX),
-    runs: z.array(
-      z.object({ runId: z.string(), status: z.string(), reportPath: z.string() }).strict(),
-    ),
+    runs: z
+      .array(
+        z
+          .object({
+            runId: z.string().max(RUN_FIELD_MAX),
+            status: z.string().max(RUN_FIELD_MAX),
+            reportPath: z.string().max(RUN_FIELD_MAX),
+          })
+          .strict(),
+      )
+      .max(RUNS_MAX),
     errors: z
       .array(
         z.object({ tool: z.string().max(64), message: z.string().max(ERROR_MESSAGE_MAX) }).strict(),
@@ -138,7 +150,11 @@ export function emptyRecord(): SessionRecord {
 // observe
 // ---------------------------------------------------------------------------------------------
 
-const clean = (s: string): string => redact(sanitizeTerminal(s));
+/** Collapse every whitespace run (newlines, tabs, CR included) to one space, and trim. */
+export const flatten = (s: string): string => s.replace(/\s+/g, " ").trim();
+
+/** Sanitize, redact (whole text, so multi-line secrets still match), then flatten. */
+const clean = (s: string): string => flatten(redact(sanitizeTerminal(s)));
 
 /** The bash tool's last line (`packages/tools/src/bash.ts`); capOutput keeps the tail. */
 const EXIT_LINE = /(?:^|\n)exit code (-?\d+)$/;
@@ -173,8 +189,9 @@ const ERROR_FIRST_LINE: RegExp[] = [
  */
 const ERROR_ONE_LINE = /^(?:error|[a-z][a-z0-9]*(?:_[a-z0-9]+)+): /;
 
+/** The recorded flag when the store has one; the shape heuristic for older files. */
 function isErrorResult(content: string, isError: unknown): boolean {
-  if (isError === true) return true;
+  if (typeof isError === "boolean") return isError;
   const first = content.split("\n", 1)[0] ?? "";
   if (ERROR_FIRST_LINE.some((re) => re.test(first))) return true;
   return !content.includes("\n") && ERROR_ONE_LINE.test(content);
@@ -207,25 +224,51 @@ export function observe(
   messages: readonly ChatMessage[],
   opts: { runs?: readonly ObservedRun[] } = {},
 ): Observed {
-  const results = new Map<string, { content: string; isError: unknown }>();
+  // Pair each call with its result. A call id pairs by id only when it is non-empty and unique
+  // across all calls and all results; otherwise (OpenAI-compatible servers may send "" or reuse
+  // ids such as call_0) by position: the loop stores a turn's results right after its assistant
+  // message, in call order.
+  type Result = { content: string; isError: unknown };
+  const callIds = new Map<string, number>();
+  const resultIds = new Map<string, number>();
   for (const m of messages) {
-    if (m.role === "tool" && m.toolCallId !== undefined && !results.has(m.toolCallId)) {
-      results.set(m.toolCallId, {
-        content: m.content,
-        isError: (m as { isError?: unknown }).isError,
-      });
+    for (const c of m.role === "assistant" ? (m.toolCalls ?? []) : []) {
+      callIds.set(c.id, (callIds.get(c.id) ?? 0) + 1);
+    }
+    if (m.role === "tool" && m.toolCallId !== undefined) {
+      resultIds.set(m.toolCallId, (resultIds.get(m.toolCallId) ?? 0) + 1);
     }
   }
+  const byId = new Map<string, Result>();
+  const toResult = (m: ChatMessage): Result => ({
+    content: m.content,
+    isError: (m as { isError?: unknown }).isError,
+  });
+  for (const m of messages) {
+    if (m.role === "tool" && m.toolCallId && resultIds.get(m.toolCallId) === 1) {
+      byId.set(m.toolCallId, toResult(m));
+    }
+  }
+  const resultFor = (call: { id: string }, idx: number, k: number): Result | undefined => {
+    if (call.id !== "" && callIds.get(call.id) === 1 && resultIds.get(call.id) === 1) {
+      return byId.get(call.id);
+    }
+    const m = messages[idx + 1 + k];
+    if (m === undefined || m.role !== "tool") return undefined;
+    // Every message between the assistant message and this one must be a tool result too.
+    for (let j = idx + 1; j < idx + 1 + k; j++) if (messages[j]?.role !== "tool") return undefined;
+    return toResult(m);
+  };
 
   let tick = 0;
   const files = new Map<string, { value: Observed["files"][number]; last: number }>();
   const commands = new Map<string, { value: Observed["commands"][number]; last: number }>();
   const errors: Observed["errors"] = [];
 
-  for (const m of messages) {
+  for (const [idx, m] of messages.entries()) {
     if (m.role !== "assistant") continue;
-    for (const call of m.toolCalls ?? []) {
-      const result = results.get(call.id);
+    for (const [k, call] of (m.toolCalls ?? []).entries()) {
+      const result = resultFor(call, idx, k);
       if (result === undefined) continue;
       tick++;
       const tool = call.name;
@@ -234,9 +277,7 @@ export function observe(
       const failed = exit === null && isErrorResult(result.content, result.isError);
 
       if (tool === "bash" && !failed) {
-        const cmd = clean(str(args.command) ?? "")
-          .trim()
-          .slice(0, CMD_MAX);
+        const cmd = clean(str(args.command) ?? "").slice(0, CMD_MAX);
         const code = exit ? Number(exit[1]) : null;
         const prev = commands.get(cmd);
         if (prev) {
@@ -249,15 +290,13 @@ export function observe(
         continue;
       }
       if (failed) {
-        const message = clean(result.content.split("\n", 1)[0] ?? "")
-          .trim()
-          .slice(0, ERROR_MESSAGE_MAX);
+        const message = clean(result.content.split("\n", 1)[0] ?? "").slice(0, ERROR_MESSAGE_MAX);
         errors.push({ tool: clean(tool).slice(0, 64), message });
         continue;
       }
       const raw = pathArg(tool, args);
       if (raw === undefined) continue;
-      const path = clean(raw).trim().slice(0, PATH_MAX);
+      const path = clean(raw).slice(0, PATH_MAX);
       if (path === "") continue;
       const prev = files.get(path);
       if (prev) {
@@ -272,10 +311,10 @@ export function observe(
   return {
     files: keepRecent([...files.values()], FILES_MAX),
     commands: keepRecent([...commands.values()], COMMANDS_MAX),
-    runs: (opts.runs ?? []).map((r) => ({
-      runId: clean(r.runId),
-      status: clean(r.status),
-      reportPath: clean(r.reportPath),
+    runs: (opts.runs ?? []).slice(-RUNS_MAX).map((r) => ({
+      runId: clean(r.runId).slice(0, RUN_FIELD_MAX),
+      status: clean(r.status).slice(0, RUN_FIELD_MAX),
+      reportPath: clean(r.reportPath).slice(0, RUN_FIELD_MAX),
     })),
     errors: errors.slice(-ERRORS_MAX),
   };
@@ -304,10 +343,23 @@ export type RenderResult = {
   dropped: { observed: number; notes: number; inferred: number };
 };
 
+/**
+ * An inline code span no value can break out of: the fence is one backtick longer than the
+ * longest backtick run in the (flattened) value, padded when the value starts or ends with one.
+ */
+export function codeSpan(value: string): string {
+  const v = flatten(value);
+  const longest = Math.max(0, ...(v.match(/`+/g) ?? []).map((r) => r.length));
+  const fence = "`".repeat(longest + 1);
+  const pad = v.startsWith("`") || v.endsWith("`") ? " " : "";
+  return `${fence}${pad}${v}${pad}${fence}`;
+}
+
 function itemLine(i: RecordItem): string {
-  const ids = (i.evidence ?? []).map((e) => e.messageId);
+  const ids = (i.evidence ?? []).map((e) => flatten(e.messageId));
   const tag = [i.source, ...ids].join(" ");
-  return `- [${tag}] ${i.text}${i.reason ? ` — ${i.reason}` : ""}`;
+  const reason = i.reason ? flatten(i.reason) : "";
+  return `- [${tag}] ${flatten(i.text)}${reason ? ` — ${reason}` : ""}`;
 }
 
 type ObservedLine = { line: string; rank: number; order: number };
@@ -322,20 +374,22 @@ function observedLines(o: Observed): ObservedLine[] {
   add(
     o.files.map(
       (f) =>
-        `- file ${f.path} (read ${f.reads}${f.writes !== undefined ? `, written ${f.writes}` : ""})`,
+        `- file ${codeSpan(f.path)} (read ${f.reads}${f.writes !== undefined ? `, written ${f.writes}` : ""})`,
     ),
     0,
   );
   add(
-    o.commands.map((c) => `- command \`${c.cmd}\` (exit ${c.exit ?? "unknown"}, ×${c.count})`),
+    o.commands.map(
+      (c) => `- command ${codeSpan(c.cmd)} (exit ${c.exit ?? "unknown"}, ×${c.count})`,
+    ),
     1,
   );
   add(
-    o.runs.map((r) => `- run ${r.runId} ${r.status} (${r.reportPath})`),
+    o.runs.map((r) => `- run ${flatten(r.runId)} ${flatten(r.status)} (${codeSpan(r.reportPath)})`),
     2,
   );
   add(
-    o.errors.map((e) => `- error ${e.tool}: ${e.message}`),
+    o.errors.map((e) => `- error ${flatten(e.tool)}: ${flatten(e.message)}`),
     3,
   );
   return out;

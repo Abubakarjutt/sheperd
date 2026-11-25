@@ -325,4 +325,120 @@ describe("stable message ids", () => {
       code: "session_corrupt",
     });
   });
+
+  test("append's corrupt-file error says how to repair it", async () => {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const id = await store.create(repo);
+    appendFileSync(sessionFile(repo, id), '{"role":"user","content":"a"}\n{"role":"assis');
+    const err = await store.append(id, { role: "user", content: "x" }).catch((e) => e);
+    expect(err).toMatchObject({ code: "session_corrupt" });
+    expect(err.hint).toMatch(/cannot store more turns.*removing its partial/);
+  });
+
+  test("an unknown line type is reported as such", async () => {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const id = await store.create(repo);
+    writeFileSync(sessionFile(repo, id), '{"type":"mystery"}\n');
+    await expect(store.load(id)).rejects.toThrow(/unknown line type/);
+  });
+});
+
+describe("isError on tool results (store-only)", () => {
+  test("a boolean isError is stored on tool lines and returned by load; absent otherwise", async () => {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const id = await store.create(repo);
+    await store.append(id, [
+      { role: "user", content: "q", isError: true },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [
+          { id: "a", name: "bash", arguments: { command: "false" } },
+          { id: "b", name: "bash", arguments: { command: "true" } },
+          { id: "c", name: "bash", arguments: { command: "x" } },
+        ],
+      },
+      { role: "tool", content: "exit code 1", toolCallId: "a", isError: true },
+      { role: "tool", content: "exit code 0", toolCallId: "b", isError: false },
+      { role: "tool", content: "exit code 0", toolCallId: "c" },
+    ]);
+    const loaded = await store.load(id);
+    expect(loaded.map((m) => m.isError)).toEqual([undefined, undefined, true, false, undefined]);
+    expect(Object.keys(loaded[0] ?? {})).not.toContain("isError");
+  });
+});
+
+describe("append lock", () => {
+  test("two writers appending at once both succeed with distinct ids and the file loads", async () => {
+    const repo = tempRepo();
+    const a = new SessionStore();
+    const id = await a.create(repo);
+    await a.append(id, { role: "user", content: "first" });
+    const b = new SessionStore();
+    await b.list(repo);
+    await b.load(id); // both stores now have the same cached count
+    const two = (who: string): ChatMessage[] => [
+      { role: "assistant", content: `${who}-1` },
+      { role: "user", content: `${who}-2` },
+    ];
+    const [ia, ib] = await Promise.all([a.append(id, two("a")), b.append(id, two("b"))]);
+    const all = [...(ia ?? []), ...(ib ?? [])];
+    expect(new Set(all).size).toBe(4);
+    expect(all.sort()).toEqual(["m1", "m2", "m3", "m4"]);
+    const loaded = await new SessionStore().list(repo).then(() => a.load(id));
+    expect(loaded.map((m) => m.id)).toEqual(["m0", "m1", "m2", "m3", "m4"]);
+    for (const [ids, who] of [
+      [ia, "a"],
+      [ib, "b"],
+    ] as const) {
+      expect(ids?.map((x) => loaded.find((m) => m.id === x)?.content)).toEqual([
+        `${who}-1`,
+        `${who}-2`,
+      ]);
+    }
+    expect(readdirSync(join(repo, ".rewire", "sessions"))).toEqual([`${id}.jsonl`]);
+  });
+
+  test("a held lock makes append fail with session_locked after about 2 s", async () => {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const id = await store.create(repo);
+    const lock = `${sessionFile(repo, id)}.lock`;
+    writeFileSync(lock, "someone-else", { mode: 0o600 });
+    const started = Date.now();
+    await expect(store.append(id, { role: "user", content: "x" })).rejects.toMatchObject({
+      code: "session_locked",
+    });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1900);
+    expect(readFileSync(lock, "utf8")).toBe("someone-else"); // not ours to remove
+    expect(readFileSync(sessionFile(repo, id), "utf8")).toBe("");
+  }, 10_000);
+
+  test("a stale lock (older than 30 s) is stolen and the append succeeds", async () => {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const id = await store.create(repo);
+    const lock = `${sessionFile(repo, id)}.lock`;
+    writeFileSync(lock, "crashed", { mode: 0o600 });
+    const old = Date.now() / 1000 - 60;
+    utimesSync(lock, old, old);
+    expect(await store.append(id, { role: "user", content: "x" })).toEqual(["m0"]);
+    expect(readdirSync(join(repo, ".rewire", "sessions"))).toEqual([`${id}.jsonl`]);
+  });
+
+  test("a symlinked lock is refused, never followed", async () => {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const id = await store.create(repo);
+    const victim = join(outside(), "victim");
+    writeFileSync(victim, "keep");
+    symlinkSync(victim, `${sessionFile(repo, id)}.lock`);
+    await expect(store.append(id, { role: "user", content: "x" })).rejects.toMatchObject({
+      code: "session_locked",
+    });
+    expect(readFileSync(victim, "utf8")).toBe("keep");
+  }, 10_000);
 });

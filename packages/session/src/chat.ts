@@ -166,10 +166,11 @@ export class ChatSession {
   private readonly skill: AgentTool;
   private messages: ChatMessage[] = [];
   /**
-   * The stable store id (`m<n>`) of each entry of `messages`, kept beside them so ids never
-   * reach a provider request (`messages` is what `runAgent` sends).
+   * Store-only fields of each entry of `messages` (its stable id `m<n>`, and `isError` on a
+   * failed tool result), kept beside them so they never reach a provider request (`messages`
+   * is what `runAgent` sends).
    */
-  private ids: string[] = [];
+  private meta: { id: string; isError?: boolean }[] = [];
   private sid: string | undefined;
   private resumed = false;
   private sandbox: { client: SandboxClient; scratch: string } | undefined;
@@ -201,8 +202,11 @@ export class ChatSession {
     if (this.resumed || this.sid === undefined) return;
     if (this.life.signal.aborted) throw disposedError();
     const loaded = await this.opts.store.load(this.sid);
-    this.messages = loaded.map(({ id: _id, ...m }) => m);
-    this.ids = loaded.map((m) => m.id);
+    this.messages = loaded.map(({ id: _id, isError: _e, ...m }) => m);
+    this.meta = loaded.map((m) => ({
+      id: m.id,
+      ...(m.isError !== undefined ? { isError: m.isError } : {}),
+    }));
     this.resumed = true;
   }
 
@@ -216,9 +220,14 @@ export class ChatSession {
     return structuredClone(this.messages);
   }
 
-  /** `history()` with each message's stable id (`m<n>`). Never send these to a provider. */
+  /**
+   * `history()` with each message's stable id (`m<n>`) and, on a tool result whose outcome
+   * was recorded, `isError`. Never send these to a provider.
+   */
   historyWithIds(): StoredMessage[] {
-    return this.messages.map((m, i) => ({ ...structuredClone(m), id: this.ids[i] as string }));
+    return this.messages.map(
+      (m, i) => ({ ...structuredClone(m), ...this.meta[i] }) as StoredMessage,
+    );
   }
 
   /**
@@ -353,6 +362,9 @@ export class ChatSession {
     // so each loop `tool_call` event gets its call id; results arrive via afterToolCall.
     const pendingCalls: ToolCall[] = [];
     const results = new Map<string, ToolResult>();
+    // The loop emits one tool_call event right after pushing each tool message, in order, so
+    // this is the error flag of each tool message this turn adds.
+    const toolErrors: boolean[] = [];
     let unnamed = 0;
     const inner = this.opts.provider;
     const provider: Provider = {
@@ -402,6 +414,7 @@ export class ChatSession {
             emitLive({ type: "usage", inputTokens: u.inputTokens, outputTokens: u.outputTokens }),
           emit: (e: RunEvent) => {
             if (e.type !== "tool_call") return;
+            toolErrors.push(e.isError);
             const call = pendingCalls.shift();
             const callId = call?.id || `tool-${++unnamed}`;
             const result = call ? results.get(call.id) : undefined;
@@ -460,9 +473,18 @@ export class ChatSession {
     }
     this.sid ??= await this.opts.store.create(this.opts.repo);
     check(); // disposed (or aborted) while the file was created: store nothing
-    const ids = await this.opts.store.append(this.sid, added);
+    let t = 0;
+    const flags = added.map((m): { isError?: boolean } => {
+      if (m.role !== "tool") return {};
+      const isError = toolErrors[t++];
+      return isError === undefined ? {} : { isError };
+    });
+    const ids = await this.opts.store.append(
+      this.sid,
+      added.map((m, i) => ({ ...m, ...flags[i] })),
+    );
     this.messages = [...prior, ...added];
-    this.ids = [...this.ids, ...ids];
+    this.meta = [...this.meta, ...ids.map((id, i) => ({ id, ...flags[i] }))];
     return {
       text: redact(result.lastText),
       ...(proposal ? { proposal } : {}),

@@ -1,5 +1,16 @@
+import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readdir, realpath } from "node:fs/promises";
+import {
+  chmod,
+  link,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  realpath,
+  rename,
+  unlink,
+} from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { newRunId, RewireError, redact } from "@rewire/core";
 import type { ChatMessage } from "@rewire/providers";
@@ -22,6 +33,11 @@ const Message = z
   .object({
     /** The stable id the store wrote (`m<n>`); absent in files written before ids existed. */
     id: z.string().optional(),
+    /**
+     * Store-only, on tool results: whether the tool call failed. Absent in files written before
+     * it was recorded. Never sent to a provider.
+     */
+    isError: z.boolean().optional(),
     role: z.enum(["user", "assistant", "tool"]),
     content: z.string(),
     toolCalls: z
@@ -37,8 +53,15 @@ const Message = z
   })
   .strict();
 
-/** A stored message with its stable id (`m<n>`: its 0-based position among message lines). */
-export type StoredMessage = ChatMessage & { id: string };
+/**
+ * A stored message with its stable id (`m<n>`: its 0-based position among message lines) and,
+ * on a tool result whose outcome was recorded, `isError`. Both are store-only: strip them before a
+ * message reaches a provider.
+ */
+export type StoredMessage = ChatMessage & { id: string; isError?: boolean };
+
+/** What `append` takes: a chat message, optionally flagged as a failed tool result. */
+export type AppendMessage = ChatMessage & { isError?: boolean };
 
 /**
  * Lines that are not chat messages (Task 6 appends `{type:"compaction",...}`). They are skipped
@@ -46,10 +69,12 @@ export type StoredMessage = ChatMessage & { id: string };
  */
 const NON_MESSAGE_TYPES = new Set(["compaction"]);
 
-type Line = { kind: "message"; message: ChatMessage & { id?: string } } | { kind: "other" };
+type Line =
+  | { kind: "message"; message: ChatMessage & { id?: string; isError?: boolean } }
+  | { kind: "other" };
 
 /** Classify one JSONL line; undefined when it is neither a chat message nor a known record. */
-function parseLine(line: string): Line | "invalid_json" | undefined {
+function parseLine(line: string): Line | "invalid_json" | "unknown_type" | undefined {
   let json: unknown;
   try {
     json = JSON.parse(line);
@@ -58,11 +83,13 @@ function parseLine(line: string): Line | "invalid_json" | undefined {
   }
   if (json !== null && typeof json === "object" && !Array.isArray(json) && !("role" in json)) {
     const type = (json as { type?: unknown }).type;
-    return typeof type === "string" && NON_MESSAGE_TYPES.has(type) ? { kind: "other" } : undefined;
+    if (typeof type === "string")
+      return NON_MESSAGE_TYPES.has(type) ? { kind: "other" } : "unknown_type";
+    return undefined;
   }
   const m = Message.safeParse(json);
   return m.success
-    ? { kind: "message", message: m.data as ChatMessage & { id?: string } }
+    ? { kind: "message", message: m.data as ChatMessage & { id?: string; isError?: boolean } }
     : undefined;
 }
 
@@ -81,6 +108,7 @@ function parseSession(id: string, raw: string): StoredMessage[] {
       const parsed = parseLine(line);
       if (parsed === "invalid_json") throw corrupt(id, `line ${i + 1} is not valid JSON`);
       if (parsed === undefined) throw corrupt(id, `line ${i + 1} is not a chat message`);
+      if (parsed === "unknown_type") throw corrupt(id, `line ${i + 1} has an unknown line type`);
       if (parsed.kind !== "message") return;
       const expected = `m${out.length}`;
       const { id: stored, ...message } = parsed.message;
@@ -113,12 +141,89 @@ function redactDeep(v: unknown): unknown {
   return v;
 }
 
-const corrupt = (id: string, why: string): RewireError =>
-  new RewireError(
-    "session_corrupt",
-    `session ${id} is corrupt: ${why}`,
-    "start a new session; the file is kept as it is",
-  );
+const corrupt = (
+  id: string,
+  why: string,
+  hint = "start a new session; the file is kept as it is",
+): RewireError => new RewireError("session_corrupt", `session ${id} is corrupt: ${why}`, hint);
+
+/** The hint `append` gives: this session stores no more turns until the file is repaired. */
+const APPEND_CORRUPT_HINT =
+  "this session cannot store more turns: start a new session, or repair the file by removing its partial or malformed line (usually the last one)";
+
+const LOCK_STALE_MS = 30_000;
+const LOCK_WAIT_MS = 2_000;
+
+/**
+ * Take `<session>.jsonl.lock` (O_CREAT|O_EXCL|O_NOFOLLOW, 0600) so a count-and-write is never
+ * interleaved with another writer's, retrying with backoff for up to 2 s (then `session_locked`).
+ * A lock older than 30 s is stolen by an atomic rename to a unique name (only one renamer wins);
+ * a stolen lock that turns out to be fresh is put back. Same scheme as the skills trust store.
+ */
+async function acquireLock(lock: string): Promise<string> {
+  const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const fh = await open(lock, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+      try {
+        await fh.writeFile(token);
+      } finally {
+        await fh.close();
+      }
+      return token;
+    } catch (e) {
+      if (errno(e) === "ELOOP") throw unsafe(`${lock} is a symlink`);
+      if (errno(e) !== "EEXIST") throw e;
+    }
+    try {
+      if (Date.now() - (await lstat(lock)).mtimeMs > LOCK_STALE_MS) {
+        const stolen = `${lock}.stale-${token}`;
+        try {
+          await rename(lock, stolen);
+        } catch {
+          continue; // someone else stole it first
+        }
+        if (Date.now() - (await lstat(stolen)).mtimeMs > LOCK_STALE_MS) {
+          await unlink(stolen).catch(() => {});
+        } else {
+          // We raced a fresh holder and took its live lock: put it back (link fails if retaken).
+          await link(stolen, lock).catch(() => {});
+          await unlink(stolen).catch(() => {});
+        }
+        continue;
+      }
+    } catch {
+      continue; // the lock vanished: retry now
+    }
+    if (Date.now() > deadline) {
+      throw new RewireError(
+        "session_locked",
+        "the session file is locked by another writer",
+        "another rewire process is writing this session; wait and retry, or remove the .lock file if no other rewire is running",
+      );
+    }
+    await new Promise((r) =>
+      setTimeout(r, Math.min(200, 5 * 2 ** Math.min(attempt, 5)) * (0.5 + Math.random())),
+    );
+  }
+}
+
+/** Remove the lock only if it still carries our token (it may have been stolen as stale). */
+async function releaseLock(lock: string, token: string): Promise<void> {
+  try {
+    const fh = await open(lock, READ_FLAGS);
+    let held: string;
+    try {
+      held = await fh.readFile("utf8");
+    } finally {
+      await fh.close();
+    }
+    if (held === token) await unlink(lock);
+  } catch {
+    // already gone
+  }
+}
 
 const notFound = (id: string): RewireError =>
   new RewireError(
@@ -225,39 +330,55 @@ export class SessionStore {
    * on disk entirely or (on a failed write) not at all. Each line gets the next stable id
    * (`m<n>`, n = the number of message lines already in the file; any id the caller passed is
    * replaced). Returns the assigned ids. The count is taken from the file itself (cached by file
-   * size), so another store's writes are never given the same ids; a file whose last line is
-   * truncated or malformed is refused (`session_corrupt`) rather than extended.
+   * size) under a per-session lock file (`session_locked` after 2 s of contention), so two
+   * writers never assign the same ids; a file whose last line is truncated or malformed is
+   * refused (`session_corrupt`, with a repair hint) rather than extended. A tool message passed
+   * with a boolean `isError` is stored with it (store-only; `load` returns it, callers strip it).
    */
-  async append(id: string, msgs: ChatMessage | ChatMessage[]): Promise<string[]> {
+  async append(id: string, msgs: AppendMessage | AppendMessage[]): Promise<string[]> {
     const path = await this.path(id);
     const list = Array.isArray(msgs) ? msgs : [msgs];
     if (list.length === 0) return [];
-    const fh = await openFile(path, O_RDWR | O_APPEND | O_NOFOLLOW | O_NONBLOCK);
+    const lock = `${path}.lock`;
+    const token = await acquireLock(lock);
     try {
-      const st = await fh.stat();
-      if (!st.isFile()) throw unsafe(`${path} is not a regular file`);
-      let base: number;
-      const cached = this.counts.get(id);
-      if (cached !== undefined && cached.size === st.size) {
-        base = cached.count;
-      } else {
-        base = parseSession(id, await fh.readFile("utf8")).length;
+      const fh = await openFile(path, O_RDWR | O_APPEND | O_NOFOLLOW | O_NONBLOCK);
+      try {
+        const st = await fh.stat();
+        if (!st.isFile()) throw unsafe(`${path} is not a regular file`);
+        let base: number;
+        const cached = this.counts.get(id);
+        if (cached !== undefined && cached.size === st.size) {
+          base = cached.count;
+        } else {
+          try {
+            base = parseSession(id, await fh.readFile("utf8")).length;
+          } catch (e) {
+            if (e instanceof RewireError && e.code === "session_corrupt") {
+              throw new RewireError(e.code, e.message, APPEND_CORRUPT_HINT);
+            }
+            throw e;
+          }
+        }
+        const ids = list.map((_, i) => `m${base + i}`);
+        const lines = list
+          .map((m, i) => {
+            const { id: _id, isError, ...rest } = m as AppendMessage & { id?: unknown };
+            const flag = typeof isError === "boolean" && rest.role === "tool" ? { isError } : {};
+            return `${JSON.stringify({ id: ids[i], ...flag, ...(redactDeep(rest) as object) })}\n`;
+          })
+          .join("");
+        await fh.appendFile(lines, "utf8");
+        this.counts.set(id, {
+          size: st.size + Buffer.byteLength(lines, "utf8"),
+          count: base + list.length,
+        });
+        return ids;
+      } finally {
+        await fh.close();
       }
-      const ids = list.map((_, i) => `m${base + i}`);
-      const lines = list
-        .map((m, i) => {
-          const { id: _ignored, ...rest } = m as ChatMessage & { id?: unknown };
-          return `${JSON.stringify({ id: ids[i], ...(redactDeep(rest) as object) })}\n`;
-        })
-        .join("");
-      await fh.appendFile(lines, "utf8");
-      this.counts.set(id, {
-        size: st.size + Buffer.byteLength(lines, "utf8"),
-        count: base + list.length,
-      });
-      return ids;
     } finally {
-      await fh.close();
+      await releaseLock(lock, token);
     }
   }
 
@@ -351,7 +472,7 @@ async function titleOf(path: string): Promise<string> {
   for (const line of raw.split("\n")) {
     if (line === "") continue;
     const parsed = parseLine(line);
-    if (parsed === undefined || parsed === "invalid_json") return "(unreadable)";
+    if (parsed === undefined || typeof parsed === "string") return "(unreadable)";
     if (parsed.kind !== "message" || parsed.message.role !== "user") continue;
     const first = parsed.message.content.split("\n")[0]?.trim() ?? "";
     return first.length > TITLE_MAX ? `${first.slice(0, TITLE_MAX - 3)}...` : first || "(empty)";

@@ -348,6 +348,7 @@ Errors carry a stable code. The ones added with interactive mode and skills:
 | `trust_store_unreadable`          | `trusted-skills.json` is unreadable: repo skills are not loaded; the session opens. |
 | `trust_store_locked`              | Another rewire process holds the trust store lock.                                  |
 | `session_corrupt`                 | A stored session file is damaged.                                                   |
+| `session_locked`                  | Another rewire process is writing this session; retry shortly.                      |
 | `session_not_found`               | `/resume` named a session that is not stored.                                       |
 | `session_disposed`                | The session was closed and can't take more turns.                                   |
 | `session_store_unsafe`            | `.rewire/sessions/` is not a plain directory owned by you (for example a symlink).  |

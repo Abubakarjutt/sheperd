@@ -422,7 +422,7 @@ describe.skipIf(!sandboxAvailable())("ChatSession", () => {
     for (const m of plain) expect(Object.keys(m)).not.toContain("id");
     const withIds = session.historyWithIds();
     expect(withIds.map((m) => m.id)).toEqual(plain.map((_, i) => `m${i}`));
-    expect(withIds.map(({ id: _id, ...m }) => m)).toEqual(plain);
+    expect(withIds.map(({ id: _id, isError: _e, ...m }) => m)).toEqual(plain);
     const id = session.id() as string;
     expect((await store.load(id)).map((m) => m.id)).toEqual(withIds.map((m) => m.id));
 
@@ -440,6 +440,33 @@ describe.skipIf(!sandboxAvailable())("ChatSession", () => {
     expect(resumed.session.historyWithIds().map((m) => m.id)).toEqual(
       [...plain, 0, 0].map((_, i) => `m${i}`),
     );
+  });
+
+  test("tool outcomes are stored as isError beside the history, never in requests", async () => {
+    const repo = makeRepo();
+    const store = new SessionStore();
+    const p = new FauxProvider([
+      call("bash", { command: "exit 3" }),
+      call("bash", { command: "true" }),
+      text("done"),
+      text("again"),
+    ]);
+    const { session } = await setup(p, { repo, store });
+    await session.send("go");
+    const tools = session.historyWithIds().filter((m) => m.role === "tool");
+    expect(tools.map((m) => m.isError)).toEqual([true, false]);
+    const id = session.id() as string;
+    expect((await store.load(id)).filter((m) => m.role === "tool").map((m) => m.isError)).toEqual([
+      true,
+      false,
+    ]);
+    for (const m of session.history()) expect(Object.keys(m)).not.toContain("isError");
+    const resumed = await setup(p, { repo, store, sessionId: id, resume: true });
+    expect(resumed.session.historyWithIds()).toEqual(session.historyWithIds());
+    await resumed.session.send("more");
+    const sent = JSON.stringify(p.requests.at(-1)?.messages);
+    expect(sent).not.toContain("isError");
+    expect(sent).toBe(JSON.stringify([...session.history(), { role: "user", content: "more" }]));
   });
 
   test("a resumed history with a dangling tool call surfaces as session_corrupt", async () => {
