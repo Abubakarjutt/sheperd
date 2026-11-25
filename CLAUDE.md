@@ -48,7 +48,7 @@ The system tools the gates need at runtime are git, ripgrep, semgrep and gitleak
 
 ## Architecture
 
-Package dependency direction, from bottom to top: `core`, then `policy` and `providers`, then `sandbox`, `pack-typescript` and `loop`, then `gates` and `tools`, then `reviewers`, then `pipeline`, then `cli`.
+Package dependency direction, from bottom to top: `core`, then `policy` and `providers`, then `sandbox`, `pack-typescript`, `loop` and `skills`, then `gates` and `tools`, then `reviewers`, then `pipeline`, then `session`, then `tui`, then `cli`.
 
 - **`core`**: zod schemas (contract, criteria with `kind: change | preserve`, events), `RewireError(code, message, hint)`, run ids, secret redaction, and `fenceUntrusted()`.
   - Errors are identified by a stable snake_case `code` (e.g. `preserve_fails_now`, `ollama_request_dropped`). Tests and docs refer to codes, so treat them as API.
@@ -72,7 +72,15 @@ Package dependency direction, from bottom to top: `core`, then `policy` and `pro
 - **`policy`**: tighten-only layering: built-in, then org, then the repo's `.rewire/policy.toml`, then the run. Protected paths (policy, CI, lint configs) are never writable by any agent stage.
 - **`tools`**: the implementer agent's tools (read, write, edit, find, grep, bash), routed through the sandbox and policy.
 - **`reviewers`**: security, spec-compliance and silent-failure reviewers, plus a verifier that tries to refute findings. Findings must cite evidence.
-- **`cli`**: the `run` and `doctor` commands, plus wiring.
+- **`skills`**: discovers, validates, trusts, hashes and snapshots `SKILL.md` skills.
+  - User skills load automatically (`~/.claude/skills`, `$XDG_CONFIG_HOME/rewire/skills`). Repo skills need trust pinned to a sha256 in `$XDG_CONFIG_HOME/rewire/trusted-skills.json`.
+  - Skills reach only the chat, spec, test-writer and implementer. Reviewers and the verifier never get them (design decision #30).
+- **`session`**: the chat agent (`read`, `grep`, `find`, `bash` under the sandbox `chat` profile, no writes), session persistence in `.rewire/sessions/`, and the controller that runs one gated pipeline at a time.
+  - The chat model is the author model (`routing.spec`).
+- **`tui`**: the Ink app: transcript, run board, checkpoints and slash commands, rendered from the `RunEvent` stream. All displayed text goes through `sanitize`.
+  - `REWIRE_TUI_SELFCHECK=1` is an internal smoke-test switch.
+  - Faux-provider caveat: chat and spec share one faux turn queue when they use the same model name, so a script must list the chat turns and spec turns in the order they are consumed.
+- **`cli`**: the `run`, `doctor` and `chat` commands (bare `rewire` on a TTY opens the TUI), plus wiring.
   - Exit codes: 0 only when verified, 1 for usage or prerequisite errors, 2 when the run escalates, 130 on a forced quit.
   - `--headless` writes events to stdout and the summary to stderr.
 - **`bench`**: 20 trap tasks (`bench/tasks/<id>/{fixture,hidden-tests,task.md}`).
