@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { CommandMenu, menuItems, menuQuery } from "./command-menu.js";
 import { atToken, FilePicker, insertPath, rankFiles } from "./file-picker.js";
 import { fit } from "./fit.js";
-import { type InputAction, initialInput, reduceInput } from "./input-state.js";
+import { type InputAction, type InputState, initialInput, reduceInput } from "./input-state.js";
 import { Safe } from "./safe.js";
 import { theme } from "./theme.js";
 import { useColumns } from "./use-columns.js";
@@ -34,6 +34,11 @@ export type InputBoxProps = {
   files?: readonly string[];
   /** Called when an `@` token is typed, so the owner can load {@link files} (once per session). */
   onWantFiles?: () => void;
+  /**
+   * Whether the `/` menu and the `@` picker may open (default). False while the input takes a
+   * free-text answer (a clarification), where `/` and `@` are typed and submitted literally.
+   */
+  popups?: boolean;
   /** Told whether the `/` menu or the `@` picker is open (it then owns Esc). */
   onPopup?: (open: boolean) => void;
 };
@@ -52,13 +57,24 @@ type Popup =
   | { kind: "menu"; query: string; items: ReturnType<typeof menuItems> }
   | { kind: "picker"; token: NonNullable<ReturnType<typeof atToken>>; paths: string[] };
 
-function popupFor(
-  value: string,
-  dismissed: string | undefined,
-  inRun: boolean,
-  files: readonly string[],
-): Popup | undefined {
-  if (dismissed === value) return undefined; // Esc closed it; the next edit may reopen it
+type PopupContext = {
+  /** Popups are allowed in this input at all. */
+  enabled: boolean;
+  /** The value Esc (or a completion that needs nothing more) closed the popup for. */
+  dismissed: string | undefined;
+  inRun: boolean;
+  files: readonly string[];
+};
+
+/**
+ * The popup to show for `s`, if any. None while popups are off, while a recalled history entry
+ * is unedited (so ↑/↓ keep browsing past `/help`), or for the value the popup was closed on.
+ */
+function popupFor(s: InputState, ctx: PopupContext): Popup | undefined {
+  if (!ctx.enabled || s.cursor !== undefined) return undefined;
+  if (s.value === ctx.dismissed) return undefined; // the next edit may reopen it
+  const { inRun, files } = ctx;
+  const value = s.value;
   const query = menuQuery(value);
   if (query !== undefined) {
     const items = menuItems(query, inRun);
@@ -96,6 +112,7 @@ export function InputBox({
   inRun = false,
   files = [],
   onWantFiles,
+  popups = true,
   onPopup,
 }: InputBoxProps) {
   const [state, setState] = useState(initialInput);
@@ -141,8 +158,8 @@ export function InputBox({
   };
 
   const live = !busy && !disabled;
-  const popup = live ? popupFor(state.value, dismissed, inRun, files) : undefined;
-  const wantsFiles = live && atToken(state.value) !== undefined;
+  const popup = live ? popupFor(state, { enabled: popups, dismissed, inRun, files }) : undefined;
+  const wantsFiles = live && popups && atToken(state.value) !== undefined;
   useEffect(() => {
     if (wantsFiles) onWantFiles?.();
   }, [wantsFiles, onWantFiles]);
@@ -154,7 +171,12 @@ export function InputBox({
   /** Keys an open popup takes. True when the key was consumed. */
   const popupKey = (key: PopupKeys): boolean => {
     const value = ref.current.value;
-    const p = popupFor(value, dismissedRef.current, inRun, filesRef.current);
+    const p = popupFor(ref.current, {
+      enabled: popups,
+      dismissed: dismissedRef.current,
+      inRun,
+      files: filesRef.current,
+    });
     if (!p) return false;
     const count = p.kind === "menu" ? p.items.length : p.paths.length;
     const sel = Math.min(selectedRef.current, count - 1);
@@ -181,8 +203,11 @@ export function InputBox({
       apply({ type: "submit" });
       return true;
     }
-    const space = key.tab || c.argsRequired === true;
-    apply({ type: "set", value: `/${c.name}${space ? " " : ""}` });
+    // Completing: a command that takes arguments gets the space (which closes the menu); one that
+    // takes none is complete, so the menu closes on it and the next Enter sends it.
+    const next = `/${c.name}${key.tab || c.args !== undefined ? " " : ""}`;
+    apply({ type: "set", value: next });
+    if (!next.endsWith(" ")) setDismissed(next);
     return true;
   };
 

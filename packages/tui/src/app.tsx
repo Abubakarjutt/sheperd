@@ -636,6 +636,8 @@ export function App(props: AppProps) {
         disabled={inputOff || live !== undefined}
         // A clarification answer is free text: `?` types there.
         helpKey={clarify === undefined}
+        // ...and so do `/` and `@`: no command menu or file picker there.
+        popups={clarify === undefined}
         onSubmit={submit}
         inRun={run !== undefined}
         files={files}

@@ -1,8 +1,8 @@
 // Task 6: `listRepoFiles`, the host-side repo listing behind the `@` picker.
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { listRepoFiles, MAX_REPO_FILES } from "../src/files.js";
 
@@ -38,8 +38,42 @@ describe("listRepoFiles", () => {
   it("gives an empty list, with no throw, outside a git repo", async () => {
     const d = await tmp();
     await writeFile(join(d, "a.ts"), "x");
-    await expect(listRepoFiles(d)).resolves.toEqual([]);
-    await expect(listRepoFiles(join(d, "does-not-exist"))).resolves.toEqual([]);
+    // Git must not find a work tree above the temp dir, wherever TMPDIR is (test-only setting).
+    const before = process.env.GIT_CEILING_DIRECTORIES;
+    process.env.GIT_CEILING_DIRECTORIES = dirname(d);
+    try {
+      await expect(listRepoFiles(d)).resolves.toEqual([]);
+      await expect(listRepoFiles(join(d, "does-not-exist"))).resolves.toEqual([]);
+    } finally {
+      if (before === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+      else process.env.GIT_CEILING_DIRECTORIES = before;
+    }
+  });
+
+  it("stops reading, and kills git, at the cap on an endless listing", async () => {
+    const d = await tmp();
+    const git = join(d, "fake-git");
+    // An ls-files that never ends: f0\0f1\0... Only the kill at 5000 can stop it in time.
+    await writeFile(
+      git,
+      "#!/bin/sh\nexec perl -e 'for ($i = 0; ; $i++) { print \"dir/f$i.ts\\0\" }'\n",
+    );
+    await chmod(git, 0o755);
+    const t0 = Date.now();
+    const files = await listRepoFiles(d, { git, timeoutMs: 10_000 });
+    expect(files).toHaveLength(5000);
+    expect(files[0]).toBe("dir/f0.ts");
+    expect(files[4999]).toBe("dir/f4999.ts");
+    expect(Date.now() - t0).toBeLessThan(5000);
+  });
+
+  it("gives an empty list when git outlives the timeout or is missing", async () => {
+    const d = await tmp();
+    const git = join(d, "slow-git");
+    await writeFile(git, "#!/bin/sh\nexec sleep 30\n");
+    await chmod(git, 0o755);
+    await expect(listRepoFiles(d, { git, timeoutMs: 200 })).resolves.toEqual([]);
+    await expect(listRepoFiles(d, { git: join(d, "no-such-git") })).resolves.toEqual([]);
   });
 
   it(`caps the list at ${5000} paths`, async () => {

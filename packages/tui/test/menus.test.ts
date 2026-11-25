@@ -106,6 +106,8 @@ describe("file picker", () => {
     if (!t) throw new Error("no token");
     expect(insertPath(v, t, "src/math.ts")).toBe("see @src/math.ts ");
     expect(insertPath(v, t, "my dir/a b.ts")).toBe('see @"my dir/a b.ts" ');
+    expect(insertPath(v, t, 'say "hi".ts')).toBe('see @"say \\"hi\\".ts" ');
+    expect(insertPath(v, t, "a\\b.ts")).toBe('see @"a\\\\b.ts" ');
   });
 
   it("splits a path into its directory and basename", () => {

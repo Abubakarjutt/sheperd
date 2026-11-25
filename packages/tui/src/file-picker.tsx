@@ -59,9 +59,12 @@ export function rankFiles(files: readonly string[], query: string, limit = POPUP
   return scored.slice(0, limit).map((s) => s.path);
 }
 
-/** `value` with the `@` token replaced by `@<path> ` (quoted when the path holds whitespace). */
+/**
+ * `value` with the `@` token replaced by `@<path> `. A path holding whitespace, `"` or `\\` is
+ * quoted, with `"` and `\\` backslash-escaped, so the reference is unambiguous.
+ */
 export function insertPath(value: string, token: AtToken, path: string): string {
-  const ref = /\s/.test(path) ? `"${path}"` : path;
+  const ref = /[\s"\\]/.test(path) ? `"${path.replace(/[\\"]/g, "\\$&")}"` : path;
   return `${value.slice(0, token.start)}@${ref} `;
 }
 

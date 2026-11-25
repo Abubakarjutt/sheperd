@@ -1,5 +1,11 @@
 // Task 6 (Review Focus 5): the `/` command menu and the `@` file picker inside the App's input.
-import type { ChatSession, ChatTurn, RunController, RunHandle } from "@rewire/session";
+import type {
+  ChatSession,
+  ChatTurn,
+  PendingPrompt,
+  RunController,
+  RunHandle,
+} from "@rewire/session";
 import { render } from "ink-testing-library";
 import stringWidth from "string-width";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -32,6 +38,30 @@ const waitInput = (v: View, text: string) =>
 /** The frame from the input box down: the box, the menu or picker, and the status line. */
 const belowInput = (f: string): string => f.slice(f.lastIndexOf("╭"));
 const settle = () => new Promise((r) => setTimeout(r, 60));
+
+/** A run that never finishes on its own; `pending` is read on every poll. */
+function fakeRun(pending: () => PendingPrompt | undefined = () => undefined) {
+  let finish: (o: unknown) => void = () => {};
+  const done = new Promise((r) => {
+    finish = r;
+  });
+  const answer = vi.fn((_p: PendingPrompt, _v: unknown) => true);
+  const run = {
+    events: {
+      [Symbol.asyncIterator]: () => ({
+        next: async () => {
+          await done;
+          return { done: true, value: undefined };
+        },
+      }),
+    },
+    pending,
+    answer,
+    abort: () => {},
+    done,
+  } as unknown as RunHandle;
+  return { run, answer, finish };
+}
 
 const views: View[] = [];
 afterEach(() => {
@@ -269,5 +299,73 @@ describe("Esc priority", () => {
     v.stdin.write(ESC);
     await waitFor(v, () => onPopup.mock.lastCall?.[0] === false, "picker closed reported");
     expect(onSubmit).not.toHaveBeenCalled();
+  });
+});
+
+describe("fix round 1", () => {
+  it("a clarify answer never opens the menu or the picker: / and @ are typed and sent as is", async () => {
+    const prompt: PendingPrompt = { kind: "clarify", questions: ["Which file?"] };
+    const { run, answer, finish } = fakeRun(() => prompt);
+    const { v, listFiles } = mount({ run });
+    await waitText(v, "Which file?");
+    v.stdin.write("/he");
+    await waitInput(v, "/he");
+    v.stdin.write(TAB);
+    await settle();
+    let f = belowInput(plain(v.lastFrame()));
+    expect(inputText(f)).toBe("/he");
+    expect(f).not.toContain("this list");
+    for (let i = 0; i < 3; i++) v.stdin.write("\x7f");
+    v.stdin.write("@RE");
+    await waitInput(v, "@RE");
+    v.stdin.write(TAB);
+    await settle();
+    f = belowInput(plain(v.lastFrame()));
+    expect(inputText(f)).toBe("@RE");
+    expect(f).not.toContain("README.md");
+    expect(listFiles).not.toHaveBeenCalled();
+    v.stdin.write("\r");
+    await waitFor(v, () => answer.mock.calls.length === 1, "answered");
+    expect(answer).toHaveBeenCalledWith(prompt, ["@RE"]);
+    finish({});
+  });
+
+  it("↑/↓ keep browsing history through slash entries; an edit reopens the menu", async () => {
+    const { v } = mount();
+    for (const line of ["first", "/help", "/model"]) {
+      v.stdin.write(line);
+      await waitInput(v, line);
+      v.stdin.write("\r");
+      await waitFor(v, (f) => inputText(f) === undefined, `sent ${line}`);
+    }
+    v.stdin.write(UP);
+    let f = await waitInput(v, "/model");
+    expect(belowInput(f)).not.toContain("❯");
+    v.stdin.write(UP);
+    await waitInput(v, "/help");
+    v.stdin.write(UP);
+    await waitInput(v, "first");
+    v.stdin.write(DOWN);
+    f = await waitInput(v, "/help");
+    expect(belowInput(f)).not.toContain("❯");
+    v.stdin.write("\x7f"); // an edit: `/hel` opens the menu again
+    await waitText(v, "❯ /help");
+  });
+
+  it("Enter on a partial name: a command with args gets the space; one without closes the menu", async () => {
+    const { v, sent } = mount();
+    v.stdin.write("/che");
+    await waitText(v, "❯ /checkpoints");
+    v.stdin.write("\r");
+    await waitInput(v, "/checkpoints ");
+    for (let i = 0; i < 13; i++) v.stdin.write("\x7f");
+    v.stdin.write("/mo");
+    await waitText(v, "❯ /model");
+    v.stdin.write("\r");
+    const f = await waitInput(v, "/model");
+    expect(belowInput(f)).not.toContain("❯");
+    v.stdin.write("\r");
+    await waitText(v, "model routing is not available here");
+    expect(sent).toEqual([]);
   });
 });
