@@ -11,6 +11,8 @@ export const SESSIONS_DIR = join(".rewire", "sessions");
 /** Session ids are run-id shaped (`YYYYMMDD-HHMMSS-<6 hex>`); nothing else is ever a path. */
 const ID = /^\d{8}-\d{6}-[0-9a-f]{6}$/;
 const TITLE_MAX = 80;
+/** `/resume` listings read at most this much of each session file for its title (M8). */
+const TITLE_READ_MAX = 64 * 1024;
 
 const { O_RDONLY, O_WRONLY, O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK } = constants;
 /** Never follow a final symlink; never block on a FIFO planted under a session name. */
@@ -243,13 +245,33 @@ async function readSession(path: string): Promise<string> {
   }
 }
 
-async function titleOf(path: string): Promise<string> {
-  let raw: string;
+/**
+ * The first `max` bytes of a session file, cut back to its last complete line; `undefined` when
+ * the file has bytes but no complete line within them.
+ */
+async function readHead(path: string, max: number): Promise<string | undefined> {
+  const fh = await openFile(path, READ_FLAGS);
   try {
-    raw = await readSession(path);
+    if (!(await fh.stat()).isFile()) throw unsafe(`${path} is not a regular file`);
+    const buf = Buffer.alloc(max);
+    const { bytesRead } = await fh.read(buf, 0, max, 0);
+    const end = buf.subarray(0, bytesRead).lastIndexOf(0x0a);
+    if (end < 0) return bytesRead === 0 ? "" : undefined;
+    return buf.subarray(0, end).toString("utf8");
+  } finally {
+    await fh.close();
+  }
+}
+
+async function titleOf(path: string): Promise<string> {
+  let raw: string | undefined;
+  try {
+    raw = await readHead(path, TITLE_READ_MAX);
   } catch {
     return "(unreadable)";
   }
+  // No complete line within the read: a first message too long to title.
+  if (raw === undefined) return "(untitled)";
   for (const line of raw.split("\n")) {
     if (line === "") continue;
     let m: unknown;

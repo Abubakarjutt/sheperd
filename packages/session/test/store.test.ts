@@ -97,6 +97,22 @@ test("list orders sessions newest first, titled by the first user line", async (
   expect(listed[2]?.title).toBe("second session");
 });
 
+test("list reads at most 64 KiB per session for its title (M8)", async () => {
+  const repo = tempRepo();
+  const store = new SessionStore();
+  const big = await store.create(repo);
+  // A first line longer than the title read is not parsed: it lists as (untitled).
+  await store.append(big, { role: "user", content: "x".repeat(70 * 1024) });
+  const ok = await store.create(repo);
+  await store.append(ok, [
+    { role: "user", content: "short title" },
+    { role: "assistant", content: "y".repeat(200 * 1024) },
+  ]);
+  const listed = await new SessionStore().list(repo);
+  expect(listed.find((s) => s.id === big)?.title).toBe("(untitled)");
+  expect(listed.find((s) => s.id === ok)?.title).toBe("short title");
+});
+
 test("list on a repo with no sessions is empty", async () => {
   expect(await new SessionStore().list(tempRepo())).toEqual([]);
 });
