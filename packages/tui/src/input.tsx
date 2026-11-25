@@ -38,7 +38,7 @@ export function InputBox({ busy, disabled = false, onSubmit }: InputBoxProps) {
   if (busy) {
     return (
       <Box>
-        <Text color={theme.busy}>… working</Text>
+        <Text color={theme.busy}>… working (Ctrl-C to interrupt)</Text>
       </Box>
     );
   }

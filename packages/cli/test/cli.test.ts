@@ -460,6 +460,21 @@ describe("process", () => {
     expect(r.stderr).not.toMatch(/\n\s+at /);
   });
 
+  test("no arguments prints usage and exits 1", async () => {
+    // Piped stdio: no TTY, so bare `rewire` never opens the TUI.
+    const r = await exec([], cleanEnv());
+    expect(r.code).toBe(1);
+    expect(r.stdout).toMatch(/usage:/);
+    expect(r.stdout).toContain("rewire chat");
+  });
+
+  test("rewire chat without a TTY exits 1 with tui_requires_tty", async () => {
+    const r = await exec(["chat"], cleanEnv());
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("tui_requires_tty");
+    expect(r.stderr).not.toMatch(/\n\s+at /);
+  });
+
   test("task-file must be a regular file and is size-capped", async () => {
     const d = tmp();
     const dirRun = await exec(["run", "--task-file", d], cleanEnv());

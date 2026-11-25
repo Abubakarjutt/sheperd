@@ -19,3 +19,15 @@ export function installSigint(deps: SigintDeps): void {
     }
   });
 }
+
+/**
+ * Installs `handler` on the process's SIGINT and returns its uninstaller. The interactive TUI
+ * feeds it to its Ctrl-C state machine (`interactive.ts`) alongside Ink's Ctrl-C key: while Ink
+ * holds the terminal in raw mode, Ctrl-C arrives as a key, not as SIGINT.
+ */
+export function onProcessSigint(handler: () => void): () => void {
+  process.on("SIGINT", handler);
+  return () => {
+    process.off("SIGINT", handler);
+  };
+}

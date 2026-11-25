@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
 import { runDoctor } from "./doctor.js";
+import { isInteractive, tuiRequiresTty } from "./interactive.js";
 import { effectivePlatform, isSupported, PLATFORM_MESSAGE } from "./platform.js";
 import { formatError, runCommand } from "./run.js";
 import { oneLine } from "./sanitize.js";
-import { installSigint } from "./sigint.js";
+import { installSigint, onProcessSigint } from "./sigint.js";
 
 const USAGE = `usage:
+  rewire                      (on a terminal: the interactive session)
+  rewire chat [--repo <path>] [--models <file>]
   rewire run <task> [--repo <path>] [--models <file>] [--headless]
   rewire run --task-file <path> [--repo <path>] [--models <file>] [--headless]
   rewire doctor [--models <file>]
@@ -24,10 +27,12 @@ async function main(argv: string[]): Promise<number> {
     return 1;
   }
   const [command, ...rest] = argv;
+  if (command === undefined && isInteractive(process)) return await chat([]);
   if (command === undefined || command === "--help" || command === "-h" || command === "help") {
     process.stdout.write(USAGE);
     return command === undefined ? 1 : 0;
   }
+  if (command === "chat") return await chat(rest);
   if (command !== "run" && command !== "doctor") {
     process.stderr.write(`unknown command: ${JSON.stringify(command.slice(0, 40))}\n${USAGE}`);
     return 1;
@@ -79,6 +84,42 @@ async function main(argv: string[]): Promise<number> {
       },
       ac.signal,
       () => ac.abort(),
+    );
+  } catch (e) {
+    if (e instanceof Error && (e as NodeJS.ErrnoException).code?.startsWith("ERR_PARSE_ARGS")) {
+      process.stderr.write(`${oneLine(e.message, 300)}\n${USAGE}`);
+      return 1;
+    }
+    process.stderr.write(`${formatError(e)}\n`);
+    return 1;
+  }
+}
+
+/** `rewire chat` (and bare `rewire` on a TTY). The TUI modules load only on this path. */
+async function chat(args: string[]): Promise<number> {
+  try {
+    const { values, positionals } = parseArgs({
+      args,
+      allowPositionals: true,
+      options: { repo: { type: "string" }, models: { type: "string" } },
+    });
+    if (positionals.length > 0) {
+      process.stderr.write(`usage: rewire chat takes no task; type it in the session\n${USAGE}`);
+      return 1;
+    }
+    if (!isInteractive(process)) throw tuiRequiresTty();
+    const { chatCommand } = await import("./tui.js");
+    return await chatCommand(
+      { repo: values.repo, models: values.models },
+      {
+        stdin: process.stdin,
+        stdout: process.stdout,
+        stderr: process.stderr,
+        env: process.env,
+        cwd: process.cwd(),
+        onSigint: onProcessSigint,
+        exit: (c) => process.exit(c),
+      },
     );
   } catch (e) {
     if (e instanceof Error && (e as NodeJS.ErrnoException).code?.startsWith("ERR_PARSE_ARGS")) {

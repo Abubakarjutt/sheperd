@@ -51,9 +51,25 @@ export type SkillsInfo = {
   trustFile: string;
 };
 
+/**
+ * What Ctrl-C can interrupt, handed out by `bindInterrupt` (the CLI's Ctrl-C state machine reads
+ * it). Backed by refs, so it stays valid for cleanup after the app unmounts.
+ */
+export type InterruptTarget = {
+  /** `run` while a gated run is active, `turn` while a chat turn is in flight, else `idle`. */
+  activity(): "run" | "turn" | "idle";
+  /** Abort the active run (no-op without one); it ends with an interrupted report. */
+  abortRun(): void;
+  /** Abort the in-flight chat turn (no-op without one). */
+  abortTurn(): void;
+  /** The active run, if any. */
+  run(): RunHandle | undefined;
+};
+
 export type AppProps = {
   session: ChatSession;
-  runController: RunController;
+  /** Only `start` is used: the CLI may hand in a facade over several controllers. */
+  runController: Pick<RunController, "start">;
   config: AppConfig;
   /** A run already in progress (tests); `/run` and accepted proposals set it from then on. */
   run?: RunHandle;
@@ -63,13 +79,16 @@ export type AppProps = {
   onExit?: (code: number) => void;
   /** For `/clear` and `/resume`. */
   sessions?: SessionFactory;
-  skills?: SkillsInfo;
+  /** A getter is re-read on every use, so a `/clear` that re-resolves the skills is reflected. */
+  skills?: SkillsInfo | (() => SkillsInfo | undefined);
   /** The `rewire doctor` output, for `/doctor` (injected: the CLI depends on this package). */
   doctor?: () => Promise<string>;
   /** The model routing, for `/model`. */
   routing?: string | (() => string);
   /** Initial checkpoints (default contract and tests). */
   checkpoints?: ReadonlySet<CheckpointKind>;
+  /** Hands out the {@link InterruptTarget} once, on mount. */
+  bindInterrupt?: (target: InterruptTarget) => void;
 };
 
 const HIDDEN_NOTES = new Set([PROPOSAL_NOTE, TURN_LIMIT_NOTE]);
@@ -128,7 +147,14 @@ function allowedInRun(c: Command): boolean {
 type Clarify = { prompt: Extract<PendingPrompt, { kind: "clarify" }>; answers: string[] };
 
 export function App(props: AppProps) {
-  const { subscribe, runController, sessions, skills, doctor, routing, onExit } = props;
+  const { subscribe, runController, sessions, doctor, routing, onExit, bindInterrupt } = props;
+  const skillsProp = props.skills;
+  const skillsNow = useCallback(
+    (): SkillsInfo | undefined => (typeof skillsProp === "function" ? skillsProp() : skillsProp),
+    [skillsProp],
+  );
+  /** The in-flight chat turn's abort, set while `send` runs. */
+  const turnAbort = useRef<AbortController | undefined>(undefined);
   const sessionRef = useRef(props.session);
   const [entries, setEntries] = useState<TranscriptEntry[]>(() => historyEntries(props.session));
   const [busy, setBusy] = useState(false);
@@ -154,6 +180,16 @@ export function App(props: AppProps) {
   );
   const [trustOpen, setTrustOpen] = useState(false);
   const [trustedLater, setTrustedLater] = useState(false);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: bound once; the target reads refs
+  useEffect(() => {
+    bindInterrupt?.({
+      activity: () => (runRef.current ? "run" : turnAbort.current ? "turn" : "idle"),
+      abortRun: () => runRef.current?.abort(),
+      abortTurn: () => turnAbort.current?.abort(),
+      run: () => runRef.current,
+    });
+  }, []);
 
   // A run handed in later by the parent replaces the current one.
   useEffect(() => {
@@ -205,8 +241,10 @@ export function App(props: AppProps) {
   const sendChat = useCallback(
     (text: string) =>
       exclusive(async () => {
+        const ac = new AbortController();
+        turnAbort.current = ac;
         try {
-          const turn = await sessionRef.current.send(text);
+          const turn = await sessionRef.current.send(text, ac.signal);
           if (turn.text.trim() !== "") add({ kind: "assistant", text: turn.text });
           if (turn.proposal) setProposal(turn.proposal.task);
           else if (turn.endedBy === "turn_limit") {
@@ -214,6 +252,8 @@ export function App(props: AppProps) {
           }
         } catch (err) {
           add(errorEntry(err));
+        } finally {
+          if (turnAbort.current === ac) turnAbort.current = undefined;
         }
       }),
     [exclusive, add, note],
@@ -241,6 +281,8 @@ export function App(props: AppProps) {
           const old = sessionRef.current;
           sessionRef.current = next;
           setEntries(entriesOf(next));
+          // The new session re-resolved the skills: a trust given earlier is now in effect.
+          setTrustedLater(false);
           await old.dispose();
         } catch (err) {
           add(errorEntry(err));
@@ -285,6 +327,7 @@ export function App(props: AppProps) {
         case "run":
           return startRun(c.task);
         case "skills": {
+          const skills = skillsNow();
           note(skillsText(skills, trustedLater));
           if (!runRef.current && skills && skills.pendingRepo.length > 0 && !trustedLater)
             setTrustOpen(true);
@@ -326,7 +369,7 @@ export function App(props: AppProps) {
     },
     [
       startRun,
-      skills,
+      skillsNow,
       trustedLater,
       checkpoints,
       routing,
@@ -401,6 +444,7 @@ export function App(props: AppProps) {
     [note],
   );
 
+  const trustSkills = trustOpen ? skillsNow() : undefined;
   const inputOff =
     proposal !== undefined || trustOpen || (run !== undefined && pending?.kind === "checkpoint");
 
@@ -412,12 +456,12 @@ export function App(props: AppProps) {
         <ClarifyPanel questions={clarify.prompt.questions} index={clarify.answers.length} />
       ) : null}
       {proposal !== undefined ? <ProposalCard task={proposal} onAnswer={onProposal} /> : null}
-      {trustOpen && skills ? (
+      {trustOpen && trustSkills ? (
         <TrustPrompt
-          pending={skills.pendingRepo}
-          found={skills.found}
-          repo={skills.repo}
-          trustFile={skills.trustFile}
+          pending={trustSkills.pendingRepo}
+          found={trustSkills.found}
+          repo={trustSkills.repo}
+          trustFile={trustSkills.trustFile}
           onDone={onTrust}
         />
       ) : null}
