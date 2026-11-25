@@ -1,4 +1,4 @@
-import { MAX_REVISIONS, type RunEvent } from "@rewire/core";
+import { MAX_REVISIONS, type RunEvent, redact } from "@rewire/core";
 import type { PendingPrompt, RunHandle } from "@rewire/session";
 import { Box } from "ink";
 import { useEffect, useRef, useState } from "react";
@@ -12,12 +12,17 @@ import {
   withCheckpoint,
 } from "./board.js";
 import { CheckpointPanel, type CheckpointPrompt } from "./checkpoint.js";
-import { fit } from "./fit.js";
-import { Safe } from "./safe.js";
+import { sanitize } from "./sanitize.js";
+import { SPINNER_GLYPHS, SPINNER_TICK_MS } from "./spinner.js";
+import { Card, cardInner, cutStyled, type Styled, StyledLine } from "./styled.js";
 import { theme } from "./theme.js";
 import { useColumns } from "./use-columns.js";
 
-const GLYPH: Record<StageStatus, string> = { pending: "○", running: "◐", done: "✓", failed: "✗" };
+const GLYPH: Record<Exclude<StageStatus, "running">, string> = {
+  pending: "○",
+  done: "✓",
+  failed: "✗",
+};
 const COLOR: Record<StageStatus, string | undefined> = {
   pending: theme.dim,
   running: theme.busy,
@@ -25,25 +30,41 @@ const COLOR: Record<StageStatus, string | undefined> = {
   failed: theme.error,
 };
 
-/** The stage board: one line per stage, each cut to the terminal width. */
+/** Untrusted detail text: sanitized, redacted, then folded onto one line. */
+const oneLine = (s: string): string => redact(sanitize(s)).replace(/[\n\t]+/g, " ");
+
+/**
+ * The stage board, in a round-bordered card: one line per stage (a status glyph, with a spinner
+ * while running, the stage name and its dim detail), each cut to the terminal width.
+ */
 export function Board({ state }: { state: BoardState }) {
   const cols = useColumns();
+  const inner = cardInner(cols);
   const label = Math.max(...STAGES.map((s) => s.length));
+  const running = STAGES.some((s) => state.rows[s].status === "running");
+  const [frame, setFrame] = useState(0);
+  useEffect(() => {
+    if (!running) return;
+    const t = setInterval(() => setFrame((f) => (f + 1) % SPINNER_GLYPHS.length), SPINNER_TICK_MS);
+    return () => clearInterval(t);
+  }, [running]);
   return (
-    <Box flexDirection="column">
+    <Card color={theme.border} cols={cols}>
       {STAGES.map((name) => {
         const r = state.rows[name];
-        const line = `${GLYPH[r.status]} ${name.padEnd(label)}${r.detail ? `  ${r.detail}` : ""}`;
-        return (
-          <Safe key={name} wrap="truncate" color={COLOR[r.status]}>
-            {fit(line, cols)}
-          </Safe>
-        );
+        const glyph =
+          r.status === "running" ? (SPINNER_GLYPHS[frame] ?? SPINNER_GLYPHS[0]) : GLYPH[r.status];
+        const segs: Styled[] = [
+          { text: glyph, color: COLOR[r.status] },
+          { text: ` ${name.padEnd(label)}`, ...(r.status === "pending" ? { dim: true } : {}) },
+        ];
+        if (r.detail) segs.push({ text: `  ${oneLine(r.detail)}`, dim: true });
+        return <StyledLine key={name} segs={cutStyled(segs, inner)} />;
       })}
       {state.ended === "escalated" ? (
-        <Safe color={theme.error}>{fit("run escalated", cols)}</Safe>
+        <StyledLine segs={cutStyled([{ text: "run escalated", color: theme.error }], inner)} />
       ) : null}
-    </Box>
+    </Card>
   );
 }
 

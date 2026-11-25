@@ -1,10 +1,9 @@
-import { CHECKPOINT_NOTE_MAX, redact } from "@rewire/core";
+import { CHECKPOINT_NOTE_MAX } from "@rewire/core";
 import type { PendingPrompt, RunHandle } from "@rewire/session";
-import { Box, useInput } from "ink";
-import { type ReactElement, useRef, useState } from "react";
-import { fit } from "./fit.js";
-import { Safe } from "./safe.js";
-import { sanitize } from "./sanitize.js";
+import { useInput } from "ink";
+import { type ReactElement, type ReactNode, useMemo, useRef, useState } from "react";
+import { cleanView, DiffView, TestsView } from "./diff-view.js";
+import { Card, cardInner, cutStyled, type Styled, StyledLine } from "./styled.js";
 import { theme } from "./theme.js";
 import { useColumns, useRows } from "./use-columns.js";
 
@@ -14,11 +13,14 @@ export const NOTE_MAX = CHECKPOINT_NOTE_MAX;
 const LIMIT = "revision limit reached; [a]pprove or [s]top";
 /** Shown when a prompt was answered or replaced before this key arrived. */
 export const STALE_PROMPT = "that prompt is no longer active";
-/** Content shown by `[v]iew` and the diff are cut here before processing; sanitize copes with a split escape. */
-const MAX_TEXT = 200_000;
+/**
+ * Rows a `[v]iew` leaves for the rest of the screen: the board (8), the card's border, title and
+ * key line (4), the view's footer, a message line and the status line.
+ */
+const VIEW_RESERVED = 16;
 
-/** Untrusted text made safe for display: sanitized first, then redacted. */
-const clean = (s: string): string => redact(sanitize(s.slice(0, MAX_TEXT)));
+/** Untrusted text made safe for display: capped, sanitized, then redacted. */
+const clean = cleanView;
 
 export type DiffStat = {
   files: Array<{ path: string; added: number; removed: number; binary: boolean }>;
@@ -77,6 +79,11 @@ export function CheckpointPanel({
   const [message, setMessage] = useState<string | undefined>();
   const modeRef = useRef<Mode>(mode);
   const cp = prompt.checkpoint;
+  // Cleaning a 200 KB diff is not free: once per prompt, not on every key.
+  const commitStat = useMemo(
+    () => (cp.kind === "commit" ? diffStat(clean(cp.diff)) : undefined),
+    [cp],
+  );
 
   const setM = (m: Mode): void => {
     modeRef.current = m;
@@ -120,69 +127,131 @@ export function CheckpointPanel({
     } else if (k === "v" && cp.kind !== "contract") setViewing((v) => !v);
   });
 
-  const line = (
-    text: string,
-    props: { color?: string; bold?: boolean; dimColor?: boolean } = {},
-  ) => (
-    <Safe wrap="truncate" {...props}>
-      {fit(clean(text), cols)}
-    </Safe>
-  );
+  const inner = cardInner(cols);
   const out: ReactElement[] = [];
-  const add = (key: string, el: ReactElement): void => {
-    out.push(<Box key={key}>{el}</Box>);
+  /** One card line of styled runs, cut to the card's content width. */
+  const add = (key: string, segs: Styled[]): void => {
+    out.push(<StyledLine key={key} segs={cutStyled(segs, inner)} />);
   };
-  /** `[v]iew`: already-cleaned lines, capped to what fits on screen. */
-  const view = (lines: string[], more: string): void => {
-    const budget = Math.max(3, Math.min(20, rows - 10));
-    lines.slice(0, budget).forEach((l, i) => {
-      add(`v${i}`, line(l, { dimColor: true }));
-    });
-    if (lines.length > budget) add("vm", line(more, { dimColor: true }));
-  };
+  /** One cleaned, flattened line of untrusted text. */
+  const one = (s: string): string => clean(s).replace(/[\n\t]+/g, " ");
+  const hints = (keys: Array<[string, string]>): Styled[] =>
+    keys.flatMap(([k, word], i) => [
+      ...(i > 0 ? [{ text: " · ", dim: true }] : []),
+      { text: k, bold: true, color: theme.user },
+      { text: ` ${word}`, dim: true },
+    ]);
+  const isCurrent = (): boolean => run.pending() === prompt;
+  const viewRows = Math.max(3, rows - VIEW_RESERVED);
+  const closeView = (): void => setViewing(false);
+  let color: string;
+  let body: ReactNode = null;
 
   if (cp.kind === "contract") {
-    add("h", line(`Contract checkpoint: ${cp.contract.title}`, { bold: true }));
+    color = theme.accent;
+    add("h", [{ text: one(`Contract checkpoint: ${cp.contract.title}`), bold: true, color }]);
     cp.contract.criteria.forEach((c, i) => {
-      add(`c${i}`, line(`  ${c.id} [${c.kind}] ${c.statement}`));
+      add(`c${i}`, [
+        { text: `${one(c.id)} ` },
+        { text: `[${c.kind}]`, color: c.kind === "change" ? theme.busy : theme.user },
+        { text: ` ${one(c.statement)}` },
+      ]);
     });
-    if (revisionLimitReached) add("lim", line(LIMIT, { color: theme.busy }));
-    else add("k", line("[a]pprove [e] revise [s]top", { color: theme.user }));
-  } else if (cp.kind === "tests") {
-    add(
-      "h",
-      line(`Tests checkpoint: ${cp.manifest.files.length} frozen test file(s)`, { bold: true }),
-    );
-    for (const [i, f] of cp.files.entries()) add(`f${i}`, line(`  ${f.path}`));
-    if (viewing) {
-      const lines: string[] = [];
-      for (const f of cp.files) {
-        lines.push(`--- ${f.path}`, ...clean(f.content).split("\n"));
-        if (lines.length > rows) break; // already more than `view` can show
-      }
-      view(lines, "… (truncated; the full tests are frozen in the worktree)");
-    }
-    add("k", line("[a]pprove [v]iew [s]top", { color: theme.user }));
-  } else {
-    const diff = clean(cp.diff);
-    const stat = diffStat(diff);
-    add("h", line(`Commit checkpoint: ${stat.files.length} file(s) changed`, { bold: true }));
-    const cap = Math.max(3, Math.min(10, rows - 10));
-    stat.files.slice(0, cap).forEach((f, i) => {
+    if (revisionLimitReached) add("lim", [{ text: LIMIT, color: theme.busy }]);
+    else
       add(
-        `d${i}`,
-        line(`  ${f.path} ${f.binary ? "(binary, omitted)" : `+${f.added} -${f.removed}`}`),
+        "k",
+        hints([
+          ["a", "approve"],
+          ["e", "revise"],
+          ["s", "stop"],
+        ]),
       );
-    });
-    if (stat.files.length > cap)
-      add("dm", line(`  … ${stat.files.length - cap} more`, { dimColor: true }));
-    if (viewing) view(diff.split("\n"), "… (truncated; the full diff is in the worktree)");
-    add("k", line("[a]pprove [v]iew [s]top", { color: theme.user }));
+  } else if (cp.kind === "tests") {
+    color = theme.busy;
+    add("h", [
+      {
+        text: `Tests checkpoint: ${cp.manifest.files.length} frozen test file(s)`,
+        bold: true,
+        color,
+      },
+    ]);
+    if (viewing) {
+      body = (
+        <TestsView
+          files={cp.files}
+          width={inner}
+          rows={viewRows}
+          isActive={isCurrent}
+          onClose={closeView}
+        />
+      );
+    } else {
+      const cap = Math.max(3, Math.min(10, rows - 10));
+      cp.files.slice(0, cap).forEach((f, i) => {
+        add(`f${i}`, [{ text: `  ${one(f.path)}` }]);
+      });
+      if (cp.files.length > cap)
+        add("fm", [{ text: `  … ${cp.files.length - cap} more`, dim: true }]);
+    }
+  } else {
+    color = "green";
+    const stat = commitStat ?? { files: [] };
+    add("h", [
+      { text: `Commit checkpoint: ${stat.files.length} file(s) changed`, bold: true, color },
+    ]);
+    if (viewing) {
+      body = (
+        <DiffView
+          diff={cp.diff}
+          width={inner}
+          rows={viewRows}
+          isActive={isCurrent}
+          onClose={closeView}
+        />
+      );
+    } else {
+      const cap = Math.max(3, Math.min(10, rows - 10));
+      stat.files.slice(0, cap).forEach((f, i) => {
+        const path = f.path.replace(/[\n\t]+/g, " ");
+        add(
+          `d${i}`,
+          f.binary
+            ? [{ text: `  ${path}  ` }, { text: "binary, omitted", dim: true }]
+            : [
+                { text: `  ${path}  ` },
+                { text: `+${f.added}`, color: "green" },
+                { text: " " },
+                { text: `−${f.removed}`, color: "red" },
+              ],
+        );
+      });
+      if (stat.files.length > cap)
+        add("dm", [{ text: `  … ${stat.files.length - cap} more`, dim: true }]);
+    }
   }
-
+  const tail: ReactElement[] = [];
+  const addTail = (key: string, segs: Styled[]): void => {
+    tail.push(<StyledLine key={key} segs={cutStyled(segs, inner)} />);
+  };
+  if (cp.kind !== "contract")
+    addTail(
+      "k",
+      hints([
+        ["a", "approve"],
+        ["v", "view"],
+        ["s", "stop"],
+      ]),
+    );
   if (mode.kind === "edit") {
-    add("e", line(`revise: ${mode.value}▌  (Enter sends, Esc cancels)`));
+    addTail("e", [{ text: one(`revise: ${mode.value}▌  (Enter sends, Esc cancels)`) }]);
   }
-  if (message) add("m", line(message, { color: theme.error }));
-  return <Box flexDirection="column">{out}</Box>;
+  if (message) addTail("m", [{ text: one(message), color: theme.error }]);
+  return (
+    <Card color={color} cols={cols}>
+      {out}
+      {body}
+      {tail}
+    </Card>
+  );
 }
