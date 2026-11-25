@@ -23,6 +23,7 @@
   "dependencies": {
     "@rewire/core": "workspace:*",
     "@rewire/loop": "workspace:*",
+    "@rewire/pipeline": "workspace:*",
     "@rewire/policy": "workspace:*",
     "@rewire/providers": "workspace:*",
     "@rewire/sandbox": "workspace:*",

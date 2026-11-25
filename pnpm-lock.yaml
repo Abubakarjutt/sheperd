@@ -229,6 +229,9 @@ importers:
       '@rewire/loop':
         specifier: workspace:*
         version: link:../loop
+      '@rewire/pipeline':
+        specifier: workspace:*
+        version: link:../pipeline
       '@rewire/policy':
         specifier: workspace:*
         version: link:../policy
