@@ -116,7 +116,7 @@ export type AppliedOp = {
 export type RiskyOp = { index: number; op: CompactionOp; target?: RecordItem };
 export type VerifyDecision = { accept: boolean; reason?: string };
 /**
- * The cross-check hook (Task 5). `evidence` maps each cited message id to its role and cleaned
+ * The cross-check hook (Task 5). Without it every risky op (`isRiskyOp`) is rejected. `evidence` maps each cited message id to its role and cleaned
  * content. Returns one decision per op, in order; a missing decision rejects that op.
  */
 export type VerifyRisky = (
@@ -215,7 +215,10 @@ function buildPrompt(
   window: readonly StoredMessage[],
   focus?: string,
 ): string {
+  const active = record.items.filter((i) => i.status === "active").length;
+  const room = Math.max(0, ACTIVE_ITEMS_MAX - active);
   const parts = [
+    `The record holds ${active} active items, at most ${ACTIVE_ITEMS_MAX}: room for ${room} more. An add beyond that is rejected; resolve or supersede items to make room.`,
     "The current record (active items, each with its id):",
     fenceUntrusted("untrusted_session_record", recordForPrompt(record)),
     "The messages since the last update, each as [id role] content (tool results are cut):",
@@ -237,9 +240,28 @@ function buildPrompt(
 
 type Parsed = { ok: true; ops: CompactionOp[] } | { ok: false; problem: string };
 
+/** How many `{` positions are tried as the start of the reply object. */
+const PARSE_CANDIDATES = 20;
+
+/**
+ * Strip fences and prose: try the first balanced JSON object, then the next ones (a reply such
+ * as `Here {is} my answer: {"ops": []}`), and report the first candidate's problem.
+ */
 function parseReply(text: string): Parsed {
+  let first: Parsed | undefined;
+  let from = text.indexOf("{");
+  for (let n = 0; n < PARSE_CANDIDATES && from >= 0; n++) {
+    const r = parseCandidate(text.slice(from));
+    if (r.ok) return r;
+    first ??= r;
+    from = text.indexOf("{", from + 1);
+  }
+  return first ?? { ok: false, problem: "no JSON object found in the reply" };
+}
+
+function parseCandidate(text: string): Parsed {
   const json = extractFirstJsonObject(text);
-  if (json === undefined) return { ok: false, problem: "no JSON object found in the reply" };
+  if (json === undefined) return { ok: false, problem: "no complete JSON object in the reply" };
   let value: unknown;
   try {
     value = JSON.parse(json);
@@ -268,6 +290,8 @@ type ApplyContext = {
   byId: Map<string, StoredMessage>;
   /** Ids an operation may cite: the window plus the ids the record already cites. */
   citable: Set<string>;
+  /** Ids in the current window: the only messages that may create a `user` item. */
+  window: Set<string>;
   /** The newest message id in the window: the compaction point. */
   asOf: string;
 };
@@ -299,8 +323,6 @@ function checkEvidence(raw: readonly Evidence[] | undefined, ctx: ApplyContext):
   });
 }
 
-const fromUser = (ev: readonly Evidence[], ctx: ApplyContext): boolean =>
-  ev.some((e) => ctx.byId.get(e.messageId)?.role === "user");
 const allFromUser = (ev: readonly Evidence[], ctx: ApplyContext): boolean =>
   ev.every((e) => ctx.byId.get(e.messageId)?.role === "user");
 
@@ -333,6 +355,8 @@ function newItem(
   if (p.source === "user") {
     if (evidence.length === 0) reject("a user item needs evidence from a user message");
     if (!allFromUser(evidence, ctx)) reject("a user item may cite only user messages");
+    const old = evidence.find((e) => !ctx.window.has(e.messageId));
+    if (old) reject(`a new user item may cite only messages in the window, not ${old.messageId}`);
   }
   const ev = evidence.length > 0 ? evidence : fallbackEvidence;
   return {
@@ -348,10 +372,15 @@ function newItem(
   };
 }
 
-const isRisky = (op: CompactionOp, target?: RecordItem): boolean =>
+/**
+ * Ops the verifier must confirm: any op on a `user` item, any add or supersede that creates a
+ * `user` item, and resolving an open question.
+ */
+export const isRiskyOp = (op: CompactionOp, target?: RecordItem): boolean =>
+  target?.source === "user" ||
   (op.op === "add" && op.source === "user") ||
   (op.op === "supersede" && op.by.source === "user") ||
-  target?.source === "user";
+  (op.op === "resolve" && target?.kind === "open_question");
 
 type ApplyOutcome = {
   record: SessionRecord;
@@ -364,7 +393,7 @@ type ApplyOutcome = {
 /**
  * Apply `ops` in order to a copy of `record`. Each operation is checked; a failing one is
  * rejected and logged, and the rest still apply. With `decisions`, a risky operation is accepted
- * only when its decision accepts it; without, every risky operation that passes the checks is.
+ * only when its decision accepts it; without (the dry run), every one that passes the checks is.
  */
 function applyOps(
   record: SessionRecord,
@@ -402,13 +431,23 @@ function applyOps(
       // A supersede may carry the user's words on the op or on its replacement.
       const authority =
         op.op === "supersede" ? [...opEvidence, ...checkEvidence(op.by.evidence, ctx)] : opEvidence;
-      if (target?.source === "user" && !fromUser(authority, ctx)) {
-        reject(`changing user item ${target.id} needs evidence from a user message`);
+      if (target?.source === "user") {
+        // Same rule as creating one: cited, and every citation from a user message.
+        if (authority.length === 0 || !allFromUser(authority, ctx)) {
+          reject(`changing user item ${target.id} needs evidence from user messages only`);
+        }
+      }
+      if ((op.op === "resolve" || op.op === "supersede") && authority.length === 0) {
+        reject(`${op.op} needs evidence`);
       }
       // Build everything first so a rejected op leaves no trace.
       let commit: () => void;
       switch (op.op) {
         case "add": {
+          const active = out.items.filter((i) => i.status === "active").length;
+          if (active >= ACTIVE_ITEMS_MAX) {
+            reject(`item_cap: the record already holds ${ACTIVE_ITEMS_MAX} active items`);
+          }
           const item = newItem(op, ctx, nextId());
           log.itemId = item.id;
           commit = () => out.items.push(item);
@@ -450,10 +489,10 @@ function applyOps(
           break;
         }
       }
-      if (isRisky(op, target)) {
+      if (isRiskyOp(op, target)) {
         const d = decisions?.get(index);
         if (decisions !== undefined && d?.accept !== true) {
-          reject(`the verifier rejected it${d?.reason ? `: ${cleanText(d.reason)}` : ""}`);
+          reject(`not confirmed by the verifier${d?.reason ? `: ${cleanText(d.reason)}` : ""}`);
         }
         risky.push({ index, op, ...(target ? { target: structuredClone(target) } : {}) });
       }
@@ -582,7 +621,7 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
     const content =
       attempt === 0
         ? prompt
-        : `${prompt}\n\nYour previous reply was rejected:\n${fenceUntrusted("untrusted_validation_error", problem)}\n\nReply again with the JSON object {"ops": [...]} only.`;
+        : `${prompt}\n\nYour previous reply was rejected:\n${fenceUntrusted("untrusted_validation_error", redact(sanitizeTerminal(problem)))}\n\nReply again with the JSON object {"ops": [...]} only.`;
     let reply: string;
     try {
       const resp = await provider.chat({
@@ -595,6 +634,10 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
       reply = resp.message.text;
       if (resp.stopReason === "length") {
         problem = "the reply was cut off at the output limit; reply with fewer operations";
+        continue;
+      }
+      if (resp.stopReason === "error") {
+        problem = "the provider reported an error for the reply";
         continue;
       }
     } catch (e) {
@@ -617,10 +660,21 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
   for (const i of [...record.items, ...record.archive]) {
     for (const e of i.evidence ?? []) citable.add(e.messageId);
   }
-  const ctx: ApplyContext = { byId, citable, asOf: last.id };
+  const ctx: ApplyContext = {
+    byId,
+    citable,
+    window: new Set(window.map((m) => m.id)),
+    asOf: last.id,
+  };
 
   let outcome = applyOps(record, ops, ctx);
-  if (input.verifyRisky !== undefined && outcome.risky.length > 0) {
+  if (outcome.risky.length > 0 && input.verifyRisky === undefined) {
+    // Fail safe: without a verifier, nothing that touches user authority is applied.
+    const none = new Map<number, VerifyDecision>(
+      outcome.risky.map((r) => [r.index, { accept: false, reason: "no verifier is configured" }]),
+    );
+    outcome = applyOps(record, ops, ctx, none);
+  } else if (input.verifyRisky !== undefined && outcome.risky.length > 0) {
     const evidence: Record<string, { role: ChatMessage["role"]; content: string }> = {};
     for (const r of outcome.risky) {
       const cited = [

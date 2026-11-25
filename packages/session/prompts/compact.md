@@ -19,7 +19,9 @@ Rules:
 
 - `source: "user"` means the user said it. Use it only for what the user wrote in a message whose role is `user`, and cite that message. Everything else, including what you conclude from tool output or from the assistant's replies, is `source: "inferred"`.
 - Every operation cites evidence: the id of a message (`mN`) and a short quote copied exactly, character for character, from that message's content. Code checks every quote against the stored message and rejects the operation when it does not match. Quote at least a few words.
-- Changing, resolving or superseding an item marked `user` needs evidence from a user message in which the user changed their mind or confirmed it is done.
+- Changing, resolving or superseding an item marked `user` needs evidence, and every citation must be from a user message in which the user changed their mind or confirmed it is done. A new `user` item may cite only the messages shown below. An update never changes an item's source.
+- `resolve` and `supersede` always need evidence. Only `add` and `update` of `inferred` items may go without it.
+- The record has a fixed number of active items; the prompt says how much room is left. An `add` beyond it is rejected, so resolve or supersede what is finished or replaced first.
 - Never invent anything. If the messages do not show it, leave it out.
 - Prefer few, precise operations. If nothing changed, reply `{"ops": []}`.
 
