@@ -27,7 +27,13 @@ export {
   literalText,
   parseCommand,
 } from "./commands.js";
-export { HIGHLIGHT_MAX_BYTES, HIGHLIGHT_MAX_LINES, highlight, type Segment } from "./highlight.js";
+export {
+  HIGHLIGHT_MAX_BYTES,
+  HIGHLIGHT_MAX_LINE,
+  HIGHLIGHT_MAX_LINES,
+  highlight,
+  type Segment,
+} from "./highlight.js";
 export { type InputAction, type InputState, initialInput, reduceInput } from "./input-state.js";
 export { cleanForMarkdown, Markdown } from "./markdown.js";
 export { Safe } from "./safe.js";

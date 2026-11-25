@@ -32,9 +32,14 @@ for (const [name, fn] of [
 export type Segment = { text: string; color?: string };
 
 /** Code larger than this (UTF-16 units, ~bytes for code) renders plain. */
-export const HIGHLIGHT_MAX_BYTES = 200_000;
+export const HIGHLIGHT_MAX_BYTES = 50_000;
 /** Code with more lines than this renders plain. */
 export const HIGHLIGHT_MAX_LINES = 5_000;
+/**
+ * Code with any line longer than this renders plain: highlight.js is quadratic on long single
+ * tokens (a 40 KB identifier takes seconds), and colour past the box width is invisible anyway.
+ */
+export const HIGHLIGHT_MAX_LINE = 2_000;
 
 const ENTITIES: Readonly<Record<string, string>> = {
   "&amp;": "&",
@@ -107,20 +112,27 @@ export function parseHighlighted(html: string): Segment[][] {
   return lines;
 }
 
-const CACHE_MAX = 128;
+/** The highlight cache holds at most this many UTF-16 units of code (LRU). */
+const CACHE_MAX_BYTES = 2_000_000;
 const cache = new Map<string, Segment[][]>();
+let cacheBytes = 0;
 
-function countLinesOver(code: string, max: number): boolean {
+/** Whether `code` has more than `maxLines` lines or a line longer than `maxLine`. One pass. */
+function tooBig(code: string, maxLines: number, maxLine: number): boolean {
   let n = 1;
-  for (let i = code.indexOf("\n"); i >= 0; i = code.indexOf("\n", i + 1))
-    if (++n > max) return true;
-  return false;
+  let start = 0;
+  for (let i = code.indexOf("\n"); i >= 0; i = code.indexOf("\n", i + 1)) {
+    if (i - start > maxLine || ++n > maxLines) return true;
+    start = i + 1;
+  }
+  return code.length - start > maxLine;
 }
 
 /**
  * Lines of coloured segments for `code` in `lang`, never HTML or ANSI. An unknown language, a
- * highlighting failure, or code over {@link HIGHLIGHT_MAX_BYTES} / {@link HIGHLIGHT_MAX_LINES}
- * gives plain text. Results are memoized by language and content (small LRU). `code` must
+ * highlighting failure, or code over {@link HIGHLIGHT_MAX_BYTES}, {@link HIGHLIGHT_MAX_LINES}
+ * or {@link HIGHLIGHT_MAX_LINE} gives plain text. Highlighted results are memoized by language
+ * and content in an LRU bounded to 2 MB of code. `code` must
  * already be sanitized: highlighting does not clean it.
  */
 export function highlight(code: string, lang: string | undefined): Segment[][] {
@@ -132,25 +144,26 @@ export function highlight(code: string, lang: string | undefined): Segment[][] {
     cache.set(key, hit);
     return hit;
   }
-  let out: Segment[][];
   if (
     !name ||
     !hljs.getLanguage(name) ||
     code.length > HIGHLIGHT_MAX_BYTES ||
-    countLinesOver(code, HIGHLIGHT_MAX_LINES)
+    tooBig(code, HIGHLIGHT_MAX_LINES, HIGHLIGHT_MAX_LINE)
   ) {
-    out = plainLines(code);
-  } else {
-    try {
-      out = parseHighlighted(hljs.highlight(code, { language: name, ignoreIllegals: true }).value);
-    } catch {
-      out = plainLines(code);
-    }
+    return plainLines(code); // cheap: not cached
+  }
+  let out: Segment[][];
+  try {
+    out = parseHighlighted(hljs.highlight(code, { language: name, ignoreIllegals: true }).value);
+  } catch {
+    return plainLines(code);
   }
   cache.set(key, out);
-  if (cache.size > CACHE_MAX) {
-    const oldest = cache.keys().next().value;
-    if (oldest !== undefined) cache.delete(oldest);
+  cacheBytes += key.length;
+  for (const k of cache.keys()) {
+    if (cacheBytes <= CACHE_MAX_BYTES) break;
+    cache.delete(k);
+    cacheBytes -= k.length;
   }
   return out;
 }
