@@ -1,7 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { RewireError } from "@rewire/core";
-import { providerError } from "./errors.js";
-import { streamCallbackFailed } from "./openai.js";
+import { providerError, streamCallbackFailed } from "./errors.js";
 import type { ChatRequest, ChatResponse, Provider, StopReason, ToolCall } from "./types.js";
 
 type Block =

@@ -1,6 +1,5 @@
-import { redact } from "@rewire/core";
 import { Text } from "ink";
-import { fit, width } from "./fit.js";
+import { fit, fitClean, width } from "./fit.js";
 import { Safe } from "./safe.js";
 import { formatTokens } from "./spinner.js";
 import { theme } from "./theme.js";
@@ -26,13 +25,13 @@ export type StatusParts = {
  * The status line's text at `cols`: `<model> · ctx <N> · checkpoints: <set> · <mode>`, with
  * `? for shortcuts` right-aligned. When it does not fit, pieces are dropped in this order: the
  * shortcuts hint, the checkpoints, the context size; what is left is cut with `fit` (which
- * sanitizes). Values are redacted before they are cut.
+ * sanitizes). Values go through fitClean: sanitized, then redacted, then cut.
  */
 export function statusText(p: StatusParts, cols: number): string {
   const max = Math.floor(cols);
   if (!(max >= 1)) return "";
-  const model = p.model ? fit(redact(p.model), max) : undefined;
-  const mode = fit(redact(p.mode), max);
+  const model = p.model ? fitClean(p.model, max) : undefined;
+  const mode = fitClean(p.mode, max);
   const left = (context: boolean, checkpoints: boolean): string =>
     [
       model,

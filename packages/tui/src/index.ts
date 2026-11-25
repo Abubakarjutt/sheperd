@@ -59,6 +59,8 @@ export {
   type LiveState,
   LiveTurn,
   liveEntries,
+  splitBlocks,
+  takeFinished,
 } from "./live-turn.js";
 export { cleanForMarkdown, Markdown } from "./markdown.js";
 export { Safe } from "./safe.js";
@@ -277,7 +279,7 @@ export {
 } from "./board.js";
 export { Board, RunView } from "./board-view.js";
 export { CheckpointPanel, type CheckpointPrompt, diffStat } from "./checkpoint.js";
-export { fit } from "./fit.js";
+export { fit, fitClean, fitStartClean } from "./fit.js";
 export { ClarifyPanel, ProposalCard } from "./proposal.js";
 export {
   listSkillFiles,

@@ -32,12 +32,12 @@ import { InputBox } from "./input.js";
 import {
   applyEvent,
   INTERRUPTED,
+  LIVE_RESERVED_ROWS,
   LIVE_THROTTLE_MS,
   type LiveState,
   LiveTurn,
-  liveEntries,
   newLive,
-  streamedText,
+  takeFinished,
 } from "./live-turn.js";
 import { ClarifyPanel, ProposalCard } from "./proposal.js";
 import { sanitize } from "./sanitize.js";
@@ -45,6 +45,7 @@ import { pickVerb } from "./spinner.js";
 import { StatusLine } from "./status-line.js";
 import { Transcript, type TranscriptEntry } from "./transcript.js";
 import { TrustPrompt } from "./trust-prompt.js";
+import { useRows } from "./use-columns.js";
 
 export { STALE_PROMPT };
 
@@ -139,12 +140,6 @@ export function historyEntries(session: ChatSession): TranscriptEntry[] {
     }
   }
   return out;
-}
-
-function eventEntry(e: ChatEvent): TranscriptEntry | undefined {
-  if (e.type === "tool_call") return { kind: "tool", summary: e.summary, isError: e.isError };
-  if (e.type === "skill_loaded") return { kind: "skill", name: e.name };
-  return undefined; // assistant_text: the turn's final text is appended from ChatTurn.text
 }
 
 function errorEntry(err: unknown): TranscriptEntry {
@@ -263,29 +258,47 @@ export function App(props: AppProps) {
   const [stage, setStage] = useState<string | undefined>(undefined);
   const [trustedLater, setTrustedLater] = useState(false);
   /**
-   * The in-flight chat turn's live area. Events fold into `liveRef` at once; the rendered copy
-   * (`live`) follows at most every LIVE_THROTTLE_MS, and is flushed whole when the turn ends.
+   * The in-flight chat turn's live area. Events fold into `liveRef` at once. Finished items (a
+   * tool with its result, closed text, complete Markdown blocks) move to the `<Static>`
+   * transcript as they finish (I1), together with the re-render that drops them from the live
+   * area, so nothing shows twice. The rendered copy (`live`) follows at most every
+   * LIVE_THROTTLE_MS for streamed text and tool calls, at once for the other events.
    */
   const liveRef = useRef<LiveState | undefined>(undefined);
   const [live, setLive] = useState<LiveState | undefined>(undefined);
   const liveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const scheduleLive = useCallback(() => {
-    if (liveTimer.current !== undefined) return;
-    liveTimer.current = setTimeout(() => {
-      liveTimer.current = undefined;
-      setLive(liveRef.current);
-    }, LIVE_THROTTLE_MS);
-  }, []);
-  /** Ends the live area (no timer left behind) and returns its final state. */
-  const endLive = useCallback((): LiveState | undefined => {
+  const flushLive = useCallback(() => {
     clearTimeout(liveTimer.current);
     liveTimer.current = undefined;
-    const last = liveRef.current;
+    const s = liveRef.current;
+    if (!s) return;
+    const { state, entries: done } = takeFinished(s);
+    liveRef.current = state;
+    // Ink's legacy root does not batch these: drop the items from `live` first, then print them
+    // through <Static>, so no frame shows them in both places.
+    setLive(state);
+    if (done.length > 0) setEntries((cur) => [...cur, ...done]);
+  }, []);
+  const scheduleLive = useCallback(() => {
+    if (liveTimer.current !== undefined) return;
+    liveTimer.current = setTimeout(flushLive, LIVE_THROTTLE_MS);
+  }, [flushLive]);
+  /**
+   * Ends the live area (no timer left behind): its remaining entries, and whether the turn
+   * showed any streamed text at all.
+   */
+  const endLive = useCallback((): { rest: TranscriptEntry[]; streamed: boolean } => {
+    clearTimeout(liveTimer.current);
+    liveTimer.current = undefined;
+    const s = liveRef.current;
     liveRef.current = undefined;
     setLive(undefined);
-    return last;
+    if (!s) return { rest: [], streamed: false };
+    const { state, entries: rest } = takeFinished(s, true);
+    return { rest, streamed: state.shownText };
   }, []);
   useEffect(() => () => clearTimeout(liveTimer.current), []);
+  const rows = useRows();
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: bound once; the target reads refs
   useEffect(() => {
@@ -329,19 +342,23 @@ export function App(props: AppProps) {
   useEffect(() => {
     if (!subscribe) return;
     return subscribe((e) => {
+      // Chat events belong to the turn live when they arrive. With none live (a late event of a
+      // turn that already ended or was interrupted) they are dropped (M4): printed now, they
+      // would land after the turn's last line, without their context.
+      if (!liveRef.current) return;
       if (e.type === "usage") {
         const n = (x: number): number => (Number.isFinite(x) && x > 0 ? x : 0);
-        setContext(n(e.inputTokens) + n(e.outputTokens));
+        const ctx = n(e.inputTokens) + n(e.outputTokens);
+        // A server that reports no usage sends 0/0: keep the last known size (M6).
+        if (ctx > 0) setContext(ctx);
       }
-      if (liveRef.current) {
-        liveRef.current = applyEvent(liveRef.current, e);
-        scheduleLive();
-        return;
-      }
-      const entry = eventEntry(e);
-      if (entry) add(entry);
+      liveRef.current = applyEvent(liveRef.current, e);
+      // A tool_call is followed at once by its tool_result (the session emits both after the tool
+      // ran): wait for the result rather than draw the line live and then print it again.
+      if (e.type === "assistant_delta" || e.type === "tool_call") scheduleLive();
+      else flushLive();
     });
-  }, [subscribe, add, scheduleLive]);
+  }, [subscribe, scheduleLive, flushLive]);
 
   /** Runs `work` with the input busy; one at a time (chat turns, session swaps). */
   const exclusive = useCallback((work: () => Promise<void>) => {
@@ -363,24 +380,19 @@ export function App(props: AppProps) {
         setLive(liveRef.current);
         try {
           const turn = await sessionRef.current.send(text, ac.signal);
-          const done = endLive();
+          const { rest, streamed } = endLive();
           // Streamed text is the turn's text (its last part is the final answer): shown once.
           const final: TranscriptEntry[] =
-            !streamedText(done) && turn.text.trim() !== ""
-              ? [{ kind: "assistant", text: turn.text }]
-              : [];
-          add(...liveEntries(done), ...final);
+            !streamed && turn.text.trim() !== "" ? [{ kind: "assistant", text: turn.text }] : [];
+          add(...rest, ...final);
           if (turn.proposal) setProposal(turn.proposal.task);
           else if (turn.endedBy === "turn_limit") {
             note("(the turn stopped at its tool-call limit; send a message to continue)");
           }
         } catch (err) {
           // What already streamed stays, then why the turn ended: Esc or Ctrl-C, or an error.
-          const done = endLive();
-          add(
-            ...liveEntries(done),
-            ac.signal.aborted ? { kind: "note", text: INTERRUPTED } : errorEntry(err),
-          );
+          const { rest } = endLive();
+          add(...rest, ac.signal.aborted ? { kind: "note", text: INTERRUPTED } : errorEntry(err));
         } finally {
           if (turnAbort.current === ac) turnAbort.current = undefined;
         }
@@ -629,6 +641,7 @@ export function App(props: AppProps) {
           state={live}
           onInterrupt={abortTurn}
           interruptible={run === undefined && proposal === undefined && !trustOpen && !popup}
+          maxRows={rows - LIVE_RESERVED_ROWS}
         />
       ) : null}
       <InputBox

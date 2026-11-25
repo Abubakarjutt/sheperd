@@ -1,3 +1,4 @@
+import { redact } from "@rewire/core";
 import stringWidth from "string-width";
 import { sanitize } from "./sanitize.js";
 
@@ -26,6 +27,20 @@ export function fit(text: string, cols: number): string {
     used += w;
   }
   return `${out}…`;
+}
+
+/**
+ * {@link fit} for untrusted text: sanitized, then redacted, then cut. Sanitizing first rejoins a
+ * secret split by an escape sequence; redacting before the cut means a cut can never leave a
+ * prefix of a secret that no longer matches its pattern.
+ */
+export function fitClean(text: string, cols: number): string {
+  return fit(redact(sanitize(text)), cols);
+}
+
+/** {@link fitStart} with the same sanitize-redact-cut order as {@link fitClean}. */
+export function fitStartClean(text: string, cols: number): string {
+  return fitStart(redact(sanitize(text)), cols);
 }
 
 /**

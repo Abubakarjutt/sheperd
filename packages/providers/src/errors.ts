@@ -47,3 +47,11 @@ function scrub(s: string, apiKey?: string): string {
     .replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, "$1[redacted]")
     .slice(0, 500);
 }
+
+/** A throw from the caller's `onDelta` stream callback: surfaced as-is, never as a transport error. */
+export function streamCallbackFailed(err: unknown): RewireError {
+  return new RewireError(
+    "provider_stream_callback_failed",
+    `the onDelta stream callback threw: ${err instanceof Error ? err.message : String(err)}`,
+  );
+}

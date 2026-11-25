@@ -1,6 +1,6 @@
 import { RewireError } from "@rewire/core";
 import OpenAI from "openai";
-import { providerError } from "./errors.js";
+import { providerError, streamCallbackFailed } from "./errors.js";
 import type { ChatRequest, ChatResponse, Provider, StopReason, ToolCall } from "./types.js";
 
 type OMessage =
@@ -184,13 +184,6 @@ export function callOnDelta(onDelta: (text: string) => void, text: string): void
   } catch (err) {
     throw streamCallbackFailed(err);
   }
-}
-
-export function streamCallbackFailed(err: unknown): RewireError {
-  return new RewireError(
-    "provider_stream_callback_failed",
-    `the onDelta stream callback threw: ${err instanceof Error ? err.message : String(err)}`,
-  );
 }
 
 /**

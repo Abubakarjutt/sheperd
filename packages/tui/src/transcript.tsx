@@ -1,6 +1,6 @@
 import { redact } from "@rewire/core";
 import { Box, Static, Text } from "ink";
-import { fit } from "./fit.js";
+import { fit, fitClean } from "./fit.js";
 import { Header, type HeaderInfo } from "./header.js";
 import { cleanForMarkdown, Markdown } from "./markdown.js";
 import { Safe } from "./safe.js";
@@ -10,7 +10,8 @@ import { useColumns } from "./use-columns.js";
 
 export type TranscriptEntry =
   | { kind: "user"; text: string }
-  | { kind: "assistant"; text: string }
+  /** `cont`: a later block of a reply whose earlier blocks are the entries above (gap above). */
+  | { kind: "assistant"; text: string; cont?: boolean }
   | {
       kind: "tool";
       summary: string;
@@ -67,15 +68,13 @@ export function ToolLine({
   const glyph = isError ? theme.glyph.toolError : theme.glyph.tool;
   const head = `${glyph} `;
   // Redacted before it is cut, so a cut can never split a secret out of its pattern.
-  const line = fit(args === "" ? `${head}${name}` : `${head}${name}(${args})`, cols);
+  const line = fitClean(args === "" ? `${head}${name}` : `${head}${name}(${args})`, cols);
   const nameEnd = Math.min(line.length, head.length + name.length);
   const color = isError ? theme.error : theme.dim;
   const extra = Number.isFinite(more) && more > 0 ? Math.floor(more) : 0;
   const shown = preview.slice(0, PREVIEW_MAX);
   const rest = extra + (preview.length - shown.length);
-  const lines = shown.map(
-    (l, i) => `${i === 0 ? PREVIEW_HEAD : PREVIEW_INDENT}${redact(sanitize(l))}`,
-  );
+  const lines = shown.map((l, i) => `${i === 0 ? PREVIEW_HEAD : PREVIEW_INDENT}${l}`);
   if (rest > 0) {
     lines.push(`${lines.length === 0 ? PREVIEW_HEAD : PREVIEW_INDENT}… +${rest} lines`);
   }
@@ -91,7 +90,7 @@ export function ToolLine({
       {lines.map((l, i) => (
         // biome-ignore lint/suspicious/noArrayIndexKey: lines of one fixed preview
         <Safe key={i} wrap="truncate" color={color}>
-          {fit(l, cols)}
+          {fitClean(l, cols)}
         </Safe>
       ))}
     </Box>
@@ -122,7 +121,13 @@ export function EntryLine({ entry }: { entry: TranscriptEntry }) {
       );
     case "assistant":
       // Cleaned whole (never per streamed delta), then parsed: see cleanForMarkdown.
-      return <Markdown text={cleanForMarkdown(entry.text)} width={cols} />;
+      return entry.cont ? (
+        <Box marginTop={1}>
+          <Markdown text={cleanForMarkdown(entry.text)} width={cols} />
+        </Box>
+      ) : (
+        <Markdown text={cleanForMarkdown(entry.text)} width={cols} />
+      );
     case "tool":
       return (
         <ToolLine

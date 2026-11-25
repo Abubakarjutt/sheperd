@@ -1,6 +1,5 @@
-import { redact } from "@rewire/core";
 import { Box, Text } from "ink";
-import { fit, fitStart } from "./fit.js";
+import { fitClean, fitStartClean } from "./fit.js";
 import { Safe } from "./safe.js";
 import { theme } from "./theme.js";
 import { useColumns } from "./use-columns.js";
@@ -59,8 +58,8 @@ export function Header({ info }: { info: HeaderInfo }) {
   const cols = useColumns();
   const boxWidth = Math.max(4, Math.min(cols, HEADER_MAX));
   const inner = boxWidth - 4; // two border columns and one column of padding on each side
-  // Redacted before it is cut, so a cut can never split a secret out of its pattern.
-  const one = (s: string): string => fit(redact(s), inner);
+  // Sanitized, then redacted, then cut (fitClean).
+  const one = (s: string): string => fitClean(s, inner);
   const CWD = "cwd: ";
   const run = runModelsLine(info.models);
   const skills = info.skills;
@@ -79,7 +78,7 @@ export function Header({ info }: { info: HeaderInfo }) {
         {one(WELCOME)}
       </Text>
       <Safe wrap="truncate" color={theme.dim}>
-        {`${CWD}${fitStart(redact(shortPath(info.cwd, info.home)), inner - CWD.length)}`}
+        {`${CWD}${fitStartClean(shortPath(info.cwd, info.home), inner - CWD.length)}`}
       </Safe>
       {info.models ? <Safe wrap="truncate">{one(`chat: ${info.models.chat}`)}</Safe> : null}
       {run ? <Safe wrap="truncate">{one(run)}</Safe> : null}

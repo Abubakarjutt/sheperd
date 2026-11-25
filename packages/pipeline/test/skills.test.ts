@@ -186,18 +186,29 @@ async function run(
   });
   const by: Record<string, FauxProvider> = { spec, tw, impl, rev, ver };
   const events: RunEvent[] = [];
+  // Every provider call the pipeline makes, and whether it asked to stream. FauxProvider drops
+  // `onDelta` before it records a request, so this wrapper is what sees it.
+  const calls: Array<{ model: string; streamed: boolean }> = [];
   const outcome = await runPipeline({
     task: "add sum(a,b)",
     repo: makeRepo(),
     routing: ROUTING,
-    providers: (ref: ModelRef): Provider => by[ref.model] as Provider,
+    providers: (ref: ModelRef): Provider => {
+      const p = by[ref.model] as Provider;
+      return {
+        chat: (req) => {
+          calls.push({ model: ref.model, streamed: req.onDelta !== undefined });
+          return p.chat(req);
+        },
+      };
+    },
     policy: DEFAULT_POLICY,
     ask: async () => null,
     emit: (e) => events.push(e),
     ...(skills ? { skills } : {}),
     seams: { implementerMaxTurns: 6, hypothesisTimeoutMs: 5000 },
   });
-  return { outcome, events, by };
+  return { outcome, events, by, calls };
 }
 
 const UUID = /[0-9a-f]{8}-[0-9a-f-]{27}/g;
@@ -258,6 +269,16 @@ describe.skipIf(!sandboxAvailable)("skills in the author stages", { timeout: 240
     // Normalise per-run random fence ids so the snapshot is stable.
     const norm = JSON.stringify(snap, null, 1).replace(UUID, "<uuid>");
     expect(norm).toMatchSnapshot();
+  });
+
+  test("no pipeline stage streams: every provider call is made without onDelta", async () => {
+    // With a finding, so the reviewers and the verifier run too.
+    const { outcome, calls } = await run(await makeSet(), true, { withFinding: true });
+    expect(outcome.status).toBe("verified");
+    for (const k of ["spec", "tw", "impl", "rev", "ver"]) {
+      expect(calls.filter((c) => c.model === k).length, k).toBeGreaterThan(0);
+    }
+    expect(calls.filter((c) => c.streamed)).toEqual([]);
   });
 
   test("a sandboxed implementer reads a materialized bundled file but cannot write there", async () => {

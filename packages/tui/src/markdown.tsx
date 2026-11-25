@@ -32,7 +32,7 @@ const TAB = "    ";
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 /** marked's lexer only (never its HTML renderer). A lexer failure shows the text as-is. */
-function lex(text: string): Token[] {
+export function lex(text: string): Token[] {
   try {
     // silent: false makes marked throw instead of writing to the console mid-render.
     return Lexer.lex(text, { gfm: true, breaks: false, pedantic: false, silent: false });

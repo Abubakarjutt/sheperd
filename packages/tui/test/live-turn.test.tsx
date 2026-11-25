@@ -27,7 +27,8 @@ import { render } from "ink-testing-library";
 import stringWidth from "string-width";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { App, type InterruptTarget } from "../src/app.js";
-import { applyEvent, liveEntries, newLive } from "../src/live-turn.js";
+import { applyEvent, liveEntries, newLive, splitBlocks, takeFinished } from "../src/live-turn.js";
+import { cleanForMarkdown } from "../src/markdown.js";
 import { formatTokens, SPINNER_GLYPHS, SPINNER_VERBS, Spinner } from "../src/spinner.js";
 import { ToolLine } from "../src/transcript.js";
 
@@ -209,6 +210,79 @@ describe("Spinner", () => {
   });
 });
 
+describe("splitBlocks and takeFinished (I1)", () => {
+  const KEY = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+
+  it("splits off complete top-level blocks and keeps the last one raw", () => {
+    expect(splitBlocks("# Title\n\nfirst para\n\nsecond gro")).toEqual({
+      done: "# Title\n\nfirst para\n\n",
+      rest: "second gro",
+    });
+    expect(splitBlocks("one paragraph still growing")).toBeUndefined();
+    expect(splitBlocks("para\n\n")).toBeUndefined(); // nothing after the gap yet
+  });
+
+  it("never splits inside an open code fence", () => {
+    const r = splitBlocks("intro\n\n```ts\nconst a = 1;\n\nconst b = 2;\n\nconst c");
+    expect(r?.done).toBe("intro\n\n");
+    expect(r?.rest.startsWith("```ts")).toBe(true);
+  });
+
+  it("a split cleans to exactly what the whole buffer cleans to, even around escape sequences", () => {
+    for (const raw of [
+      "a\x1b]52;c;\n\nZXZpbA==",
+      "a\x1b]52;c;\n\nZXZpbA==\x07b",
+      "x\x1b[31mred\n\n\x1b[0mmore",
+      "p \x1bP+q\n\nrest\x1b\\ tail",
+    ]) {
+      const r = splitBlocks(raw);
+      const whole = cleanForMarkdown(raw);
+      if (r) expect(r.done + cleanForMarkdown(r.rest)).toBe(whole);
+      expect(`${r?.done ?? ""}${cleanForMarkdown(r?.rest ?? raw)}`).not.toContain("\x1b");
+    }
+  });
+
+  it("a key right before a block boundary, split across deltas, is redacted when flushed", () => {
+    let s = newLive("Thinking", 0);
+    for (const text of ["intro ", KEY.slice(0, 20), `${KEY.slice(20)}\n\n`, "next"]) {
+      s = applyEvent(s, { type: "assistant_delta", text });
+    }
+    const { state, entries } = takeFinished(s);
+    expect(entries).toHaveLength(1);
+    const text = entries[0]?.kind === "assistant" ? entries[0].text : "";
+    expect(text).toContain("[redacted]");
+    expect(text).not.toContain("abcdefghij");
+    expect(state.items).toEqual([{ kind: "text", raw: "next", cont: true }]);
+  });
+
+  it("takes a tool once its result arrives, and closed text; keeps a running tool", () => {
+    let s = newLive("Thinking", 0);
+    s = applyEvent(s, { type: "assistant_delta", text: "Looking." });
+    s = applyEvent(s, {
+      type: "tool_call",
+      callId: "a",
+      tool: "read",
+      summary: "read a",
+      isError: false,
+    });
+    let r = takeFinished(s);
+    expect(r.entries.map((e) => e.kind)).toEqual(["assistant"]);
+    expect(r.state.items.map((i) => i.kind)).toEqual(["tool"]);
+    s = applyEvent(r.state, {
+      type: "tool_result",
+      callId: "a",
+      tool: "read",
+      preview: ["x"],
+      more: 0,
+      isError: false,
+    });
+    r = takeFinished(s);
+    expect(r.entries.map((e) => e.kind)).toEqual(["tool"]);
+    expect(r.state.items).toEqual([]);
+    expect(r.state.shownText).toBe(true);
+  });
+});
+
 describe("live turn", () => {
   it("streams deltas as Markdown above a spinner with the token count, then moves them to the transcript", async () => {
     let finish: (t: ChatTurn) => void = () => {};
@@ -373,6 +447,63 @@ describe("live turn", () => {
     await waitText(m.v, "second reply");
     expect(persisted).toEqual(["second"]);
     expect(m.signals[1]?.aborted).toBe(false);
+  });
+
+  it("keeps the last ctx when a model call reports no usage (0/0, M6)", async () => {
+    let finish: (t: ChatTurn) => void = () => {};
+    const m = track(
+      mount(
+        (_t, _s, emit) =>
+          new Promise<ChatTurn>((res) => {
+            finish = res;
+            emit({ type: "usage", inputTokens: 100, outputTokens: 23 });
+            emit({ type: "usage", inputTokens: 0, outputTokens: 0 });
+          }),
+      ),
+    );
+    await send(m.v, "q");
+    await waitText(m.v, "ctx 123");
+    finish({ text: "done" });
+    const f = await waitFor(m.v, (x) => !x.includes("esc to interrupt)"), "the turn to end");
+    expect(f).toContain("ctx 123");
+    expect(f).not.toContain("ctx 0");
+  });
+
+  it("drops late events that arrive after the turn ended (M4)", async () => {
+    let emitLate: (e: ChatEvent) => void = () => {};
+    const m = track(
+      mount(
+        hold((emit) => {
+          emitLate = emit;
+          emit({ type: "assistant_delta", text: "before" });
+        }),
+      ),
+    );
+    await send(m.v, "q");
+    await waitText(m.v, "before");
+    m.target()?.abortTurn();
+    await waitText(m.v, "Interrupted by user");
+    emitLate({
+      type: "tool_call",
+      callId: "z",
+      tool: "read",
+      summary: "read late.ts",
+      isError: false,
+    });
+    emitLate({
+      type: "tool_result",
+      callId: "z",
+      tool: "read",
+      preview: ["late"],
+      more: 0,
+      isError: false,
+    });
+    emitLate({ type: "assistant_delta", text: "late text" });
+    emitLate({ type: "skill_loaded", name: "late-skill" });
+    await new Promise((r) => setTimeout(r, 150));
+    const f = plain(m.v.lastFrame());
+    expect(f).not.toContain("late");
+    expect(f).toContain("> ");
   });
 
   it("a Ctrl-C abortTurn renders the same Interrupted line", async () => {
