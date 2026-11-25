@@ -276,20 +276,20 @@ interactive session); `rewire --help` prints it and exits 0.
 
 Errors carry a stable code. The ones added with interactive mode and skills:
 
-| code                     | meaning                                                                            |
-| ------------------------ | ---------------------------------------------------------------------------------- |
-| `tui_requires_tty`       | `rewire chat` needs a terminal. Exit 1.                                            |
-| `tui_render_failed`      | The terminal UI failed to render.                                                  |
-| `skill_invalid`          | A skill is malformed or over a limit (name, description, size, symlink).           |
-| `trust_store_unreadable` | `trusted-skills.json` could not be read, so repo skills are not loaded (a warning line; the session still opens). |
-| `trust_store_locked`     | Another rewire process holds the trust store lock.                                 |
-| `session_corrupt`        | A stored session file is damaged.                                                  |
-| `session_not_found`      | `/resume` named a session that is not stored.                                      |
-| `session_disposed`       | The session was closed and can't take more turns.                                  |
-| `session_store_unsafe`   | `.rewire/sessions/` is not a plain directory owned by you (for example a symlink). |
-| `run_in_progress`        | A gated run is already active; only one runs at a time.                            |
-| `stopped_by_user`        | You chose stop at a checkpoint. The run escalates (exit 2).                        |
-| `aborted`                | You pressed Ctrl-C during a chat turn; the turn was dropped.                       |
+| code                     | meaning                                                                             |
+| ------------------------ | ----------------------------------------------------------------------------------- |
+| `tui_requires_tty`       | `rewire chat` needs a terminal. Exit 1.                                             |
+| `tui_render_failed`      | The terminal UI failed to render.                                                   |
+| `skill_invalid`          | A skill is malformed or over a limit (name, description, size, symlink).            |
+| `trust_store_unreadable` | `trusted-skills.json` is unreadable: repo skills are not loaded; the session opens. |
+| `trust_store_locked`     | Another rewire process holds the trust store lock.                                  |
+| `session_corrupt`        | A stored session file is damaged.                                                   |
+| `session_not_found`      | `/resume` named a session that is not stored.                                       |
+| `session_disposed`       | The session was closed and can't take more turns.                                   |
+| `session_store_unsafe`   | `.rewire/sessions/` is not a plain directory owned by you (for example a symlink).  |
+| `run_in_progress`        | A gated run is already active; only one runs at a time.                             |
+| `stopped_by_user`        | You chose stop at a checkpoint. The run escalates (exit 2).                         |
+| `aborted`                | You pressed Ctrl-C during a chat turn; the turn was dropped.                        |
 
 ### Run directory
 
