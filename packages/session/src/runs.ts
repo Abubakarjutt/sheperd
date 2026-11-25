@@ -30,9 +30,12 @@ export type RunHandle = {
    * Answer `p`. A checkpoint takes a `CheckpointDecision` (passed to the pipeline as given: it
    * validates and escalates `stage_error` on an invalid one). A clarification takes the answers,
    * or `null` to decline. Answering a prompt that is not the current one (stale, already
-   * answered, or after the run ended) is a no-op.
+   * answered, or after the run ended) is a no-op that returns `false`. So is a value whose type
+   * does not match the prompt kind (`null` or an array for a checkpoint; anything but a string
+   * array or `null` for a clarification): the prompt stays pending and the run continues.
+   * Returns `true` when the answer was accepted.
    */
-  answer(p: PendingPrompt, value: CheckpointDecision | string[] | null): void;
+  answer(p: PendingPrompt, value: CheckpointDecision | string[] | null): boolean;
   /** Abort the run (idempotent). `done` then resolves escalated/interrupted. */
   abort(): void;
   /** Never rejects: a thrown pipeline error becomes an escalated outcome. */
@@ -53,8 +56,13 @@ export type RunControllerOptions = {
 };
 
 const ERROR_TEXT_CAP = 500;
+const OVERLAP_TEXT = "a prompt is already pending for this run";
 
-/** A buffered event stream: every iterator sees every event from the start, then ends. */
+/**
+ * A buffered event stream: every iterator sees every event from the start, then ends.
+ * Lifetime: one stream per run (one `start`). The buffer holds only that run's events and is
+ * freed with its handle; never share a stream across runs, or it grows without bound.
+ */
 class EventStream implements AsyncIterable<RunEvent> {
   private readonly buf: RunEvent[] = [];
   private ended = false;
@@ -130,8 +138,11 @@ export class RunController {
     let runId = "";
 
     const wait = <T>(prompt: PendingPrompt, onAbort: T): Promise<T> =>
-      new Promise<T>((resolve) => {
+      new Promise<T>((resolve, reject) => {
         if (ac.signal.aborted) return resolve(onAbort);
+        // The pipeline asks one thing at a time. If it ever overlapped, the new request fails
+        // (fixed text) and the existing prompt stays pending and answerable: nothing is orphaned.
+        if (slot !== undefined) return reject(new Error(OVERLAP_TEXT));
         slot = { prompt, settle: (v) => resolve(v as T) };
       });
     // Settle the current deferred once and clear it.
@@ -183,13 +194,14 @@ export class RunController {
       events: stream,
       pending: () => slot?.prompt,
       answer: (p, value) => {
-        if (slot === undefined || slot.prompt !== p) return;
-        if (p.kind === "clarify") {
-          const ok = Array.isArray(value) && value.every((a) => typeof a === "string");
-          settle(ok ? value : null);
-        } else {
-          settle(value);
-        }
+        if (slot === undefined || slot.prompt !== p) return false;
+        const fits =
+          p.kind === "clarify"
+            ? value === null || (Array.isArray(value) && value.every((a) => typeof a === "string"))
+            : typeof value === "object" && value !== null && !Array.isArray(value);
+        if (!fits) return false;
+        settle(value);
+        return true;
       },
       abort: () => {
         if (ac.signal.aborted) return;
@@ -219,7 +231,7 @@ function thrownOutcome(e: unknown, runId: string, aborted: boolean): RunOutcome 
       reason: aborted ? "interrupted" : "stage_error",
       tried: [],
       unresolved: [],
-      hypothesis: "The run failed with an error before it could write a report.",
+      hypothesis: "The run stopped on an unexpected error; no report was written.",
       question: "Check the error and re-run the task.",
       details: [detail],
     },
@@ -239,6 +251,9 @@ export function outcomeMessage(o: RunOutcome): string {
   const esc = o.escalation;
   const lines = [`Run${id} escalated (${esc?.reason ?? "unknown"}).`];
   if (esc?.question) lines.push(`Question: ${esc.question}`);
+  // With no report, the error text (already redacted and capped) exists only here.
+  const detail = esc?.details?.[0];
+  if (!o.reportPath && detail) lines.push(`Error: ${detail}`);
   lines.push(report);
   return lines.join("\n");
 }

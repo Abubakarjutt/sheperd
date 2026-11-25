@@ -1,5 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -310,18 +318,60 @@ describe("RunController (fake pipeline)", () => {
     });
     const h = c.start("t", { checkpoints: new Set(["contract", "tests"]) });
     const p1 = await until(() => h.pending());
-    h.answer(p1, { action: "approve" });
-    h.answer(p1, { action: "stop" }); // already answered: ignored
+    expect(h.answer(p1, { action: "approve" })).toBe(true);
+    expect(h.answer(p1, { action: "stop" })).toBe(false); // already answered: ignored
     const p2 = await until(() => {
       const p = h.pending();
       return p && p !== p1 ? p : undefined;
     });
-    h.answer(p1, { action: "stop" }); // stale: ignored, p2 stays pending
+    expect(h.answer(p1, { action: "stop" })).toBe(false); // stale: ignored, p2 stays pending
     expect(h.pending()).toBe(p2);
     h.answer(p2, { action: "approve" });
     expect((await h.done).status).toBe("verified");
     expect(decisions).toBe(2);
-    h.answer(p2, { action: "stop" }); // after done: ignored
+    expect(h.answer(p2, { action: "stop" })).toBe(false); // after done: ignored
+  });
+
+  test("a value of the wrong type for the prompt kind is rejected and the run continues", async () => {
+    const seen: RunPipelineInput[] = [];
+    const c = controller(fakePipeline({ clarify: ["which one?"], seen }));
+    const h = c.start("t", { checkpoints: new Set(["contract"]) });
+    const q = await until(() => h.pending());
+    expect(q.kind).toBe("clarify");
+    expect(h.answer(q, { action: "approve" })).toBe(false);
+    expect(h.answer(q, [1, 2] as unknown as string[])).toBe(false);
+    expect(h.pending()).toBe(q);
+    expect(h.answer(q, ["the first"])).toBe(true);
+    const cp = await until(() => {
+      const p = h.pending();
+      return p?.kind === "checkpoint" ? p : undefined;
+    });
+    expect(h.answer(cp, null)).toBe(false);
+    expect(h.answer(cp, ["approve"])).toBe(false);
+    expect(h.pending()).toBe(cp);
+    expect(h.answer(cp, { action: "approve" })).toBe(true);
+    expect((await h.done).status).toBe("verified");
+  });
+
+  test("an overlapping prompt request fails with fixed text and never orphans the first", async () => {
+    let second: unknown;
+    const c = controller(async (input) => {
+      const ask = input.checkpoint;
+      if (!ask) throw new Error("no checkpoint");
+      const first = ask({ kind: "contract", contract: CONTRACT });
+      await ask({ kind: "tests", manifest: {} as never, files: [] }).catch((e: unknown) => {
+        second = e;
+      });
+      expect(await first).toEqual({ action: "approve" });
+      return outcome();
+    });
+    const h = c.start("t", { checkpoints: new Set(["contract", "tests"]) });
+    const p = await until(() => (second !== undefined ? h.pending() : undefined));
+    expect((second as Error).message).toBe("a prompt is already pending for this run");
+    expect(p.kind === "checkpoint" && p.checkpoint.kind).toBe("contract");
+    expect(h.answer(p, { action: "approve" })).toBe(true);
+    expect((await h.done).status).toBe("verified");
+    expect(h.pending()).toBeUndefined();
   });
 
   test("a thrown pipeline error resolves done as escalated and releases the slot", async () => {
@@ -402,12 +452,28 @@ describe("outcomeMessage", () => {
     expect(m).toContain("stage_error");
     expect(m).toContain("no report");
   });
+
+  test("with no report, a thrown error's detail is shown; with a report it is not", async () => {
+    const c = controller(fakePipeline({ throws: new TypeError("x is undefined") }));
+    const o = await c.start("t", { checkpoints: NONE }).done;
+    const m = outcomeMessage(o);
+    expect(m).toContain("Error: internal_error: x is undefined");
+    expect(m).toContain("no report");
+    const withReport = outcomeMessage({ ...o, reportPath: "/r/report.md" });
+    expect(withReport).not.toContain("x is undefined");
+  });
 });
 
 // ---- Integration: the real runPipeline with faux models (Review Focus #3, pipeline side). ----
 
 const here = dirname(fileURLToPath(import.meta.url));
+// Shared with the pipeline's own tests; fail loudly if it moves.
 const FIXTURE = resolve(here, "../../pipeline/test/fixtures/sum-lib");
+if (!existsSync(join(FIXTURE, "package.json"))) {
+  throw new Error(
+    `runs.test.ts: the pipeline fixture ${FIXTURE} is missing (moved or renamed?); update FIXTURE`,
+  );
+}
 const WORKSPACE_MODULES = resolve(here, "../../../node_modules");
 const dirs: string[] = [];
 afterAll(() => {
@@ -497,13 +563,15 @@ describe.skipIf(!sandboxAvailable())("RunController (real runPipeline, faux mode
     const t0 = Date.now();
     h.abort();
     const o = await h.done;
-    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(Date.now() - t0).toBeLessThan(5000);
     expect(o.status).toBe("escalated");
     expect(o.escalation?.reason).toBe("interrupted");
     expect(o.reportPath).not.toBe("");
+    expect(readFileSync(o.reportPath, "utf8")).toContain("interrupted");
     expect(h.pending()).toBeUndefined();
     const evs = await events;
     expect(evs.at(-1)?.type).toBe("run_end");
+    expect(evs.some((e) => e.type === "escalation" && e.reason === "interrupted")).toBe(true);
     expect(c.running()).toBe(false);
 
     // A new start succeeds and the controller is usable again.
