@@ -135,7 +135,9 @@ function writeScript(scripts: Record<string, unknown[]>): string {
 describe("sanitize (#23)", () => {
   test("strips ANSI, C0 and C1 controls except newline, and redacts secrets", () => {
     const out = sanitize(`a\x1b[2Jb\x07c\x9bd\x1b]0;evil\x07e\nf ${SECRET}`);
-    expect(out).toBe("abcde\nf [redacted]");
+    // \x9b is a C1 CSI: like a terminal, the single sanitizer (core sanitizeTerminal) consumes
+    // its final byte "d" too; the old regex dropped only the introducer.
+    expect(out).toBe("abce\nf [redacted]");
     expect(out).not.toContain("\x1b");
     expect(out).not.toContain("\x07");
     expect(out).not.toContain("\x9b");
