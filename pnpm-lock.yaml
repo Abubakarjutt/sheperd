@@ -293,6 +293,9 @@ importers:
       '@rewire/session':
         specifier: workspace:*
         version: link:../session
+      '@rewire/skills':
+        specifier: workspace:*
+        version: link:../skills
       ink:
         specifier: 8.0.0
         version: 8.0.0(@types/react@19.3.0)(react@19.3.1)

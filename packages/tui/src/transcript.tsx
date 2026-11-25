@@ -11,7 +11,7 @@ export type TranscriptEntry =
   | { kind: "tool"; summary: string; isError: boolean }
   | { kind: "skill"; name: string }
   | { kind: "error"; code: string; message: string }
-  | { kind: "note"; text: string };
+  | { kind: "note"; text: string; error?: boolean };
 
 /** `read src/x.ts` renders as `Read src/x.ts`. */
 export function toolLabel(summary: string): string {
@@ -64,7 +64,7 @@ export function EntryLine({ entry }: { entry: TranscriptEntry }) {
         </Safe>
       );
     case "note":
-      return <Safe color={theme.dim}>{entry.text}</Safe>;
+      return <Safe color={entry.error ? theme.error : theme.dim}>{entry.text}</Safe>;
   }
 }
 

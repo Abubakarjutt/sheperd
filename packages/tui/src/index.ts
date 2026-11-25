@@ -3,7 +3,26 @@ import { type RenderOptions, render } from "ink";
 import { Component, createElement, type ReactNode } from "react";
 import { App, type AppProps } from "./app.js";
 
-export { App, type AppConfig, type AppProps, historyEntries } from "./app.js";
+export {
+  App,
+  type AppConfig,
+  type AppProps,
+  historyEntries,
+  RUN_ACTIVE,
+  type SessionFactory,
+  type SkillsInfo,
+  STALE_PROMPT,
+  TRUSTED_LATER,
+} from "./app.js";
+export {
+  type Command,
+  DEFAULT_CHECKPOINTS,
+  describeCheckpoints,
+  HELP,
+  isCommand,
+  literalText,
+  parseCommand,
+} from "./commands.js";
 export { type InputAction, type InputState, initialInput, reduceInput } from "./input-state.js";
 export { Safe } from "./safe.js";
 export { sanitize } from "./sanitize.js";
@@ -77,3 +96,11 @@ export { type BoardState, initialBoard, reduceBoard, STAGES, withCheckpoint } fr
 export { Board, RunView } from "./board-view.js";
 export { CheckpointPanel, type CheckpointPrompt, diffStat } from "./checkpoint.js";
 export { fit } from "./fit.js";
+export { ClarifyPanel, ProposalCard } from "./proposal.js";
+export {
+  listSkillFiles,
+  type SkillFile,
+  TrustPrompt,
+  type TrustPromptProps,
+  VIEW_FILES_CAP,
+} from "./trust-prompt.js";

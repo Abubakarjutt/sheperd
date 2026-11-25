@@ -71,8 +71,19 @@ function withFacts(b: BoardState, p: CheckpointPrompt): BoardState {
 /** What `RunHandle.done` resolves with. */
 export type RunDone = Awaited<RunHandle["done"]>;
 
-/** Folds a run's events into a board and shows the pending checkpoint, if any. */
-export function RunView({ run, onDone }: { run: RunHandle; onDone?: (outcome: RunDone) => void }) {
+/**
+ * Folds a run's events into a board and shows the pending checkpoint, if any. `onPending` hears
+ * every change of the pending prompt (the App routes clarifications to the input box).
+ */
+export function RunView({
+  run,
+  onDone,
+  onPending,
+}: {
+  run: RunHandle;
+  onDone?: (outcome: RunDone) => void;
+  onPending?: (p: PendingPrompt | undefined) => void;
+}) {
   const [board, setBoard] = useState(initialBoard);
   const [pending, setPending] = useState<PendingPrompt | undefined>(undefined);
   // Remounts the panel for each new prompt, so its message/edit state never carries over.
@@ -81,6 +92,8 @@ export function RunView({ run, onDone }: { run: RunHandle; onDone?: (outcome: Ru
   // Held in a ref so an inline callback never restarts the effect (a restart replays the events).
   const doneRef = useRef(onDone);
   doneRef.current = onDone;
+  const pendingRef = useRef(onPending);
+  pendingRef.current = onPending;
 
   useEffect(() => {
     let live = true;
@@ -104,6 +117,7 @@ export function RunView({ run, onDone }: { run: RunHandle; onDone?: (outcome: Ru
       if (p === last.current) return;
       last.current = p;
       setPending(p);
+      pendingRef.current?.(p);
       if (p) setPromptKey((k) => k + 1);
       if (isCheckpoint(p)) setBoard((b) => withFacts(b, p));
     };

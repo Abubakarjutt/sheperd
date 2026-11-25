@@ -6,11 +6,13 @@ import { theme } from "./theme.js";
 
 export type InputBoxProps = {
   busy: boolean;
+  /** Hidden and deaf (a panel owns the keys), keeping its text and history. */
+  disabled?: boolean;
   onSubmit: (text: string) => void;
 };
 
 /** Multi-line input. Shift+Enter (where Ink reports it) or a trailing `\` + Enter adds a line. */
-export function InputBox({ busy, onSubmit }: InputBoxProps) {
+export function InputBox({ busy, disabled = false, onSubmit }: InputBoxProps) {
   const [state, setState] = useState(initialInput);
   const ref = useRef(state);
 
@@ -22,7 +24,7 @@ export function InputBox({ busy, onSubmit }: InputBoxProps) {
   };
 
   useInput((input, key) => {
-    if (busy) return; // one send at a time: typing is ignored while a turn is in flight
+    if (busy || disabled) return; // one send at a time: typing is ignored while a turn is in flight
     if (key.return) apply({ type: key.shift ? "newline" : "submit" });
     else if (key.upArrow) apply({ type: "up" });
     else if (key.downArrow) apply({ type: "down" });
@@ -32,6 +34,7 @@ export function InputBox({ busy, onSubmit }: InputBoxProps) {
     }
   });
 
+  if (disabled) return null;
   if (busy) {
     return (
       <Box>
