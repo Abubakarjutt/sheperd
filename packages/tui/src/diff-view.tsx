@@ -283,3 +283,27 @@ export function TestsView({
     />
   );
 }
+
+/**
+ * Already-cleaned styled lines in the shared scroll frame (the contract card's `v`, every
+ * criterion). Each line must be on one line and cleaned by the caller.
+ */
+export function ListView({
+  lines,
+  width,
+  rows,
+  isActive,
+  onClose,
+}: ViewProps & { lines: readonly (readonly Styled[])[] }) {
+  const page = Math.max(1, Math.floor(rows));
+  const top = useScroll(lines.length, page, { isActive, onClose });
+  return (
+    <ScrollFrame
+      count={lines.length}
+      top={top}
+      page={page}
+      width={width}
+      line={(i) => lines[i] ?? []}
+    />
+  );
+}

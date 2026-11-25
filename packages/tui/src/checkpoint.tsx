@@ -2,7 +2,7 @@ import { CHECKPOINT_NOTE_MAX } from "@rewire/core";
 import type { PendingPrompt, RunHandle } from "@rewire/session";
 import { useInput } from "ink";
 import { type ReactElement, type ReactNode, useMemo, useRef, useState } from "react";
-import { cleanView, DiffView, TestsView } from "./diff-view.js";
+import { cleanView, DiffView, ListView, TestsView } from "./diff-view.js";
 import { Card, cardInner, cutStyled, type Styled, StyledLine } from "./styled.js";
 import { theme } from "./theme.js";
 import { useColumns, useRows } from "./use-columns.js";
@@ -87,6 +87,11 @@ export function CheckpointPanel({
   const [viewing, setViewing] = useState(false);
   const [message, setMessage] = useState<string | undefined>();
   const modeRef = useRef<Mode>(mode);
+  /**
+   * True for the rest of the key event that closed the revise box: the view's own key handler
+   * may run after this panel's, and must not also take that Esc (or Enter) as its own.
+   */
+  const keyTaken = useRef(false);
   const cp = prompt.checkpoint;
   // Cleaning a 200 KB diff is not free: once per prompt, not on every key.
   const commitStat = useMemo(
@@ -107,6 +112,10 @@ export function CheckpointPanel({
   useInput((input, key) => {
     const m = modeRef.current;
     if (m.kind === "edit") {
+      keyTaken.current = true;
+      queueMicrotask(() => {
+        keyTaken.current = false;
+      });
       if (key.escape) {
         setM({ kind: "keys" });
         setMessage(undefined);
@@ -133,7 +142,7 @@ export function CheckpointPanel({
       if (run.pending() !== prompt) setMessage(STALE_PROMPT);
       else if (revisionLimitReached) setMessage(LIMIT);
       else setM({ kind: "edit", value: "" });
-    } else if (k === "v" && cp.kind !== "contract") setViewing((v) => !v);
+    } else if (k === "v") setViewing((v) => !v);
   });
 
   const inner = cardInner(cols);
@@ -150,7 +159,9 @@ export function CheckpointPanel({
       { text: k, bold: true, color: theme.user },
       { text: ` ${word}`, dim: true },
     ]);
-  const isCurrent = (): boolean => run.pending() === prompt;
+  // View keys act only for the current prompt, and never while the revise box takes text.
+  const isCurrent = (): boolean =>
+    run.pending() === prompt && modeRef.current.kind !== "edit" && !keyTaken.current;
   const viewRows = Math.max(1, rows - VIEW_FIXED - outside);
   /** List lines (criteria, files) that fit; the rest are summed up in a "… more" line. */
   const cap = Math.max(1, Math.min(10, rows - CARD_FIXED - outside));
@@ -158,28 +169,41 @@ export function CheckpointPanel({
   let color: string;
   let body: ReactNode = null;
 
+  const tail: ReactElement[] = [];
+  const addTail = (key: string, segs: Styled[]): void => {
+    tail.push(<StyledLine key={key} segs={cutStyled(segs, inner)} />);
+  };
   if (cp.kind === "contract") {
     color = theme.accent;
     add("h", [{ text: one(`Contract checkpoint: ${cp.contract.title}`), bold: true, color }]);
-    // Every criterion that fits: a contract is approved on all of them, so no fixed cap of 10.
-    const ccap = Math.max(1, rows - CARD_FIXED - outside);
-    cp.contract.criteria.slice(0, ccap).forEach((c, i) => {
-      add(`c${i}`, [
-        { text: `${one(c.id)} ` },
-        { text: `[${c.kind}]`, color: c.kind === "change" ? theme.busy : theme.user },
-        { text: ` ${one(c.statement)}` },
-      ]);
-    });
-    if (cp.contract.criteria.length > ccap)
-      add("cm", [
-        {
-          text: `  … ${cp.contract.criteria.length - ccap} more criteria (a taller terminal shows all)`,
-          dim: true,
-        },
-      ]);
-    if (revisionLimitReached) add("lim", [{ text: LIMIT, color: theme.busy }]);
+    const crit: Styled[][] = cp.contract.criteria.map((c) => [
+      { text: `${one(c.id)} ` },
+      { text: `[${c.kind}]`, color: c.kind === "change" ? theme.busy : theme.user },
+      { text: ` ${one(c.statement)}` },
+    ]);
+    if (viewing) {
+      // Every criterion, scrollable: a contract is never approved on criteria it could not show.
+      body = (
+        <ListView
+          lines={crit}
+          width={inner}
+          rows={viewRows}
+          isActive={isCurrent}
+          onClose={closeView}
+        />
+      );
+    } else {
+      // Every criterion that fits (no fixed cap of 10); `v` shows the rest.
+      const ccap = Math.max(1, rows - CARD_FIXED - outside);
+      crit.slice(0, ccap).forEach((segs, i) => {
+        add(`c${i}`, segs);
+      });
+      if (crit.length > ccap)
+        add("cm", [{ text: `  … ${crit.length - ccap} more criteria · v view all`, dim: true }]);
+    }
+    if (revisionLimitReached) addTail("lim", [{ text: LIMIT, color: theme.busy }]);
     else
-      add(
+      addTail(
         "k",
         hints([
           ["a", "approve"],
@@ -248,10 +272,6 @@ export function CheckpointPanel({
         add("dm", [{ text: `  … ${stat.files.length - cap} more`, dim: true }]);
     }
   }
-  const tail: ReactElement[] = [];
-  const addTail = (key: string, segs: Styled[]): void => {
-    tail.push(<StyledLine key={key} segs={cutStyled(segs, inner)} />);
-  };
   if (cp.kind !== "contract")
     addTail(
       "k",
