@@ -147,6 +147,31 @@ describe("slash commands", () => {
     expect(v.lastFrame()).toContain("/checkpoints");
   });
 
+  it("/doctor output is redacted", async () => {
+    const { session } = fakeSession();
+    const secret = `ghp_${"a".repeat(36)}`;
+    const v = mount({ session, doctor: async () => `token ${secret} found` });
+    await enter(v.stdin, "/doctor");
+    await tick();
+    expect(v.lastFrame()).toContain("token");
+    expect(v.lastFrame()).not.toContain(secret);
+  });
+
+  it("a line that arrives right after /run, before a re-render, is not sent to the model", async () => {
+    const { session, sent } = fakeSession();
+    const { run } = fakeRun(() => undefined);
+    const { rc, start } = controller(run);
+    const v = mount({ session, runController: rc });
+    v.stdin.write("/run go");
+    await tick();
+    v.stdin.write("\r");
+    v.stdin.write("h");
+    v.stdin.write("\r");
+    await tick(100);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(sent).toEqual([]);
+  });
+
   it("/exit calls onExit(0)", async () => {
     const { session } = fakeSession();
     const onExit = vi.fn();

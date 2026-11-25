@@ -11,7 +11,7 @@ import {
 } from "@rewire/skills";
 import { render } from "ink-testing-library";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { listSkillFiles, TrustPrompt } from "../src/trust-prompt.js";
+import { listSkillFiles, SHADOWED_LABEL, TrustPrompt } from "../src/trust-prompt.js";
 
 const tick = (ms = 40) => new Promise((r) => setTimeout(r, ms));
 
@@ -124,5 +124,81 @@ describe("listSkillFiles", () => {
     const link = all.entries.find((e) => e.path === "link");
     expect(link?.symlink).toBe(true);
     expect(link?.bytes).not.toBe(100);
+  });
+});
+
+describe("TrustPrompt covers every repo skill the hash pins", () => {
+  it("shows a shadowed repo skill, labelled, and pins repoSkillsHash(found)", async () => {
+    const home = join(root, "home");
+    await mkdir(join(home, ".claude", "skills", "lint"), { recursive: true });
+    await writeFile(join(home, ".claude", "skills", "lint", "SKILL.md"), md("lint", "mine"));
+    const rdir = join(repo, ".claude", "skills", "lint");
+    await mkdir(rdir, { recursive: true });
+    await writeFile(join(rdir, "SKILL.md"), md("lint", "repo lint runs rm"));
+    ({ skills: found } = await discoverSkills({ home, xdgConfig: join(root, "xdg"), repo }));
+    pending = resolveSkills(found, false).pendingRepo;
+    expect(pending.map((s) => s.name)).toEqual(["deploy"]);
+    expect(found.some((s) => s.source === "repo" && s.shadowed)).toBe(true);
+    expect(repoSkillsHash(found)).not.toBe(repoSkillsHash(pending));
+
+    const onDone = vi.fn();
+    const v = mount(onDone);
+    const f = v.lastFrame() ?? "";
+    expect(f).toContain("repo lint runs rm");
+    expect(f).toContain(SHADOWED_LABEL);
+    v.stdin.write("v");
+    await tick(150);
+    expect(v.lastFrame()).toMatch(/lint\/ \(shadowed/);
+    v.stdin.write("v");
+    await tick();
+    v.stdin.write("y");
+    await tick(150);
+    expect(onDone).toHaveBeenCalledWith(true);
+    const store = await loadTrust(file);
+    expect(store.repos.get(await trustKey(repo))).toBe(repoSkillsHash(found));
+    v.unmount();
+  });
+
+  it("[v]iew lists the pinned files and flags (sanitized) files added on disk since", async () => {
+    await writeFile(join(repo, ".claude", "skills", "deploy", "evil\x1b]52;c;aGk=\x07.sh"), "x");
+    const v = mount(() => {});
+    v.stdin.write("v");
+    await tick(150);
+    const f = v.lastFrame() ?? "";
+    expect(f).toContain("files covered by this approval");
+    expect(f).toContain("scripts/run.sh  8 B");
+    expect(f).toContain("current files on disk differ");
+    expect(f).toContain("on disk: evil");
+    expect(f).not.toContain("\x1b");
+    expect(f).not.toContain("\x07");
+    v.unmount();
+  });
+});
+
+describe("listSkillFiles bounds", () => {
+  it("stops at the depth limit", async () => {
+    let d = join(root, "deep");
+    for (let i = 0; i < 20; i++) d = join(d, "d");
+    await mkdir(d, { recursive: true });
+    await writeFile(join(d, "f"), "x");
+    const r = await listSkillFiles(join(root, "deep"));
+    expect(r.truncated).toBe(true);
+    expect(r.entries).toEqual([]);
+  });
+
+  it("counts directories toward the cap", async () => {
+    const dir = join(root, "many");
+    for (let i = 0; i < 10; i++) await mkdir(join(dir, `e${i}`), { recursive: true });
+    const r = await listSkillFiles(dir, 5);
+    expect(r.truncated).toBe(true);
+  });
+
+  it("is not truncated when exactly cap files exist", async () => {
+    const dir = join(root, "exact");
+    await mkdir(dir);
+    for (let i = 0; i < 3; i++) await writeFile(join(dir, `f${i}`), "a");
+    const r = await listSkillFiles(dir, 3);
+    expect(r.truncated).toBe(false);
+    expect(r.entries).toHaveLength(3);
   });
 });

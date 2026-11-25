@@ -133,9 +133,21 @@ export function App(props: AppProps) {
   const [entries, setEntries] = useState<TranscriptEntry[]>(() => historyEntries(props.session));
   const [busy, setBusy] = useState(false);
   const inFlight = useRef(false);
-  const [run, setRun] = useState<RunHandle | undefined>(props.run);
+  const [run, setRunState] = useState<RunHandle | undefined>(props.run);
+  // Mirrors of `run` and `clarify`, set synchronously: `submit` gates on these, so lines that
+  // arrive before React re-renders still see a run that has just started (or a new answer).
+  const runRef = useRef<RunHandle | undefined>(props.run);
+  const setRun = useCallback((h: RunHandle | undefined) => {
+    runRef.current = h;
+    setRunState(h);
+  }, []);
   const [pending, setPending] = useState<PendingPrompt | undefined>(undefined);
-  const [clarify, setClarify] = useState<Clarify | undefined>(undefined);
+  const [clarify, setClarifyState] = useState<Clarify | undefined>(undefined);
+  const clarifyRef = useRef<Clarify | undefined>(undefined);
+  const setClarify = useCallback((c: Clarify | undefined) => {
+    clarifyRef.current = c;
+    setClarifyState(c);
+  }, []);
   const [proposal, setProposal] = useState<string | undefined>(undefined);
   const [checkpoints, setCheckpoints] = useState<ReadonlySet<CheckpointKind>>(
     () => props.checkpoints ?? DEFAULT_CHECKPOINTS,
@@ -146,7 +158,7 @@ export function App(props: AppProps) {
   // A run handed in later by the parent replaces the current one.
   useEffect(() => {
     if (props.run) setRun(props.run);
-  }, [props.run]);
+  }, [props.run, setRun]);
 
   const add = useCallback((...e: TranscriptEntry[]) => setEntries((cur) => [...cur, ...e]), []);
   const note = useCallback(
@@ -161,12 +173,15 @@ export function App(props: AppProps) {
       setPending(undefined);
       setClarify(undefined);
     },
-    [add],
+    [add, setRun, setClarify],
   );
-  const onPending = useCallback((p: PendingPrompt | undefined) => {
-    setPending(p);
-    setClarify(p?.kind === "clarify" ? { prompt: p, answers: [] } : undefined);
-  }, []);
+  const onPending = useCallback(
+    (p: PendingPrompt | undefined) => {
+      setPending(p);
+      setClarify(p?.kind === "clarify" ? { prompt: p, answers: [] } : undefined);
+    },
+    [setClarify],
+  );
 
   useEffect(() => {
     if (!subscribe) return;
@@ -215,7 +230,7 @@ export function App(props: AppProps) {
         add(errorEntry(err));
       }
     },
-    [runController, checkpoints, add],
+    [runController, checkpoints, add, setRun, setClarify],
   );
 
   const swapSession = useCallback(
@@ -271,7 +286,8 @@ export function App(props: AppProps) {
           return startRun(c.task);
         case "skills": {
           note(skillsText(skills, trustedLater));
-          if (!run && skills && skills.pendingRepo.length > 0 && !trustedLater) setTrustOpen(true);
+          if (!runRef.current && skills && skills.pendingRepo.length > 0 && !trustedLater)
+            setTrustOpen(true);
           return;
         }
         case "checkpoints":
@@ -292,7 +308,7 @@ export function App(props: AppProps) {
         case "doctor":
           if (!doctor) return note("doctor is not available here", true);
           doctor().then(
-            (out) => note(out),
+            (out) => note(redact(out)),
             (err: unknown) => add(errorEntry(err)),
           );
           return;
@@ -312,7 +328,6 @@ export function App(props: AppProps) {
       startRun,
       skills,
       trustedLater,
-      run,
       checkpoints,
       routing,
       resume,
@@ -328,6 +343,7 @@ export function App(props: AppProps) {
   /** One typed line while a clarification is pending: the next answer, or `/skip`. */
   const answerClarify = useCallback(
     (c: Clarify, value: string | null) => {
+      const run = runRef.current;
       if (!run) return;
       const answers = value === null ? null : [...c.answers, value];
       if (answers !== null && answers.length < c.prompt.questions.length) {
@@ -339,7 +355,7 @@ export function App(props: AppProps) {
       if (!run.answer(c.prompt, reply)) note(STALE_PROMPT, true);
       setClarify(undefined);
     },
-    [run, note],
+    [note, setClarify],
   );
 
   const submit = useCallback(
@@ -347,7 +363,8 @@ export function App(props: AppProps) {
       if (inFlight.current) return;
       add({ kind: "user", text: line });
       const cmd = parseCommand(line);
-      if (run) {
+      const clarify = clarifyRef.current;
+      if (runRef.current) {
         if (cmd === undefined) {
           if (clarify) return answerClarify(clarify, literalText(line));
           return note(RUN_ACTIVE, true);
@@ -359,7 +376,7 @@ export function App(props: AppProps) {
       if (cmd === undefined) return sendChat(literalText(line));
       runCommand(cmd);
     },
-    [run, clarify, add, note, answerClarify, runCommand, sendChat],
+    [add, note, answerClarify, runCommand, sendChat],
   );
 
   const onProposal = useCallback(
