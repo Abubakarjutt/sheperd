@@ -1582,6 +1582,80 @@ describe("pending citations and the window (N1, N3)", () => {
     expect(r.ok && r.record.pending).toEqual([]);
   });
 
+  test("an older instruction cannot overturn a newer one (stale_evidence)", async () => {
+    // m0 is kept verbatim (default budget), so it is citable; but the items rest on m3.
+    const onM3 = (id: string, text: string) =>
+      userItem({
+        id,
+        text,
+        evidence: [{ messageId: "m3", quote: "use postgres instead of sqlite" }],
+      });
+    const record = withItems([
+      onM3("i1", "use postgres"),
+      onM3("i2", "postgres"),
+      onM3("i3", "pg"),
+    ]);
+    const old = [{ messageId: "m0", quote: "use sqlite for storage" }];
+    const same = [{ messageId: "m3", quote: "Actually use postgres instead of sqlite." }];
+    const provider = faux(
+      json([
+        {
+          op: "supersede",
+          itemId: "i1",
+          by: { kind: "constraint", text: "use sqlite", source: "user", evidence: old },
+          evidence: old,
+        },
+        { op: "update", itemId: "i2", text: "sqlite", evidence: old },
+        { op: "resolve", itemId: "i3", evidence: same },
+      ]),
+    );
+    const asked: number[] = [];
+    const r = await compact({
+      record,
+      messages: conv.slice(0, 5),
+      since: "m2",
+      provider,
+      model: "m",
+      verifyRisky: async (ops) => {
+        asked.push(...ops.map((o) => o.index));
+        return ops.map(() => ({ accept: true }));
+      },
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(asked).toEqual([]);
+    expect(r.ops.map((o) => o.accepted)).toEqual([false, false, false]);
+    for (const o of r.ops) expect(o.reason).toMatch(/^stale_evidence/);
+    expect(r.record.items).toEqual(record.items);
+    // An authority failure: nothing becomes pending.
+    expect(r.record.pending).toEqual([]);
+  });
+
+  test("a newer correction is accepted over the item's evidence", async () => {
+    // sqlite rests on m0; m3 is newer.
+    const r = await step(withItems([sqlite]), [toPostgres], "m2", 4);
+    expect(r.ok && r.ops[0]?.accepted).toBe(true);
+    expect(r.ok && r.record.items.map((i) => i.text)).toEqual(["use postgres instead of sqlite"]);
+    // Ids compare as numbers: m11 is newer than m9.
+    const flags = userItem({
+      text: "work on the flags",
+      evidence: [{ messageId: "m9", quote: "Now the flags." }],
+    });
+    const docs = {
+      op: "supersede",
+      itemId: "i1",
+      by: {
+        kind: "goal",
+        text: "work on the docs",
+        source: "user",
+        evidence: [{ messageId: "m11", quote: "And the docs." }],
+      },
+      evidence: [{ messageId: "m11", quote: "And the docs." }],
+    };
+    const r2 = await step(withItems([flags]), [docs], "m10", 12);
+    expect(r2.ok && r2.ops[0]?.accepted).toBe(true);
+  });
+
   test("an authority failure makes nothing pending, even with a real user quote in it", async () => {
     // Mixed evidence: m3 is a real, citable user quote, but m4 is the assistant.
     const mixed = {

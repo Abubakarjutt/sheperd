@@ -399,6 +399,9 @@ function checkEvidence(raw: readonly Evidence[] | undefined, ctx: ApplyContext):
   });
 }
 
+/** The number in a message id (`m12` is 12); ids are checked by `MessageId` before use. */
+const messageNumber = (id: string): number => Number(id.slice(1));
+
 const allFromUser = (ev: readonly Evidence[], ctx: ApplyContext): boolean =>
   ev.every((e) => ctx.byId.get(e.messageId)?.role === "user");
 
@@ -554,6 +557,17 @@ function applyOps(
         if (old) {
           rejectAuthority(
             `changing user item ${target.id} may cite only messages in the window, recent or pending, not ${old.messageId}`,
+          );
+        }
+        // An older instruction never overturns a newer one: at least one citation must be newer
+        // than everything the item already rests on.
+        const newest = Math.max(
+          -1,
+          ...(target.evidence ?? []).map((e) => messageNumber(e.messageId)),
+        );
+        if (!authority.some((e) => messageNumber(e.messageId) > newest)) {
+          rejectAuthority(
+            `stale_evidence: changing user item ${target.id} needs a user message newer than m${newest}`,
           );
         }
         // A user item ends only by resolve, or by another user item: never a downgrade.
