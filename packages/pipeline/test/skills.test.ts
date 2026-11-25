@@ -40,6 +40,9 @@ import { authorSkills, skillMemoSize } from "../src/skills.js";
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = resolve(here, "fixtures/sum-lib");
 const WORKSPACE_MODULES = resolve(here, "../../../node_modules");
+/** Outside /tmp (see makeSet); node_modules is git-ignored. */
+const CACHE_BASE = resolve(here, "../node_modules/.cache/rewire-test");
+mkdirSync(CACHE_BASE, { recursive: true });
 const sandboxAvailable = sandboxIsAvailable();
 
 const dirs: string[] = [];
@@ -80,7 +83,11 @@ async function makeSet(): Promise<SkillSet> {
     "---\nname: tdd\ndescription: Test-driven development helper\n---\nWrite the test first.\n",
   );
   const { skills } = await discoverSkills({ home, xdgConfig, repo: base });
-  const set = createSkillSet(skills, { home, xdgConfig, cacheDir: join(base, "cache") });
+  // Not under tmpdir(): the Linux sandbox mounts a private /tmp, so a skill set there is
+  // invisible inside it. The real default (~/.cache) is outside /tmp.
+  const cache = realpathSync(mkdtempSync(join(CACHE_BASE, "skill-cache-")));
+  dirs.push(cache);
+  const set = createSkillSet(skills, { home, xdgConfig, cacheDir: cache });
   sets.push(set);
   return set;
 }
