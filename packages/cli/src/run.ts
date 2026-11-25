@@ -6,6 +6,7 @@ import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 import { RewireError, type RunEvent } from "@rewire/core";
 import {
+  defaultCompactionConfig,
   loadModelsFile,
   type ModelsFile,
   type RunOutcome,
@@ -123,12 +124,17 @@ export async function resolveModels(
     return {
       available: names.map((model) => ({ provider: "faux", model }) as ModelRef),
       overrides: {},
+      compaction: defaultCompactionConfig(),
     };
   }
   if (modelsPath !== undefined) return loadModelsFile(resolve(cwd, modelsPath));
   const fromFile = await defaultModelsFile(env);
   if (fromFile !== undefined) return loadModelsFile(fromFile);
-  return { available: await discoverModels(env), overrides: {} };
+  return {
+    available: await discoverModels(env),
+    overrides: {},
+    compaction: defaultCompactionConfig(),
+  };
 }
 
 export function providerFactory(env: NodeJS.ProcessEnv, faux: FauxScript | undefined) {

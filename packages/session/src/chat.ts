@@ -10,6 +10,7 @@ import { profileFor, SandboxClient } from "@rewire/sandbox";
 import { type SkillSet, skillIndex, skillTool } from "@rewire/skills";
 import { createTools } from "@rewire/tools";
 import type { SessionStore } from "./store.js";
+import { PrefillMeter } from "./trigger.js";
 
 const PACKAGE_ROOT = assetRoot("session", import.meta.url);
 const STAGE = "chat";
@@ -104,6 +105,11 @@ export type ChatSessionOptions = {
   sessionId?: string;
   /** Model calls per `send` (default 40). */
   maxTurns?: number;
+  /**
+   * The model's prompt-reading meter, to share it between sessions of the same model; a new one
+   * per session otherwise.
+   */
+  prefillMeter?: PrefillMeter;
 };
 
 let promptCache: string | undefined;
@@ -166,9 +172,11 @@ export class ChatSession {
   private readonly life = new AbortController();
   /** Skills already reported by a live turn (a load in an abandoned turn is not reported). */
   private readonly reportedSkills = new Set<string>();
+  private readonly meter: PrefillMeter;
 
   constructor(opts: ChatSessionOptions) {
     this.opts = opts;
+    this.meter = opts.prefillMeter ?? new PrefillMeter();
     this.sid = opts.sessionId;
     this.resumed = opts.sessionId === undefined;
     // One skill tool per session. Its loads are reported per turn by the wrapper in `turn`, so
@@ -199,6 +207,15 @@ export class ChatSession {
   /** A copy of the conversation so far (complete turns only). */
   history(): ChatMessage[] {
     return structuredClone(this.messages);
+  }
+
+  /**
+   * The model's measured prompt-reading speed (input tokens over the time from the start of a
+   * model call to its first streamed delta), or undefined before a usable sample. Calls that
+   * stream no text are not measured.
+   */
+  prefill(): { tokensPerSec: number; samples: number } | undefined {
+    return this.meter.rate();
   }
 
   send(text: string, signal?: AbortSignal): Promise<ChatTurn> {
@@ -328,7 +345,20 @@ export class ChatSession {
     const inner = this.opts.provider;
     const provider: Provider = {
       chat: async (req: ChatRequest) => {
-        const res = await inner.chat(req);
+        const started = performance.now();
+        let ttftMs: number | undefined;
+        const onDelta = req.onDelta;
+        const timed: ChatRequest = onDelta
+          ? {
+              ...req,
+              onDelta: (delta) => {
+                ttftMs ??= performance.now() - started;
+                onDelta(delta);
+              },
+            }
+          : req;
+        const res = await inner.chat(timed);
+        if (ttftMs !== undefined) this.meter.sample(res.usage.inputTokens, ttftMs);
         pendingCalls.push(...res.message.toolCalls);
         if (res.message.text !== "") {
           emitLive({ type: "assistant_text", text: redact(res.message.text) });

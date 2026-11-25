@@ -489,6 +489,8 @@ type StreamTurn = {
   chunks?: string[];
   toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[];
   usage?: { inputTokens: number; outputTokens: number };
+  /** Waited before the first delta: a slow prompt read. */
+  delayMs?: number;
 };
 
 /** Streams each turn's chunks through onDelta (when set); the final text is their join. */
@@ -501,6 +503,7 @@ function streaming(turns: StreamTurn[], stream = true): Provider & { requests: C
       const t = turns[i++];
       if (t === undefined) throw new RewireError("faux_script_exhausted", "exhausted");
       const chunks = t.chunks ?? [];
+      if (t.delayMs) await new Promise((r) => setTimeout(r, t.delayMs));
       if (stream) for (const c of chunks) req.onDelta?.(c);
       const toolCalls = t.toolCalls ?? [];
       return {
@@ -739,5 +742,25 @@ describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(deltas(events)).toEqual(["early "]);
     expect(events.filter((e) => e.type === "usage" || e.type === "assistant_text")).toEqual([]);
+  });
+
+  test("prefill() measures prompt reading: input tokens over the time to the first delta", async () => {
+    const p = streaming([
+      { chunks: ["slow"], delayMs: 400, usage: { inputTokens: 4000, outputTokens: 1 } },
+      // A prefix-cache hit (first delta at once) and a tiny prompt are not reading speeds.
+      { chunks: ["cached"], usage: { inputTokens: 4000, outputTokens: 1 } },
+      { chunks: ["tiny"], delayMs: 400, usage: { inputTokens: 500, outputTokens: 1 } },
+    ]);
+    const { session } = await setup(p);
+    expect(session.prefill()).toBeUndefined();
+    await session.send("one");
+    const r = session.prefill();
+    expect(r?.samples).toBe(1);
+    // ttft >= ~400 ms (timers may fire a ms early), and well under 2 s on any runner.
+    expect(r?.tokensPerSec).toBeLessThanOrEqual(4000 / 0.39);
+    expect(r?.tokensPerSec).toBeGreaterThan(4000 / 2);
+    await session.send("two");
+    await session.send("three");
+    expect(session.prefill()).toEqual(r);
   });
 });

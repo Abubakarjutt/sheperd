@@ -1,9 +1,15 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { RewireError } from "@rewire/core";
 import { modelFamily, parseModelRef } from "@rewire/providers";
-import { expect, test } from "vitest";
-import { loadModelsFile, resolveRouting } from "../src/routing.js";
+import { describe, expect, test } from "vitest";
+import {
+  compactionLimitOverride,
+  DEFAULT_COMPACTION_CONFIG,
+  loadModelsFile,
+  resolveRouting,
+} from "../src/routing.js";
 
 const refs = (...s: string[]) => s.map(parseModelRef);
 const fam = (r: ReturnType<typeof parseModelRef>) => modelFamily(r);
@@ -93,4 +99,63 @@ test("loadModelsFile rejects a top-level typo like [role]", async () => {
   await expect(
     loadModelsFile(file(`available = ["anthropic:a"]\n[role]\nverifier = "anthropic:a"\n`)),
   ).rejects.toThrow(/role/);
+});
+
+describe("loadModelsFile [compaction]", () => {
+  const base = `available = ["anthropic:a"]\n`;
+
+  test("a file without [compaction] gets the defaults", async () => {
+    const m = await loadModelsFile(file(base));
+    expect(m.compaction).toEqual(DEFAULT_COMPACTION_CONFIG);
+    expect(DEFAULT_COMPACTION_CONFIG).toEqual({
+      latencyBudgetS: 60,
+      recentUserTokens: 20000,
+      limits: {},
+    });
+  });
+
+  test("reads budgets and per-model limits", async () => {
+    const m = await loadModelsFile(
+      file(
+        `${base}[compaction]\nlatency_budget_s = 90\nrecent_user_tokens = 8000\n[compaction.models."ollama:qwen3.8:27b-mlx"]\nlimit = 32000\n[compaction.models."anthropic:claude-opus-5-5"]\nlimit = 150000\n`,
+      ),
+    );
+    expect(m.compaction).toEqual({
+      latencyBudgetS: 90,
+      recentUserTokens: 8000,
+      limits: { "ollama:qwen3.8:27b-mlx": 32000, "anthropic:claude-opus-5-5": 150000 },
+    });
+    expect(
+      compactionLimitOverride(m.compaction, { provider: "ollama", model: "qwen3.8:27b-mlx" }),
+    ).toBe(32000);
+    expect(compactionLimitOverride(m.compaction, { provider: "ollama", model: "other" })).toBe(
+      undefined,
+    );
+  });
+
+  test("a partial [compaction] table keeps the other defaults", async () => {
+    const m = await loadModelsFile(file(`${base}[compaction]\nlatency_budget_s = 5\n`));
+    expect(m.compaction).toEqual({ latencyBudgetS: 5, recentUserTokens: 20000, limits: {} });
+  });
+
+  test.each([
+    ["unknown key", `[compaction]\nlatency_budget = 60\n`, /latency_budget/],
+    ["budget below 5", `[compaction]\nlatency_budget_s = 4\n`, /latency_budget_s/],
+    ["budget above 3600", `[compaction]\nlatency_budget_s = 3601\n`, /latency_budget_s/],
+    ["budget as a string", `[compaction]\nlatency_budget_s = "60"\n`, /latency_budget_s/],
+    ["recent below 1000", `[compaction]\nrecent_user_tokens = 999\n`, /recent_user_tokens/],
+    ["recent above 200000", `[compaction]\nrecent_user_tokens = 200001\n`, /recent_user_tokens/],
+    ["recent not an integer", `[compaction]\nrecent_user_tokens = 1500.5\n`, /recent_user_tokens/],
+    ["limit below 4096", `[compaction.models."anthropic:a"]\nlimit = 4095\n`, /limit/],
+    ["limit not an integer", `[compaction.models."anthropic:a"]\nlimit = 5000.5\n`, /limit/],
+    ["limit missing", `[compaction.models."anthropic:a"]\n`, /limit/],
+    ["unknown model key", `[compaction.models."anthropic:a"]\nlimit = 5000\nmax = 1\n`, /max/],
+    ["bad model ref", `[compaction.models."nope"]\nlimit = 5000\n`, /nope/],
+    ["models not a table", `[compaction]\nmodels = 3\n`, /models/],
+  ])("rejects %s with models_file_invalid", async (_name, body, why) => {
+    const err = await loadModelsFile(file(`${base}${body}`)).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RewireError);
+    expect(err).toMatchObject({ code: "models_file_invalid" });
+    expect((err as Error).message).toMatch(why);
+  });
 });
