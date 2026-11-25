@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import { RewireError } from "@rewire/core";
 import type {
   ChatEvent,
@@ -6,7 +7,7 @@ import type {
   RunHandle,
   SessionSummary,
 } from "@rewire/session";
-import { resolveSkills, type Skill, type SkillSet } from "@rewire/skills";
+import { resolveSkills, type Skill, type SkillProblem, type SkillSet } from "@rewire/skills";
 // Type-only: the TUI (Ink, React) is loaded by the caller, only on the interactive path.
 import type { InterruptTarget, SkillsInfo, TuiDeps } from "@rewire/tui";
 import { type Activity, Interrupter } from "./interactive.js";
@@ -19,9 +20,12 @@ export type StartDeps = {
   repo: string;
   /** `$XDG_CONFIG_HOME/rewire/trusted-skills.json`. */
   trustFile: string;
-  /** User and repo skills as found now (`discoverSkills(...).skills`). */
-  discover: () => Promise<Skill[]>;
-  /** Whether the trust store pins exactly these repo skills (`isTrusted(loadTrust, trustKey, repoSkillsHash(found))`). */
+  /** User and repo skills as found now, and the skill dirs skipped (`discoverSkills(...)`). */
+  discover: () => Promise<{ skills: Skill[]; problems: SkillProblem[] }>;
+  /**
+   * Whether the trust store pins exactly these repo skills (`isTrusted(loadTrust, trustKey,
+   * repoSkillsHash(found))`). A `trust_store_unreadable` throw leaves the repo skills untrusted.
+   */
   trusted: (found: Skill[]) => Promise<boolean>;
   /** The startup `<TrustPrompt>`: true = saved, false = declined, undefined = closed by Ctrl-C. */
   promptTrust: (p: {
@@ -54,7 +58,18 @@ export type StartDeps = {
   now?: () => number;
 };
 
-type Resolved = { found: Skill[]; active: Skill[]; pendingRepo: Skill[] };
+type Resolved = {
+  found: Skill[];
+  active: Skill[];
+  pendingRepo: Skill[];
+  /** Lines shown at TUI start: skipped skill dirs, an unreadable trust store. */
+  warnings: string[];
+  /** The trust store could not be read: do not prompt (saving would fail the same way). */
+  trustUnreadable: boolean;
+};
+
+const problemLine = (p: SkillProblem): string =>
+  `skill ${basename(p.dir)} skipped: ${p.code} ${p.message}`;
 
 async function settleWithin(work: Promise<unknown>, ms: number): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
@@ -121,14 +136,26 @@ export async function startInteractive(d: StartDeps): Promise<number> {
 
   try {
     const resolveNow = async (): Promise<Resolved> => {
-      const found = await d.discover();
-      const trusted = found.some((s) => s.source === "repo") ? await d.trusted(found) : false;
-      return { found, ...resolveSkills(found, trusted) };
+      const { skills: found, problems } = await d.discover();
+      const warnings = problems.map(problemLine);
+      let trusted = false;
+      let trustUnreadable = false;
+      if (found.some((s) => s.source === "repo")) {
+        try {
+          trusted = await d.trusted(found);
+        } catch (e) {
+          // M3: an unreadable trust store blocks the repo skills, not the session.
+          if (!(e instanceof RewireError) || e.code !== "trust_store_unreadable") throw e;
+          trustUnreadable = true;
+          warnings.push(`repo skills not loaded: ${e.code} ${e.message}`);
+        }
+      }
+      return { found, ...resolveSkills(found, trusted), warnings, trustUnreadable };
     };
 
     let r = await resolveNow();
     if (exiting !== undefined) return exiting;
-    if (r.pendingRepo.length > 0) {
+    if (r.pendingRepo.length > 0 && !r.trustUnreadable) {
       const answer = await d.promptTrust({
         found: r.found,
         pendingRepo: r.pendingRepo,
@@ -137,12 +164,19 @@ export async function startInteractive(d: StartDeps): Promise<number> {
       });
       closeUi = undefined;
       if (answer === undefined || exiting !== undefined) return exiting ?? 0;
-      if (answer) r = { found: r.found, ...resolveSkills(r.found, true) };
+      if (answer) r = { ...r, ...resolveSkills(r.found, true) };
     }
 
     let set = d.createSkillSet(r.active);
     sets.push(set);
-    let info: SkillsInfo = { ...r, repo: d.repo, trustFile: d.trustFile };
+    const skillsInfo = (x: Resolved): SkillsInfo => ({
+      found: x.found,
+      active: x.active,
+      pendingRepo: x.pendingRepo,
+      repo: d.repo,
+      trustFile: d.trustFile,
+    });
+    let info = skillsInfo(r);
 
     let forward: ((e: ChatEvent) => void) | undefined;
     const emit = (e: ChatEvent): void => forward?.(e);
@@ -191,7 +225,7 @@ export async function startInteractive(d: StartDeps): Promise<number> {
       set = nextSet;
       sets.push(nextSet);
       runs = d.newRunController(nextSet);
-      info = { ...next, repo: d.repo, trustFile: d.trustFile };
+      info = skillsInfo(next);
       sets.splice(sets.indexOf(old), 1);
       await d.disposeSkillSet(old).catch(() => {});
       return s;
@@ -219,6 +253,7 @@ export async function startInteractive(d: StartDeps): Promise<number> {
         list: () => d.listSessions(),
       },
       skills: () => info,
+      warnings: r.warnings,
       ...(d.doctor ? { doctor: d.doctor } : {}),
       ...(d.routing !== undefined ? { routing: d.routing } : {}),
       bindEmit: (l) => {

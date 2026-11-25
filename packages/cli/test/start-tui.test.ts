@@ -1,6 +1,6 @@
 import { RewireError } from "@rewire/core";
 import type { ChatEvent, ChatSession, RunHandle } from "@rewire/session";
-import type { Skill, SkillSet } from "@rewire/skills";
+import type { Skill, SkillProblem, SkillSet } from "@rewire/skills";
 import type { InterruptTarget, SkillsInfo, TuiDeps } from "@rewire/tui";
 import { describe, expect, test } from "vitest";
 import { formatError } from "../src/run.js";
@@ -21,7 +21,13 @@ const skill = (name: string, source: "user" | "repo", extra: Partial<Skill> = {}
 
 type Log = string[];
 
-function fakeDeps(over: Partial<StartDeps> & { found?: Skill[][]; trust?: boolean[] } = {}) {
+function fakeDeps(
+  over: Partial<StartDeps> & {
+    found?: Skill[][];
+    trust?: boolean[];
+    problems?: SkillProblem[];
+  } = {},
+) {
   const log: Log = [];
   const found = over.found ?? [[skill("u1", "user")]];
   const trust = over.trust ?? [];
@@ -40,7 +46,7 @@ function fakeDeps(over: Partial<StartDeps> & { found?: Skill[][]; trust?: boolea
       const f = found[Math.min(discoveries, found.length - 1)] ?? [];
       discoveries++;
       log.push("discover");
-      return f;
+      return { skills: f, problems: over.problems ?? [] };
     },
     trusted: async () => {
       log.push("trust");
@@ -94,6 +100,53 @@ function fakeDeps(over: Partial<StartDeps> & { found?: Skill[][]; trust?: boolea
 }
 
 describe("startInteractive wiring", () => {
+  test("discovery problems reach the TUI as warning lines (M1)", async () => {
+    let seen: TuiDeps | undefined;
+    const f = fakeDeps({
+      problems: [
+        { dir: "/repo/.claude/skills/evil", code: "skill_invalid", message: "symlink in skill" },
+      ],
+      render: async (d) => {
+        seen = d;
+        return 0;
+      },
+    });
+    await startInteractive(f.deps);
+    expect(seen?.warnings).toEqual(["skill evil skipped: skill_invalid symlink in skill"]);
+  });
+
+  test("an unreadable trust store: repo skills untrusted, no prompt, a warning; the session opens (M3)", async () => {
+    let seen: TuiDeps | undefined;
+    const f = fakeDeps({
+      found: [[skill("u1", "user"), skill("r1", "repo")]],
+      trusted: async () => {
+        throw new RewireError("trust_store_unreadable", "EACCES on trusted-skills.json");
+      },
+      render: async (d) => {
+        seen = d;
+        return 0;
+      },
+    });
+    expect(await startInteractive(f.deps)).toBe(0);
+    expect(f.log).not.toContain("prompt");
+    expect(f.createdSets[0]?.names).toEqual(["u1"]);
+    expect(seen?.warnings).toEqual([
+      "repo skills not loaded: trust_store_unreadable EACCES on trusted-skills.json",
+    ]);
+    const info = typeof seen?.skills === "function" ? seen.skills() : seen?.skills;
+    expect(info?.pendingRepo.map((k) => k.name)).toEqual(["r1"]);
+  });
+
+  test("other trust errors still fail startup", async () => {
+    const f = fakeDeps({
+      found: [[skill("r1", "repo")]],
+      trusted: async () => {
+        throw new RewireError("boom", "x");
+      },
+    });
+    await expect(startInteractive(f.deps)).rejects.toMatchObject({ code: "boom" });
+  });
+
   test("no pending repo skills: no trust prompt; startup order; set disposed on exit", async () => {
     const f = fakeDeps({ found: [[skill("u1", "user")]] });
     expect(await startInteractive(f.deps)).toBe(0);

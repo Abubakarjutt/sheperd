@@ -420,3 +420,18 @@ describe("Safe redacts as well as sanitizes (I2)", () => {
     expect(f).not.toContain("SECRET");
   });
 });
+
+describe("startup warnings (M1, M3)", () => {
+  it("are shown first as lines, sanitized and redacted", async () => {
+    const { session } = fakeSession({ history: [{ role: "user", content: "earlier" }] });
+    const v = mount({
+      session,
+      warnings: ["skill ev\x1b]52;c;x\x07il skipped: skill_invalid symlink sk-ant-api03-SECRETxx"],
+    });
+    await tick();
+    const f = v.lastFrame() ?? "";
+    expect(f).toContain("skill evil skipped: skill_invalid symlink [redacted]");
+    expect(f.indexOf("skill evil")).toBeLessThan(f.indexOf("earlier"));
+    expect(f).not.toContain("\x1b]52");
+  });
+});

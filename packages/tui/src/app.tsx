@@ -87,6 +87,8 @@ export type AppProps = {
   routing?: string | (() => string);
   /** Initial checkpoints (default contract and tests). */
   checkpoints?: ReadonlySet<CheckpointKind>;
+  /** Startup warnings (skipped skills, an unreadable trust store), shown as dim lines first. */
+  warnings?: string[];
   /** Hands out the {@link InterruptTarget} once, on mount. */
   bindInterrupt?: (target: InterruptTarget) => void;
 };
@@ -157,7 +159,10 @@ export function App(props: AppProps) {
   /** The in-flight chat turn's abort, set while `send` runs. */
   const turnAbort = useRef<AbortController | undefined>(undefined);
   const sessionRef = useRef(props.session);
-  const [entries, setEntries] = useState<TranscriptEntry[]>(() => historyEntries(props.session));
+  const [entries, setEntries] = useState<TranscriptEntry[]>(() => [
+    ...(props.warnings ?? []).map((text): TranscriptEntry => ({ kind: "note", text })),
+    ...historyEntries(props.session),
+  ]);
   /** Bumped on every session swap: a fresh `<Static>` region for the new transcript (I3). */
   const [region, setRegion] = useState(0);
   const [busy, setBusy] = useState(false);

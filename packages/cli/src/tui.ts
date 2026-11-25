@@ -80,7 +80,7 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
   return await startInteractive({
     repo,
     trustFile,
-    discover: async () => (await discoverSkills({ home, xdgConfig, repo })).skills,
+    discover: () => discoverSkills({ home, xdgConfig, repo }),
     trusted: async (found) =>
       isTrusted(await loadTrust(trustFile), await trustKey(repo), repoSkillsHash(found)),
     promptTrust: (p) =>
