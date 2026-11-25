@@ -28,8 +28,9 @@ export type ChatEvent =
   | { type: "tool_call"; callId: string; tool: string; summary: string; isError: boolean }
   /**
    * The start of a tool's result, emitted right after its `tool_call` (same `callId` and `tool`).
-   * Redacted, then sanitized: the first 4 non-empty lines, each capped at 300 characters; `more`
-   * counts the non-empty lines left out. A tool that threw, or a call the loop did not run, has
+   * The whole result is sanitized, then redacted, then split: the first 4 non-empty lines, each
+   * capped at 300 code points (not terminal cells: the renderer still wraps or clips each line to
+   * the columns it has); `more` counts the non-empty lines left out. A tool that threw, or a call the loop did not run, has
    * no `tool_result`.
    */
   | {
@@ -53,12 +54,13 @@ export type ChatEvent =
   | { type: "usage"; inputTokens: number; outputTokens: number };
 
 /**
- * A tool result as a short preview: redacted, then sanitized (and redacted again, in case
- * sanitizing joined a secret that an escape sequence had split), then the first non-empty lines,
- * each capped by code point.
+ * A tool result as a short preview. Order matters: `sanitizeTerminal` first, so a secret split
+ * by an escape sequence or an invisible character is rejoined, then `redact` on the whole text
+ * (a key or PEM block spanning the cap or a line break is caught whole), and only then split
+ * into non-empty lines, each capped at 300 code points.
  */
 export function toolPreview(content: string): { preview: string[]; more: number } {
-  const lines = redact(sanitizeTerminal(redact(content)))
+  const lines = redact(sanitizeTerminal(content))
     .split("\n")
     .filter((l) => l.trim() !== "");
   const preview = lines.slice(0, PREVIEW_LINES).map((l) => {

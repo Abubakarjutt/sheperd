@@ -30,7 +30,13 @@ import {
   type SkillSet,
 } from "@rewire/skills";
 import { afterAll, describe, expect, test } from "vitest";
-import { type ChatEvent, ChatSession, SessionStore, TURN_LIMIT_NOTE } from "../src/index.js";
+import {
+  type ChatEvent,
+  ChatSession,
+  SessionStore,
+  TURN_LIMIT_NOTE,
+  toolPreview,
+} from "../src/index.js";
 
 /**
  * Skill sets live outside /tmp: the Linux sandbox mounts a private /tmp, so a set under tmpdir()
@@ -509,6 +515,45 @@ function streaming(turns: StreamTurn[], stream = true): Provider & { requests: C
 const deltas = (events: ChatEvent[]): string[] =>
   events.flatMap((e) => (e.type === "assistant_delta" ? [e.text] : []));
 
+describe("toolPreview ordering: sanitize, then redact the whole text, then split and cap", () => {
+  const KEY_BODY = "A".repeat(40);
+
+  test("a key split by SGR sequences (grep --color=always) is redacted whole (I1)", () => {
+    const out = toolPreview(`match: \x1b[01;31m\x1b[Ksk-ant-api03\x1b[m\x1b[K-${KEY_BODY} end`);
+    expect(out).toEqual({ preview: ["match: [redacted] end"], more: 0 });
+    expect(JSON.stringify(out)).not.toContain("AAAA");
+  });
+
+  test("a key split by an SGR reset or a zero-width character is redacted whole", () => {
+    expect(toolPreview(`sk-ant-api03-${"A".repeat(20)}\x1b[m${"B".repeat(20)}`).preview).toEqual([
+      "[redacted]",
+    ]);
+    expect(toolPreview("sk-ant-SEC\u200bRET123abcdef").preview).toEqual(["[redacted]"]);
+  });
+
+  test("a key straddling the 300 code point cap is redacted before the cap", () => {
+    const out = toolPreview(`${"x".repeat(295)}sk-ant-api03-${KEY_BODY}`);
+    expect(out.preview).toEqual([`${"x".repeat(295)}[reda`]);
+    expect(Array.from(out.preview[0] ?? "")).toHaveLength(300);
+  });
+
+  test("secrets across line breaks: a lone CR is rejoined and a PEM block is redacted whole", () => {
+    expect(toolPreview("pre sk-ant-SEC\rRET123abc post").preview).toEqual(["pre [redacted] post"]);
+    const pem =
+      "-----BEGIN RSA PRIVATE KEY-----\nMIIEbody1\nMIIEbody2\n-----END RSA PRIVATE KEY-----\nafter";
+    const out = toolPreview(pem);
+    expect(out).toEqual({ preview: ["[redacted]", "after"], more: 0 });
+    expect(JSON.stringify(out)).not.toContain("MIIE");
+  });
+
+  test("an OSC opened on one line and closed on the next is inert", () => {
+    const out = toolPreview("a\x1b]52;c;aGk=\nb\x07c");
+    // Unterminated before the newline: only the introducer is dropped (N2); BEL is a C0 control.
+    expect(out).toEqual({ preview: ["a52;c;aGk=", "bc"], more: 0 });
+    expect(JSON.stringify(out)).not.toMatch(/\\u001b|\\u0007/);
+  });
+});
+
 describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
   test("assistant deltas concatenate to the final text", async () => {
     const p = streaming([{ chunks: ["The ans", "wer is ", "42."] }]);
@@ -659,5 +704,40 @@ describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
     expect(events.filter((e) => e.type === "usage")).toEqual([]);
     await session.send("again");
     expect(deltas(events)).toEqual(["early ", "after"]);
+  });
+
+  test("deltas and usage after dispose() emit nothing", async () => {
+    let lateDone: () => void = () => {};
+    const late = new Promise<void>((r) => {
+      lateDone = r;
+    });
+    const p: Provider = {
+      chat(req: ChatRequest): Promise<ChatResponse> {
+        req.onDelta?.("early ");
+        return new Promise((resolve) => {
+          req.signal?.addEventListener("abort", () => {
+            // A provider that keeps streaming and then completes after the dispose.
+            setTimeout(() => {
+              req.onDelta?.("late");
+              resolve({
+                message: { text: "early late", toolCalls: [] },
+                stopReason: "end",
+                usage: { inputTokens: 5, outputTokens: 5 },
+              });
+              lateDone();
+            }, 10);
+          });
+        });
+      },
+    };
+    const { session, events } = await setup(p);
+    const pending = session.send("slow");
+    await new Promise((r) => setTimeout(r, 20));
+    await session.dispose();
+    await expect(pending).rejects.toMatchObject({ code: "session_disposed" });
+    await late;
+    await new Promise((r) => setTimeout(r, 20));
+    expect(deltas(events)).toEqual(["early "]);
+    expect(events.filter((e) => e.type === "usage" || e.type === "assistant_text")).toEqual([]);
   });
 });
