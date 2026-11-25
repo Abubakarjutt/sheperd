@@ -41,6 +41,8 @@ export function toolParts(summary: string): { name: string; args: string } {
 /** Prefix of a tool's first preview line, and the indent of the lines under it. */
 const PREVIEW_HEAD = "  ⎿  ";
 const PREVIEW_INDENT = "     ";
+/** At most this many preview lines are drawn; the rest count toward `… +N lines`. */
+export const PREVIEW_MAX = 4;
 
 /**
  * `● Read(src/x.ts)` with the name bold, then the result preview under `  ⎿  ` (dim) and
@@ -65,8 +67,10 @@ export function ToolLine({
   const line = fit(args === "" ? `${head}${name}` : `${head}${name}(${args})`, cols);
   const nameEnd = Math.min(line.length, head.length + name.length);
   const color = isError ? theme.error : theme.dim;
-  const rest = Number.isFinite(more) && more > 0 ? Math.floor(more) : 0;
-  const lines = preview.map(
+  const extra = Number.isFinite(more) && more > 0 ? Math.floor(more) : 0;
+  const shown = preview.slice(0, PREVIEW_MAX);
+  const rest = extra + (preview.length - shown.length);
+  const lines = shown.map(
     (l, i) => `${i === 0 ? PREVIEW_HEAD : PREVIEW_INDENT}${redact(sanitize(l))}`,
   );
   if (rest > 0) {

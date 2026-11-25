@@ -27,7 +27,9 @@ import { render } from "ink-testing-library";
 import stringWidth from "string-width";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { App, type InterruptTarget } from "../src/app.js";
+import { applyEvent, liveEntries, newLive } from "../src/live-turn.js";
 import { formatTokens, SPINNER_GLYPHS, SPINNER_VERBS, Spinner } from "../src/spinner.js";
+import { ToolLine } from "../src/transcript.js";
 
 afterAll(() => {
   if (previousForceColor === undefined) delete process.env.FORCE_COLOR;
@@ -119,12 +121,12 @@ function mount(
       return turn(text, signal, emit);
     },
   } as unknown as ChatSession;
-  const v = render(
+  const app = (run: RunHandle | undefined) => (
     <App
       session={session}
       runController={{} as RunController}
       config={{}}
-      {...(extra.run ? { run: extra.run } : {})}
+      {...(run ? { run } : {})}
       subscribe={(l) => {
         listener = l;
         return () => {};
@@ -132,9 +134,12 @@ function mount(
       bindInterrupt={(t) => {
         target = t;
       }}
-    />,
+    />
   );
-  return { v, emit, signals, target: () => target };
+  const v = render(app(extra.run));
+  /** Hands a run in from the parent, as the CLI may while the App is mounted. */
+  const handRun = (run: RunHandle) => v.rerender(app(run));
+  return { v, emit, signals, target: () => target, handRun };
 }
 
 /** A turn that never settles until aborted (then rejects like ChatSession does). */
@@ -382,7 +387,7 @@ describe("live turn", () => {
     expect(f).not.toContain("aborted");
   });
 
-  it("Esc during a gated run does not abort it", async () => {
+  it("Esc while a gated run is active aborts neither the run nor the chat turn", async () => {
     let aborted = 0;
     const run = {
       events: { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }) },
@@ -393,14 +398,98 @@ describe("live turn", () => {
       },
       done: new Promise(() => {}),
     } as unknown as RunHandle;
-    const m = track(mount(hold(), { run }));
+    // A chat turn is live (so the Esc listener is mounted), then a run is handed in: Esc must
+    // now be inert. Without the `interruptible` gating it would abort the turn's signal.
+    const m = track(mount(hold((emit) => emit({ type: "assistant_delta", text: "streaming" }))));
+    await send(m.v, "q");
+    await waitText(m.v, "esc to interrupt");
+    m.handRun(run);
     await until(() => m.target()?.activity() === "run", "the run");
     for (let i = 0; i < 3; i++) {
       m.v.stdin.write("\x1b");
-      await new Promise((r) => setTimeout(r, 60));
+      await new Promise((r) => setTimeout(r, 80));
     }
     expect(aborted).toBe(0);
+    expect(m.signals[0]?.aborted).toBe(false);
     expect(m.target()?.activity()).toBe("run");
+    expect(plain(m.v.lastFrame())).not.toContain("Interrupted");
+  });
+
+  it("starts a new paragraph for each model call, even with no tool between them", async () => {
+    let finish: (t: ChatTurn) => void = () => {};
+    const m = track(
+      mount(
+        (_t, _s, emit) =>
+          new Promise<ChatTurn>((res) => {
+            finish = res;
+            emit({ type: "assistant_delta", text: "Let me check." });
+            emit({ type: "usage", inputTokens: 5, outputTokens: 4 });
+            emit({ type: "assistant_delta", text: "The answer." });
+          }),
+      ),
+    );
+    await send(m.v, "q");
+    const live = await waitText(m.v, "The answer.");
+    expect(live).not.toContain("check.The");
+    expect(live).toContain("Let me check.");
+    finish({ text: "The answer." });
+    const done = await waitFor(m.v, (f) => !f.includes("esc to interrupt"), "the turn to end");
+    expect(done).not.toContain("check.The");
+    expect(done).toContain("Let me check.");
+    expect(done.split("The answer.")).toHaveLength(2);
+  });
+
+  it("estimates tokens from streamed text until usage reports the real count", async () => {
+    let emitNow: (e: ChatEvent) => void = () => {};
+    const m = track(
+      mount(
+        hold((emit) => {
+          emitNow = emit;
+          emit({ type: "assistant_delta", text: "x".repeat(400) });
+        }),
+      ),
+    );
+    await send(m.v, "q");
+    await waitText(m.v, "↓ ~100 tokens");
+    emitNow({ type: "usage", inputTokens: 1, outputTokens: 1234 });
+    const f = await waitText(m.v, "↓ 1.2k tokens");
+    expect(f).not.toContain("~");
+    emitNow({ type: "assistant_delta", text: "y".repeat(400) });
+    await waitText(m.v, "↓ ~1.3k tokens");
+  });
+
+  it("stores cleaned (sanitized, redacted) text in transcript entries", () => {
+    let s = newLive("Thinking", 0);
+    for (const text of [
+      "a\x1b]5",
+      "2;c;eHg=\x07b sk-ant-api03-",
+      "abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+    ]) {
+      s = applyEvent(s, { type: "assistant_delta", text });
+    }
+    const [entry] = liveEntries(s);
+    expect(entry?.kind).toBe("assistant");
+    const text = entry?.kind === "assistant" ? entry.text : "";
+    expect(text).toContain("[redacted]");
+    expect(text).not.toContain("\x1b");
+    expect(text).not.toContain("eHg=");
+    expect(text).not.toContain("abcdefghij");
+  });
+
+  it("ToolLine shows at most 4 preview lines and counts the rest", () => {
+    const v = render(
+      <ToolLine
+        summary="read a.ts"
+        isError={false}
+        preview={["l1", "l2", "l3", "l4", "l5", "l6"]}
+        more={2}
+      />,
+    );
+    const f = plain(v.lastFrame());
+    v.unmount();
+    expect(f).toContain("l4");
+    expect(f).not.toContain("l5");
+    expect(f).toContain("… +4 lines");
   });
 
   it("an error mid-turn keeps the streamed text and tool lines, then the error line", async () => {

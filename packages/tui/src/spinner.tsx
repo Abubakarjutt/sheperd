@@ -34,13 +34,15 @@ export type SpinnerProps = {
   startedAt: number;
   /** Output tokens so far this turn; the count is omitted while 0. */
   tokens: number;
+  /** True while part of `tokens` is estimated from streamed text: shown as `~N`. */
+  estimated?: boolean;
 };
 
 /**
  * `✻ Thinking… (12s · ↓ 1.2k tokens · esc to interrupt)`, cut to the terminal width. Its only
  * timer is the glyph interval, cleared on unmount; elapsed time is re-read on each tick.
  */
-export function Spinner({ verb, startedAt, tokens }: SpinnerProps) {
+export function Spinner({ verb, startedAt, tokens, estimated = false }: SpinnerProps) {
   const cols = useColumns();
   const [frame, setFrame] = useState(0);
   useEffect(() => {
@@ -48,7 +50,7 @@ export function Spinner({ verb, startedAt, tokens }: SpinnerProps) {
     return () => clearInterval(t);
   }, []);
   const secs = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
-  const count = tokens > 0 ? ` · ↓ ${formatTokens(tokens)} tokens` : "";
+  const count = tokens > 0 ? ` · ↓ ${estimated ? "~" : ""}${formatTokens(tokens)} tokens` : "";
   const glyph = SPINNER_GLYPHS[frame] ?? SPINNER_GLYPHS[0];
   const line = fit(`${glyph} ${verb}… (${secs}s${count} · esc to interrupt)`, cols);
   // The glyph is one code unit; `fit` keeps the line's start, so the split is exact.

@@ -8,7 +8,12 @@ import { useColumns } from "./use-columns.js";
 /** One piece of an in-flight turn, in arrival order. */
 export type LiveItem =
   /** Streamed assistant text, RAW (as the deltas arrived): render only via cleanForMarkdown. */
-  | { kind: "text"; raw: string }
+  | {
+      kind: "text";
+      raw: string;
+      /** Set when its model call ended (a `usage` event): the next delta starts a new item. */
+      closed?: boolean;
+    }
   | {
       kind: "tool";
       callId: string;
@@ -21,8 +26,10 @@ export type LiveItem =
 
 export type LiveState = {
   items: readonly LiveItem[];
-  /** Sum of `outputTokens` over this turn's usage events. */
+  /** Sum of `outputTokens` over this turn's usage events (finished model calls). */
   tokens: number;
+  /** Characters streamed by the model call in flight (not yet counted by a usage event). */
+  pendingChars: number;
   verb: string;
   startedAt: number;
 };
@@ -36,6 +43,7 @@ export const INTERRUPTED = "  ⎿ Interrupted by user";
 export const newLive = (verb: string, startedAt: number): LiveState => ({
   items: [],
   tokens: 0,
+  pendingChars: 0,
   verb,
   startedAt,
 });
@@ -45,11 +53,13 @@ export function applyEvent(s: LiveState, e: ChatEvent): LiveState {
   switch (e.type) {
     case "assistant_delta": {
       if (e.text === "") return s;
+      const pendingChars = s.pendingChars + e.text.length;
       const last = s.items[s.items.length - 1];
-      if (last?.kind === "text") {
-        return { ...s, items: [...s.items.slice(0, -1), { kind: "text", raw: last.raw + e.text }] };
+      if (last?.kind === "text" && !last.closed) {
+        const items = [...s.items.slice(0, -1), { kind: "text" as const, raw: last.raw + e.text }];
+        return { ...s, pendingChars, items };
       }
-      return { ...s, items: [...s.items, { kind: "text", raw: e.text }] };
+      return { ...s, pendingChars, items: [...s.items, { kind: "text", raw: e.text }] };
     }
     case "tool_call":
       return {
@@ -81,8 +91,15 @@ export function applyEvent(s: LiveState, e: ChatEvent): LiveState {
     case "skill_loaded":
       return { ...s, items: [...s.items, { kind: "skill", name: e.name }] };
     case "usage": {
+      // One usage event per model call: its text is complete, so a later call's text (even with
+      // no tool in between) starts a new paragraph, and the estimate gives way to the count.
       const n = Number.isFinite(e.outputTokens) && e.outputTokens > 0 ? e.outputTokens : 0;
-      return { ...s, tokens: s.tokens + n };
+      const last = s.items[s.items.length - 1];
+      const items =
+        last?.kind === "text" && !last.closed
+          ? [...s.items.slice(0, -1), { ...last, closed: true }]
+          : s.items;
+      return { ...s, items, tokens: s.tokens + n, pendingChars: 0 };
     }
     default:
       // assistant_text: the streamed deltas (or the turn's final text) already carry it.
@@ -90,12 +107,22 @@ export function applyEvent(s: LiveState, e: ChatEvent): LiveState {
   }
 }
 
-/** The finished transcript entries for a live turn, in arrival order (blank text dropped). */
+/** Output tokens to show: the reported count plus ~chars/4 for the call still streaming. */
+export function liveTokens(s: LiveState): { tokens: number; estimated: boolean } {
+  const guess = Math.ceil(s.pendingChars / 4);
+  return { tokens: s.tokens + guess, estimated: guess > 0 };
+}
+
+/**
+ * The finished transcript entries for a live turn, in arrival order (blank text dropped).
+ * Assistant text is stored cleaned (`cleanForMarkdown`, on each whole segment), never raw.
+ */
 export function liveEntries(s: LiveState | undefined): TranscriptEntry[] {
   const out: TranscriptEntry[] = [];
   for (const it of s?.items ?? []) {
     if (it.kind === "text") {
-      if (it.raw.trim() !== "") out.push({ kind: "assistant", text: it.raw });
+      const text = cleanForMarkdown(it.raw);
+      if (text.trim() !== "") out.push({ kind: "assistant", text });
     } else if (it.kind === "tool") {
       out.push({
         kind: "tool",
@@ -111,7 +138,7 @@ export function liveEntries(s: LiveState | undefined): TranscriptEntry[] {
 
 /** True when the turn streamed any visible text. */
 export const streamedText = (s: LiveState | undefined): boolean =>
-  (s?.items ?? []).some((it) => it.kind === "text" && it.raw.trim() !== "");
+  (s?.items ?? []).some((it) => it.kind === "text" && cleanForMarkdown(it.raw).trim() !== "");
 
 function LiveItemView({ item, cols }: { item: LiveItem; cols: number }) {
   if (item.kind === "text") return <Markdown text={cleanForMarkdown(item.raw)} width={cols} />;
@@ -155,7 +182,7 @@ export function LiveTurn({ state, onInterrupt, interruptible }: LiveTurnProps) {
         // biome-ignore lint/suspicious/noArrayIndexKey: append-only within one turn
         <LiveItemView key={i} item={it} cols={cols} />
       ))}
-      <Spinner verb={state.verb} startedAt={state.startedAt} tokens={state.tokens} />
+      <Spinner verb={state.verb} startedAt={state.startedAt} {...liveTokens(state)} />
     </Box>
   );
 }
