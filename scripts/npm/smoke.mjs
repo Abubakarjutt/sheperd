@@ -9,8 +9,9 @@
 //   - the interactive entry points without a TTY: bare `rewire` prints the usage and exits 1,
 //     `rewire chat </dev/null` exits 1 with tui_requires_tty, and REWIRE_TUI_SELFCHECK=1 makes
 //     `rewire chat` load the bundled TUI (Ink, React, yoga-layout) and exit 0;
-//   - the bundle has React and Ink inside it: no require("react") and no runtime import of
-//     react, ink, yoga-layout or react-devtools-core (stubbed at build time).
+//   - the bundle has React and Ink inside it: no require("react") / __require("react") and no
+//     runtime import of react, react-reconciler, scheduler, ink, yoga-layout or
+//     react-devtools-core (stubbed at build time).
 // With --faux-run it also drives one headless `rewire run` with the faux provider against a copy
 // of the sum-lib fixture and requires a verified result. That loads every prompt and the semgrep
 // rules from the installed package, so it proves the bundled assets resolve. It needs git, rg,
@@ -139,8 +140,13 @@ if (selfcheck.status !== 0 || selfcheck.stdout !== "tui: loaded\n") {
 pass("the bundled TUI (Ink, React, yoga-layout) loads without a TTY");
 
 const bundle = readFileSync(join(app, "node_modules", "sheperd", "dist", "main.js"), "utf8");
-const externalUi =
-  /\brequire\(\s*["'](react|react-dom|ink|yoga-layout|react-devtools-core)(\/[^"']*)?["']\s*\)|\bfrom\s*["'](react|ink|yoga-layout|react-devtools-core)(\/[^"']*)?["']|\bimport\(\s*["'](react|ink|yoga-layout|react-devtools-core)(\/[^"']*)?["']\s*\)/;
+// esbuild emits `__require("x")` for an external reached from CommonJS (react-reconciler,
+// scheduler), `from "x"` / `import("x")` from ESM; match all three (no \b before require).
+const UI_PKGS = "react|react-dom|react-reconciler|scheduler|ink|yoga-layout|react-devtools-core";
+const spec = `["'](?:${UI_PKGS})(?:/[^"']*)?["']`;
+const externalUi = new RegExp(
+  `require\\(\\s*${spec}\\s*\\)|\\bfrom\\s*${spec}|\\bimport\\(\\s*${spec}\\s*\\)`,
+);
 const leaked = externalUi.exec(bundle);
 if (leaked) fail(`the bundle loads ${leaked[0]} at runtime; it must be bundled (or stubbed)`);
 pass("React, Ink and yoga-layout are bundled; react-devtools-core is never imported");

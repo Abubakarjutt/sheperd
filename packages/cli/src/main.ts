@@ -107,11 +107,17 @@ async function chat(args: string[]): Promise<number> {
       process.stderr.write(`usage: rewire chat takes no task; type it in the session\n${USAGE}`);
       return 1;
     }
-    // Packaging self-check (scripts/npm/smoke.mjs): load the TUI modules (Ink, React, yoga-layout)
-    // exactly as a TTY session would, then exit, so the bundled TUI is proven to import.
+    // Internal packaging self-check (scripts/npm/smoke.mjs, docs/RELEASING.md): load the TUI
+    // modules (Ink, React, yoga-layout) exactly as a TTY session would, then exit, so the bundled
+    // TUI is proven to import. Not a user feature: on a terminal, say why no session opened.
     if (process.env.REWIRE_TUI_SELFCHECK === "1") {
       const { chatCommand } = await import("./tui.js");
       if (typeof chatCommand !== "function") throw new Error("the TUI entry point did not load");
+      if (isInteractive(process)) {
+        process.stderr.write(
+          "REWIRE_TUI_SELFCHECK=1 is set: loaded the TUI and exited (an internal packaging check); unset it to start a session\n",
+        );
+      }
       process.stdout.write("tui: loaded\n");
       return 0;
     }

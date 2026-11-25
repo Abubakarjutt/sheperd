@@ -105,6 +105,7 @@ The workflow cannot do these for you; it refuses to publish until they are in pl
   node scripts/npm/build.mjs pack        # checks npm pack --dry-run, writes dist-npm/tarballs/
   node scripts/npm/smoke.mjs --faux-run  # installs (project and -g, offline): --help, doctor,
                                          # a tampered binary refused, a verified faux run
+                                         # internal REWIRE_TUI_SELFCHECK=1: rewire chat loads the TUI, exits 0
   ```
 
 ## Publishing a release

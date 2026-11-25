@@ -134,7 +134,8 @@ function licenseText(dir) {
  * Ink imports `react-devtools-core` (an optional peer it loads only when DEV=true and the package
  * resolves) from its devtools module. sheperd does not ship it: left unresolved the build fails,
  * and a plain `external` leaves a static import that crashes the bundle on load
- * (ERR_MODULE_NOT_FOUND). Replace it with an inert stub, so it is never loaded.
+ * (ERR_MODULE_NOT_FOUND). Replace it with an inert stub; {@link inkDevtoolsOff} makes Ink's
+ * devtools branch dead code, so neither the stub nor Ink's devtools module ever runs.
  */
 const stubDevtools = {
   name: "stub-react-devtools-core",
@@ -147,6 +148,29 @@ const stubDevtools = {
       contents: "export default { initialize() {}, connectToDevTools() {} };\n",
       loader: "js",
     }));
+  },
+};
+
+/**
+ * Ink gates every devtools path (the react-devtools-core import and its window polyfill and
+ * localhost probe, injectIntoDevTools, a package.json read) on `process.env['DEV'] === 'true'`,
+ * with `process` imported from node:process, which an esbuild `define` cannot reach. Rewrite
+ * that test to `false` in Ink's own files, so a user's DEV=true never turns them on.
+ * `inkDevGuards` counts the rewrites; the build fails if Ink stops matching.
+ */
+const INK_DEV_GUARD = /process\.env\[(['"])DEV\1\]\s*===\s*(['"])true\2/g;
+let inkDevGuards = 0;
+const inkDevtoolsOff = {
+  name: "ink-devtools-off",
+  setup(b) {
+    b.onLoad({ filter: /[\\/]node_modules[\\/]ink[\\/]build[\\/][^\\/]+\.js$/ }, (a) => {
+      const src = readFileSync(a.path, "utf8");
+      const contents = src.replace(INK_DEV_GUARD, () => {
+        inkDevGuards++;
+        return "false";
+      });
+      return { contents, loader: "js" };
+    });
   },
 };
 
@@ -181,12 +205,14 @@ async function buildSheperd(out, allPlatforms) {
       REWIRE_BUNDLE_VERSION: JSON.stringify(m.version),
       REWIRE_BUNDLE_SANDBOX_SHA256: JSON.stringify(hashes),
     },
-    plugins: [stubDevtools],
+    plugins: [stubDevtools, inkDevtoolsOff],
     // CommonJS dependencies call require() on node builtins; give the ESM bundle one.
     banner: {
       js: 'import { createRequire as __sheperdRequire } from "node:module";\nconst require = __sheperdRequire(import.meta.url);',
     },
   });
+
+  if (inkDevGuards === 0) fail("no Ink DEV guard was rewritten: update inkDevtoolsOff");
 
   // Every bundled @rewire package ships its non-dist `files` (prompts/, rules/) under
   // assets/<dir>/, which is where assetRoot() looks in the bundle.
@@ -199,7 +225,9 @@ async function buildSheperd(out, allPlatforms) {
     const root = pkgRootOf(abs);
     const pkg = readJson(join(root, "package.json"));
     if (abs.split(sep).includes("node_modules")) {
-      if (!third.has(pkg.name)) third.set(pkg.name, { pkg, root });
+      // One entry per bundled version: two majors of a package may carry different notices.
+      const key = `${pkg.name}@${pkg.version}`;
+      if (!third.has(key)) third.set(key, { pkg, root });
     } else if (pkg.name?.startsWith("@rewire/")) {
       workspace.add(root);
     } else {
@@ -220,11 +248,11 @@ async function buildSheperd(out, allPlatforms) {
     "",
     "sheperd bundles the following packages. Their licenses follow.",
   ];
-  for (const name of [...third.keys()].sort()) {
-    const { pkg, root } = third.get(name);
+  const byNameVersion = ([a], [b]) => a.localeCompare(b, "en", { numeric: true });
+  for (const [id, { pkg, root }] of [...third.entries()].sort(byNameVersion)) {
     const text = licenseText(root);
-    if (!text && !pkg.license) fail(`${name} has no license`);
-    notices.push("", `## ${name}@${pkg.version} (${pkg.license ?? "see below"})`, "");
+    if (!text && !pkg.license) fail(`${id} has no license`);
+    notices.push("", `## ${id} (${pkg.license ?? "see below"})`, "");
     notices.push(text ? ["```", text, "```"].join("\n") : `License: ${pkg.license}`);
   }
   writeFileSync(join(dest, "dist", "THIRD_PARTY_LICENSES.md"), `${notices.join("\n")}\n`);
