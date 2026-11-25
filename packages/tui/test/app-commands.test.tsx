@@ -374,3 +374,47 @@ describe("/skills", () => {
     }
   });
 });
+
+describe("Safe redacts as well as sanitizes (I2)", () => {
+  const KEY = "sk-ant-api03-SECRETsecret123";
+
+  it("a proposal task with a secret renders as [redacted]", async () => {
+    const { session } = fakeSession({
+      send: async () => ({ text: "", proposal: { task: `use ${KEY}` }, endedBy: "proposal" }),
+    });
+    const v = mount({ session });
+    await enter(v.stdin, "go");
+    const f = v.lastFrame() ?? "";
+    expect(f).toContain("use [redacted]");
+    expect(f).not.toContain("SECRET");
+  });
+
+  it("clarification questions with a secret render as [redacted]", async () => {
+    const prompt: PendingPrompt = { kind: "clarify", questions: [`Is ${KEY} the key?`] };
+    const { session } = fakeSession();
+    const { run } = fakeRun(() => prompt);
+    const v = mount({ session, run });
+    await tick(120);
+    const f = v.lastFrame() ?? "";
+    expect(f).toContain("Is [redacted] the key?");
+    expect(f).not.toContain("SECRET");
+  });
+
+  it("an escalation question with a secret renders as [redacted] in the outcome note", async () => {
+    const { session } = fakeSession();
+    const { run, finish } = fakeRun(() => undefined);
+    const v = mount({ session, run });
+    await tick(80);
+    finish({
+      status: "escalated",
+      runId: "r",
+      branch: "",
+      reportPath: "/r/report.md",
+      escalation: { reason: "stuck", question: `Should I rotate ${KEY}?` },
+    });
+    await tick(120);
+    const f = v.lastFrame() ?? "";
+    expect(f).toContain("Should I rotate [redacted]?");
+    expect(f).not.toContain("SECRET");
+  });
+});

@@ -351,7 +351,7 @@ export function App(props: AppProps) {
         case "doctor":
           if (!doctor) return note("doctor is not available here", true);
           doctor().then(
-            (out) => note(redact(out)),
+            (out) => note(out), // the note renders through <Safe>, which redacts
             (err: unknown) => add(errorEntry(err)),
           );
           return;
