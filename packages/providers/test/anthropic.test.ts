@@ -285,3 +285,113 @@ describe("anthropic streaming (onDelta)", () => {
     expect(err.message).toMatch(/render blew up/);
   });
 });
+
+describe("anthropic onFirstChunk", () => {
+  const req: ChatRequest = {
+    model: "m",
+    system: "s",
+    messages: [{ role: "user", content: "hi" }],
+    maxTokens: 9,
+  };
+  const usage = { input_tokens: 11, output_tokens: 7 };
+  const mk = (reply: (body: Record<string, unknown>) => FetchReply) => {
+    const f = scriptedFetch(reply);
+    const client = new Anthropic({ apiKey: "sk-ant-test", fetch: f.fetch, maxRetries: 0 });
+    return { provider: new AnthropicProvider("sk-ant-test", client), bodies: f.bodies };
+  };
+
+  test("fires once, on a thinking block before any text, not on message_start", async () => {
+    const text = anthropicEvents({
+      blocks: [{ type: "text", pieces: ["Hi", "!"] }],
+      stop: "end_turn",
+      usage,
+    });
+    const [start, ...rest] = text;
+    // Shift the text block to index 1 behind a thinking block at index 0.
+    const shifted = rest.map((e) => {
+      const d = e.data as { index?: number };
+      return d.index === undefined ? e : { ...e, data: { ...d, index: d.index + 1 } };
+    });
+    const thinking = [
+      {
+        event: "content_block_start",
+        data: {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "thinking", thinking: "", signature: "" },
+        },
+      },
+      {
+        event: "content_block_delta",
+        data: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "thinking_delta", thinking: "hmm" },
+        },
+      },
+      { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
+    ];
+    const { provider } = mk(() => ({
+      sse: anthropicSSE([start, ...thinking, ...shifted] as typeof text),
+    }));
+    const order: string[] = [];
+    const r = await provider.chat({
+      ...req,
+      onFirstChunk: () => order.push("first"),
+      onDelta: (d) => order.push(d),
+    });
+    expect(order).toEqual(["first", "Hi", "!"]);
+    expect(r.message.text).toBe("Hi!");
+  });
+
+  test("never fires without onDelta, and leaves both request bodies unchanged", async () => {
+    const events = anthropicEvents({
+      blocks: [{ type: "text", pieces: ["x"] }],
+      stop: "end_turn",
+      usage,
+    });
+    const { provider, bodies } = mk((b) =>
+      b.stream
+        ? { sse: anthropicSSE(events) }
+        : {
+            json: {
+              id: "msg_1",
+              type: "message",
+              role: "assistant",
+              model: "m",
+              content: [{ type: "text", text: "x" }],
+              stop_reason: "end_turn",
+              stop_sequence: null,
+              usage,
+            },
+          },
+    );
+    let n = 0;
+    await provider.chat({ ...req, onFirstChunk: () => n++ });
+    expect(n).toBe(0);
+    expect(bodies[0]).toEqual(JSON.parse(JSON.stringify(toAnthropicParams(req))));
+    await provider.chat({ ...req, onDelta: () => {} });
+    await provider.chat({ ...req, onDelta: () => {}, onFirstChunk: () => n++ });
+    expect(bodies[2]).toEqual(bodies[1]);
+    expect(n).toBe(1);
+  });
+
+  test("a throw from onFirstChunk propagates as provider_stream_callback_failed", async () => {
+    const events = anthropicEvents({
+      blocks: [{ type: "text", pieces: ["x"] }],
+      stop: "end_turn",
+      usage,
+    });
+    const { provider } = mk(() => ({ sse: anthropicSSE(events) }));
+    const err = await provider
+      .chat({
+        ...req,
+        onDelta: () => {},
+        onFirstChunk: () => {
+          throw new Error("boom");
+        },
+      })
+      .catch((e) => e);
+    expect(err).toMatchObject({ code: "provider_stream_callback_failed" });
+  });
+});

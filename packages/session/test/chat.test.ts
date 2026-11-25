@@ -489,8 +489,10 @@ type StreamTurn = {
   chunks?: string[];
   toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[];
   usage?: { inputTokens: number; outputTokens: number };
-  /** Waited before the first delta: a slow prompt read. */
+  /** Waited before the first chunk (onFirstChunk): a slow prompt read. */
   delayMs?: number;
+  /** Waited after the first chunk and before any text: a thinking model's reasoning. */
+  reasoningMs?: number;
 };
 
 /** Streams each turn's chunks through onDelta (when set); the final text is their join. */
@@ -504,6 +506,8 @@ function streaming(turns: StreamTurn[], stream = true): Provider & { requests: C
       if (t === undefined) throw new RewireError("faux_script_exhausted", "exhausted");
       const chunks = t.chunks ?? [];
       if (t.delayMs) await new Promise((r) => setTimeout(r, t.delayMs));
+      if (stream) req.onFirstChunk?.();
+      if (t.reasoningMs) await new Promise((r) => setTimeout(r, t.reasoningMs));
       if (stream) for (const c of chunks) req.onDelta?.(c);
       const toolCalls = t.toolCalls ?? [];
       return {
@@ -744,7 +748,7 @@ describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
     expect(events.filter((e) => e.type === "usage" || e.type === "assistant_text")).toEqual([]);
   });
 
-  test("prefill() measures prompt reading: input tokens over the time to the first delta", async () => {
+  test("prefill() measures prompt reading: input tokens over the time to the first chunk", async () => {
     const p = streaming([
       { chunks: ["slow"], delayMs: 400, usage: { inputTokens: 4000, outputTokens: 1 } },
       // A prefix-cache hit (first delta at once) and a tiny prompt are not reading speeds.
@@ -762,5 +766,58 @@ describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
     await session.send("two");
     await session.send("three");
     expect(session.prefill()).toEqual(r);
+  });
+
+  test("prefill() stops at the first chunk, so a thinking model's reasoning is not counted as reading", async () => {
+    const p = streaming([
+      {
+        chunks: ["answer"],
+        delayMs: 400,
+        reasoningMs: 1200,
+        usage: { inputTokens: 4000, outputTokens: 1 },
+      },
+    ]);
+    const { session } = await setup(p);
+    await session.send("think");
+    const r = session.prefill();
+    expect(r?.samples).toBe(1);
+    // Timed to the first text delta this would be >= 1.6 s (<= 2500 tok/s).
+    expect(r?.tokensPerSec).toBeGreaterThan(4000 / 1.0);
+    expect(r?.tokensPerSec).toBeLessThanOrEqual(4000 / 0.39);
+  });
+
+  test("prefill() takes one sample per model call, tool-call-only calls included", async () => {
+    const p = streaming([
+      {
+        toolCalls: [{ id: "c1", name: "find", arguments: { pattern: "*.ts" } }],
+        delayMs: 400,
+        usage: { inputTokens: 4000, outputTokens: 1 },
+      },
+      { chunks: ["done"], delayMs: 400, usage: { inputTokens: 6000, outputTokens: 1 } },
+    ]);
+    const { session } = await setup(p);
+    await session.send("look");
+    expect(session.prefill()?.samples).toBe(2);
+  });
+
+  test("an aborted model call leaves no sample", async () => {
+    const p: Provider = {
+      async chat(req: ChatRequest): Promise<ChatResponse> {
+        await new Promise((r) => setTimeout(r, 350));
+        req.onFirstChunk?.();
+        return new Promise((_res, rej) => {
+          const fail = () => rej(new RewireError("provider_aborted", "aborted"));
+          if (req.signal?.aborted) fail();
+          else req.signal?.addEventListener("abort", fail, { once: true });
+        });
+      },
+    };
+    const { session } = await setup(p);
+    const ac = new AbortController();
+    const pending = session.send("slow", ac.signal);
+    await new Promise((r) => setTimeout(r, 500));
+    ac.abort();
+    await expect(pending).rejects.toMatchObject({ code: "aborted" });
+    expect(session.prefill()).toBeUndefined();
   });
 });

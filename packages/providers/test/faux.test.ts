@@ -54,4 +54,15 @@ describe("FauxProvider", () => {
     expect(deltas).toEqual(["hello"]);
     for (const q of faux.requests) expect(q).not.toHaveProperty("onDelta");
   });
+  test("onFirstChunk fires once per streamed call, before the delta, and is not recorded", async () => {
+    const faux = new FauxProvider([text("hello"), call("read", {}), text("plain")]);
+    const order: string[] = [];
+    const onDelta = (d: string) => order.push(d);
+    const onFirstChunk = () => order.push("first");
+    await faux.chat({ ...base, messages: [], onDelta, onFirstChunk });
+    await faux.chat({ ...base, messages: [], onDelta, onFirstChunk });
+    await faux.chat({ ...base, messages: [], onFirstChunk });
+    expect(order).toEqual(["first", "hello", "first"]);
+    for (const q of faux.requests) expect(q).not.toHaveProperty("onFirstChunk");
+  });
 });

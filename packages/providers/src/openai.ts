@@ -186,8 +186,20 @@ export function callOnDelta(onDelta: (text: string) => void, text: string): void
   }
 }
 
+/** Call the caller's `onFirstChunk`; its throw surfaces as-is, never as a transport error. */
+export function callOnFirstChunk(onFirstChunk: (() => void) | undefined): void {
+  if (onFirstChunk === undefined) return;
+  try {
+    onFirstChunk();
+  } catch (err) {
+    throw streamCallbackFailed(err, "onFirstChunk");
+  }
+}
+
 /**
- * Consume a chat-completions chunk stream: call `onDelta` per text delta and rebuild the
+ * Consume a chat-completions chunk stream: call `onFirstChunk` once on the first chunk that
+ * carries a choice (reasoning-only and tool-call chunks included), `onDelta` per text delta, and
+ * rebuild the
  * response a non-streamed call would have returned, for `fromOpenAIResponse` to parse.
  * Tool calls arrive as indexed deltas: id/name are set when present, argument fragments joined.
  * The SDK ends iteration quietly when the request is aborted, so an aborted signal is rethrown;
@@ -197,7 +209,9 @@ export async function collectOpenAIStream(
   stream: AsyncIterable<unknown>,
   onDelta: (text: string) => void,
   signal?: AbortSignal,
+  onFirstChunk?: () => void,
 ): Promise<OResponse> {
+  let first = true;
   let text = "";
   let finish: string | null = null;
   let usage: OResponse["usage"] = null;
@@ -208,6 +222,10 @@ export async function collectOpenAIStream(
     if (chunk.usage) usage = chunk.usage;
     const choice = chunk.choices?.find((c) => (c.index ?? 0) === 0);
     if (!choice) continue;
+    if (first) {
+      first = false;
+      callOnFirstChunk(onFirstChunk);
+    }
     if (choice.finish_reason) finish = choice.finish_reason;
     const delta = choice.delta;
     if (typeof delta?.content === "string" && delta.content !== "") {
@@ -259,7 +277,7 @@ export class OpenAIProvider implements Provider {
           ) as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
           req.signal ? { signal: req.signal } : undefined,
         );
-        resp = await collectOpenAIStream(stream, req.onDelta, req.signal);
+        resp = await collectOpenAIStream(stream, req.onDelta, req.signal, req.onFirstChunk);
       } else
         resp = await this.client.chat.completions.create(
           toOpenAIParams(

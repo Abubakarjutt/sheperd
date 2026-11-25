@@ -211,8 +211,8 @@ export class ChatSession {
 
   /**
    * The model's measured prompt-reading speed (input tokens over the time from the start of a
-   * model call to its first streamed delta), or undefined before a usable sample. Calls that
-   * stream no text are not measured.
+   * model call to its first streamed chunk of any kind, via `ChatRequest.onFirstChunk`), or
+   * undefined before a usable sample. A call that fails or is aborted is not measured.
    */
   prefill(): { tokensPerSec: number; samples: number } | undefined {
     return this.meter.rate();
@@ -345,15 +345,15 @@ export class ChatSession {
     const inner = this.opts.provider;
     const provider: Provider = {
       chat: async (req: ChatRequest) => {
+        // Prompt reading ends at the first streamed chunk of any kind: a thinking model's
+        // reasoning comes before its first text delta and is generation, not reading.
         const started = performance.now();
         let ttftMs: number | undefined;
-        const onDelta = req.onDelta;
-        const timed: ChatRequest = onDelta
+        const timed: ChatRequest = req.onDelta
           ? {
               ...req,
-              onDelta: (delta) => {
+              onFirstChunk: () => {
                 ttftMs ??= performance.now() - started;
-                onDelta(delta);
               },
             }
           : req;

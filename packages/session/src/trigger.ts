@@ -1,5 +1,5 @@
 import { MIN_COMPACTION_LIMIT } from "@rewire/pipeline";
-import type { ContextWindow } from "@rewire/providers";
+import { type ContextWindow, DEFAULT_CONTEXT_WINDOW } from "@rewire/providers";
 
 /** No compaction limit, computed or configured, is below this many tokens. */
 export const COMPACTION_FLOOR = MIN_COMPACTION_LIMIT;
@@ -47,8 +47,10 @@ export function formulaLimit(window: number): number {
 /**
  * The token count at which the chat session compacts: the smallest candidate (formula or
  * calibrated, the window share, and the latency budget once the prompt-reading speed has
- * `MIN_PREFILL_SAMPLES` samples), never below `COMPACTION_FLOOR`. A configured override replaces
- * the computation. Ties go to the earlier candidate.
+ * `MIN_PREFILL_SAMPLES` samples), never below `COMPACTION_FLOOR` and never above 0.85·W (so a
+ * window under ~4.8K still compacts before it overflows). A window that is not a positive finite
+ * number is treated as `DEFAULT_CONTEXT_WINDOW`. A configured override replaces the computation
+ * (floored, not capped: it is explicit). Ties go to the earlier candidate.
  */
 export function compactionLimit(input: CompactionLimitInput): CompactionLimit {
   if (usable(input.override)) {
@@ -59,7 +61,7 @@ export function compactionLimit(input: CompactionLimitInput): CompactionLimit {
       candidates: [{ reason: "override", value }],
     };
   }
-  const W = input.window.window;
+  const W = usable(input.window.window) ? input.window.window : DEFAULT_CONTEXT_WINDOW;
   const candidates: LimitCandidate[] = [
     usable(input.calibrated)
       ? { reason: "calibrated", value: Math.floor(input.calibrated) }
@@ -67,12 +69,18 @@ export function compactionLimit(input: CompactionLimitInput): CompactionLimit {
     { reason: "window", value: floor1k(WINDOW_SHARE * W) },
   ];
   const p = input.prefill;
-  if (p !== undefined && p.samples >= MIN_PREFILL_SAMPLES && usable(p.tokensPerSec)) {
+  if (
+    p !== undefined &&
+    p.samples >= MIN_PREFILL_SAMPLES &&
+    usable(p.tokensPerSec) &&
+    usable(input.latencyBudgetS)
+  ) {
     candidates.push({ reason: "latency", value: floor1k(p.tokensPerSec * input.latencyBudgetS) });
   }
   let best = candidates[0] as LimitCandidate;
   for (const c of candidates) if (c.value < best.value) best = c;
-  return { limit: Math.max(COMPACTION_FLOOR, best.value), reason: best.reason, candidates };
+  const limit = Math.min(Math.max(COMPACTION_FLOOR, best.value), Math.floor(WINDOW_SHARE * W));
+  return { limit, reason: best.reason, candidates };
 }
 
 /** Tokens of recent user messages kept verbatim: the configured value, capped at 25% of the limit. */

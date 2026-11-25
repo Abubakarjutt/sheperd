@@ -93,8 +93,8 @@ describe("compactionLimit", () => {
 
   test("the limit never drops below 4096", () => {
     expect(COMPACTION_FLOOR).toBe(4096);
-    const tiny = compactionLimit({ window: loaded(2048), latencyBudgetS: 60 });
-    expect(tiny.limit).toBe(4096);
+    const small = compactionLimit({ window: loaded(8192), latencyBudgetS: 60 });
+    expect(small.limit).toBe(6000);
     const slow = compactionLimit({
       window: loaded(131072),
       prefill: { tokensPerSec: 10, samples: 3 },
@@ -115,6 +115,31 @@ describe("compactionLimit", () => {
       expect(r.reason).toBe("formula");
       expect(r.limit).toBe(75000);
     }
+  });
+});
+
+describe("compactionLimit window guards", () => {
+  test("a window under ~4.8K is capped at 0.85·W, not raised above it by the floor", () => {
+    expect(compactionLimit({ window: loaded(2048), latencyBudgetS: 60 }).limit).toBe(1740);
+    expect(compactionLimit({ window: loaded(4096), latencyBudgetS: 60 }).limit).toBe(3481);
+  });
+
+  test("a non-positive or non-finite window is treated as the 32K default", () => {
+    for (const bad of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const r = compactionLimit({ window: loaded(bad), latencyBudgetS: 60 });
+      expect(r.limit).toBe(27000);
+      expect(Number.isFinite(r.limit)).toBe(true);
+    }
+  });
+
+  test("a non-finite latency budget drops the latency candidate", () => {
+    const r = compactionLimit({
+      window: loaded(131072),
+      prefill: { tokensPerSec: 100, samples: 5 },
+      latencyBudgetS: Number.NaN,
+    });
+    expect(r).toMatchObject({ limit: 75000, reason: "formula" });
+    expect(r.candidates.map((c) => c.reason)).not.toContain("latency");
   });
 });
 

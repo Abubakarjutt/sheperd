@@ -6,7 +6,7 @@ import { modelFamily, parseModelRef } from "@rewire/providers";
 import { describe, expect, test } from "vitest";
 import {
   compactionLimitOverride,
-  DEFAULT_COMPACTION_CONFIG,
+  defaultCompactionConfig,
   loadModelsFile,
   resolveRouting,
 } from "../src/routing.js";
@@ -106,8 +106,8 @@ describe("loadModelsFile [compaction]", () => {
 
   test("a file without [compaction] gets the defaults", async () => {
     const m = await loadModelsFile(file(base));
-    expect(m.compaction).toEqual(DEFAULT_COMPACTION_CONFIG);
-    expect(DEFAULT_COMPACTION_CONFIG).toEqual({
+    expect(m.compaction).toEqual(defaultCompactionConfig());
+    expect(defaultCompactionConfig()).toEqual({
       latencyBudgetS: 60,
       recentUserTokens: 20000,
       limits: {},

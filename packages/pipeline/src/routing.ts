@@ -32,12 +32,6 @@ export const DEFAULT_RECENT_USER_TOKENS = 20_000;
 /** The smallest compaction limit, configured or computed. */
 export const MIN_COMPACTION_LIMIT = 4096;
 
-export const DEFAULT_COMPACTION_CONFIG: Readonly<CompactionConfig> = Object.freeze({
-  latencyBudgetS: DEFAULT_LATENCY_BUDGET_S,
-  recentUserTokens: DEFAULT_RECENT_USER_TOKENS,
-  limits: Object.freeze({}) as Record<string, number>,
-});
-
 /** A fresh copy of the defaults, safe to mutate. */
 export const defaultCompactionConfig = (): CompactionConfig => ({
   latencyBudgetS: DEFAULT_LATENCY_BUDGET_S,

@@ -330,7 +330,7 @@ export class OllamaProvider implements Provider {
           { signal },
         );
         streaming = true;
-        resp = await collectOpenAIStream(stream, req.onDelta, signal);
+        resp = await collectOpenAIStream(stream, req.onDelta, signal, req.onFirstChunk);
       } else
         resp = await this.client.chat.completions.create(
           // Ollama's OpenAI-compat layer lists `max_tokens` (not `max_completion_tokens`) as supported:
