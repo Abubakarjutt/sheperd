@@ -406,6 +406,42 @@ describe.skipIf(!sandboxAvailable())("ChatSession", () => {
     ]);
   });
 
+  test("stable ids live beside the history: provider requests are byte-identical", async () => {
+    const repo = makeRepo();
+    const store = new SessionStore();
+    const p = new FauxProvider([
+      call("bash", { command: "echo hi" }),
+      text("one"),
+      text("two"),
+      text("three"),
+    ]);
+    const { session } = await setup(p, { repo, store });
+    await session.send("q1");
+    await session.send("q2");
+    const plain = session.history();
+    for (const m of plain) expect(Object.keys(m)).not.toContain("id");
+    const withIds = session.historyWithIds();
+    expect(withIds.map((m) => m.id)).toEqual(plain.map((_, i) => `m${i}`));
+    expect(withIds.map(({ id: _id, ...m }) => m)).toEqual(plain);
+    const id = session.id() as string;
+    expect((await store.load(id)).map((m) => m.id)).toEqual(withIds.map((m) => m.id));
+
+    // The request carries exactly the plain messages, with no id key: the same bytes as
+    // before ids existed. The same holds after a resume.
+    const req = p.requests[2]?.messages ?? [];
+    expect(JSON.stringify(req)).toBe(JSON.stringify([...plain.slice(0, -1)]));
+    const q = new FauxProvider([text("resumed")]);
+    const resumed = await setup(q, { repo, store, sessionId: id, resume: true });
+    expect(resumed.session.historyWithIds()).toEqual(withIds);
+    await resumed.session.send("q3");
+    expect(JSON.stringify(q.requests[0]?.messages)).toBe(
+      JSON.stringify([...plain, { role: "user", content: "q3" }]),
+    );
+    expect(resumed.session.historyWithIds().map((m) => m.id)).toEqual(
+      [...plain, 0, 0].map((_, i) => `m${i}`),
+    );
+  });
+
   test("a resumed history with a dangling tool call surfaces as session_corrupt", async () => {
     const repo = makeRepo();
     const store = new SessionStore();

@@ -14,12 +14,14 @@ const TITLE_MAX = 80;
 /** `/resume` listings read at most this much of each session file for its title (M8). */
 const TITLE_READ_MAX = 64 * 1024;
 
-const { O_RDONLY, O_WRONLY, O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK } = constants;
+const { O_RDONLY, O_RDWR, O_WRONLY, O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK } = constants;
 /** Never follow a final symlink; never block on a FIFO planted under a session name. */
 const READ_FLAGS = O_RDONLY | O_NOFOLLOW | O_NONBLOCK;
 
 const Message = z
   .object({
+    /** The stable id the store wrote (`m<n>`); absent in files written before ids existed. */
+    id: z.string().optional(),
     role: z.enum(["user", "assistant", "tool"]),
     content: z.string(),
     toolCalls: z
@@ -34,6 +36,64 @@ const Message = z
     toolCallId: z.string().optional(),
   })
   .strict();
+
+/** A stored message with its stable id (`m<n>`: its 0-based position among message lines). */
+export type StoredMessage = ChatMessage & { id: string };
+
+/**
+ * Lines that are not chat messages (Task 6 appends `{type:"compaction",...}`). They are skipped
+ * by `load` and never shift message numbering. Any other `type` is corruption.
+ */
+const NON_MESSAGE_TYPES = new Set(["compaction"]);
+
+type Line = { kind: "message"; message: ChatMessage & { id?: string } } | { kind: "other" };
+
+/** Classify one JSONL line; undefined when it is neither a chat message nor a known record. */
+function parseLine(line: string): Line | "invalid_json" | undefined {
+  let json: unknown;
+  try {
+    json = JSON.parse(line);
+  } catch {
+    return "invalid_json";
+  }
+  if (json !== null && typeof json === "object" && !Array.isArray(json) && !("role" in json)) {
+    const type = (json as { type?: unknown }).type;
+    return typeof type === "string" && NON_MESSAGE_TYPES.has(type) ? { kind: "other" } : undefined;
+  }
+  const m = Message.safeParse(json);
+  return m.success
+    ? { kind: "message", message: m.data as ChatMessage & { id?: string } }
+    : undefined;
+}
+
+/**
+ * Every message of a session's raw text with its id, checked: a malformed or truncated line, an
+ * unknown line type, or a stored id that disagrees with its position throws `session_corrupt`.
+ */
+function parseSession(id: string, raw: string): StoredMessage[] {
+  if (raw === "") return [];
+  if (!raw.endsWith("\n")) throw corrupt(id, "the last line is truncated");
+  const out: StoredMessage[] = [];
+  raw
+    .slice(0, -1)
+    .split("\n")
+    .forEach((line, i) => {
+      const parsed = parseLine(line);
+      if (parsed === "invalid_json") throw corrupt(id, `line ${i + 1} is not valid JSON`);
+      if (parsed === undefined) throw corrupt(id, `line ${i + 1} is not a chat message`);
+      if (parsed.kind !== "message") return;
+      const expected = `m${out.length}`;
+      const { id: stored, ...message } = parsed.message;
+      if (stored !== undefined && stored !== expected) {
+        throw corrupt(
+          id,
+          `line ${i + 1} has id ${JSON.stringify(stored).slice(0, 40)}, expected ${expected}`,
+        );
+      }
+      out.push({ id: expected, ...message });
+    });
+  return out;
+}
 
 export type SessionSummary = {
   id: string;
@@ -114,6 +174,8 @@ async function realDir(path: string, create: boolean, mode?: number): Promise<bo
  */
 export class SessionStore {
   private readonly repos = new Map<string, string>();
+  /** Message-line count per session, valid while the file has `size` bytes. */
+  private readonly counts = new Map<string, { size: number; count: number }>();
 
   /** The checked sessions dir, or undefined when it does not exist and `create` is false. */
   private async dir(repo: string, create: boolean): Promise<string | undefined> {
@@ -160,17 +222,40 @@ export class SessionStore {
 
   /**
    * Append one message, or a whole turn, as redacted JSONL lines in a single write, so a turn is
-   * on disk entirely or (on a failed write) not at all.
+   * on disk entirely or (on a failed write) not at all. Each line gets the next stable id
+   * (`m<n>`, n = the number of message lines already in the file; any id the caller passed is
+   * replaced). Returns the assigned ids. The count is taken from the file itself (cached by file
+   * size), so another store's writes are never given the same ids; a file whose last line is
+   * truncated or malformed is refused (`session_corrupt`) rather than extended.
    */
-  async append(id: string, msgs: ChatMessage | ChatMessage[]): Promise<void> {
+  async append(id: string, msgs: ChatMessage | ChatMessage[]): Promise<string[]> {
     const path = await this.path(id);
     const list = Array.isArray(msgs) ? msgs : [msgs];
-    if (list.length === 0) return;
-    const lines = list.map((m) => `${JSON.stringify(redactDeep(m))}\n`).join("");
-    const fh = await openFile(path, O_WRONLY | O_APPEND | O_NOFOLLOW | O_NONBLOCK);
+    if (list.length === 0) return [];
+    const fh = await openFile(path, O_RDWR | O_APPEND | O_NOFOLLOW | O_NONBLOCK);
     try {
-      if (!(await fh.stat()).isFile()) throw unsafe(`${path} is not a regular file`);
+      const st = await fh.stat();
+      if (!st.isFile()) throw unsafe(`${path} is not a regular file`);
+      let base: number;
+      const cached = this.counts.get(id);
+      if (cached !== undefined && cached.size === st.size) {
+        base = cached.count;
+      } else {
+        base = parseSession(id, await fh.readFile("utf8")).length;
+      }
+      const ids = list.map((_, i) => `m${base + i}`);
+      const lines = list
+        .map((m, i) => {
+          const { id: _ignored, ...rest } = m as ChatMessage & { id?: unknown };
+          return `${JSON.stringify({ id: ids[i], ...(redactDeep(rest) as object) })}\n`;
+        })
+        .join("");
       await fh.appendFile(lines, "utf8");
+      this.counts.set(id, {
+        size: st.size + Buffer.byteLength(lines, "utf8"),
+        count: base + list.length,
+      });
+      return ids;
     } finally {
       await fh.close();
     }
@@ -205,23 +290,24 @@ export class SessionStore {
     );
   }
 
-  /** Every message of a session. A malformed or truncated line throws `session_corrupt`. */
-  async load(id: string): Promise<ChatMessage[]> {
-    const raw = await readSession(await this.path(id));
-    if (raw === "") return [];
-    if (!raw.endsWith("\n")) throw corrupt(id, "the last line is truncated");
-    const lines = raw.slice(0, -1).split("\n");
-    return lines.map((line, i) => {
-      let json: unknown;
-      try {
-        json = JSON.parse(line);
-      } catch {
-        throw corrupt(id, `line ${i + 1} is not valid JSON`);
-      }
-      const m = Message.safeParse(json);
-      if (!m.success) throw corrupt(id, `line ${i + 1} is not a chat message`);
-      return m.data as ChatMessage;
-    });
+  /**
+   * Every message of a session, each with its stable id (files written before ids existed get
+   * ids from their position). Non-message lines are skipped. A malformed or truncated line, an
+   * unknown line type, or an id that disagrees with its position throws `session_corrupt`.
+   */
+  async load(id: string): Promise<StoredMessage[]> {
+    const path = await this.path(id);
+    const fh = await openFile(path, READ_FLAGS);
+    try {
+      const st = await fh.stat();
+      if (!st.isFile()) throw unsafe(`${path} is not a regular file`);
+      const raw = await fh.readFile("utf8");
+      const messages = parseSession(id, raw);
+      this.counts.set(id, { size: Buffer.byteLength(raw, "utf8"), count: messages.length });
+      return messages;
+    } finally {
+      await fh.close();
+    }
   }
 }
 
@@ -232,16 +318,6 @@ async function openFile(path: string, flags: number) {
     if (errno(e) === "ELOOP") throw unsafe(`${path} is a symlink`);
     if (errno(e) === "ENXIO") throw unsafe(`${path} is not a regular file`);
     throw e;
-  }
-}
-
-async function readSession(path: string): Promise<string> {
-  const fh = await openFile(path, READ_FLAGS);
-  try {
-    if (!(await fh.stat()).isFile()) throw unsafe(`${path} is not a regular file`);
-    return await fh.readFile("utf8");
-  } finally {
-    await fh.close();
   }
 }
 
@@ -274,16 +350,10 @@ async function titleOf(path: string): Promise<string> {
   if (raw === undefined) return "(untitled)";
   for (const line of raw.split("\n")) {
     if (line === "") continue;
-    let m: unknown;
-    try {
-      m = JSON.parse(line);
-    } catch {
-      return "(unreadable)";
-    }
-    const parsed = Message.safeParse(m);
-    if (!parsed.success) return "(unreadable)";
-    if (parsed.data.role !== "user") continue;
-    const first = parsed.data.content.split("\n")[0]?.trim() ?? "";
+    const parsed = parseLine(line);
+    if (parsed === undefined || parsed === "invalid_json") return "(unreadable)";
+    if (parsed.kind !== "message" || parsed.message.role !== "user") continue;
+    const first = parsed.message.content.split("\n")[0]?.trim() ?? "";
     return first.length > TITLE_MAX ? `${first.slice(0, TITLE_MAX - 3)}...` : first || "(empty)";
   }
   return "(empty)";

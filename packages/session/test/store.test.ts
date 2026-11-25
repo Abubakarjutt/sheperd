@@ -14,7 +14,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, expect, test } from "vitest";
+import type { ChatMessage } from "@rewire/providers";
+import { afterAll, describe, expect, test } from "vitest";
 import { SessionStore } from "../src/index.js";
 
 const dirs: string[] = [];
@@ -125,7 +126,7 @@ test("load of a listed session works from a fresh store", async () => {
   const fresh = new SessionStore();
   await expect(fresh.load(id)).rejects.toMatchObject({ code: "session_not_found" });
   await fresh.list(repo);
-  expect(await fresh.load(id)).toEqual([{ role: "user", content: "x" }]);
+  expect(await fresh.load(id)).toEqual([{ id: "m0", role: "user", content: "x" }]);
 });
 
 test("a truncated last line makes load throw session_corrupt", async () => {
@@ -215,4 +216,113 @@ test("an existing .rewire dir is used as is, never chmodded", async () => {
   chmodSync(join(repo, ".rewire"), 0o755);
   await new SessionStore().create(repo);
   expect(statSync(join(repo, ".rewire")).mode & 0o777).toBe(0o755);
+});
+
+describe("stable message ids", () => {
+  test("the store assigns m<n> across appends and writes it into each line", async () => {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const id = await store.create(repo);
+    expect(await store.append(id, { role: "user", content: "a" })).toEqual(["m0"]);
+    expect(
+      await store.append(id, [
+        { role: "assistant", content: "b" },
+        { role: "user", content: "c" },
+      ]),
+    ).toEqual(["m1", "m2"]);
+    expect(await store.append(id, [])).toEqual([]);
+    const lines = readFileSync(sessionFile(repo, id), "utf8").trimEnd().split("\n");
+    expect(lines.map((l) => JSON.parse(l).id)).toEqual(["m0", "m1", "m2"]);
+    expect((await store.load(id)).map((m) => [m.id, m.content])).toEqual([
+      ["m0", "a"],
+      ["m1", "b"],
+      ["m2", "c"],
+    ]);
+  });
+
+  test("a caller-supplied id is replaced by the store's", async () => {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const id = await store.create(repo);
+    const msg = { id: "m99", role: "user", content: "a" } as ChatMessage;
+    expect(await store.append(id, msg)).toEqual(["m0"]);
+    expect((await store.load(id))[0]?.id).toBe("m0");
+  });
+
+  test("numbering continues across load, a fresh store, and an outside write", async () => {
+    const repo = tempRepo();
+    const first = new SessionStore();
+    const id = await first.create(repo);
+    await first.append(id, [
+      { role: "user", content: "a" },
+      { role: "assistant", content: "b" },
+    ]);
+    const fresh = new SessionStore();
+    await fresh.list(repo);
+    expect(await fresh.append(id, { role: "user", content: "c" })).toEqual(["m2"]);
+    // The first store's view is stale: it recounts rather than reuse an id.
+    expect(await first.append(id, { role: "assistant", content: "d" })).toEqual(["m3"]);
+    expect((await fresh.load(id)).map((m) => m.id)).toEqual(["m0", "m1", "m2", "m3"]);
+  });
+
+  test("legacy files without ids get ids from their line position", async () => {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const id = await store.create(repo);
+    writeFileSync(
+      sessionFile(repo, id),
+      '{"role":"user","content":"old q"}\n{"role":"assistant","content":"old a"}\n',
+    );
+    expect((await store.load(id)).map((m) => [m.id, m.content])).toEqual([
+      ["m0", "old q"],
+      ["m1", "old a"],
+    ]);
+    expect(await store.append(id, { role: "user", content: "new" })).toEqual(["m2"]);
+    expect((await store.load(id)).map((m) => m.id)).toEqual(["m0", "m1", "m2"]);
+  });
+
+  test("non-message (compaction) lines do not shift the numbering and are not messages", async () => {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const id = await store.create(repo);
+    await store.append(id, [
+      { role: "user", content: "a" },
+      { role: "assistant", content: "b" },
+    ]);
+    appendFileSync(
+      sessionFile(repo, id),
+      `${JSON.stringify({ type: "compaction", record: {}, retainedFrom: "m0", at: "x" })}\n`,
+    );
+    expect(await store.append(id, { role: "user", content: "c" })).toEqual(["m2"]);
+    const loaded = await store.load(id);
+    expect(loaded.map((m) => [m.id, m.content])).toEqual([
+      ["m0", "a"],
+      ["m1", "b"],
+      ["m2", "c"],
+    ]);
+    // The title still comes from the first user message.
+    expect((await new SessionStore().list(repo))[0]?.title).toBe("a");
+  });
+
+  test("a stored id that disagrees with its position, or an unknown line type, is corrupt", async () => {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const a = await store.create(repo);
+    writeFileSync(sessionFile(repo, a), '{"id":"m5","role":"user","content":"x"}\n');
+    await expect(store.load(a)).rejects.toMatchObject({ code: "session_corrupt" });
+    const b = await store.create(repo);
+    writeFileSync(sessionFile(repo, b), '{"type":"mystery"}\n');
+    await expect(store.load(b)).rejects.toMatchObject({ code: "session_corrupt" });
+  });
+
+  test("append refuses to extend a file whose last line is truncated", async () => {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const id = await store.create(repo);
+    await store.append(id, { role: "user", content: "hello" });
+    appendFileSync(sessionFile(repo, id), '{"role":"assistant","content":"cut');
+    await expect(store.append(id, { role: "user", content: "x" })).rejects.toMatchObject({
+      code: "session_corrupt",
+    });
+  });
 });

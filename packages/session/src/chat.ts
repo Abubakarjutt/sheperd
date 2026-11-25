@@ -9,7 +9,7 @@ import type { ChatMessage, ChatRequest, ModelRef, Provider, ToolCall } from "@re
 import { profileFor, SandboxClient } from "@rewire/sandbox";
 import { type SkillSet, skillIndex, skillTool } from "@rewire/skills";
 import { createTools } from "@rewire/tools";
-import type { SessionStore } from "./store.js";
+import type { SessionStore, StoredMessage } from "./store.js";
 import { PrefillMeter } from "./trigger.js";
 
 const PACKAGE_ROOT = assetRoot("session", import.meta.url);
@@ -165,6 +165,11 @@ export class ChatSession {
   private readonly opts: ChatSessionOptions;
   private readonly skill: AgentTool;
   private messages: ChatMessage[] = [];
+  /**
+   * The stable store id (`m<n>`) of each entry of `messages`, kept beside them so ids never
+   * reach a provider request (`messages` is what `runAgent` sends).
+   */
+  private ids: string[] = [];
   private sid: string | undefined;
   private resumed = false;
   private sandbox: { client: SandboxClient; scratch: string } | undefined;
@@ -195,7 +200,9 @@ export class ChatSession {
   async open(): Promise<void> {
     if (this.resumed || this.sid === undefined) return;
     if (this.life.signal.aborted) throw disposedError();
-    this.messages = await this.opts.store.load(this.sid);
+    const loaded = await this.opts.store.load(this.sid);
+    this.messages = loaded.map(({ id: _id, ...m }) => m);
+    this.ids = loaded.map((m) => m.id);
     this.resumed = true;
   }
 
@@ -207,6 +214,11 @@ export class ChatSession {
   /** A copy of the conversation so far (complete turns only). */
   history(): ChatMessage[] {
     return structuredClone(this.messages);
+  }
+
+  /** `history()` with each message's stable id (`m<n>`). Never send these to a provider. */
+  historyWithIds(): StoredMessage[] {
+    return this.messages.map((m, i) => ({ ...structuredClone(m), id: this.ids[i] as string }));
   }
 
   /**
@@ -448,8 +460,9 @@ export class ChatSession {
     }
     this.sid ??= await this.opts.store.create(this.opts.repo);
     check(); // disposed (or aborted) while the file was created: store nothing
-    await this.opts.store.append(this.sid, added);
+    const ids = await this.opts.store.append(this.sid, added);
     this.messages = [...prior, ...added];
+    this.ids = [...this.ids, ...ids];
     return {
       text: redact(result.lastText),
       ...(proposal ? { proposal } : {}),
