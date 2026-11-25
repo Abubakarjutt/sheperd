@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { assetRoot, RewireError, type RunEvent, redact } from "@rewire/core";
+import { assetRoot, RewireError, type RunEvent, redact, sanitizeTerminal } from "@rewire/core";
 import { type AgentTool, type RunAgentResult, runAgent } from "@rewire/loop";
 import type { Policy } from "@rewire/policy";
 import type { ChatMessage, ChatRequest, ModelRef, Provider } from "@rewire/providers";
@@ -237,10 +237,19 @@ export class ChatSession {
         if (task.length > TASK_MAX) {
           return { content: `the task is too long (max ${TASK_MAX} characters)`, isError: true };
         }
+        // I1: the user approves what the card renders, so what runs must be exactly that text.
+        if (sanitizeTerminal(task) !== task) {
+          return {
+            content:
+              "the task contains control characters or escape sequences that the user would not see; resend it as plain text",
+            isError: true,
+          };
+        }
         if (proposal !== undefined) {
           return { content: "a run was already proposed in this turn", isError: true };
         }
-        proposal = { task };
+        // Redacted like the turn text: the card shows it redacted and the run gets the same string.
+        proposal = { task: redact(task) };
         end.abort();
         return {
           content: "Proposal recorded. The user will be asked to confirm the run.",

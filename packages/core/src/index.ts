@@ -5,3 +5,4 @@ export * from "./fence.js";
 export * from "./ids.js";
 export * from "./redact.js";
 export * from "./schemas.js";
+export * from "./terminal.js";

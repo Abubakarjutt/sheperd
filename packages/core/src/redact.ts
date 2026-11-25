@@ -1,4 +1,4 @@
-// biome-ignore-all lint/suspicious/noControlCharactersInRegex: matching control characters is the job
+import { sanitizeTerminal } from "./terminal.js";
 
 /**
  * The one secret matcher (I9). Every sink for model, repo or tool text (event log, headless
@@ -26,22 +26,12 @@ export const SECRET = new RegExp(SECRET_SOURCES.join("|"), "g");
 /** Replace every secret-looking token with `[redacted]`. */
 export const redact = (s: string): string => s.replace(SECRET, "[redacted]");
 
-const OSC = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/g;
-const CSI = /\u001b\[[0-?]*[ -/]*[@-~]?/g;
-const ESC_PAIR = /\u001b[@-Z\\-_]?/g;
-const INVISIBLE = /[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
-const CONTROLS = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g;
-
 /**
- * Untrusted text (#23) on its way to a terminal, a file people `cat`, or `git log`: drop ANSI
- * OSC/CSI sequences, every C0/C1 control character except the newline, and bidi/invisible
- * marks. Run it before `redact` so a secret split by an escape code is rejoined first.
+ * Untrusted text (#23) on its way to a terminal, a file people `cat`, or `git log`:
+ * `sanitizeTerminal` (ANSI sequences and control-string bodies, every C0/C1 control except the
+ * newline, CR, bidi/invisible marks), with tabs dropped too. Run it before `redact` so a secret
+ * split by an escape code is rejoined first.
  */
 export function stripControls(s: string): string {
-  return s
-    .replace(OSC, "")
-    .replace(CSI, "")
-    .replace(ESC_PAIR, "")
-    .replace(CONTROLS, "")
-    .replace(INVISIBLE, "");
+  return sanitizeTerminal(s).replaceAll("\t", "");
 }
