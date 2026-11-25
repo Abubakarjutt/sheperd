@@ -28,6 +28,10 @@
     "string-width": "8.3.0"
   },
   "devDependencies": {
+    "@rewire/pipeline": "workspace:*",
+    "@rewire/policy": "workspace:*",
+    "@rewire/providers": "workspace:*",
+    "@rewire/sandbox": "workspace:*",
     "@types/react": "19.3.0",
     "ink-testing-library": "4.0.0"
   }

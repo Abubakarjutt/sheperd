@@ -130,6 +130,26 @@ function licenseText(dir) {
   return f ? readFileSync(join(dir, f), "utf8").trim() : undefined;
 }
 
+/**
+ * Ink imports `react-devtools-core` (an optional peer it loads only when DEV=true and the package
+ * resolves) from its devtools module. sheperd does not ship it: left unresolved the build fails,
+ * and a plain `external` leaves a static import that crashes the bundle on load
+ * (ERR_MODULE_NOT_FOUND). Replace it with an inert stub, so it is never loaded.
+ */
+const stubDevtools = {
+  name: "stub-react-devtools-core",
+  setup(b) {
+    b.onResolve({ filter: /^react-devtools-core$/ }, (a) => ({
+      path: a.path,
+      namespace: "sheperd-stub",
+    }));
+    b.onLoad({ filter: /.*/, namespace: "sheperd-stub" }, () => ({
+      contents: "export default { initialize() {}, connectToDevTools() {} };\n",
+      loader: "js",
+    }));
+  },
+};
+
 async function buildSheperd(out, allPlatforms) {
   const m = manifest();
   const hashes = stagedHashes(out);
@@ -161,6 +181,7 @@ async function buildSheperd(out, allPlatforms) {
       REWIRE_BUNDLE_VERSION: JSON.stringify(m.version),
       REWIRE_BUNDLE_SANDBOX_SHA256: JSON.stringify(hashes),
     },
+    plugins: [stubDevtools],
     // CommonJS dependencies call require() on node builtins; give the ESM bundle one.
     banner: {
       js: 'import { createRequire as __sheperdRequire } from "node:module";\nconst require = __sheperdRequire(import.meta.url);',
@@ -173,6 +194,7 @@ async function buildSheperd(out, allPlatforms) {
   const workspace = new Set();
   for (const input of Object.keys(result.metafile.inputs)) {
     if (input.startsWith("<define:")) continue; // an object `define`, not a file
+    if (input.startsWith("sheperd-stub:")) continue; // stubDevtools: no file, nothing bundled
     const abs = resolve(ROOT, input);
     const root = pkgRootOf(abs);
     const pkg = readJson(join(root, "package.json"));

@@ -475,6 +475,13 @@ describe("process", () => {
     expect(r.stderr).not.toMatch(/\n\s+at /);
   });
 
+  test("REWIRE_TUI_SELFCHECK=1 rewire chat loads the TUI modules without a TTY and exits 0", async () => {
+    const r = await exec(["chat"], cleanEnv({ REWIRE_TUI_SELFCHECK: "1" }));
+    expect(r.stderr).toBe("");
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("tui: loaded\n");
+  });
+
   test("task-file must be a regular file and is size-capped", async () => {
     const d = tmp();
     const dirRun = await exec(["run", "--task-file", d], cleanEnv());

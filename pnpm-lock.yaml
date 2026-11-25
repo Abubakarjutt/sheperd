@@ -315,6 +315,18 @@ importers:
         specifier: 8.3.0
         version: 8.3.0
     devDependencies:
+      '@rewire/pipeline':
+        specifier: workspace:*
+        version: link:../pipeline
+      '@rewire/policy':
+        specifier: workspace:*
+        version: link:../policy
+      '@rewire/providers':
+        specifier: workspace:*
+        version: link:../providers
+      '@rewire/sandbox':
+        specifier: workspace:*
+        version: link:../sandbox
       '@types/react':
         specifier: 19.3.0
         version: 19.3.0

@@ -107,6 +107,14 @@ async function chat(args: string[]): Promise<number> {
       process.stderr.write(`usage: rewire chat takes no task; type it in the session\n${USAGE}`);
       return 1;
     }
+    // Packaging self-check (scripts/npm/smoke.mjs): load the TUI modules (Ink, React, yoga-layout)
+    // exactly as a TTY session would, then exit, so the bundled TUI is proven to import.
+    if (process.env.REWIRE_TUI_SELFCHECK === "1") {
+      const { chatCommand } = await import("./tui.js");
+      if (typeof chatCommand !== "function") throw new Error("the TUI entry point did not load");
+      process.stdout.write("tui: loaded\n");
+      return 0;
+    }
     if (!isInteractive(process)) throw tuiRequiresTty();
     const { chatCommand } = await import("./tui.js");
     return await chatCommand(
