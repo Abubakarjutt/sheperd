@@ -115,13 +115,22 @@ export type AppliedOp = {
 /** An operation the verifier is asked about: it creates or changes `user` authority. */
 export type RiskyOp = { index: number; op: CompactionOp; target?: RecordItem };
 export type VerifyDecision = { accept: boolean; reason?: string };
+/** A message cited by a risky op, as the verifier sees it. */
+export type CitedMessage = {
+  role: ChatMessage["role"];
+  /** Cleaned (sanitized, redacted, flattened) content. */
+  content: string;
+  /** Whether the message is in the window being compacted now. */
+  inWindow: boolean;
+};
 /**
- * The cross-check hook (Task 5). Without it every risky op (`isRiskyOp`) is rejected. `evidence` maps each cited message id to its role and cleaned
- * content. Returns one decision per op, in order; a missing decision rejects that op.
+ * The cross-check hook (`createRiskyVerifier`). Without it every risky op (`isRiskyOp`) is
+ * rejected. `evidence` maps each cited message id to its role, cleaned content and window
+ * membership. Returns one decision per op, in order; a missing decision rejects that op.
  */
 export type VerifyRisky = (
   ops: RiskyOp[],
-  evidence: Record<string, { role: ChatMessage["role"]; content: string }>,
+  evidence: Record<string, CitedMessage>,
 ) => Promise<VerifyDecision[]>;
 
 export type CompactInput = {
@@ -238,20 +247,21 @@ function buildPrompt(
 // Parsing
 // ---------------------------------------------------------------------------------------------
 
-type Parsed = { ok: true; ops: CompactionOp[] } | { ok: false; problem: string };
+export type ParsedReply<T> = { ok: true; value: T } | { ok: false; problem: string };
 
 /** How many `{` positions are tried as the start of the reply object. */
 const PARSE_CANDIDATES = 20;
 
 /**
- * Strip fences and prose: try the first balanced JSON object, then the next ones (a reply such
- * as `Here {is} my answer: {"ops": []}`), and report the first candidate's problem.
+ * Parse a model's JSON reply against `schema`. Strips fences and prose: tries the first balanced
+ * JSON object, then the next ones (a reply such as `Here {is} my answer: {"ops": []}`), and
+ * reports the first candidate's problem. Shared by the compactor and the risky-op verifier.
  */
-function parseReply(text: string): Parsed {
-  let first: Parsed | undefined;
+export function parseJsonReply<T>(text: string, schema: z.ZodType<T>): ParsedReply<T> {
+  let first: ParsedReply<T> | undefined;
   let from = text.indexOf("{");
   for (let n = 0; n < PARSE_CANDIDATES && from >= 0; n++) {
-    const r = parseCandidate(text.slice(from));
+    const r = parseCandidate(text.slice(from), schema);
     if (r.ok) return r;
     first ??= r;
     from = text.indexOf("{", from + 1);
@@ -259,7 +269,7 @@ function parseReply(text: string): Parsed {
   return first ?? { ok: false, problem: "no JSON object found in the reply" };
 }
 
-function parseCandidate(text: string): Parsed {
+function parseCandidate<T>(text: string, schema: z.ZodType<T>): ParsedReply<T> {
   const json = extractFirstJsonObject(text);
   if (json === undefined) return { ok: false, problem: "no complete JSON object in the reply" };
   let value: unknown;
@@ -268,7 +278,7 @@ function parseCandidate(text: string): Parsed {
   } catch (e) {
     return { ok: false, problem: `invalid JSON: ${e instanceof Error ? e.message : String(e)}` };
   }
-  const parsed = CompactionOps.safeParse(value);
+  const parsed = schema.safeParse(value);
   if (!parsed.success) {
     const issues = parsed.error.issues
       .slice(0, 10)
@@ -276,7 +286,7 @@ function parseCandidate(text: string): Parsed {
       .join("\n");
     return { ok: false, problem: `the reply does not match the schema:\n${issues}` };
   }
-  return { ok: true, ops: parsed.data.ops };
+  return { ok: true, value: parsed.data };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -374,13 +384,13 @@ function newItem(
 
 /**
  * Ops the verifier must confirm: any op on a `user` item, any add or supersede that creates a
- * `user` item, and resolving an open question.
+ * `user` item, and removing an open question (resolve or supersede).
  */
 export const isRiskyOp = (op: CompactionOp, target?: RecordItem): boolean =>
   target?.source === "user" ||
   (op.op === "add" && op.source === "user") ||
   (op.op === "supersede" && op.by.source === "user") ||
-  (op.op === "resolve" && target?.kind === "open_question");
+  ((op.op === "resolve" || op.op === "supersede") && target?.kind === "open_question");
 
 type ApplyOutcome = {
   record: SessionRecord;
@@ -432,9 +442,19 @@ function applyOps(
       const authority =
         op.op === "supersede" ? [...opEvidence, ...checkEvidence(op.by.evidence, ctx)] : opEvidence;
       if (target?.source === "user") {
-        // Same rule as creating one: cited, and every citation from a user message.
+        // Same rule as creating one: cited, every citation from a user message in the window.
         if (authority.length === 0 || !allFromUser(authority, ctx)) {
           reject(`changing user item ${target.id} needs evidence from user messages only`);
+        }
+        const old = authority.find((e) => !ctx.window.has(e.messageId));
+        if (old) {
+          reject(
+            `changing user item ${target.id} may cite only messages in the window, not ${old.messageId}`,
+          );
+        }
+        // A user item ends only by resolve, or by another user item: never a downgrade.
+        if (op.op === "supersede" && op.by.source !== "user") {
+          reject(`user item ${target.id} may be superseded only by a user item`);
         }
       }
       if ((op.op === "resolve" || op.op === "supersede") && authority.length === 0) {
@@ -491,8 +511,10 @@ function applyOps(
       }
       if (isRiskyOp(op, target)) {
         const d = decisions?.get(index);
-        if (decisions !== undefined && d?.accept !== true) {
-          reject(`not confirmed by the verifier${d?.reason ? `: ${cleanText(d.reason)}` : ""}`);
+        // Risky only in the second pass (a slot freed by a rejection): never sent, so rejected.
+        if (decisions !== undefined && d === undefined) reject("not verified (cap reflow)");
+        if (d !== undefined && !d.accept) {
+          reject(`not confirmed by the verifier${d.reason ? `: ${cleanText(d.reason)}` : ""}`);
         }
         risky.push({ index, op, ...(target ? { target: structuredClone(target) } : {}) });
       }
@@ -643,8 +665,8 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
     } catch (e) {
       return { ok: false, code: "compaction_invalid", reason: errorText(e) };
     }
-    const parsed = parseReply(reply);
-    if (parsed.ok) ops = parsed.ops;
+    const parsed = parseJsonReply(reply, CompactionOps);
+    if (parsed.ok) ops = parsed.value.ops;
     else problem = parsed.problem;
   }
   if (ops === undefined) {
@@ -675,7 +697,7 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
     );
     outcome = applyOps(record, ops, ctx, none);
   } else if (input.verifyRisky !== undefined && outcome.risky.length > 0) {
-    const evidence: Record<string, { role: ChatMessage["role"]; content: string }> = {};
+    const evidence: Record<string, CitedMessage> = {};
     for (const r of outcome.risky) {
       const cited = [
         ...(r.op.op === "supersede" ? (r.op.by.evidence ?? []) : []),
@@ -683,7 +705,13 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
       ];
       for (const e of cited) {
         const m = byId.get(e.messageId);
-        if (m) evidence[m.id] = { role: m.role, content: cleanText(m.content) };
+        if (m) {
+          evidence[m.id] = {
+            role: m.role,
+            content: cleanText(m.content),
+            inWindow: ctx.window.has(m.id),
+          };
+        }
       }
     }
     const decisions = new Map<number, VerifyDecision>();
@@ -691,7 +719,7 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
       const got = await input.verifyRisky(outcome.risky, evidence);
       outcome.risky.forEach((r, k) => {
         const d = got[k];
-        if (d !== undefined) decisions.set(r.index, d);
+        decisions.set(r.index, d ?? { accept: false, reason: "the verifier gave no decision" });
       });
     } catch (e) {
       for (const r of outcome.risky) {

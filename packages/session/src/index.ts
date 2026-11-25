@@ -4,3 +4,4 @@ export * from "./record.js";
 export * from "./runs.js";
 export * from "./store.js";
 export * from "./trigger.js";
+export * from "./verify-ops.js";

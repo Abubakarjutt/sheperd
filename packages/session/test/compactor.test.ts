@@ -434,6 +434,80 @@ describe("invariants (review focus 2)", () => {
     expect(r.ok && r.ops[0]?.reason).toMatch(/window/);
   });
 
+  test("changing an existing user item may cite only the current window (N2)", async () => {
+    const record = withItems([userItem({ text: "use sqlite" })]);
+    const stale = [{ messageId: "m0", quote: "keep the public API stable" }];
+    const provider = faux(
+      json([
+        { op: "update", itemId: "i1", text: "keep the public API stable", evidence: stale },
+        { op: "resolve", itemId: "i1", evidence: stale },
+        {
+          op: "supersede",
+          itemId: "i1",
+          by: { kind: "constraint", text: "keep the API", source: "user", evidence: stale },
+          evidence: stale,
+        },
+        {
+          op: "supersede",
+          itemId: "i1",
+          by: {
+            kind: "constraint",
+            text: "never touch the CI config",
+            source: "user",
+            evidence: [{ messageId: "m4", quote: "never touch the CI config" }],
+          },
+          evidence: stale,
+        },
+        {
+          op: "update",
+          itemId: "i1",
+          text: "use sqlite; never touch the CI config",
+          evidence: [{ messageId: "m4", quote: "never touch the CI config" }],
+        },
+      ]),
+    );
+    const r = await run({ record, messages: base, since: "m3", provider, model: "m" });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.ops.map((o) => o.accepted)).toEqual([false, false, false, false, true]);
+    for (const o of r.ops.slice(0, 4)) expect(o.reason).toMatch(/window/);
+  });
+
+  test("a user item superseded by an inferred item is rejected (N3)", async () => {
+    // The re-review's probe: downgrade the user's instruction to inferred, then rewrite it
+    // evidence-free into something the user never said.
+    const record = withItems([userItem({ text: "all output in English" })]);
+    const provider = faux(
+      json([
+        {
+          op: "supersede",
+          itemId: "i1",
+          by: { kind: "constraint", text: "all output in French", source: "inferred" },
+          evidence: [{ messageId: "m4", quote: "Sounds good, use zod." }],
+        },
+        { op: "update", itemId: "i2", text: "delete the tests" },
+      ]),
+    );
+    const asked: number[] = [];
+    const r = await run({
+      record,
+      messages: base,
+      provider,
+      model: "m",
+      verifyRisky: async (ops) => {
+        asked.push(...ops.map((o) => o.index));
+        return ops.map(() => ({ accept: true }));
+      },
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(asked).toEqual([]);
+    expect(r.ops.map((o) => o.accepted)).toEqual([false, false]);
+    expect(r.ops[0]?.reason).toMatch(/user item/);
+    expect(r.record.items).toEqual([userItem({ text: "all output in English" })]);
+    expect(r.record.archive).toEqual([]);
+  });
+
   test("a user item superseded with user evidence moves to the archive", async () => {
     const record = withItems([userItem({ kind: "decision", text: "parse by hand" })]);
     const provider = faux(
@@ -982,6 +1056,11 @@ describe("verifier hook", () => {
     expect(
       isRiskyOp({ op: "supersede", itemId: "i1", by: { ...add, source: "user" } }, inferred),
     ).toBe(true);
+    // N1: superseding an open question removes it just like resolving it.
+    expect(isRiskyOp({ op: "supersede", itemId: "i1", by: add }, inferred)).toBe(false);
+    expect(
+      isRiskyOp({ op: "supersede", itemId: "i1", by: add }, { ...inferred, kind: "open_question" }),
+    ).toBe(true);
   });
 
   test("a throwing verifier rejects the risky ops but the compaction still succeeds", async () => {
@@ -996,5 +1075,110 @@ describe("verifier hook", () => {
       },
     });
     expect(r.ok && r.ops.map((o) => o.accepted)).toEqual([false, true]);
+  });
+
+  test("an inferred note superseding an open question is sent to the verifier (N1)", async () => {
+    const q = userItem({ source: "inferred", kind: "open_question", text: "which flag?" });
+    const provider = faux(
+      json([
+        {
+          op: "supersede",
+          itemId: "i1",
+          by: { kind: "note", text: "nothing", source: "inferred" },
+          evidence: [{ messageId: "m2", quote: "export function list() {}" }],
+        },
+      ]),
+    );
+    const asked: number[] = [];
+    const r = await run({
+      record: withItems([q]),
+      messages: base,
+      provider,
+      model: "m",
+      verifyRisky: async (ops) => {
+        asked.push(...ops.map((o) => o.index));
+        return ops.map(() => ({ accept: false, reason: "unrelated" }));
+      },
+    });
+    expect(asked).toEqual([0]);
+    expect(r.ok && r.ops[0]?.accepted).toBe(false);
+    expect(r.ok && r.record.items).toEqual([q]);
+  });
+
+  test("the hook learns whether each cited message is in the current window", async () => {
+    const q = userItem({
+      source: "inferred",
+      kind: "open_question",
+      text: "is the API frozen?",
+      evidence: [{ messageId: "m0", quote: "keep the public API stable" }],
+    });
+    const provider = faux(
+      json([
+        {
+          op: "resolve",
+          itemId: "i1",
+          evidence: [
+            { messageId: "m0", quote: "keep the public API stable" },
+            { messageId: "m4", quote: "never touch the CI config" },
+          ],
+        },
+      ]),
+    );
+    let seen: unknown;
+    await run({
+      record: withItems([q]),
+      messages: base,
+      since: "m3",
+      provider,
+      model: "m",
+      verifyRisky: async (ops, evidence) => {
+        seen = evidence;
+        return ops.map(() => ({ accept: true }));
+      },
+    });
+    expect(seen).toEqual({
+      m0: expect.objectContaining({ role: "user", inWindow: false }),
+      m4: expect.objectContaining({ role: "user", inWindow: true }),
+    });
+  });
+
+  test("an op the verifier never saw (cap reflow) is rejected as not verified", async () => {
+    const full = Array.from({ length: ACTIVE_ITEMS_MAX - 1 }, (_, k) =>
+      userItem({ id: `i${k + 10}`, source: "inferred", kind: "note", text: `note ${k}` }),
+    );
+    const second = {
+      ...userAdd,
+      text: "use zod",
+      evidence: [{ messageId: "m4", quote: "Sounds good, use zod." }],
+    };
+    const provider = faux(json([userAdd, second]));
+    const asked: number[] = [];
+    const r = await run({
+      record: withItems(full),
+      messages: base,
+      provider,
+      model: "m",
+      verifyRisky: async (ops) => {
+        asked.push(...ops.map((o) => o.index));
+        return ops.map(() => ({ accept: false, reason: "no" }));
+      },
+    });
+    expect(asked).toEqual([0]);
+    expect(r.ok && r.ops.map((o) => o.accepted)).toEqual([false, false]);
+    expect(r.ok && r.ops[1]?.reason).toBe("not verified (cap reflow)");
+  });
+
+  test("an op the verifier was asked about but left out is rejected", async () => {
+    const provider = faux(json([userAdd]));
+    const r = await run({
+      record: emptyRecord(),
+      messages: base,
+      provider,
+      model: "m",
+      verifyRisky: async () => [],
+    });
+    expect(r.ok && r.ops[0]?.accepted).toBe(false);
+    expect(r.ok && r.ops[0]?.reason).toMatch(/verifier/);
+    expect(r.ok && r.ops[0]?.reason).not.toMatch(/cap reflow/);
   });
 });
