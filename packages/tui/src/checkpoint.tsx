@@ -1,4 +1,4 @@
-import { redact } from "@rewire/core";
+import { CHECKPOINT_NOTE_MAX, redact } from "@rewire/core";
 import type { PendingPrompt, RunHandle } from "@rewire/session";
 import { Box, useInput } from "ink";
 import { type ReactElement, useRef, useState } from "react";
@@ -10,9 +10,10 @@ import { useColumns, useRows } from "./use-columns.js";
 
 export type CheckpointPrompt = Extract<PendingPrompt, { kind: "checkpoint" }>;
 
-export const NOTE_MAX = 2000;
+export const NOTE_MAX = CHECKPOINT_NOTE_MAX;
 const LIMIT = "revision limit reached; [a]pprove or [s]top";
-const STALE = "that prompt is no longer active";
+/** Shown when a prompt was answered or replaced before this key arrived. */
+export const STALE_PROMPT = "that prompt is no longer active";
 /** Content shown by `[v]iew` and the diff are cut here before processing; sanitize copes with a split escape. */
 const MAX_TEXT = 200_000;
 
@@ -83,7 +84,7 @@ export function CheckpointPanel({
   };
 
   const send = (decision: Parameters<RunHandle["answer"]>[1]): void => {
-    if (run.pending() !== prompt || !run.answer(prompt, decision)) setMessage(STALE);
+    if (run.pending() !== prompt || !run.answer(prompt, decision)) setMessage(STALE_PROMPT);
     else setMessage(undefined);
   };
 
@@ -113,10 +114,10 @@ export function CheckpointPanel({
     if (k === "a") send({ action: "approve" });
     else if (k === "s") send({ action: "stop" });
     else if (k === "e" && cp.kind === "contract") {
-      if (run.pending() !== prompt) setMessage(STALE);
+      if (run.pending() !== prompt) setMessage(STALE_PROMPT);
       else if (revisionLimitReached) setMessage(LIMIT);
       else setM({ kind: "edit", value: "" });
-    } else if (k === "v" && cp.kind === "tests") setViewing((v) => !v);
+    } else if (k === "v" && cp.kind !== "contract") setViewing((v) => !v);
   });
 
   const line = (
@@ -131,6 +132,14 @@ export function CheckpointPanel({
   const add = (key: string, el: ReactElement): void => {
     out.push(<Box key={key}>{el}</Box>);
   };
+  /** `[v]iew`: already-cleaned lines, capped to what fits on screen. */
+  const view = (lines: string[], more: string): void => {
+    const budget = Math.max(3, Math.min(20, rows - 10));
+    lines.slice(0, budget).forEach((l, i) => {
+      add(`v${i}`, line(l, { dimColor: true }));
+    });
+    if (lines.length > budget) add("vm", line(more, { dimColor: true }));
+  };
 
   if (cp.kind === "contract") {
     add("h", line(`Contract checkpoint: ${cp.contract.title}`, { bold: true }));
@@ -138,7 +147,7 @@ export function CheckpointPanel({
       add(`c${i}`, line(`  ${c.id} [${c.kind}] ${c.statement}`));
     });
     if (revisionLimitReached) add("lim", line(LIMIT, { color: theme.busy }));
-    else add("k", line("[a]pprove [e]dit via chat [s]top", { color: theme.user }));
+    else add("k", line("[a]pprove [e] revise [s]top", { color: theme.user }));
   } else if (cp.kind === "tests") {
     add(
       "h",
@@ -146,24 +155,17 @@ export function CheckpointPanel({
     );
     for (const [i, f] of cp.files.entries()) add(`f${i}`, line(`  ${f.path}`));
     if (viewing) {
-      const budget = Math.max(3, Math.min(20, rows - 10));
       const lines: string[] = [];
       for (const f of cp.files) {
         lines.push(`--- ${f.path}`, ...clean(f.content).split("\n"));
-        if (lines.length > budget) break;
+        if (lines.length > rows) break; // already more than `view` can show
       }
-      lines.slice(0, budget).forEach((l, i) => {
-        add(`v${i}`, line(l, { dimColor: true }));
-      });
-      if (lines.length > budget)
-        add(
-          "vm",
-          line("… (truncated; the full tests are frozen in the worktree)", { dimColor: true }),
-        );
+      view(lines, "… (truncated; the full tests are frozen in the worktree)");
     }
     add("k", line("[a]pprove [v]iew [s]top", { color: theme.user }));
   } else {
-    const stat = diffStat(clean(cp.diff));
+    const diff = clean(cp.diff);
+    const stat = diffStat(diff);
     add("h", line(`Commit checkpoint: ${stat.files.length} file(s) changed`, { bold: true }));
     const cap = Math.max(3, Math.min(10, rows - 10));
     stat.files.slice(0, cap).forEach((f, i) => {
@@ -174,7 +176,8 @@ export function CheckpointPanel({
     });
     if (stat.files.length > cap)
       add("dm", line(`  … ${stat.files.length - cap} more`, { dimColor: true }));
-    add("k", line("[a]pprove [s]top", { color: theme.user }));
+    if (viewing) view(diff.split("\n"), "… (truncated; the full diff is in the worktree)");
+    add("k", line("[a]pprove [v]iew [s]top", { color: theme.user }));
   }
 
   if (mode.kind === "edit") {

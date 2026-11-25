@@ -17,6 +17,7 @@ import {
   type Finding,
   type FrozenTestManifest,
   type GateResult,
+  MAX_REVISIONS,
   newRunId,
   RewireError,
   RunEvent,
@@ -103,10 +104,11 @@ export type PipelineSeams = {
 export type Checkpoint =
   | { kind: "contract"; contract: Contract }
   | { kind: "tests"; manifest: FrozenTestManifest; files: Array<{ path: string; content: string }> }
-  | { kind: "commit"; diff: string; reportPreview: string };
+  | { kind: "commit"; diff: string };
 
-/** Contract-checkpoint revisions allowed per run; a further `revise` is treated as `stop`. */
-export const MAX_REVISIONS = 3;
+/** Re-exported from `@rewire/core` (its one definition, shared with the TUI). */
+export { MAX_REVISIONS };
+
 const DEFAULT_CHECKPOINT_KINDS: readonly CheckpointKind[] = ["contract", "tests"];
 
 export type RunPipelineInput = {
@@ -999,8 +1001,7 @@ async function execute(ctx: Ctx): Promise<void> {
   if (checkpointOn(ctx, "commit")) {
     // Computed only when the commit checkpoint is on: the staged change against the frozen tests.
     const diff = await commitDiff(worktree, frozenCommit, sig);
-    const reportPreview = renderReport(reportData(ctx, "verified", false));
-    const d = await checkpointDecision(ctx, { kind: "commit", diff, reportPreview });
+    const d = await checkpointDecision(ctx, { kind: "commit", diff });
     if (d.action !== "approve")
       throw stoppedByUser("commit", d.action === "stop" ? d.note : undefined);
   }

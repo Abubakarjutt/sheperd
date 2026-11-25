@@ -86,7 +86,12 @@ export type FrozenTestManifest = z.infer<typeof FrozenTestManifest>;
 export const CheckpointKind = z.enum(["contract", "tests", "commit"]);
 export type CheckpointKind = z.infer<typeof CheckpointKind>;
 
-const CheckpointNote = z.string().min(1).max(2000);
+/** Longest note a checkpoint decision may carry (revise or stop). */
+export const CHECKPOINT_NOTE_MAX = 2000;
+/** Contract-checkpoint revisions allowed per run; a further `revise` is treated as `stop`. */
+export const MAX_REVISIONS = 3;
+
+const CheckpointNote = z.string().min(1).max(CHECKPOINT_NOTE_MAX);
 
 export const CheckpointDecision = z.discriminatedUnion("action", [
   z.object({ action: z.literal("approve") }),

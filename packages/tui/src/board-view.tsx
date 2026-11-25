@@ -1,4 +1,4 @@
-import type { RunEvent } from "@rewire/core";
+import { MAX_REVISIONS, type RunEvent } from "@rewire/core";
 import type { PendingPrompt, RunHandle } from "@rewire/session";
 import { Box } from "ink";
 import { useEffect, useRef, useState } from "react";
@@ -15,9 +15,6 @@ import { fit } from "./fit.js";
 import { Safe } from "./safe.js";
 import { theme } from "./theme.js";
 import { useColumns } from "./use-columns.js";
-
-/** Mirrors the pipeline's MAX_REVISIONS (orchestrator.ts): the 4th revise is treated as stop. */
-const MAX_REVISIONS = 3;
 
 const GLYPH: Record<StageStatus, string> = { pending: "○", running: "◐", done: "✓", failed: "✗" };
 const COLOR: Record<StageStatus, string | undefined> = {

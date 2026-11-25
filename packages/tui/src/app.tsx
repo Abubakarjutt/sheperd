@@ -14,6 +14,7 @@ import type { Skill } from "@rewire/skills";
 import { Box } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type RunDone, RunView } from "./board-view.js";
+import { STALE_PROMPT } from "./checkpoint.js";
 import {
   age,
   type Command,
@@ -28,6 +29,8 @@ import { ClarifyPanel, ProposalCard } from "./proposal.js";
 import { sanitize } from "./sanitize.js";
 import { Transcript, type TranscriptEntry } from "./transcript.js";
 import { TrustPrompt } from "./trust-prompt.js";
+
+export { STALE_PROMPT };
 
 export type AppConfig = Record<string, unknown>;
 
@@ -96,7 +99,6 @@ export type AppProps = {
 const HIDDEN_NOTES = new Set([PROPOSAL_NOTE, TURN_LIMIT_NOTE]);
 
 export const RUN_ACTIVE = "a run is active; answer its prompt or press Ctrl-C to abort";
-export const STALE_PROMPT = "that prompt is no longer active";
 const SEPARATOR = "───";
 export const TRUSTED_LATER = "trusted; takes effect in a new session (/clear)";
 

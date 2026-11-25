@@ -127,7 +127,7 @@ function fakePipeline(
                 >["manifest"],
                 files: [{ path: "t.ts", content: "a\u0000b" }],
               }
-            : { kind, diff: "d", reportPreview: "p" };
+            : { kind, diff: "d" };
       const aborted = new Promise<"aborted">((res) => {
         if (input.signal?.aborted) res("aborted");
         input.signal?.addEventListener("abort", () => res("aborted"), { once: true });

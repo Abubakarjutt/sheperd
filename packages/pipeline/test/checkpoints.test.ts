@@ -492,7 +492,7 @@ describe.skipIf(!sandboxAvailable)(
       expect(existsSync(outcome.reportPath)).toBe(true);
     });
 
-    test("the commit checkpoint runs only when enabled, with the diff and a report preview", async () => {
+    test("the commit checkpoint runs only when enabled, with the diff", async () => {
       const seen: Checkpoint[] = [];
       const { outcome } = await run({
         checkpointKinds: ["commit"],
@@ -506,7 +506,7 @@ describe.skipIf(!sandboxAvailable)(
       const c = seen[0];
       if (c?.kind !== "commit") throw new Error("no commit checkpoint");
       expect(c.diff).toContain("+++ b/src/sum.ts");
-      expect(c.reportPreview).toContain("# rewire run");
+      expect(Object.keys(c).sort()).toEqual(["diff", "kind"]);
     });
 
     test("a changed text-valued asset is shown on the commit checkpoint", async () => {

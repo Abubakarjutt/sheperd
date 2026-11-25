@@ -52,7 +52,7 @@ describe("CheckpointPanel keys", () => {
     const { handle, answer } = fakeRun(contractPrompt);
     const { stdin, lastFrame } = render(<CheckpointPanel run={handle} prompt={contractPrompt} />);
     expect(lastFrame()).toContain("AC-1 [change] parse() returns tokens");
-    expect(lastFrame()).toContain("[a]pprove [e]dit via chat [s]top");
+    expect(lastFrame()).toContain("[a]pprove [e] revise [s]top");
     await type(stdin, "a");
     expect(answer).toHaveBeenCalledWith(contractPrompt, { action: "approve" });
   });
@@ -157,7 +157,7 @@ describe("CheckpointPanel keys", () => {
     ].join("\n");
     const prompt: CheckpointPrompt = {
       kind: "checkpoint",
-      checkpoint: { kind: "commit", diff, reportPreview: "" },
+      checkpoint: { kind: "commit", diff },
     };
     const { handle, answer } = fakeRun(prompt);
     const { stdin, lastFrame } = render(<CheckpointPanel run={handle} prompt={prompt} />);
@@ -165,11 +165,36 @@ describe("CheckpointPanel keys", () => {
     expect(f).toContain("src/a.ts +2 -1");
     expect(f).toContain("img/logo.png (binary, omitted)");
     expect(f).not.toContain("\x1b");
-    expect(f).toContain("[a]pprove [s]top");
+    expect(f).toContain("[a]pprove [v]iew [s]top");
     await type(stdin, "e");
     expect(lastFrame()).not.toContain("revise:");
     await type(stdin, "s");
     expect(answer).toHaveBeenCalledWith(prompt, { action: "stop" });
+  });
+
+  it("commit panel: [v]iew shows the diff redacted, sanitized and capped to the rows (M4)", async () => {
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "@@ -1,2 +1,2 @@",
+      "-old",
+      "+const k = 'AKIAIOSFODNN7EXAMPLE'\x1b]52;c;ZXZpbA==\x07;",
+      ...Array.from({ length: 60 }, (_, i) => `+line ${i}`),
+    ].join("\n");
+    const prompt: CheckpointPrompt = { kind: "checkpoint", checkpoint: { kind: "commit", diff } };
+    const { handle, answer } = fakeRun(prompt);
+    const v = render(<CheckpointPanel run={handle} prompt={prompt} />);
+    expect(v.lastFrame()).not.toContain("+line 0");
+    await type(v.stdin, "v");
+    const f = v.lastFrame() ?? "";
+    expect(f).toContain("+const k = '[redacted]';");
+    expect(f).toContain("+line 0");
+    expect(f).not.toContain("+line 59");
+    expect(f).toContain("… (truncated");
+    expect(f).not.toContain("\x1b");
+    await type(v.stdin, "v");
+    expect(v.lastFrame()).not.toContain("+line 0");
+    await type(v.stdin, "a");
+    expect(answer).toHaveBeenCalledWith(prompt, { action: "approve" });
   });
 
   it("diffStat counts per file", () => {
@@ -316,7 +341,7 @@ describe("RunView", () => {
     const f = v.lastFrame() ?? "";
     expect(f).toContain("✓ Spec");
     expect(f).toContain("1 change · 1 preserve");
-    expect(f).toContain("[a]pprove [e]dit via chat [s]top");
+    expect(f).toContain("[a]pprove [e] revise [s]top");
     await type(v.stdin, "a");
     expect(answer).toHaveBeenCalledWith(contractPrompt, { action: "approve" });
     release();
@@ -404,7 +429,7 @@ describe("RunView", () => {
     const v = render(<RunView run={run} />);
     await tick(120);
     expect(v.lastFrame()).toContain("revision limit reached; [a]pprove or [s]top");
-    expect(v.lastFrame()).not.toContain("[e]dit via chat");
+    expect(v.lastFrame()).not.toContain("[e] revise");
     await type(v.stdin, "e");
     expect(v.lastFrame()).not.toContain("revise:");
     // a message on the first panel must not survive onto the next prompt
