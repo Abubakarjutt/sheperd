@@ -9,7 +9,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { RewireError } from "@rewire/core";
 import { DEFAULT_POLICY } from "@rewire/policy";
 import {
@@ -30,6 +31,16 @@ import {
 } from "@rewire/skills";
 import { afterAll, describe, expect, test } from "vitest";
 import { type ChatEvent, ChatSession, SessionStore, TURN_LIMIT_NOTE } from "../src/index.js";
+
+/**
+ * Skill sets live outside /tmp: the Linux sandbox mounts a private /tmp, so a set under tmpdir()
+ * is invisible inside it (the real default, ~/.cache, is outside /tmp). node_modules is ignored.
+ */
+const CACHE_BASE = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "../node_modules/.cache/rewire-test",
+);
+mkdirSync(CACHE_BASE, { recursive: true });
 
 const dirs: string[] = [];
 const sets: SkillSet[] = [];
@@ -73,7 +84,9 @@ async function makeSet(): Promise<SkillSet> {
     "---\nname: tdd\ndescription: Test-driven development helper\n---\nWrite the test first.\n",
   );
   const { skills } = await discoverSkills({ home, xdgConfig, repo: base });
-  const set = createSkillSet(skills, { home, xdgConfig, cacheDir: join(base, "cache") });
+  const cache = realpathSync(mkdtempSync(join(CACHE_BASE, "skill-cache-")));
+  dirs.push(cache);
+  const set = createSkillSet(skills, { home, xdgConfig, cacheDir: cache });
   sets.push(set);
   return set;
 }
