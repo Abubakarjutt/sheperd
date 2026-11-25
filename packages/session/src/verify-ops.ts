@@ -68,7 +68,12 @@ export type RiskyVerifierOptions = {
   timeoutMs?: number;
 };
 
-/** The hook, plus whether it is a different model from the author (a dim notice when not). */
+/**
+ * The hook, plus `independent`: false when the verifier is the author's very model (same model id
+ * and, when given, provider). This is model-level only: a different model of the same family
+ * counts as independent. Family independence comes from routing (`independence`), which the
+ * caller should use for any notice.
+ */
 export type RiskyVerifier = VerifyRisky & { readonly independent: boolean };
 
 let promptCache: string | undefined;
@@ -119,9 +124,16 @@ function opBlock(r: RiskyOp, k: number): string {
   ].join("\n");
 }
 
+const WHERE: Record<CitedMessage["scope"], string> = {
+  window: "in the current window",
+  recent: "a recent message kept verbatim",
+  pending: "unresolved from an earlier update",
+  older: "outside the current window",
+};
+
 function messageLine(id: string, m: CitedMessage | undefined): string {
   if (m === undefined) return `[${cleanText(id)}] (not available)`;
-  const where = m.inWindow ? "in the current window" : "outside the current window";
+  const where = WHERE[m.scope ?? (m.inWindow ? "window" : "older")];
   // Cleaned content is flattened to one line, so it can never start a `[mN …]` line.
   return `[${cleanText(id)} ${m.role}, ${where}] ${cut(cleanText(m.content), VERIFY_MESSAGE_CHARS)}`;
 }
@@ -177,6 +189,10 @@ function buildPrompt(
 const errorText = (e: unknown): string =>
   cleanText(e instanceof Error ? e.message : String(e)).slice(0, 300);
 
+/** `850 ms`, `2 s`, `1.5 s`. */
+const duration = (ms: number): string =>
+  ms < 1000 ? `${Math.round(ms)} ms` : `${Number((ms / 1000).toFixed(1))} s`;
+
 /**
  * Run one call against the overall deadline and the caller's signal. Either one aborts the call
  * at once and rejects, even when the provider ignores its signal; timers and listeners are
@@ -195,7 +211,7 @@ async function guarded<T>(
     const left = deadline - Date.now();
     const expire = () => {
       ctl.abort();
-      rej(new VerifierUnavailable(`timed out after ${Math.round(timeoutMs / 1000)}s`));
+      rej(new VerifierUnavailable(`timed out after ${duration(timeoutMs)}`));
     };
     if (left <= 0) expire();
     else timer = setTimeout(expire, left);

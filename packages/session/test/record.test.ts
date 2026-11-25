@@ -38,6 +38,17 @@ const record = (over: Partial<SessionRecordT> = {}): SessionRecordT => ({
 });
 
 describe("schemas", () => {
+  test("pending: absent in older records, capped, and never longer than 3 compactions", () => {
+    const { pending: _p, ...old } = emptyRecord();
+    expect(SessionRecord.parse(old).pending).toEqual([]);
+    const p = (n: number, left = 3) =>
+      Array.from({ length: n }, (_, k) => ({ messageId: `m${k}`, compactionsLeft: left }));
+    expect(SessionRecord.safeParse({ ...emptyRecord(), pending: p(50) }).success).toBe(true);
+    expect(SessionRecord.safeParse({ ...emptyRecord(), pending: p(51) }).success).toBe(false);
+    expect(SessionRecord.safeParse({ ...emptyRecord(), pending: p(1, 4) }).success).toBe(false);
+    expect(SessionRecord.safeParse({ ...emptyRecord(), pending: p(1, 0) }).success).toBe(false);
+  });
+
   test("a full record round-trips through JSON unchanged", () => {
     const r: SessionRecordT = {
       version: 1,
@@ -62,6 +73,7 @@ describe("schemas", () => {
       }),
       archive: [item({ id: "r0", status: "superseded", supersededBy: "r1" })],
       compactions: 2,
+      pending: [{ messageId: "m4", compactionsLeft: 2 }],
     };
     const json = JSON.parse(JSON.stringify(r));
     expect(SessionRecord.parse(json)).toEqual(JSON.parse(JSON.stringify(r)));

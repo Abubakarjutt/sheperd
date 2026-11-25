@@ -106,6 +106,25 @@ export const Observed = z
 export type Observed = z.infer<typeof Observed>;
 export type ObservedRun = Observed["runs"][number];
 
+/** At most this many pending citations. */
+export const PENDING_MAX = 50;
+/** How many further compactions a pending citation stays citable. */
+export const PENDING_COMPACTIONS = 3;
+
+/**
+ * A user message an op cited that was rejected for a reason other than a failed authority check
+ * (a verifier reject, `duplicate_target`, `verification_budget`, …). It stays citable for user
+ * authority for `compactionsLeft` more compactions, so a correction is not lost when the window
+ * moves on. Computed by code, never by the model.
+ */
+export const PendingCitation = z
+  .object({
+    messageId: MessageId,
+    compactionsLeft: z.number().int().min(1).max(PENDING_COMPACTIONS),
+  })
+  .strict();
+export type PendingCitation = z.infer<typeof PendingCitation>;
+
 export const SessionRecord = z
   .object({
     version: z.literal(1),
@@ -115,6 +134,8 @@ export const SessionRecord = z
     archive: z.array(RecordItem),
     /** How many compactions produced this record. */
     compactions: z.number().int().nonnegative(),
+    /** User messages still citable after a rejected op (absent in older records). */
+    pending: z.array(PendingCitation).max(PENDING_MAX).default([]),
   })
   .strict()
   .superRefine((r, ctx) => {
@@ -143,6 +164,7 @@ export function emptyRecord(): SessionRecord {
     observed: { files: [], commands: [], runs: [], errors: [] },
     archive: [],
     compactions: 0,
+    pending: [],
   };
 }
 

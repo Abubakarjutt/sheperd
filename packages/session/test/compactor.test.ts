@@ -12,6 +12,7 @@ import {
   type RecordItem,
   type SessionRecord,
   type StoredMessage,
+  sameJudgedState,
 } from "../src/index.js";
 
 const user = (id: string, content: string): StoredMessage => ({ id, role: "user", content });
@@ -56,6 +57,9 @@ const base: StoredMessage[] = [
   assistant("m3", "The list command lives in src/list.ts. I suggest we use zod for parsing."),
   user("m4", "Sounds good, use zod. Also never touch the CI config."),
 ];
+
+/** Keep only the newest user message verbatim, so earlier ones are not citable as recent. */
+const tight = { messages: base, model: "m", recentUserTokens: 1 };
 
 describe("CompactionOps schema", () => {
   test("accepts the four operations", () => {
@@ -430,7 +434,8 @@ describe("invariants (review focus 2)", () => {
         },
       ]),
     );
-    const r = await run({ record, messages: base, since: "m3", provider, model: "m" });
+    // Only the newest user message is kept verbatim, so m0 is neither recent nor pending.
+    const r = await run({ ...tight, record, since: "m3", provider });
     expect(r.ok && r.ops.map((o) => o.accepted)).toEqual([false, true]);
     expect(r.ok && r.ops[0]?.reason).toMatch(/window/);
   });
@@ -464,7 +469,7 @@ describe("invariants (review focus 2)", () => {
         { op: "update", itemId: "i5", text: "use sqlite; never touch the CI config", evidence: ci },
       ]),
     );
-    const r = await run({ record, messages: base, since: "m3", provider, model: "m" });
+    const r = await run({ ...tight, record, since: "m3", provider });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.ops.map((o) => o.accepted)).toEqual([false, false, false, false, true]);
@@ -816,9 +821,10 @@ describe("prompt", () => {
 
   test("only messages since the last compaction are in the window", async () => {
     const provider = faux(json([]));
-    await run({ record: emptyRecord(), messages: base, since: "m3", provider, model: "m" });
+    await run({ ...tight, record: emptyRecord(), since: "m3", provider });
     const prompt = provider.requests[0]?.messages[0]?.content ?? "";
     expect(prompt).not.toContain("[m0 user]");
+    expect(prompt).not.toContain("untrusted_earlier_user_messages");
     expect(prompt).toContain("[m3 assistant]");
   });
 });
@@ -1186,7 +1192,7 @@ describe("verifier hook", () => {
     expect(r.ok && r.record.items.map((i) => i.text)).toEqual(["n"]);
   });
 
-  test("an accepted op whose target differs from what the verifier judged is state_changed", async () => {
+  test("the verifier gets deep copies: mutating them changes nothing", async () => {
     const record = withItems([userItem()]);
     const provider = faux(
       json([
@@ -1205,14 +1211,31 @@ describe("verifier hook", () => {
       model: "m",
       verifyRisky: async (ops) =>
         ops.map((o) => {
-          // The verifier judged a different state of the item than the one applied.
           if (o.target) o.target.text = "something else";
+          if (o.op.op === "update") o.op.text = "delete the tests";
           return { accept: true };
         }),
     });
-    expect(r.ok && r.ops[0]?.accepted).toBe(false);
-    expect(r.ok && r.ops[0]?.reason).toMatch(/^state_changed/);
-    expect(r.ok && r.record.items).toEqual([userItem()]);
+    expect(r.ok && r.ops[0]?.accepted).toBe(true);
+    expect(r.ok && r.record.items[0]?.text).toBe(
+      "keep the public API stable; never touch the CI config",
+    );
+  });
+
+  test("sameJudgedState, the state_changed backstop, compares what the verifier was shown", () => {
+    // Unreachable through compact(): duplicate_target makes every target its input state. The
+    // backstop compares every field the verifier's prompt shows.
+    const a = userItem();
+    expect(sameJudgedState(a, structuredClone(a))).toBe(true);
+    expect(sameJudgedState(undefined, undefined)).toBe(true);
+    expect(sameJudgedState(a, undefined)).toBe(false);
+    expect(sameJudgedState(a, { ...a, text: "x" })).toBe(false);
+    expect(sameJudgedState(a, { ...a, kind: "goal" })).toBe(false);
+    expect(sameJudgedState(a, { ...a, source: "inferred" })).toBe(false);
+    expect(sameJudgedState(a, { ...a, status: "resolved" })).toBe(false);
+    expect(sameJudgedState(a, { ...a, reason: "because" })).toBe(false);
+    // Evidence and timestamps are not part of the judged state.
+    expect(sameJudgedState(a, { ...a, updatedAt: "m9", evidence: [] })).toBe(true);
   });
 
   test("P5: an abort during verification returns at once with nothing changed (I2)", async () => {
@@ -1328,6 +1351,7 @@ describe("verifier hook", () => {
       record: withItems([q]),
       messages: base,
       since: "m3",
+      recentUserTokens: 1,
       provider,
       model: "m",
       verifyRisky: async (ops, evidence) => {
@@ -1336,8 +1360,8 @@ describe("verifier hook", () => {
       },
     });
     expect(seen).toEqual({
-      m0: expect.objectContaining({ role: "user", inWindow: false }),
-      m4: expect.objectContaining({ role: "user", inWindow: true }),
+      m0: expect.objectContaining({ role: "user", inWindow: false, scope: "older" }),
+      m4: expect.objectContaining({ role: "user", inWindow: true, scope: "window" }),
     });
   });
 
@@ -1379,5 +1403,242 @@ describe("verifier hook", () => {
     expect(r.ok && r.ops[0]?.accepted).toBe(false);
     expect(r.ok && r.ops[0]?.reason).toMatch(/verifier/);
     expect(r.ok && r.ops[0]?.reason).not.toMatch(/became valid/);
+  });
+});
+
+describe("pending citations and the window (N1, N3)", () => {
+  const conv: StoredMessage[] = [
+    user("m0", "Please use sqlite for storage."),
+    assistant("m1", "OK, sqlite it is."),
+    user("m2", "Let me think about the storage again."),
+    user("m3", "Actually use postgres instead of sqlite."),
+    assistant("m4", "Switching to postgres."),
+    user("m5", "Thanks, carry on."),
+    assistant("m6", "Carrying on."),
+    user("m7", "Next, the list command."),
+    assistant("m8", "Looking at it."),
+    user("m9", "Now the flags."),
+    assistant("m10", "Done."),
+    user("m11", "And the docs."),
+    assistant("m12", "Updated."),
+  ];
+  const sqlite = userItem({
+    text: "use sqlite",
+    evidence: [{ messageId: "m0", quote: "use sqlite for storage" }],
+  });
+  const toPostgres = {
+    op: "supersede",
+    itemId: "i1",
+    by: {
+      kind: "constraint",
+      text: "use postgres instead of sqlite",
+      source: "user",
+      evidence: [{ messageId: "m3", quote: "use postgres instead of sqlite" }],
+    },
+    evidence: [{ messageId: "m3", quote: "Actually use postgres instead of sqlite." }],
+  };
+  type Hook = NonNullable<CompactInput["verifyRisky"]>;
+  const accept: Hook = async (ops) => ops.map(() => ({ accept: true }));
+  const refuse: Hook = async (ops) => ops.map(() => ({ accept: false, reason: "not sure" }));
+  /** One compaction over conv[0..upto], window from `since`, only the newest user message kept. */
+  const step = (
+    record: SessionRecord,
+    ops: unknown[],
+    since: string,
+    upto: number,
+    verifyRisky: Hook = accept,
+  ) =>
+    compact({
+      record,
+      messages: conv.slice(0, upto + 1),
+      since,
+      provider: faux(json(ops)),
+      model: "m",
+      recentUserTokens: 1,
+      verifyRisky,
+    });
+
+  for (const [name, junk] of [
+    ["an evidence-free update", { op: "update", itemId: "i1", reason: "tweak" }],
+    [
+      "a fake-quote resolve",
+      {
+        op: "resolve",
+        itemId: "i1",
+        evidence: [{ messageId: "m3", quote: "use mysql instead of sqlite" }],
+      },
+    ],
+  ] as const) {
+    test(`${name} before the correction does not block it (N1 probe)`, async () => {
+      const asked: number[] = [];
+      const r = await step(withItems([sqlite]), [junk, toPostgres], "m2", 4, async (ops) => {
+        asked.push(...ops.map((o) => o.index));
+        return ops.map(() => ({ accept: true }));
+      });
+      expect(asked).toEqual([1]);
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect(r.ops.map((o) => o.accepted)).toEqual([false, true]);
+      expect(r.record.items).toEqual([
+        expect.objectContaining({ text: "use postgres instead of sqlite", source: "user" }),
+      ]);
+      expect(r.record.archive).toEqual([
+        expect.objectContaining({ id: "i1", status: "superseded" }),
+      ]);
+      // A failed authority check (the fake quote) makes nothing pending.
+      expect(r.record.pending).toEqual([]);
+    });
+  }
+
+  test("a rejected correction stays citable: the next compaction applies it", async () => {
+    const r1 = await step(withItems([sqlite]), [toPostgres], "m2", 4, refuse);
+    expect(r1.ok).toBe(true);
+    if (!r1.ok) return;
+    expect(r1.ops[0]?.accepted).toBe(false);
+    expect(r1.record.items).toEqual([sqlite]);
+    expect(r1.record.pending).toEqual([{ messageId: "m3", compactionsLeft: 3 }]);
+
+    // The window has moved on to m5..m6; m3 is neither in it nor kept verbatim.
+    let scope: unknown;
+    const provider = faux(json([toPostgres]));
+    const r2 = await compact({
+      record: r1.record,
+      messages: conv.slice(0, 7),
+      since: "m5",
+      provider,
+      model: "m",
+      recentUserTokens: 1,
+      verifyRisky: async (ops, ev) => {
+        scope = ev.m3?.scope;
+        return ops.map(() => ({ accept: true }));
+      },
+    });
+    expect(scope).toBe("pending");
+    const prompt = String(provider.requests[0]?.messages[0]?.content ?? "");
+    expect(prompt).toMatch(/Unresolved user messages you may still cite/);
+    expect(prompt).toMatch(/<untrusted_earlier_user_messages id="[^"]+">\n\[m3 user\]/);
+    expect(r2.ok && r2.ops[0]?.accepted).toBe(true);
+    expect(r2.ok && r2.record.items.map((i) => i.text)).toEqual(["use postgres instead of sqlite"]);
+
+    // Control: without the pending entry, the same op is out of the window.
+    const r3 = await step({ ...r1.record, pending: [] }, [toPostgres], "m5", 6);
+    expect(r3.ok && r3.ops[0]?.accepted).toBe(false);
+    expect(r3.ok && r3.ops[0]?.reason).toMatch(/window/);
+  });
+
+  test("a pending citation expires after 3 compactions", async () => {
+    const r1 = await step(withItems([sqlite]), [toPostgres], "m2", 4, refuse);
+    if (!r1.ok) throw new Error("compaction 1 failed");
+    let record = r1.record;
+    const seen: unknown[] = [];
+    for (const [since, upto] of [
+      ["m5", 6],
+      ["m7", 8],
+      ["m9", 10],
+    ] as const) {
+      const r = await step(record, [], since, upto);
+      if (!r.ok) throw new Error(`compaction from ${since} failed`);
+      record = r.record;
+      seen.push(record.pending);
+    }
+    expect(seen).toEqual([
+      [{ messageId: "m3", compactionsLeft: 2 }],
+      [{ messageId: "m3", compactionsLeft: 1 }],
+      [],
+    ]);
+    const r5 = await step(record, [toPostgres], "m11", 12);
+    expect(r5.ok && r5.ops[0]?.accepted).toBe(false);
+    expect(r5.ok && r5.ops[0]?.reason).toMatch(/window/);
+  });
+
+  test("user citations of a verifier reject and of a duplicate_target become pending", async () => {
+    const think = [{ messageId: "m2", quote: "Let me think about the storage again." }];
+    const r = await step(
+      withItems([sqlite]),
+      [{ op: "resolve", itemId: "i1", evidence: think }, toPostgres],
+      "m2",
+      4,
+      refuse,
+    );
+    expect(r.ok && r.ops.map((o) => o.reason)).toEqual([
+      "not confirmed by the verifier: not sure",
+      expect.stringMatching(/^duplicate_target/),
+    ]);
+    expect(r.ok && r.record.pending).toEqual([
+      { messageId: "m3", compactionsLeft: 3 },
+      { messageId: "m2", compactionsLeft: 3 },
+    ]);
+  });
+
+  test("a message that was not citable never becomes pending", async () => {
+    // m0 is outside the window and not kept verbatim: citing it is an authority failure.
+    const stale = {
+      ...toPostgres,
+      by: { ...toPostgres.by, evidence: [{ messageId: "m0", quote: "use sqlite for storage" }] },
+      evidence: [{ messageId: "m0", quote: "use sqlite for storage" }],
+    };
+    const r = await step(withItems([sqlite]), [stale], "m2", 4);
+    expect(r.ok && r.ops[0]?.accepted).toBe(false);
+    expect(r.ok && r.record.pending).toEqual([]);
+  });
+
+  test("an authority failure makes nothing pending, even with a real user quote in it", async () => {
+    // Mixed evidence: m3 is a real, citable user quote, but m4 is the assistant.
+    const mixed = {
+      ...toPostgres,
+      evidence: [
+        { messageId: "m3", quote: "Actually use postgres instead of sqlite." },
+        { messageId: "m4", quote: "Switching to postgres." },
+      ],
+    };
+    const r = await step(withItems([sqlite]), [mixed], "m2", 4);
+    expect(r.ok && r.ops[0]?.reason).toMatch(/user messages only/);
+    expect(r.ok && r.record.pending).toEqual([]);
+  });
+
+  test("a non-authority reject citing an uncitable user message makes nothing pending", async () => {
+    // m0 is citable for inferred items (the record cites it) but not for user authority.
+    const empty = {
+      op: "add",
+      kind: "note",
+      text: "   ",
+      source: "inferred",
+      evidence: [{ messageId: "m0", quote: "use sqlite for storage" }],
+    };
+    const r = await step(withItems([sqlite]), [empty], "m2", 4);
+    expect(r.ok && r.ops[0]?.reason).toMatch(/text is empty/);
+    expect(r.ok && r.record.pending).toEqual([]);
+  });
+
+  test("a recent user message kept verbatim is citable, and shown, outside the window", async () => {
+    const provider = faux(
+      json([
+        {
+          op: "add",
+          kind: "constraint",
+          text: "keep the public API stable",
+          source: "user",
+          evidence: [{ messageId: "m0", quote: "keep the public API stable" }],
+        },
+      ]),
+    );
+    let scope: unknown;
+    const r = await compact({
+      record: emptyRecord(),
+      messages: base,
+      since: "m3",
+      provider,
+      model: "m",
+      verifyRisky: async (ops, ev) => {
+        scope = ev.m0?.scope;
+        return ops.map(() => ({ accept: true }));
+      },
+    });
+    expect(r.ok && r.retainedFrom).toBe("m0");
+    expect(scope).toBe("recent");
+    expect(r.ok && r.ops[0]?.accepted).toBe(true);
+    expect(String(provider.requests[0]?.messages[0]?.content)).toMatch(
+      /untrusted_earlier_user_messages id="[^"]+">\n\[m0 user\]/,
+    );
   });
 });

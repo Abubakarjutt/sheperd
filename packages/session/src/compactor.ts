@@ -17,6 +17,9 @@ import {
   MessageId,
   type ObservedRun,
   observe,
+  PENDING_COMPACTIONS,
+  PENDING_MAX,
+  type PendingCitation,
   QUOTE_MAX,
   type RecordItem,
   SessionRecord,
@@ -127,6 +130,12 @@ export type CitedMessage = {
   content: string;
   /** Whether the message is in the window being compacted now. */
   inWindow: boolean;
+  /**
+   * Where the user may still be speaking through it: the current `window`, a `recent` user
+   * message kept verbatim, a `pending` citation from an earlier rejected op, or `older` context
+   * (which cannot show a new change of mind).
+   */
+  scope: "window" | "recent" | "pending" | "older";
 };
 /**
  * The cross-check hook (`createRiskyVerifier`). Without it every risky op (`isRiskyOp`) is
@@ -230,6 +239,7 @@ function recordForPrompt(record: SessionRecord): string {
 function buildPrompt(
   record: SessionRecord,
   window: readonly StoredMessage[],
+  earlier: readonly StoredMessage[],
   focus?: string,
 ): string {
   const active = record.items.filter((i) => i.status === "active").length;
@@ -241,6 +251,12 @@ function buildPrompt(
     "The messages since the last update, each as [id role] content (tool results are cut):",
     fenceUntrusted("untrusted_messages", window.map(messageLine).join("\n")),
   ];
+  if (earlier.length > 0) {
+    parts.push(
+      "Unresolved user messages you may still cite (from before this window: a change an earlier update could not apply, or a recent message kept verbatim):",
+      fenceUntrusted("untrusted_earlier_user_messages", earlier.map(messageLine).join("\n")),
+    );
+  }
   const f = focus === undefined ? "" : cleanText(focus).slice(0, FOCUS_MAX);
   if (f !== "") {
     parts.push(
@@ -260,17 +276,15 @@ export type ParsedReply<T> = { ok: true; value: T } | { ok: false; problem: stri
 /** How many `{` positions are tried as the start of the reply object. */
 const PARSE_CANDIDATES = 20;
 
-/** Upper bound on `{` positions scanned in strict mode. */
-const STRICT_PARSE_CANDIDATES = 5000;
-
 /**
  * Parse a model's JSON reply against `schema`. Strips fences and prose: tries the first balanced
  * JSON object, then the next ones (a reply such as `Here {is} my answer: {"ops": []}`), and
  * reports the first candidate's problem. Shared by the compactor and the risky-op verifier.
  *
- * With `strict`, the reply must contain exactly one object that matches `schema`: none, or more
- * than one (an echoed, forged object next to the real answer), is a problem. The verifier uses
- * it, because there the parse is the decision; the compactor's ops are re-checked by code.
+ * With `strict`, the whole reply (trimmed, optionally inside one ```json fence) must be exactly
+ * one JSON object that matches `schema`: no prose, no second object, no echo. The verifier uses
+ * it, because there the parse is the decision, and an echoed forged object must never win; the
+ * compactor's ops are re-checked by code.
  */
 export function parseJsonReply<T>(
   text: string,
@@ -289,27 +303,31 @@ export function parseJsonReply<T>(
   return first ?? { ok: false, problem: "no JSON object found in the reply" };
 }
 
+const FENCED = /^```(?:json)?[ \t]*\n([\s\S]*)\n[ \t]*```$/;
+
 function parseStrict<T>(text: string, schema: z.ZodType<T>): ParsedReply<T> {
-  let first: ParsedReply<T> | undefined;
-  let found: ParsedReply<T> | undefined;
-  let from = text.indexOf("{");
-  for (let n = 0; from >= 0; n++) {
-    if (n >= STRICT_PARSE_CANDIDATES)
-      return { ok: false, problem: "the reply is too long to parse" };
-    const r = parseCandidate(text.slice(from), schema);
-    if (r.ok) {
-      if (found !== undefined) {
-        return {
-          ok: false,
-          problem: "the reply contains more than one answer object; give exactly one",
-        };
-      }
-      found = r;
-    } else first ??= r;
-    from = text.indexOf("{", from + 1);
+  let body = text.trim();
+  const fenced = FENCED.exec(body);
+  if (fenced) body = (fenced[1] ?? "").trim();
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch (e) {
+    return {
+      ok: false,
+      problem: `the reply must be exactly one JSON object and nothing else (${e instanceof Error ? e.message : String(e)})`,
+    };
   }
-  return found ?? first ?? { ok: false, problem: "no JSON object found in the reply" };
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) return { ok: false, problem: schemaProblem(parsed.error) };
+  return { ok: true, value: parsed.data };
 }
+
+const schemaProblem = (error: z.ZodError): string =>
+  `the reply does not match the schema:\n${error.issues
+    .slice(0, 10)
+    .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+    .join("\n")}`;
 
 function parseCandidate<T>(text: string, schema: z.ZodType<T>): ParsedReply<T> {
   const json = extractFirstJsonObject(text);
@@ -321,13 +339,7 @@ function parseCandidate<T>(text: string, schema: z.ZodType<T>): ParsedReply<T> {
     return { ok: false, problem: `invalid JSON: ${e instanceof Error ? e.message : String(e)}` };
   }
   const parsed = schema.safeParse(value);
-  if (!parsed.success) {
-    const issues = parsed.error.issues
-      .slice(0, 10)
-      .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
-      .join("\n");
-    return { ok: false, problem: `the reply does not match the schema:\n${issues}` };
-  }
+  if (!parsed.success) return { ok: false, problem: schemaProblem(parsed.error) };
   return { ok: true, value: parsed.data };
 }
 
@@ -342,34 +354,46 @@ type ApplyContext = {
   byId: Map<string, StoredMessage>;
   /** Ids an operation may cite: the window plus the ids the record already cites. */
   citable: Set<string>;
-  /** Ids in the current window: the only messages that may create a `user` item. */
+  /** Ids in the current window. */
   window: Set<string>;
+  /**
+   * Ids user authority may cite: the window, the recent user messages kept verbatim, and the
+   * record's pending citations.
+   */
+  userCitable: Set<string>;
   /** The newest message id in the window: the compaction point. */
   asOf: string;
 };
 
 class Reject extends Error {}
+/** A failed authority check: not from the user, not citable, or the quote not found. */
+class AuthorityReject extends Reject {}
 const reject = (reason: string): never => {
   throw new Reject(reason);
+};
+const rejectAuthority = (reason: string): never => {
+  throw new AuthorityReject(reason);
 };
 
 /** Check and clean a list of citations; throws `Reject` on the first bad one. */
 function checkEvidence(raw: readonly Evidence[] | undefined, ctx: ApplyContext): Evidence[] {
   const list = raw ?? [];
-  if (list.length > EVIDENCE_MAX) reject(`more than ${EVIDENCE_MAX} citations`);
+  if (list.length > EVIDENCE_MAX) rejectAuthority(`more than ${EVIDENCE_MAX} citations`);
   return list.map((e) => {
     const id = e.messageId;
-    if (!MessageId.safeParse(id).success) reject(`evidence cites an invalid message id`);
-    if (!ctx.citable.has(id)) reject(`evidence cites ${id}, which is not in the window`);
+    if (!MessageId.safeParse(id).success) rejectAuthority(`evidence cites an invalid message id`);
+    if (!ctx.citable.has(id)) rejectAuthority(`evidence cites ${id}, which is not in the window`);
     const m = ctx.byId.get(id);
-    if (m === undefined) return reject(`evidence cites ${id}, which is not a stored message`);
+    if (m === undefined)
+      return rejectAuthority(`evidence cites ${id}, which is not a stored message`);
     const quote = cleanText(e.quote);
-    if (quote === "") reject(`evidence for ${id} has an empty quote`);
-    if (quote.length > QUOTE_MAX) reject(`a quote from ${id} is over ${QUOTE_MAX} characters`);
+    if (quote === "") rejectAuthority(`evidence for ${id} has an empty quote`);
+    if (quote.length > QUOTE_MAX)
+      rejectAuthority(`a quote from ${id} is over ${QUOTE_MAX} characters`);
     const content = cleanText(m.content);
-    if (!content.includes(quote)) reject(`the quote is not found in ${id}`);
+    if (!content.includes(quote)) rejectAuthority(`the quote is not found in ${id}`);
     if (quote.length < Math.min(QUOTE_MIN, content.length)) {
-      reject(`the quote from ${id} is too short to identify what was said`);
+      rejectAuthority(`the quote from ${id} is too short to identify what was said`);
     }
     return { messageId: id, quote };
   });
@@ -405,10 +429,14 @@ function newItem(
   const reason = p.reason === undefined ? undefined : cleanField(p.reason, "reason", true);
   const evidence = checkEvidence(p.evidence, ctx);
   if (p.source === "user") {
-    if (evidence.length === 0) reject("a user item needs evidence from a user message");
-    if (!allFromUser(evidence, ctx)) reject("a user item may cite only user messages");
-    const old = evidence.find((e) => !ctx.window.has(e.messageId));
-    if (old) reject(`a new user item may cite only messages in the window, not ${old.messageId}`);
+    if (evidence.length === 0) rejectAuthority("a user item needs evidence from a user message");
+    if (!allFromUser(evidence, ctx)) rejectAuthority("a user item may cite only user messages");
+    const old = evidence.find((e) => !ctx.userCitable.has(e.messageId));
+    if (old) {
+      rejectAuthority(
+        `a new user item may cite only messages in the window, recent or pending, not ${old.messageId}`,
+      );
+    }
   }
   const ev = evidence.length > 0 ? evidence : fallbackEvidence;
   return {
@@ -437,11 +465,18 @@ export const isRiskyOp = (op: CompactionOp, target?: RecordItem): boolean =>
 /** A verifier decision, with the target state the verifier was shown. */
 type Verdict = VerifyDecision & { shown?: RecordItem };
 
-/** The fields of an item the verifier judged; any difference at apply time is `state_changed`. */
-const sameState = (a: RecordItem | undefined, b: RecordItem | undefined): boolean =>
+/**
+ * The fields of an item the verifier judged; any difference at apply time is `state_changed`.
+ * A defensive backstop: `duplicate_target` already makes every target its input state.
+ */
+export const sameJudgedState = (a: RecordItem | undefined, b: RecordItem | undefined): boolean =>
   a === undefined || b === undefined
     ? a === b
-    : a.text === b.text && a.kind === b.kind && a.source === b.source && a.status === b.status;
+    : a.text === b.text &&
+      a.kind === b.kind &&
+      a.source === b.source &&
+      a.status === b.status &&
+      a.reason === b.reason;
 
 type ApplyOutcome = {
   record: SessionRecord;
@@ -449,6 +484,8 @@ type ApplyOutcome = {
   risky: RiskyOp[];
   /** Ids of user items resolved or superseded by an accepted operation. */
   released: Set<string>;
+  /** User messages cited by ops rejected for a reason other than a failed authority check. */
+  pending: Set<string>;
 };
 
 /**
@@ -474,6 +511,7 @@ function applyOps(
   const nextId = nextIdFactory(out);
   const original = new Set(record.items.map((i) => i.id));
   const targeted = new Set<string>();
+  const pending = new Set<string>();
 
   const activeTarget = (itemId: string): RecordItem => {
     const t = out.items.find((i) => i.id === itemId);
@@ -495,9 +533,9 @@ function applyOps(
     if (op.op !== "add") log.itemId = op.itemId;
     try {
       if (op.op !== "add") {
-        const seen = targeted.has(op.itemId);
-        targeted.add(op.itemId);
-        if (seen) reject(`duplicate_target: item ${op.itemId} is already changed in this batch`);
+        if (targeted.has(op.itemId)) {
+          reject(`duplicate_target: item ${op.itemId} is already changed in this batch`);
+        }
         if (!original.has(op.itemId) && out.items.some((i) => i.id === op.itemId)) {
           reject(`duplicate_target: item ${op.itemId} is created in this batch`);
         }
@@ -510,12 +548,12 @@ function applyOps(
       if (target?.source === "user") {
         // Same rule as creating one: cited, every citation from a user message in the window.
         if (authority.length === 0 || !allFromUser(authority, ctx)) {
-          reject(`changing user item ${target.id} needs evidence from user messages only`);
+          rejectAuthority(`changing user item ${target.id} needs evidence from user messages only`);
         }
-        const old = authority.find((e) => !ctx.window.has(e.messageId));
+        const old = authority.find((e) => !ctx.userCitable.has(e.messageId));
         if (old) {
-          reject(
-            `changing user item ${target.id} may cite only messages in the window, not ${old.messageId}`,
+          rejectAuthority(
+            `changing user item ${target.id} may cite only messages in the window, recent or pending, not ${old.messageId}`,
           );
         }
         // A user item ends only by resolve, or by another user item: never a downgrade.
@@ -581,6 +619,9 @@ function applyOps(
           break;
         }
       }
+      // The op passed every code check: it claims its item, whatever the verifier says.
+      // (An op failing code checks claims nothing, so it can never block a later one.)
+      if (op.op !== "add") targeted.add(op.itemId);
       if (isRiskyOp(op, target)) {
         const d = decisions?.get(index);
         // Valid only in the second pass (e.g. a slot freed by a rejection): never sent.
@@ -590,7 +631,7 @@ function applyOps(
         if (d !== undefined && !d.accept) {
           reject(`not confirmed by the verifier${d.reason ? `: ${cleanText(d.reason)}` : ""}`);
         }
-        if (d !== undefined && !sameState(d.shown, target)) {
+        if (d !== undefined && !sameJudgedState(d.shown, target)) {
           reject(`state_changed: item ${target?.id ?? "?"} is not the state the verifier judged`);
         }
         risky.push({ index, op, ...(target ? { target: structuredClone(target) } : {}) });
@@ -599,13 +640,44 @@ function applyOps(
       log.accepted = true;
     } catch (e) {
       if (!(e instanceof Reject)) throw e;
+      if (!(e instanceof AuthorityReject)) collectPending(op, ctx, pending);
       log.reason = e.message;
       if (op.op === "add") delete log.itemId;
       delete log.newItemId;
     }
     applied.push(log);
   });
-  return { record: out, applied, risky, released };
+  return { record: out, applied, risky, released, pending };
+}
+
+/**
+ * The user messages a rejected op cited that may carry a correction: user-role, already
+ * citable for user authority, and the quote really in the message. Nothing becomes citable that
+ * was not citable already.
+ */
+function collectPending(op: CompactionOp, ctx: ApplyContext, into: Set<string>): void {
+  const cited = [...(op.evidence ?? []), ...(op.op === "supersede" ? (op.by.evidence ?? []) : [])];
+  for (const e of cited) {
+    const m = ctx.byId.get(e.messageId);
+    if (m?.role !== "user" || !ctx.userCitable.has(m.id)) continue;
+    const quote = cleanText(e.quote);
+    if (quote !== "" && cleanText(m.content).includes(quote)) into.add(m.id);
+  }
+}
+
+/** Age the record's pending citations by one compaction, then add the new ones (fresh). */
+function nextPending(
+  before: readonly PendingCitation[],
+  fresh: ReadonlySet<string>,
+  order: ReadonlyMap<string, number>,
+): PendingCitation[] {
+  const added = [...fresh]
+    .sort((a, b) => (order.get(b) ?? 0) - (order.get(a) ?? 0))
+    .map((messageId) => ({ messageId, compactionsLeft: PENDING_COMPACTIONS }));
+  const aged = before
+    .filter((p) => !fresh.has(p.messageId) && p.compactionsLeft > 1)
+    .map((p) => ({ messageId: p.messageId, compactionsLeft: p.compactionsLeft - 1 }));
+  return [...added, ...aged].slice(0, PENDING_MAX);
 }
 
 /**
@@ -715,8 +787,28 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
     return { ok: false, code: "compaction_invalid", reason: "no new messages to compact" };
   }
 
+  // Retention depends only on the messages, so it is known before the model is asked.
+  const est = input.estimator ?? new TokenEstimator();
+  const kept = retain(messages, input.recentUserTokens ?? DEFAULT_RECENT_USER_TOKENS, est);
+  const windowIds = new Set(window.map((m) => m.id));
+  const keptFrom =
+    kept.retainedFrom === null ? -1 : messages.findIndex((m) => m.id === kept.retainedFrom);
+  const recent = new Set(
+    keptFrom < 0
+      ? []
+      : messages
+          .slice(keptFrom)
+          .filter((m) => m.role === "user")
+          .map((m) => m.id),
+  );
+  const pendingIds = new Set((record.pending ?? []).map((p) => p.messageId));
+  const userCitable = new Set([...windowIds, ...recent, ...pendingIds]);
+  const earlier = messages.filter(
+    (m) => m.role === "user" && !windowIds.has(m.id) && (recent.has(m.id) || pendingIds.has(m.id)),
+  );
+
   const system = compactPrompt();
-  const prompt = buildPrompt(record, window, input.focus);
+  const prompt = buildPrompt(record, window, earlier, input.focus);
   let ops: CompactionOp[] | undefined;
   let problem = "";
   for (let attempt = 0; attempt < 2 && ops === undefined; attempt++) {
@@ -760,16 +852,11 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
   }
 
   const byId = new Map(messages.map((m) => [m.id, m]));
-  const citable = new Set(window.map((m) => m.id));
+  const citable = new Set(userCitable);
   for (const i of [...record.items, ...record.archive]) {
     for (const e of i.evidence ?? []) citable.add(e.messageId);
   }
-  const ctx: ApplyContext = {
-    byId,
-    citable,
-    window: new Set(window.map((m) => m.id)),
-    asOf: last.id,
-  };
+  const ctx: ApplyContext = { byId, citable, window: windowIds, userCitable, asOf: last.id };
 
   let outcome = applyOps(record, ops, ctx);
   if (outcome.risky.length > 0 && input.verifyRisky === undefined) {
@@ -788,17 +875,25 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
       for (const e of cited) {
         const m = byId.get(e.messageId);
         if (m) {
+          const scope = windowIds.has(m.id)
+            ? "window"
+            : m.role === "user" && recent.has(m.id)
+              ? "recent"
+              : m.role === "user" && pendingIds.has(m.id)
+                ? "pending"
+                : "older";
           evidence[m.id] = {
             role: m.role,
             content: cleanText(m.content),
-            inWindow: ctx.window.has(m.id),
+            inWindow: scope === "window",
+            scope,
           };
         }
       }
     }
     const decisions = new Map<number, Verdict>();
-    // The verifier gets its own copies; `shown` keeps exactly what it was given to judge.
-    const sent = outcome.risky;
+    // The verifier gets deep copies; `shown` keeps our own copy of exactly what it was given.
+    const sent = structuredClone(outcome.risky);
     let got: VerifyDecision[];
     try {
       got = await input.verifyRisky(sent, evidence, input.signal);
@@ -812,7 +907,7 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
       };
     }
     if (input.signal?.aborted) return ABORTED;
-    sent.forEach((r, k) => {
+    outcome.risky.forEach((r, k) => {
       const d = got[k] ?? { accept: false, reason: "the verifier gave no decision" };
       decisions.set(r.index, { ...d, ...(r.target ? { shown: r.target } : {}) });
     });
@@ -822,12 +917,15 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
   const next = outcome.record;
   next.observed = observe(messages, { runs: input.runs ?? record.observed.runs });
   next.compactions = record.compactions + 1;
+  next.pending = nextPending(
+    record.pending ?? [],
+    outcome.pending,
+    new Map(messages.map((m, k) => [m.id, k])),
+  );
   const broken = checkInvariants(record, next, outcome.released);
   if (broken !== undefined) {
     return { ok: false, code: "compaction_rejected", reason: broken, ops: outcome.applied };
   }
 
-  const est = input.estimator ?? new TokenEstimator();
-  const kept = retain(messages, input.recentUserTokens ?? DEFAULT_RECENT_USER_TOKENS, est);
   return { ok: true, record: next, ops: outcome.applied, ...kept };
 }
