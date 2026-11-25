@@ -136,7 +136,9 @@ const MAX_CANDIDATES = 8;
  * - is a top-level block boundary of the whole cleaned text (not inside a fence or a list);
  * - cleans the same whole and in parts: the whole buffer is cleaned once more and must start
  *   with the cleaned prefix (a secret or escape sequence across the boundary is not split), and
- *   the prefix leaves no escape sequence open (appending text cleans to the same prefix).
+ *   the prefix leaves nothing open (appending text cleans to the same prefix). The probe check is
+ *   what refuses a split inside an unfinished PEM block, whose redaction runs to the end of the
+ *   text, as well as after an unterminated escape sequence.
  */
 export function splitBlocks(raw: string): { done: string; rest: string } | undefined {
   const runs = [...raw.matchAll(/\n(?:[ \t]*\n)+/g)];

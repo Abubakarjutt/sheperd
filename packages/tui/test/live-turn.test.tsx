@@ -222,6 +222,16 @@ describe("splitBlocks and takeFinished (I1)", () => {
     expect(splitBlocks("para\n\n")).toBeUndefined(); // nothing after the gap yet
   });
 
+  it("never flushes the body of a PEM block that is still open (the probe check)", () => {
+    // PEM redaction runs to the end of the text while END has not arrived, so `whole.startsWith`
+    // alone would accept a split after the blank line; the probe check is what refuses it.
+    for (const body of ["SECRETA\n\nSECRETB", "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES\n\nSECRETB"]) {
+      const r = splitBlocks(`intro\n\n-----BEGIN PRIVATE KEY-----\n${body}`);
+      expect(r?.done).toBe("intro\n\n");
+      expect(r?.done).not.toContain("SECRET");
+    }
+  });
+
   it("never splits inside an open code fence", () => {
     const r = splitBlocks("intro\n\n```ts\nconst a = 1;\n\nconst b = 2;\n\nconst c");
     expect(r?.done).toBe("intro\n\n");
