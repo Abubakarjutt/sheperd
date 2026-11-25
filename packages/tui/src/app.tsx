@@ -2,6 +2,7 @@ import { RewireError, redact } from "@rewire/core";
 import {
   type ChatEvent,
   type ChatSession,
+  outcomeMessage,
   PROPOSAL_NOTE,
   type RunController,
   type RunHandle,
@@ -9,7 +10,7 @@ import {
 } from "@rewire/session";
 import { Box } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { RunView } from "./board-view.js";
+import { type RunDone, RunView } from "./board-view.js";
 import { InputBox } from "./input.js";
 import { Transcript, type TranscriptEntry } from "./transcript.js";
 
@@ -57,9 +58,15 @@ export function App({ session, subscribe, run }: AppProps) {
   // A new run handle starts active again.
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset when the handle changes
   useEffect(() => setRunDone(false), [run]);
-  const onRunDone = useCallback(() => setRunDone(true), []);
 
   const add = useCallback((...e: TranscriptEntry[]) => setEntries((cur) => [...cur, ...e]), []);
+  const onRunDone = useCallback(
+    (outcome: RunDone) => {
+      add({ kind: "note", text: outcomeMessage(outcome) });
+      setRunDone(true);
+    },
+    [add],
+  );
 
   useEffect(() => {
     if (!subscribe) return;

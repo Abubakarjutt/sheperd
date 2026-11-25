@@ -16,6 +16,11 @@ export type BoardState = {
   redOk: boolean;
   frozen: boolean;
   testCount?: number;
+  /** Reviewer/verifier stages that have started and not ended. */
+  reviewOpen: string[];
+  reviewFailed: boolean;
+  /** `revise` decisions seen at the contract checkpoint. */
+  revisions: number;
   ended?: "verified" | "escalated";
 };
 
@@ -37,7 +42,13 @@ export const initialBoard = (): BoardState => ({
   round: 0,
   redOk: false,
   frozen: false,
+  reviewOpen: [],
+  reviewFailed: false,
+  revisions: 0,
 });
+
+/** Reviewer and verifier stage names (packages/reviewers: routing.ts, verifier.ts). */
+const REVIEW_STAGES = new Set(["security", "spec-compliance", "silent-failure", "verifier"]);
 
 /** Pipeline stage names that own a board row. */
 const STAGE_ROW: Record<string, StageName> = {
@@ -67,6 +78,8 @@ function gatesDetail(g: BoardState["gates"]): string {
   return `${passed}/${all.length} passed${bad.length > 0 ? ` · failed: ${bad.join(", ")}` : ""}`;
 }
 
+const reviewStatus = (s: BoardState): StageStatus => (s.reviewFailed ? "failed" : "running");
+
 function reviewDetail(s: BoardState): string {
   return `${s.findings} finding${s.findings === 1 ? "" : "s"} · ${s.upheld} upheld · ${s.refuted} refuted`;
 }
@@ -87,6 +100,14 @@ function settleGates(s: BoardState): BoardState {
 export function reduceBoard(state: BoardState, e: RunEvent): BoardState {
   switch (e.type) {
     case "stage_start": {
+      if (REVIEW_STAGES.has(e.stage)) {
+        const s = settleGates(state);
+        const open = [...s.reviewOpen, e.stage];
+        return set({ ...s, reviewOpen: open }, "Review", {
+          status: s.reviewFailed ? "failed" : "running",
+          detail: s.rows.Review.detail,
+        });
+      }
       const name = STAGE_ROW[e.stage];
       if (!name) return state;
       let s = set(state, name, {
@@ -100,6 +121,13 @@ export function reduceBoard(state: BoardState, e: RunEvent): BoardState {
       return s;
     }
     case "stage_end": {
+      if (REVIEW_STAGES.has(e.stage)) {
+        const i = state.reviewOpen.indexOf(e.stage);
+        const open = i < 0 ? state.reviewOpen : state.reviewOpen.filter((_, j) => j !== i);
+        const reviewFailed = state.reviewFailed || !e.ok;
+        const status: StageStatus = reviewFailed ? "failed" : open.length > 0 ? "running" : "done";
+        return set({ ...state, reviewOpen: open, reviewFailed }, "Review", { status });
+      }
       const name = STAGE_ROW[e.stage];
       if (!name) return state;
       let s = set(state, name, { status: e.ok ? "done" : "failed" });
@@ -110,6 +138,11 @@ export function reduceBoard(state: BoardState, e: RunEvent): BoardState {
       return s;
     }
     case "tool_call": {
+      if (REVIEW_STAGES.has(e.stage)) {
+        return set(state, "Review", {
+          detail: `${e.isError ? "✗ " : ""}${e.stage}/${e.tool}: ${e.summary}`,
+        });
+      }
       const name = STAGE_ROW[e.stage];
       if (!name || state.rows[name].status !== "running") return state;
       const mark = e.isError ? "✗ " : "";
@@ -126,7 +159,7 @@ export function reduceBoard(state: BoardState, e: RunEvent): BoardState {
     case "finding": {
       const s0 = settleGates(state);
       const s = { ...s0, findings: s0.findings + 1 };
-      return set(s, "Review", { status: "running", detail: reviewDetail(s) });
+      return set(s, "Review", { status: reviewStatus(s), detail: reviewDetail(s) });
     }
     case "verdict": {
       const s0 = settleGates(state);
@@ -135,7 +168,7 @@ export function reduceBoard(state: BoardState, e: RunEvent): BoardState {
         upheld: s0.upheld + (e.verdict.verdict === "upheld" ? 1 : 0),
         refuted: s0.refuted + (e.verdict.verdict === "refuted" ? 1 : 0),
       };
-      return set(s, "Review", { status: "running", detail: reviewDetail(s) });
+      return set(s, "Review", { status: reviewStatus(s), detail: reviewDetail(s) });
     }
     case "fix_round": {
       // A new round re-runs the implementer, gates and review from scratch.
@@ -147,6 +180,8 @@ export function reduceBoard(state: BoardState, e: RunEvent): BoardState {
         findings: 0,
         upheld: 0,
         refuted: 0,
+        reviewOpen: [],
+        reviewFailed: false,
         rows: {
           ...state.rows,
           Implement: row("running", `round ${e.round}`),
@@ -156,6 +191,9 @@ export function reduceBoard(state: BoardState, e: RunEvent): BoardState {
       };
     }
     case "checkpoint": {
+      if (e.kind === "contract" && e.decision.action === "revise") {
+        return { ...state, revisions: state.revisions + 1 };
+      }
       if (e.kind === "tests" && e.decision.action === "approve") {
         const s = { ...state, frozen: true };
         return set(s, "Tests", { detail: testsDetail(s) });
@@ -187,9 +225,8 @@ export function reduceBoard(state: BoardState, e: RunEvent): BoardState {
 
 function settleReview(s: BoardState): BoardState {
   const settled = settleGates(s);
-  return settled.rows.Review.status === "running"
-    ? set(settled, "Review", { status: "done" })
-    : settled;
+  const r = settled.rows.Review.status;
+  return r === "running" || r === "pending" ? set(settled, "Review", { status: "done" }) : settled;
 }
 
 /** Details only a checkpoint payload carries: criteria counts, test file count. */

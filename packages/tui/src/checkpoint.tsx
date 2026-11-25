@@ -11,6 +11,7 @@ import { useColumns, useRows } from "./use-columns.js";
 export type CheckpointPrompt = Extract<PendingPrompt, { kind: "checkpoint" }>;
 
 export const NOTE_MAX = 2000;
+const LIMIT = "revision limit reached; [a]pprove or [s]top";
 const STALE = "that prompt is no longer active";
 /** Content shown by `[v]iew` and the diff are cut here before processing; sanitize copes with a split escape. */
 const MAX_TEXT = 200_000;
@@ -55,13 +56,19 @@ type Mode = { kind: "keys" } | { kind: "edit"; value: string };
 export type CheckpointPanelProps = {
   run: Pick<RunHandle, "answer" | "pending">;
   prompt: CheckpointPrompt;
+  /** True once the contract has been revised the pipeline's maximum (3) times: a further revise stops the run. */
+  revisionLimitReached?: boolean;
 };
 
 /**
  * Shows one checkpoint and takes its keys. Keys act only while `prompt` is the run's current
  * pending prompt; the revise box ignores everything but text, Enter and Esc.
  */
-export function CheckpointPanel({ run, prompt }: CheckpointPanelProps) {
+export function CheckpointPanel({
+  run,
+  prompt,
+  revisionLimitReached = false,
+}: CheckpointPanelProps) {
   const cols = useColumns();
   const rows = useRows();
   const [mode, setMode] = useState<Mode>({ kind: "keys" });
@@ -107,6 +114,7 @@ export function CheckpointPanel({ run, prompt }: CheckpointPanelProps) {
     else if (k === "s") send({ action: "stop" });
     else if (k === "e" && cp.kind === "contract") {
       if (run.pending() !== prompt) setMessage(STALE);
+      else if (revisionLimitReached) setMessage(LIMIT);
       else setM({ kind: "edit", value: "" });
     } else if (k === "v" && cp.kind === "tests") setViewing((v) => !v);
   });
@@ -114,7 +122,11 @@ export function CheckpointPanel({ run, prompt }: CheckpointPanelProps) {
   const line = (
     text: string,
     props: { color?: string; bold?: boolean; dimColor?: boolean } = {},
-  ) => <Safe {...props}>{fit(text, cols)}</Safe>;
+  ) => (
+    <Safe wrap="truncate" {...props}>
+      {fit(clean(text), cols)}
+    </Safe>
+  );
   const out: ReactElement[] = [];
   const add = (key: string, el: ReactElement): void => {
     out.push(<Box key={key}>{el}</Box>);
@@ -125,7 +137,8 @@ export function CheckpointPanel({ run, prompt }: CheckpointPanelProps) {
     cp.contract.criteria.forEach((c, i) => {
       add(`c${i}`, line(`  ${c.id} [${c.kind}] ${c.statement}`));
     });
-    add("k", line("[a]pprove [e]dit via chat [s]top", { color: theme.user }));
+    if (revisionLimitReached) add("lim", line(LIMIT, { color: theme.busy }));
+    else add("k", line("[a]pprove [e]dit via chat [s]top", { color: theme.user }));
   } else if (cp.kind === "tests") {
     add(
       "h",

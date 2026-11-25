@@ -16,6 +16,9 @@ import { Safe } from "./safe.js";
 import { theme } from "./theme.js";
 import { useColumns } from "./use-columns.js";
 
+/** Mirrors the pipeline's MAX_REVISIONS (orchestrator.ts): the 4th revise is treated as stop. */
+const MAX_REVISIONS = 3;
+
 const GLYPH: Record<StageStatus, string> = { pending: "○", running: "◐", done: "✓", failed: "✗" };
 const COLOR: Record<StageStatus, string | undefined> = {
   pending: theme.dim,
@@ -34,7 +37,7 @@ export function Board({ state }: { state: BoardState }) {
         const r = state.rows[name];
         const line = `${GLYPH[r.status]} ${name.padEnd(label)}${r.detail ? `  ${r.detail}` : ""}`;
         return (
-          <Safe key={name} color={COLOR[r.status]}>
+          <Safe key={name} wrap="truncate" color={COLOR[r.status]}>
             {fit(line, cols)}
           </Safe>
         );
@@ -65,14 +68,26 @@ function withFacts(b: BoardState, p: CheckpointPrompt): BoardState {
   return b;
 }
 
-/** Folds a run's events into a board and shows the pending checkpoint, if any. */
-export function RunView({ run, onDone }: { run: RunHandle; onDone?: () => void }) {
-  const [board, setBoard] = useState(initialBoard);
-  const [pending, setPending] = useState<PendingPrompt | undefined>(() => run.pending());
+/** What `RunHandle.done` resolves with. */
+export type RunDone = Awaited<RunHandle["done"]>;
 
+/** Folds a run's events into a board and shows the pending checkpoint, if any. */
+export function RunView({ run, onDone }: { run: RunHandle; onDone?: (outcome: RunDone) => void }) {
+  const [board, setBoard] = useState(initialBoard);
+  const [pending, setPending] = useState<PendingPrompt | undefined>(undefined);
+  // Remounts the panel for each new prompt, so its message/edit state never carries over.
+  const [promptKey, setPromptKey] = useState(0);
   const last = useRef<PendingPrompt | undefined>(undefined);
+  // Held in a ref so an inline callback never restarts the effect (a restart replays the events).
+  const doneRef = useRef(onDone);
+  doneRef.current = onDone;
+
   useEffect(() => {
     let live = true;
+    // `events` replays from the start, so a new handle (or a restart) begins from a clean board.
+    setBoard(initialBoard());
+    setPending(undefined);
+    last.current = undefined;
     (async () => {
       try {
         for await (const e of run.events as AsyncIterable<RunEvent>) {
@@ -83,30 +98,41 @@ export function RunView({ run, onDone }: { run: RunHandle; onDone?: () => void }
         // the stream ended abnormally; `done` carries the outcome
       }
     })();
-    run.done.then(
-      () => live && onDone?.(),
-      () => live && onDone?.(),
-    );
-    // Prompts have no event of their own, so poll.
+    // Prompts have no event of their own, so poll until the run is done.
     const sync = (): void => {
       const p = run.pending();
       if (p === last.current) return;
       last.current = p;
       setPending(p);
+      if (p) setPromptKey((k) => k + 1);
       if (isCheckpoint(p)) setBoard((b) => withFacts(b, p));
     };
     sync();
     const t = setInterval(sync, 50);
+    run.done.then(
+      (o) => {
+        clearInterval(t);
+        if (live) doneRef.current?.(o);
+      },
+      () => clearInterval(t),
+    );
     return () => {
       live = false;
       clearInterval(t);
     };
-  }, [run, onDone]);
+  }, [run]);
 
   return (
     <Box flexDirection="column">
       <Board state={board} />
-      {isCheckpoint(pending) ? <CheckpointPanel run={run} prompt={pending} /> : null}
+      {isCheckpoint(pending) ? (
+        <CheckpointPanel
+          key={promptKey}
+          run={run}
+          prompt={pending}
+          revisionLimitReached={board.revisions >= MAX_REVISIONS}
+        />
+      ) : null}
     </Box>
   );
 }

@@ -125,3 +125,67 @@ describe("fit", () => {
     expect(fit("x\x1b[31mred\x1b[0m", 80)).toBe("xred");
   });
 });
+
+describe("review stages (real names from packages/reviewers)", () => {
+  const start = (stage: string) => ev({ type: "stage_start", stage });
+  const end = (stage: string, ok: boolean) => ev({ type: "stage_end", stage, ok });
+  const impl = [start("implementer"), end("implementer", true), gate("types", "pass")];
+
+  it("a verified run with zero findings ends with every row done", () => {
+    const s = run(
+      start("spec"),
+      end("spec", true),
+      start("test-writer"),
+      end("test-writer", true),
+      ...impl,
+      start("security"),
+      start("spec-compliance"),
+      start("silent-failure"),
+      end("security", true),
+      end("spec-compliance", true),
+      end("silent-failure", true),
+      start("verifier"),
+      end("verifier", true),
+      ev({ type: "run_end", status: "verified", reportPath: "r" }),
+    );
+    for (const name of ["Spec", "Tests", "Implement", "Gates", "Review", "Commit"] as const) {
+      expect(s.rows[name].status, name).toBe("done");
+    }
+  });
+
+  it("Gates settles when review starts; Review stays running while a reviewer is open", () => {
+    const s = run(...impl, start("security"), start("silent-failure"), end("security", true));
+    expect(s.rows.Gates.status).toBe("done");
+    expect(s.rows.Review.status).toBe("running");
+  });
+
+  it("a failed reviewer fails Review and stays failed", () => {
+    const s = run(
+      ...impl,
+      start("security"),
+      end("security", false),
+      start("spec-compliance"),
+      end("spec-compliance", true),
+    );
+    expect(s.rows.Review.status).toBe("failed");
+  });
+
+  it("reviewer tool calls show in the Review detail", () => {
+    const s = run(
+      ...impl,
+      start("security"),
+      ev({ type: "tool_call", stage: "security", tool: "grep", isError: false, summary: "eval(" }),
+    );
+    expect(s.rows.Review.detail).toBe("security/grep: eval(");
+  });
+
+  it("counts contract revisions", () => {
+    const rev = ev({
+      type: "checkpoint",
+      stage: "spec",
+      kind: "contract",
+      decision: { action: "revise", note: "n" },
+    });
+    expect(run(rev, rev, rev).revisions).toBe(3);
+  });
+});
