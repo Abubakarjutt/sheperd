@@ -10,6 +10,15 @@ import { App } from "../src/app.js";
 
 const tick = (ms = 40) => new Promise((r) => setTimeout(r, ms));
 
+/** Polls until `ok()` holds (slow CI runners render late); fails the test at the deadline. */
+async function waitFor(ok: () => boolean, what: string, ms = 5000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!ok()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await tick(20);
+  }
+}
+
 class TtyOut extends EventEmitter {
   isTTY = true;
   columns = 60;
@@ -73,12 +82,15 @@ describe("transcript in <Static> (I3)", () => {
       },
     );
     try {
-      await tick(80);
+      const out = () => stdout.chunks.join("");
+      await waitFor(() => out().includes("line-29-marker"), "the transcript");
       for (const ch of "typing") {
         stdin.send(ch);
         await tick(30);
       }
-      const all = stdout.chunks.join("");
+      await waitFor(() => out().includes("typing"), "the typed text");
+      await tick(100); // let any (wrong) full repaint land before counting
+      const all = out();
       expect(all).toContain("typing");
       expect(count(all, "line-0-marker")).toBe(1);
       expect(count(all, "line-29-marker")).toBe(1);
