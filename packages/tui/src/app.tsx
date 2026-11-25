@@ -25,8 +25,19 @@ import {
   parseCommand,
 } from "./commands.js";
 import { InputBox } from "./input.js";
+import {
+  applyEvent,
+  INTERRUPTED,
+  LIVE_THROTTLE_MS,
+  type LiveState,
+  LiveTurn,
+  liveEntries,
+  newLive,
+  streamedText,
+} from "./live-turn.js";
 import { ClarifyPanel, ProposalCard } from "./proposal.js";
 import { sanitize } from "./sanitize.js";
+import { pickVerb } from "./spinner.js";
 import { Transcript, type TranscriptEntry } from "./transcript.js";
 import { TrustPrompt } from "./trust-prompt.js";
 
@@ -190,6 +201,30 @@ export function App(props: AppProps) {
   );
   const [trustOpen, setTrustOpen] = useState(false);
   const [trustedLater, setTrustedLater] = useState(false);
+  /**
+   * The in-flight chat turn's live area. Events fold into `liveRef` at once; the rendered copy
+   * (`live`) follows at most every LIVE_THROTTLE_MS, and is flushed whole when the turn ends.
+   */
+  const liveRef = useRef<LiveState | undefined>(undefined);
+  const [live, setLive] = useState<LiveState | undefined>(undefined);
+  const liveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const scheduleLive = useCallback(() => {
+    if (liveTimer.current !== undefined) return;
+    liveTimer.current = setTimeout(() => {
+      liveTimer.current = undefined;
+      setLive(liveRef.current);
+    }, LIVE_THROTTLE_MS);
+  }, []);
+  /** Ends the live area (no timer left behind) and returns its final state. */
+  const endLive = useCallback((): LiveState | undefined => {
+    clearTimeout(liveTimer.current);
+    liveTimer.current = undefined;
+    const last = liveRef.current;
+    liveRef.current = undefined;
+    setLive(undefined);
+    return last;
+  }, []);
+  useEffect(() => () => clearTimeout(liveTimer.current), []);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: bound once; the target reads refs
   useEffect(() => {
@@ -232,10 +267,15 @@ export function App(props: AppProps) {
   useEffect(() => {
     if (!subscribe) return;
     return subscribe((e) => {
+      if (liveRef.current) {
+        liveRef.current = applyEvent(liveRef.current, e);
+        scheduleLive();
+        return;
+      }
       const entry = eventEntry(e);
       if (entry) add(entry);
     });
-  }, [subscribe, add]);
+  }, [subscribe, add, scheduleLive]);
 
   /** Runs `work` with the input busy; one at a time (chat turns, session swaps). */
   const exclusive = useCallback((work: () => Promise<void>) => {
@@ -253,20 +293,33 @@ export function App(props: AppProps) {
       exclusive(async () => {
         const ac = new AbortController();
         turnAbort.current = ac;
+        liveRef.current = newLive(pickVerb(), Date.now());
+        setLive(liveRef.current);
         try {
           const turn = await sessionRef.current.send(text, ac.signal);
-          if (turn.text.trim() !== "") add({ kind: "assistant", text: turn.text });
+          const done = endLive();
+          // Streamed text is the turn's text (its last part is the final answer): shown once.
+          const final: TranscriptEntry[] =
+            !streamedText(done) && turn.text.trim() !== ""
+              ? [{ kind: "assistant", text: turn.text }]
+              : [];
+          add(...liveEntries(done), ...final);
           if (turn.proposal) setProposal(turn.proposal.task);
           else if (turn.endedBy === "turn_limit") {
             note("(the turn stopped at its tool-call limit; send a message to continue)");
           }
         } catch (err) {
-          add(errorEntry(err));
+          // What already streamed stays, then why the turn ended: Esc or Ctrl-C, or an error.
+          const done = endLive();
+          add(
+            ...liveEntries(done),
+            ac.signal.aborted ? { kind: "note", text: INTERRUPTED } : errorEntry(err),
+          );
         } finally {
           if (turnAbort.current === ac) turnAbort.current = undefined;
         }
       }),
-    [exclusive, add, note],
+    [exclusive, add, note, endLive],
   );
 
   const startRun = useCallback(
@@ -468,6 +521,8 @@ export function App(props: AppProps) {
     [note],
   );
 
+  /** Esc in the live area: aborts the turn's signal, like the Ctrl-C machine's abortTurn. */
+  const abortTurn = useCallback(() => turnAbort.current?.abort(), []);
   const trustSkills = trustOpen ? skillsNow() : undefined;
   const inputOff =
     proposal !== undefined || trustOpen || (run !== undefined && pending?.kind === "checkpoint");
@@ -489,7 +544,14 @@ export function App(props: AppProps) {
           onDone={onTrust}
         />
       ) : null}
-      <InputBox busy={busy} disabled={inputOff} onSubmit={submit} />
+      {live ? (
+        <LiveTurn
+          state={live}
+          onInterrupt={abortTurn}
+          interruptible={run === undefined && proposal === undefined && !trustOpen}
+        />
+      ) : null}
+      <InputBox busy={busy} disabled={inputOff || live !== undefined} onSubmit={submit} />
     </Box>
   );
 }

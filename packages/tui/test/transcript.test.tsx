@@ -65,8 +65,8 @@ describe("tui transcript", () => {
     emit({ type: "tool_call", tool: "read", summary: "read src/math.ts", isError: false });
     emit({ type: "tool_call", tool: "bash", summary: "bash rm x", isError: true });
     await tick();
-    expect(lastFrame()).toContain("● Read src/math.ts");
-    expect(lastFrame()).toContain("✗ Bash rm x");
+    expect(lastFrame()).toContain("● Read(src/math.ts)");
+    expect(lastFrame()).toContain("✗ Bash(rm x)");
   });
 
   it("renders escape sequences in assistant text, tool summaries, errors and history inert", async () => {
@@ -84,7 +84,7 @@ describe("tui transcript", () => {
     const frame = lastFrame() ?? "";
     expect(frame).toContain("reply aredb");
     expect(frame).toContain("old aredb");
-    expect(frame).toContain("Read aredb");
+    expect(frame).toContain("Read(aredb)");
     // ink-testing-library frames carry no styling of their own, so no ESC byte may appear at all.
     expect(frame).not.toContain("\x1b");
     expect(frame).not.toContain("\x07");
@@ -147,14 +147,14 @@ describe("tui transcript", () => {
     await tick();
     await type(stdin, "one");
     await type(stdin, "\r");
-    expect(lastFrame()).toContain("working");
+    expect(lastFrame()).toContain("esc to interrupt");
     await type(stdin, "two");
     await type(stdin, "\r");
     expect(sent).toEqual(["one"]);
     release({ text: "done" });
     await tick();
     expect(lastFrame()).toContain("done");
-    expect(lastFrame()).not.toContain("working");
+    expect(lastFrame()).not.toContain("esc to interrupt");
   });
 
   it("a trailing backslash plus Enter inserts a newline instead of sending", async () => {

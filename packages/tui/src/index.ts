@@ -35,11 +35,28 @@ export {
   type Segment,
 } from "./highlight.js";
 export { type InputAction, type InputState, initialInput, reduceInput } from "./input-state.js";
+export {
+  applyEvent,
+  INTERRUPTED,
+  LIVE_THROTTLE_MS,
+  type LiveItem,
+  type LiveState,
+  LiveTurn,
+  liveEntries,
+} from "./live-turn.js";
 export { cleanForMarkdown, Markdown } from "./markdown.js";
 export { Safe } from "./safe.js";
 export { sanitize } from "./sanitize.js";
+export { formatTokens, SPINNER_GLYPHS, SPINNER_VERBS, Spinner } from "./spinner.js";
 export { theme } from "./theme.js";
-export { EntryLine, Transcript, type TranscriptEntry, toolLabel } from "./transcript.js";
+export {
+  EntryLine,
+  ToolLine,
+  Transcript,
+  type TranscriptEntry,
+  toolLabel,
+  toolParts,
+} from "./transcript.js";
 
 /** Turns a render-time throw into a settled `renderTui` (exit 1) instead of a hung promise. */
 class Boundary extends Component<

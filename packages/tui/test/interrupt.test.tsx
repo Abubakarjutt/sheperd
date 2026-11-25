@@ -78,12 +78,13 @@ describe("App interrupt target", () => {
     v.stdin.write("\r");
     await tick(80);
     expect(target?.activity()).toBe("turn");
-    expect(v.lastFrame()).toContain("Ctrl-C to interrupt");
+    expect(v.lastFrame()).toContain("esc to interrupt");
     target?.abortTurn();
     await tick(80);
     expect(signal?.aborted).toBe(true);
     expect(target?.activity()).toBe("idle");
-    expect(v.lastFrame()).not.toContain("working");
+    expect(v.lastFrame()).not.toContain("esc to interrupt");
+    expect(v.lastFrame()).toContain("Interrupted by user");
     v.unmount();
   });
 
