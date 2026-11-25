@@ -248,3 +248,45 @@ test("network exceptions text is platform-specific (M3)", () => {
   expect(linux).toMatch(/full network access/);
   expect(linux).not.toMatch(/any host on port 443/);
 });
+
+test("skillsUsed renders a Skills used section; omitted when empty", () => {
+  const sha = "a".repeat(64);
+  const md = renderReport(
+    base({
+      skillsUsed: [
+        { name: "tdd", source: "user", sha256: sha, stages: ["test-writer", "implementer"] },
+      ],
+    }),
+  );
+  expect(md).toContain(
+    "## Skills used\n\n- tdd (user, sha256 aaaaaaaaaaaa) — test-writer, implementer",
+  );
+  expect(renderReport(base({ skillsUsed: [] }))).not.toContain("Skills used");
+  expect(renderReport(base())).not.toContain("Skills used");
+});
+
+test("a skill name is shown verbatim (not redacted) and invalid entries are dropped", () => {
+  const ok = "b".repeat(64);
+  const md = renderReport(
+    base({
+      skillsUsed: [
+        { name: "sk-review", source: "repo", sha256: ok, stages: ["spec"] },
+        { name: "bad", source: "user", sha256: "zz", stages: ["spec"] },
+      ],
+    }),
+  );
+  expect(md).toContain("- sk-review (repo, sha256 bbbbbbbbbbbb) — spec");
+  expect(md).not.toContain("- bad");
+});
+
+test("a skill name is autolink-escaped like inline text", () => {
+  const md = renderReport(
+    base({
+      skillsUsed: [
+        { name: "http://x.test", source: "user", sha256: "c".repeat(64), stages: ["spec"] },
+      ],
+    }),
+  );
+  expect(md).not.toContain("- http://x.test");
+  expect(md).toContain("- http");
+});

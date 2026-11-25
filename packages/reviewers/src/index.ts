@@ -1,6 +1,7 @@
 /** Re-exported from @rewire/core (the one implementation, I9); import it from there. */
 export { redact, SECRET } from "@rewire/core";
 export {
+  BINARY_ASSET_EXTS,
   buildDiffSummary,
   type DiffSummary,
   PATCH_CAP,

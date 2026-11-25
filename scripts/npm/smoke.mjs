@@ -5,7 +5,13 @@
 //   - `rewire --help` exits 0 and prints the usage;
 //   - `rewire doctor` resolves rewire-sandbox from the installed sheperd-<os>-<arch> package, in
 //     both installs (other doctor checks, e.g. a missing semgrep or no models, are not asserted);
-//   - a platform binary whose bytes differ from the ones the bundle recorded is refused.
+//   - a platform binary whose bytes differ from the ones the bundle recorded is refused;
+//   - the interactive entry points without a TTY: bare `rewire` prints the usage and exits 1,
+//     `rewire chat </dev/null` exits 1 with tui_requires_tty, and REWIRE_TUI_SELFCHECK=1 makes
+//     `rewire chat` load the bundled TUI (Ink, React, yoga-layout) and exit 0;
+//   - the bundle has React and Ink inside it: no require("react") / __require("react") and no
+//     runtime import of react, react-reconciler, scheduler, ink, yoga-layout or
+//     react-devtools-core (stubbed at build time).
 // With --faux-run it also drives one headless `rewire run` with the faux provider against a copy
 // of the sum-lib fixture and requires a verified result. That loads every prompt and the semgrep
 // rules from the installed package, so it proves the bundled assets resolve. It needs git, rg,
@@ -14,9 +20,11 @@
 //   node scripts/npm/smoke.mjs [--tarballs dir] [--work dir] [--faux-run] [--modules dir]
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  closeSync,
   cpSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -95,6 +103,53 @@ if (help.status !== 0 || !help.stdout.includes("usage:")) {
   fail(`rewire --help exited ${help.status}: ${help.stdout}${help.stderr}`);
 }
 pass("rewire --help");
+
+// No TTY anywhere: stdin is /dev/null, stdout and stderr are pipes.
+function noTty(args, extra = {}) {
+  const devNull = openSync("/dev/null", "r");
+  try {
+    return spawnSync(bin, args, {
+      cwd: app,
+      env: { ...env, ...extra },
+      encoding: "utf8",
+      timeout: 60_000,
+      stdio: [devNull, "pipe", "pipe"],
+    });
+  } finally {
+    closeSync(devNull);
+  }
+}
+const bare = noTty([]);
+if (bare.status !== 1 || !bare.stdout.includes("usage:")) {
+  fail(`rewire with no TTY exited ${bare.status}: ${bare.stdout}${bare.stderr}`);
+}
+pass("rewire with no TTY prints the usage and exits 1");
+const chat = noTty(["chat"]);
+if (chat.status !== 1 || !chat.stderr.includes("tui_requires_tty")) {
+  fail(`rewire chat </dev/null exited ${chat.status}: ${chat.stdout}${chat.stderr}`);
+}
+pass("rewire chat </dev/null exits 1 with tui_requires_tty");
+// The TUI is a lazily initialised part of the one-file bundle, reached only on a TTY; the
+// self-check runs that same dynamic import without one, so a broken bundled Ink fails here.
+const selfcheck = noTty(["chat"], { REWIRE_TUI_SELFCHECK: "1" });
+if (selfcheck.status !== 0 || selfcheck.stdout !== "tui: loaded\n") {
+  fail(
+    `the bundled TUI did not load (exit ${selfcheck.status}): ${selfcheck.stdout}${selfcheck.stderr}`,
+  );
+}
+pass("the bundled TUI (Ink, React, yoga-layout) loads without a TTY");
+
+const bundle = readFileSync(join(app, "node_modules", "sheperd", "dist", "main.js"), "utf8");
+// esbuild emits `__require("x")` for an external reached from CommonJS (react-reconciler,
+// scheduler), `from "x"` / `import("x")` from ESM; match all three (no \b before require).
+const UI_PKGS = "react|react-dom|react-reconciler|scheduler|ink|yoga-layout|react-devtools-core";
+const spec = `["'](?:${UI_PKGS})(?:/[^"']*)?["']`;
+const externalUi = new RegExp(
+  `require\\(\\s*${spec}\\s*\\)|\\bfrom\\s*${spec}|\\bimport\\(\\s*${spec}\\s*\\)`,
+);
+const leaked = externalUi.exec(bundle);
+if (leaked) fail(`the bundle loads ${leaked[0]} at runtime; it must be bundled (or stubbed)`);
+pass("React, Ink and yoga-layout are bundled; react-devtools-core is never imported");
 
 const sandboxLine = (path) => `✓ rewire-sandbox ${path} (platform package ${platformPkg})`;
 /** Runs doctor and requires its sandbox line to be one of `paths`; returns the path found. */

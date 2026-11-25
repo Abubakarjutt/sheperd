@@ -30,7 +30,8 @@ export type EscalationReport = {
     | "interrupted"
     | "stage_error"
     | "review_incomplete"
-    | "implementer_truncated";
+    | "implementer_truncated"
+    | "stopped_by_user";
   tried: string[];
   unresolved: Array<GateResult | Finding>;
   hypothesis: string;

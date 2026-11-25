@@ -127,3 +127,28 @@ test.skipIf(!mac)(
     expect(alive).toBe(false);
   },
 );
+
+test("chat profile: exec cannot write the root but can write scratch", async () => {
+  const { root, scratch, c } = setup("chat");
+  const denied = await c.exec(["sh", "-c", "echo x > a.txt"], { timeoutMs: 10000, cwd: root });
+  expect(denied.exitCode).not.toBe(0);
+  expect(denied.stderr).toMatch(
+    /a\.txt: (Operation not permitted|Read-only file system|Permission denied)/,
+  );
+  expect(existsSync(join(root, "a.txt"))).toBe(false);
+  const ok = await c.exec(["sh", "-c", `echo x > "${scratch}/a"`], { timeoutMs: 10000, cwd: root });
+  expect(ok.exitCode).toBe(0);
+  expect(readFileSync(join(scratch, "a"), "utf8")).toBe("x\n");
+});
+
+test("chat profile: exec cannot read .env files at the repo root or below", async () => {
+  const { root, c } = setup("chat");
+  mkdirSync(join(root, "sub"));
+  writeFileSync(join(root, ".env"), "SECRET_ONE=hunter2");
+  writeFileSync(join(root, "sub/.env.local"), "SECRET_TWO=hunter3");
+  for (const f of [".env", "sub/.env.local"]) {
+    const r = await c.exec(["sh", "-c", `cat ${f}`], { timeoutMs: 10000, cwd: root });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.stdout).not.toContain("hunter");
+  }
+});

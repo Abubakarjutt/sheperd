@@ -85,6 +85,12 @@ cd my-typescript-project
 rewire run "add a --json flag to the export command"
 ```
 
+Or open the interactive session and describe the task there (see "Interactive mode" below):
+
+```sh
+rewire
+```
+
 **5. Read the result.** A verified run (exit code `0`) is committed to the branch
 `rewire/<runId>`; your current branch is never touched. The evidence report explains what was
 checked and why it passed:
@@ -95,7 +101,106 @@ cat .rewire/runs/<runId>/report.md
 ```
 
 If the run escalates instead (exit code `2`), the same report says why and what it needs from
-you. Add `.rewire/runs/`, `.rewire/worktrees/` and `.rewire/cache/` to your `.gitignore`.
+you. Add `.rewire/runs/`, `.rewire/worktrees/`, `.rewire/cache/` and `.rewire/sessions/` to your
+`.gitignore`.
+
+## Interactive mode
+
+Run `rewire` with no arguments in a terminal, from the root of a clean git repository:
+
+```sh
+rewire                # on a TTY: the interactive session
+rewire chat           # always the interactive session; exits 1 with tui_requires_tty without a TTY
+```
+
+You chat with an agent that can read the repo, run sandboxed read-only commands and use skills.
+It cannot write to your repo. When you want a code change, it proposes a task and you confirm it.
+The change then goes through the same gated pipeline as `rewire run`, shown as a live stage board.
+The chat model is the author model (`routing.spec`). Chats are saved to `.rewire/sessions/` and
+can be resumed with `/resume`.
+
+A sample session:
+
+```
+> why does export ignore the --limit flag?
+  (the agent reads src/export.ts and explains)
+> add a --json flag to the export command
+╭───────────────────────────────────────────╮
+│ add a --json flag to the export command   │
+│ Run this as a gated task? [y/n]           │
+╰───────────────────────────────────────────╯
+  (press y)
+✓ Spec        contract ready
+Contract checkpoint: add a --json flag to the export command
+  AC-1 [change] export --json prints the rows as JSON
+[a]pprove [e] revise [s]top
+  (press a; the tests checkpoint shows [a]pprove [v]iew [s]top)
+  ... tests, implement, gates, review ...
+Run <runId> verified.
+Branch: rewire/<runId>
+```
+
+By default a run pauses for your approval after the contract and after the tests. It does not
+pause before the commit. Checkpoints and proposal cards take single keys, not typed lines. A
+contract checkpoint takes `a` (approve), `e` (revise: type a note in the box that opens, Enter
+sends it; at most 3 revisions, a 4th is treated as stop) or `s` (stop). The tests checkpoint
+takes `a`, `v` (view the frozen tests) or `s`. The commit checkpoint, when on, takes `a`, `v`
+(view the diff) or `s`.
+Stopping ends the run with reason `stopped_by_user` (exit 2 semantics). Every decision is
+recorded in `events.jsonl` and `report.md`. `rewire run` and `--headless` never pause.
+
+### Slash commands
+
+| Command                                    | What it does                                                     | During a run |
+| ------------------------------------------ | ---------------------------------------------------------------- | ------------ |
+| `/run <task>`                              | Start a gated run directly, without proposing first.             | no           |
+| `/skills`                                  | List skills and review pending repo skills.                      | yes          |
+| `/checkpoints [contract] [tests] [commit]` | Show or set where runs pause. `/checkpoints off` pauses nowhere. | show only    |
+| `/model`                                   | Show the model routing.                                          | yes          |
+| `/resume [id]`                             | List stored sessions, or resume one.                             | no           |
+| `/clear`                                   | Start a fresh session. The old one stays resumable.              | no           |
+| `/doctor`                                  | Check prerequisites.                                             | no           |
+| `/skip`                                    | Decline a run's clarification questions.                         | yes          |
+| `/help`                                    | List the commands.                                               | yes          |
+| `/exit`                                    | Quit.                                                            | no           |
+| `//text`                                   | Send `/text` as chat text (a literal leading slash).             | -            |
+
+While a run is active, the input box answers clarifications (one answer per line, `/skip` to
+decline); checkpoints and proposals take single keys.
+
+### Ctrl-C
+
+| When                                   | What happens                                                   |
+| -------------------------------------- | -------------------------------------------------------------- |
+| during a run                           | aborts the run (an interrupted report); the session stays open |
+| during a chat turn                     | aborts the turn                                                |
+| idle at the prompt                     | exits 0                                                        |
+| a second press within 1 second         | exits 130                                                      |
+| at a proposal card or the trust prompt | exits 0 (the chat is saved and can be resumed)                 |
+
+A chat `bash` command ignores the abort and runs to its own timeout (up to 600 seconds). It
+cannot write to the repo.
+
+## Skills
+
+Interactive mode can use Claude-style skills (`<name>/SKILL.md`).
+
+- **User skills** load automatically from `~/.claude/skills` and `$XDG_CONFIG_HOME/rewire/skills`
+  (default `~/.config/rewire/skills`). A user skill wins over a repo skill with the same name.
+- **Repo skills** (`<repo>/.claude/skills`) load only after you approve them. The approval is
+  stored once per repo, pinned to a sha256 over all the skills' files, in
+  `$XDG_CONFIG_HOME/rewire/trusted-skills.json`. If any file changes, rewire asks again. The
+  prompt also lists repo skills shadowed by a user skill, because they are part of the hash.
+- Skills are read once per session. A skill you trust mid-session takes effect after `/clear`.
+- A skill that is rejected (malformed, over a limit, or a repo skill with a symlink) is skipped
+  and shown as a warning line when the session starts.
+- Skills are given to the chat, the spec stage, the test writer and the implementer. The
+  reviewers and the verifier never get them. Skill text can still reach a reviewer indirectly if
+  an author stage copies it into the contract or the diff.
+
+Limits: `SKILL.md` up to 256 KiB. A repo skill directory up to 2 MiB and 200 files, with no
+symlinks. A user skill directory up to 64 MiB and 5000 files; its symlinks are followed only to
+targets inside your home directory that are not credential files.
 
 ## How a run works
 
@@ -143,6 +248,8 @@ you. Add `.rewire/runs/`, `.rewire/worktrees/` and `.rewire/cache/` to your `.gi
 ## Usage
 
 ```sh
+rewire                                     # interactive session (on a TTY)
+rewire chat [--repo <path>] [--models <file>]
 rewire run "add a --json flag to the export command" [--repo <path>] [--models <file>] [--headless]
 rewire run --task-file task.md [--repo <path>] [--models <file>] [--headless]
 ```
@@ -162,7 +269,27 @@ stderr.
 | 2    | the run escalated to a human (see the evidence report for the reason)                          |
 | 130  | a second Ctrl-C: forced quit (the first Ctrl-C stops the run and writes an interrupted report) |
 
-Running `rewire` with no arguments prints the usage and exits 1; `rewire --help` prints it and exits 0.
+Running `rewire` with no arguments and no TTY prints the usage and exits 1 (on a TTY it opens the
+interactive session); `rewire --help` prints it and exits 0.
+
+### Error codes
+
+Errors carry a stable code. The ones added with interactive mode and skills:
+
+| code                     | meaning                                                                             |
+| ------------------------ | ----------------------------------------------------------------------------------- |
+| `tui_requires_tty`       | `rewire chat` needs a terminal. Exit 1.                                             |
+| `tui_render_failed`      | The terminal UI failed to render.                                                   |
+| `skill_invalid`          | A skill is malformed or over a limit (name, description, size, symlink).            |
+| `trust_store_unreadable` | `trusted-skills.json` is unreadable: repo skills are not loaded; the session opens. |
+| `trust_store_locked`     | Another rewire process holds the trust store lock.                                  |
+| `session_corrupt`        | A stored session file is damaged.                                                   |
+| `session_not_found`      | `/resume` named a session that is not stored.                                       |
+| `session_disposed`       | The session was closed and can't take more turns.                                   |
+| `session_store_unsafe`   | `.rewire/sessions/` is not a plain directory owned by you (for example a symlink).  |
+| `run_in_progress`        | A gated run is already active; only one runs at a time.                             |
+| `stopped_by_user`        | You chose stop at a checkpoint. The run escalates (exit 2).                         |
+| `aborted`                | You pressed Ctrl-C during a chat turn; the turn was dropped.                        |
 
 ### Run directory
 
@@ -176,7 +303,8 @@ Every run writes into the target repo:
   report.md      the evidence report, including the known limitations below
 ```
 
-Add `.rewire/runs/`, `.rewire/worktrees/` and `.rewire/cache/` to the repo's ignore file (not
+Add `.rewire/runs/`, `.rewire/worktrees/`, `.rewire/cache/` and `.rewire/sessions/` to the repo's
+ignore file (not
 all of `.rewire/`: `.rewire/policy.toml` is the repo policy and belongs in version control). The
 result of a verified run lives on the branch `rewire/<runId>`.
 

@@ -65,3 +65,9 @@ test("a run worktree's own repo .env files are read-denied (I3: outside the work
   const q = profileFor("implementer", "/w", DEFAULT_POLICY, "/tmp/s");
   expect(q.readDeny.filter((g) => g.startsWith("/r/"))).toEqual([]);
 });
+
+test("chat profile equals verify (read-only root, scratch, no network)", () => {
+  const chat = profileFor("chat", "/w", DEFAULT_POLICY, "/tmp/s");
+  expect(chat).toEqual(profileFor("verify", "/w", DEFAULT_POLICY, "/tmp/s"));
+  expect(chat).toMatchObject({ write: [], writeDeny: [], extraWrite: ["/tmp/s"], network: "deny" });
+});

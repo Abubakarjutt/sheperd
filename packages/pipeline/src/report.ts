@@ -1,4 +1,5 @@
 import {
+  type CheckpointKind,
   type Contract,
   type Finding,
   type FrozenTestManifest,
@@ -20,6 +21,15 @@ export type ReviewData = {
   dropped: Dropped[];
   escalationReasons: string[];
 };
+
+/** One approval-checkpoint decision, in the order it was made. */
+export type CheckpointRecord = {
+  kind: CheckpointKind;
+  action: "approve" | "revise" | "stop";
+  note?: string;
+};
+
+export type SkillUse = { name: string; source: "user" | "repo"; sha256: string; stages: string[] };
 
 export type ReportData = {
   runId: string;
@@ -43,6 +53,10 @@ export type ReportData = {
   /** Ignored untracked entries deleted before gate runs and the final commit (R38). */
   removedIgnored?: string[];
   escalation?: EscalationReport;
+  /** Skills the author stages loaded; the section is omitted when empty or absent. */
+  skillsUsed?: SkillUse[];
+  /** Approval-checkpoint decisions; the section is omitted when empty or absent. */
+  checkpoints?: CheckpointRecord[];
   eventLogIncomplete: boolean;
 };
 
@@ -249,6 +263,36 @@ function escalationSection(e: EscalationReport): string {
   return out.join("\n");
 }
 
+/** `inline` without redact(): a regex-restricted skill name must not become [redacted]. */
+function verbatim(s: string): string {
+  return stripControls(s)
+    .replace(/\r\n?|\n/g, " ")
+    .replace(MARKUP, "\\$&")
+    .replace(AUTOLINK, "$1\\$2")
+    .replace(WWW, "www\\.");
+}
+
+function skillsSection(skills: SkillUse[]): string {
+  // The name is regex-restricted by the skills package, so it is shown verbatim (redact() would
+  // rewrite e.g. "sk-review"); markup characters are still escaped defensively.
+  return skills
+    .filter((s) => (s.source === "user" || s.source === "repo") && /^[0-9a-f]{64}$/.test(s.sha256))
+    .map(
+      (s) =>
+        `- ${verbatim(s.name)} (${s.source}, sha256 ${s.sha256.slice(0, 12)}) — ${s.stages.map(inline).join(", ")}`,
+    )
+    .join("\n");
+}
+
+function checkpointsSection(cps: CheckpointRecord[]): string {
+  return cps
+    .map(
+      (c) =>
+        `- ${inline(c.kind)}: ${inline(c.action)}${c.note ? ` (note: ${inline(c.note)})` : ""}`,
+    )
+    .join("\n");
+}
+
 export function renderReport(d: ReportData): string {
   const sections: Array<[string, string]> = [
     ["Status", statusSection(d)],
@@ -258,6 +302,12 @@ export function renderReport(d: ReportData): string {
       ? ([["Ignored files removed", removedSection(d.removedIgnored)]] as Array<[string, string]>)
       : []),
     ["Review", reviewSection(d)],
+    ...(d.checkpoints && d.checkpoints.length > 0
+      ? ([["Checkpoints", checkpointsSection(d.checkpoints)]] as Array<[string, string]>)
+      : []),
+    ...(d.skillsUsed && d.skillsUsed.length > 0
+      ? ([["Skills used", skillsSection(d.skillsUsed)]] as Array<[string, string]>)
+      : []),
     ["Models & independence", modelsSection(d)],
     ["Network exceptions", networkSection(d)],
     ["Fix rounds", roundsSection(d)],

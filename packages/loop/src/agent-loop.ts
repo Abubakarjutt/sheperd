@@ -72,9 +72,30 @@ async function runTool(
   }
 }
 
+function validateHistory(history: ChatMessage[]): void {
+  for (let i = 0; i < history.length; i++) {
+    const m = history[i];
+    if (m?.role !== "assistant" || !m.toolCalls || m.toolCalls.length === 0) continue;
+    const answered = new Set<string>();
+    for (let j = i + 1; j < history.length && history[j]?.role === "tool"; j++) {
+      const id = history[j]?.toolCallId;
+      if (id !== undefined) answered.add(id);
+    }
+    const missing = m.toolCalls.filter((c) => !answered.has(c.id));
+    if (missing.length > 0) {
+      throw new RewireError(
+        "loop_history_invalid",
+        `history has tool calls without tool results: ${missing.map((c) => c.name).join(", ")}`,
+      );
+    }
+  }
+}
+
 export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   const { provider, tools, hooks, signal } = opts;
-  const messages: ChatMessage[] = [{ role: "user", content: opts.prompt }];
+  const history = opts.history ?? [];
+  validateHistory(history);
+  const messages: ChatMessage[] = [...history, { role: "user", content: opts.prompt }];
   const usage = { inputTokens: 0, outputTokens: 0 };
   let turns = 0;
   let lastText = "";

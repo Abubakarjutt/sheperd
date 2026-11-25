@@ -1,14 +1,26 @@
-import { appendFile, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import {
+  appendFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, sep } from "node:path";
+import {
+  CheckpointDecision,
+  type CheckpointKind,
   type Contract,
   type Finding,
   type FrozenTestManifest,
   type GateResult,
+  MAX_REVISIONS,
   newRunId,
   RewireError,
-  type RunEvent,
+  RunEvent,
   redact,
   stripControls,
   type Verdict,
@@ -54,15 +66,24 @@ import {
   trustedGit,
   trustedGitOk,
 } from "@rewire/sandbox";
+import type { SkillSet } from "@rewire/skills";
 import { z } from "zod";
+import { commitDiff } from "./commit-diff.js";
 import { type EscalationReport, FixLoopController, type RoundState, score } from "./fix-loop.js";
 import {
   linkNodeModules,
   type NodeModulesState,
   nodeModulesTampered,
 } from "./node-modules-guard.js";
-import { type ReportData, type ReviewData, renderReport } from "./report.js";
+import {
+  type CheckpointRecord,
+  type ReportData,
+  type ReviewData,
+  renderReport,
+  type SkillUse,
+} from "./report.js";
 import { ROLES, type Role, type RoleRouting } from "./routing.js";
+import { endRunSkills } from "./skills.js";
 import { runImplementerStage } from "./stages/implementer.js";
 import { runSpecStage } from "./stages/spec.js";
 import { PreserveFailsNowError, runTestWriterStage } from "./stages/test-writer.js";
@@ -79,6 +100,17 @@ export type PipelineSeams = {
   hypothesisTimeoutMs?: number;
 };
 
+/** What a run shows the user at an approval checkpoint. */
+export type Checkpoint =
+  | { kind: "contract"; contract: Contract }
+  | { kind: "tests"; manifest: FrozenTestManifest; files: Array<{ path: string; content: string }> }
+  | { kind: "commit"; diff: string };
+
+/** Re-exported from `@rewire/core` (its one definition, shared with the TUI). */
+export { MAX_REVISIONS };
+
+const DEFAULT_CHECKPOINT_KINDS: readonly CheckpointKind[] = ["contract", "tests"];
+
 export type RunPipelineInput = {
   task: string;
   repo: string;
@@ -91,6 +123,15 @@ export type RunPipelineInput = {
   seams?: PipelineSeams;
   /** The models are the faux provider (a harness self-test): the commit says so (M7). */
   faux?: boolean;
+  /** Claude skills for the author stages (spec, test-writer, implementer) only. The caller owns the set. */
+  skills?: SkillSet;
+  /**
+   * Approval checkpoints. Unset (`rewire run`, headless): nothing pauses and nothing extra is
+   * computed. The pending promise races the run's abort signal.
+   */
+  checkpoint?: (cp: Checkpoint) => Promise<CheckpointDecision>;
+  /** Which checkpoints call `checkpoint`. Default: contract and tests (commit is off). */
+  checkpointKinds?: readonly CheckpointKind[];
 };
 
 export type RunOutcome = {
@@ -167,6 +208,8 @@ class Escalation extends Error {
  */
 class EventLog {
   incomplete = false;
+  /** Skills the author stages loaded, by name (from `skill_loaded` events). */
+  readonly skills = new Map<string, SkillUse>();
   /** Lines are buffered until `start` (the run dir exists only after preflight, M8). */
   started = false;
   private buffered: string[] = [];
@@ -188,6 +231,20 @@ class EventLog {
     } catch {
       this.writeFailed();
       return;
+    }
+    // Aggregate from the raw event (a skill name is regex-restricted, so redact() must not
+    // rewrite it), but only when it is schema-valid.
+    const sl = e.type === "skill_loaded" ? RunEvent.safeParse(e) : undefined;
+    if (sl?.success && sl.data.type === "skill_loaded") {
+      const d = sl.data;
+      const u = this.skills.get(d.name) ?? {
+        name: d.name,
+        source: d.source,
+        sha256: d.sha256,
+        stages: [],
+      };
+      if (!u.stages.includes(d.stage)) u.stages.push(d.stage);
+      this.skills.set(d.name, u);
     }
     if (this.started) this.append(`${line}\n`);
     else this.buffered.push(`${line}\n`);
@@ -245,6 +302,8 @@ type State = {
   removedIgnored: Set<string>;
   /** Tree id (as `git add -A` would commit it) the last policy-gate run saw (R38). */
   gatedTree?: string;
+  /** Approval-checkpoint decisions, in order (for the report). */
+  checkpoints: CheckpointRecord[];
 };
 
 type Ctx = {
@@ -303,6 +362,7 @@ export async function runPipeline(input: RunPipelineInput): Promise<RunOutcome> 
     rounds: [],
     tried: [],
     removedIgnored: new Set(),
+    checkpoints: [],
   };
   const ctx: Ctx = { input, runId, repo, runDir, log, st, usage, providerFor, build };
 
@@ -325,6 +385,8 @@ export async function runPipeline(input: RunPipelineInput): Promise<RunOutcome> 
       reason: escalation.reason,
       question: escalation.question,
     });
+  } finally {
+    endRunSkills(input.skills, runId);
   }
 
   if (!log.started) {
@@ -350,8 +412,29 @@ export async function runPipeline(input: RunPipelineInput): Promise<RunOutcome> 
   }
 
   await log.flush();
-  const data: ReportData = {
+  await writeFile(reportPath, renderReport(reportData(ctx, status, worktreeKept, escalation)));
+  log.emit({ type: "run_end", runId, ts: new Date().toISOString(), status, reportPath });
+  await log.flush();
+
+  return {
     runId,
+    status,
+    branch: st.branch,
+    worktree: st.worktree,
+    reportPath,
+    ...(escalation ? { escalation } : {}),
+  };
+}
+
+function reportData(
+  ctx: Ctx,
+  status: "verified" | "escalated",
+  worktreeKept: boolean,
+  escalation?: EscalationReport,
+): ReportData {
+  const { input, st, log } = ctx;
+  return {
+    runId: ctx.runId,
     task: input.task,
     status,
     branch: st.branch,
@@ -363,26 +446,16 @@ export async function runPipeline(input: RunPipelineInput): Promise<RunOutcome> 
     ...(st.review ? { review: st.review } : {}),
     routing: input.routing,
     rounds: st.rounds,
-    usage,
+    usage: ctx.usage,
     removedIgnored: [...st.removedIgnored].sort(),
     knownLimitations: [
       ...KNOWN_LIMITATIONS,
       ...(input.routing.independence === "same-family" ? ["independence: same-family"] : []),
     ],
     ...(escalation ? { escalation } : {}),
+    skillsUsed: [...log.skills.values()],
+    ...(st.checkpoints.length > 0 ? { checkpoints: [...st.checkpoints] } : {}),
     eventLogIncomplete: log.incomplete,
-  };
-  await writeFile(reportPath, renderReport(data));
-  log.emit({ type: "run_end", runId, ts: new Date().toISOString(), status, reportPath });
-  await log.flush();
-
-  return {
-    runId,
-    status,
-    branch: st.branch,
-    worktree: st.worktree,
-    reportPath,
-    ...(escalation ? { escalation } : {}),
   };
 }
 
@@ -505,6 +578,122 @@ async function hypothesize(
   }
 }
 
+const checkpointOn = (ctx: Ctx, kind: CheckpointKind): boolean =>
+  ctx.input.checkpoint !== undefined &&
+  (ctx.input.checkpointKinds ?? DEFAULT_CHECKPOINT_KINDS).includes(kind);
+
+/**
+ * Ask the user at one checkpoint. The pending promise races the run's abort signal, so Ctrl-C
+ * ends the run as interrupted even if the callback never settles. The decision is validated;
+ * the caller records it (`recordCheckpoint`) as what actually happens.
+ */
+async function awaitCheckpoint(ctx: Ctx, cp: Checkpoint): Promise<CheckpointDecision> {
+  const ask = ctx.input.checkpoint;
+  if (ask === undefined) return { action: "approve" };
+  checkAbort(ctx);
+  const signal = ctx.input.signal;
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new Escalation("interrupted", [], [`during the ${cp.kind} checkpoint`]));
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+  aborted.catch(() => {});
+  let raw: unknown;
+  try {
+    const call = Promise.resolve().then(() => ask(cp));
+    call.catch(() => {});
+    raw = await Promise.race([call, aborted]);
+  } catch (e) {
+    if (e instanceof Escalation) throw e;
+    checkAbort(ctx);
+    throw checkpointFault(cp.kind, `the ${cp.kind} checkpoint failed: ${errClip(e)}`);
+  } finally {
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
+  }
+  checkAbort(ctx);
+  const parsed = CheckpointDecision.safeParse(raw);
+  if (!parsed.success) {
+    throw checkpointFault(cp.kind, `the ${cp.kind} checkpoint returned an invalid decision`);
+  }
+  const decision = parsed.data;
+  if (cp.kind !== "contract" && decision.action === "revise") {
+    throw checkpointFault(cp.kind, `the ${cp.kind} checkpoint does not accept revise`);
+  }
+  return decision;
+}
+
+/** A checkpoint protocol error (a caller bug): fixed text, never a model call to explain it. */
+function checkpointFault(kind: CheckpointKind, detail: string): Escalation {
+  return new Escalation("stage_error", [], [detail], {
+    hypothesis: `The ${kind} approval checkpoint did not return a valid decision (a bug in the caller, not in the task), so the run stopped.`,
+    question: "Re-run the task; if it happens again, report the checkpoint error in the details?",
+  });
+}
+
+/** Log a checkpoint decision (events.jsonl) and keep it for the report. */
+function recordCheckpoint(ctx: Ctx, kind: CheckpointKind, decision: CheckpointDecision): void {
+  ctx.log.emit({
+    type: "checkpoint",
+    runId: ctx.runId,
+    ts: new Date().toISOString(),
+    stage: ctx.st.stage,
+    kind,
+    decision,
+  });
+  ctx.st.checkpoints.push({
+    kind,
+    action: decision.action,
+    ...("note" in decision && decision.note !== undefined ? { note: decision.note } : {}),
+  });
+}
+
+/** Ask, then record what happens (a non-contract checkpoint has no revise). */
+async function checkpointDecision(ctx: Ctx, cp: Checkpoint): Promise<CheckpointDecision> {
+  const d = await awaitCheckpoint(ctx, cp);
+  recordCheckpoint(ctx, cp.kind, d);
+  return d;
+}
+
+/**
+ * The frozen test files for the tests checkpoint, read on the host without following links: a
+ * non-regular entry (a symlink to a secret, a directory) is refused, never read.
+ */
+async function frozenFiles(
+  worktree: string,
+  manifest: FrozenTestManifest,
+): Promise<Array<{ path: string; content: string }>> {
+  const refuse = (detail: string): Escalation =>
+    new Escalation("stage_error", [], [detail], {
+      hypothesis:
+        "A frozen test file is not a regular file inside the worktree at the tests checkpoint (a symlink or a symlinked directory), so the harness refused to read it.",
+      question: "Inspect the kept worktree for the link, then re-run the task?",
+    });
+  const root = await realpath(worktree);
+  const out: Array<{ path: string; content: string }> = [];
+  for (const f of manifest.files) {
+    const abs = join(worktree, f.path);
+    const st = await lstat(abs).catch(() => undefined);
+    if (!st?.isFile()) {
+      throw refuse(`frozen test ${f.path} is not a regular file at the tests checkpoint`);
+    }
+    // A symlinked parent directory passes lstat: the real path must stay under the worktree.
+    const real = await realpath(abs).catch(() => "");
+    if (!real.startsWith(`${root}${sep}`)) {
+      throw refuse(`frozen test ${f.path} resolves outside the worktree at the tests checkpoint`);
+    }
+    out.push({ path: f.path, content: await readFile(real, "utf8") });
+  }
+  return out;
+}
+
+/** `stop` (or a revision past the limit): hand the run back to the user, exit 2 semantics. */
+function stoppedByUser(kind: CheckpointKind, note: string | undefined, why?: string): Escalation {
+  return new Escalation("stopped_by_user", [], note ? [note] : [], {
+    hypothesis: `The user stopped the run at the ${kind} checkpoint${why ? ` (${why})` : ""}.`,
+    question: "Re-run the task with a clearer description, or inspect the kept worktree?",
+  });
+}
+
 function checkAbort(ctx: Ctx): void {
   if (ctx.input.signal?.aborted)
     throw new Escalation("interrupted", [], [`during ${ctx.st.stage}`]);
@@ -595,22 +784,40 @@ async function execute(ctx: Ctx): Promise<void> {
   const ident = await identity(worktree);
   checkAbort(ctx);
 
-  st.stage = "spec";
-  const contract = await runSpecStage({
-    task: input.task,
-    worktree,
-    model: routing.spec,
-    provider: ctx.providerFor("spec"),
-    ask: input.ask,
-    emit: log.emit,
-    runId,
-    policy,
-    ...sig,
-    ...clientFactory,
-  });
-  st.contract = contract;
-  await writeFile(join(ctx.runDir, "contract.json"), redact(JSON.stringify(contract, null, 2)));
-  checkAbort(ctx);
+  const notes: string[] = [];
+  let contract: Contract;
+  for (;;) {
+    st.stage = "spec";
+    contract = await runSpecStage({
+      task: input.task,
+      worktree,
+      model: routing.spec,
+      provider: ctx.providerFor("spec"),
+      ask: input.ask,
+      emit: log.emit,
+      runId,
+      policy,
+      ...(notes.length > 0 ? { reviewerNotes: [...notes] } : {}),
+      ...(input.skills ? { skills: input.skills } : {}),
+      ...sig,
+      ...clientFactory,
+    });
+    st.contract = contract;
+    await writeFile(join(ctx.runDir, "contract.json"), redact(JSON.stringify(contract, null, 2)));
+    checkAbort(ctx);
+    if (!checkpointOn(ctx, "contract")) break;
+    const d = await awaitCheckpoint(ctx, { kind: "contract", contract });
+    if (d.action === "revise" && notes.length >= MAX_REVISIONS) {
+      // A revise past the limit is treated as stop, and recorded as what happens.
+      recordCheckpoint(ctx, "contract", { action: "stop", note: d.note });
+      throw stoppedByUser("contract", d.note, `revision limit of ${MAX_REVISIONS} reached`);
+    }
+    recordCheckpoint(ctx, "contract", d);
+    if (d.action === "approve") break;
+    if (d.action === "stop") throw stoppedByUser("contract", d.note);
+    notes.push(d.note);
+    st.tried.push(`contract checkpoint: revision ${notes.length} requested`);
+  }
 
   st.stage = "test-writer";
   const manifest = await runTestWriterStage({
@@ -624,12 +831,19 @@ async function execute(ctx: Ctx): Promise<void> {
     runId,
     policy,
     gateGuard: preGate(worktree, st, sig),
+    ...(input.skills ? { skills: input.skills } : {}),
     ...sig,
     ...clientFactory,
   });
   st.manifest = manifest;
   await writeFile(join(ctx.runDir, "manifest.json"), redact(JSON.stringify(manifest, null, 2)));
   checkAbort(ctx);
+  if (checkpointOn(ctx, "tests")) {
+    const files = await frozenFiles(worktree, manifest);
+    const d = await checkpointDecision(ctx, { kind: "tests", manifest, files });
+    if (d.action !== "approve")
+      throw stoppedByUser("tests", d.action === "stop" ? d.note : undefined);
+  }
 
   st.stage = "freeze";
   const paths = manifest.files.map((f) => `:(literal)${f.path}`);
@@ -669,6 +883,7 @@ async function execute(ctx: Ctx): Promise<void> {
       ...(feedback !== undefined ? { feedback } : {}),
       ...(input.seams?.implementerMaxTurns ? { maxTurns: input.seams.implementerMaxTurns } : {}),
       gateGuard: preGate(worktree, st, sig),
+      ...(input.skills ? { skills: input.skills } : {}),
       ...sig,
       ...clientFactory,
     });
@@ -782,6 +997,13 @@ async function execute(ctx: Ctx): Promise<void> {
         `the tree to commit ${tree} is not the tree the last gates verified ${st.gatedTree ?? "(none)"}: the worktree changed after gating`,
       ],
     );
+  }
+  if (checkpointOn(ctx, "commit")) {
+    // Computed only when the commit checkpoint is on: the staged change against the frozen tests.
+    const diff = await commitDiff(worktree, frozenCommit, sig);
+    const d = await checkpointDecision(ctx, { kind: "commit", diff });
+    if (d.action !== "approve")
+      throw stoppedByUser("commit", d.action === "stop" ? d.note : undefined);
   }
   await trustedGitOk(
     worktree,

@@ -8,6 +8,7 @@ export type StageName =
   | "test-writer"
   | "implementer"
   | "verify"
+  | "chat"
   | "review"
   | "verify-registry";
 
@@ -62,6 +63,7 @@ export function profileFor(
     case "review":
       break;
     case "verify":
+    case "chat":
     case "verify-registry":
       extraWrite = [scratch];
       break;
