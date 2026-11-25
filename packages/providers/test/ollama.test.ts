@@ -16,6 +16,7 @@ import {
   ollamaChatTimeoutMs,
   probeOllama,
 } from "../src/index.js";
+import { openaiChunks, openaiSSE } from "./sse.js";
 
 type Mock = {
   version: string;
@@ -23,7 +24,10 @@ type Mock = {
   models: { name: string; digest: string }[];
   showStatus: number;
   tagsBody: string | null;
-  /** Called for each chat request; returns the OpenAI-style body, or "destroy" to drop the socket. */
+  /**
+   * Called for each chat request; returns the OpenAI-style body, "destroy" to drop the socket,
+   * "hang", or `{ __sse, after }` to stream SSE text and then end, hang or destroy the socket.
+   */
   chat: (body: Record<string, unknown>) => unknown;
 };
 
@@ -97,6 +101,14 @@ beforeEach(async () => {
         const out = mock.chat(body);
         if (out === "destroy") return void req.socket.destroy();
         if (out === "hang") return;
+        if (typeof out === "object" && out !== null && "__sse" in out) {
+          const { __sse, after } = out as { __sse: string; after?: "end" | "hang" | "destroy" };
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write(__sse);
+          if (after === "destroy") setTimeout(() => req.socket.destroy(), 20);
+          else if (after !== "hang") res.end();
+          return;
+        }
         if (typeof out === "object" && out !== null && "__status" in out) {
           return json((out as { __status: number }).__status, { error: "server error" });
         }
@@ -313,6 +325,88 @@ describe("OllamaProvider", () => {
     await expect(
       p.chat({ model: "m", system: "s", messages: [], maxTokens: 5, signal: ac.signal }),
     ).rejects.toMatchObject({ code: "provider_aborted" });
+  });
+});
+
+describe("OllamaProvider streaming (onDelta)", () => {
+  const usage = { prompt_tokens: 4, completion_tokens: 5 };
+  const req = {
+    model: "tiny:1b",
+    system: "s",
+    messages: [{ role: "user" as const, content: "hi" }],
+    maxTokens: 5,
+    tools: [{ name: "echo", description: "d", inputSchema: { type: "object" } }],
+  };
+  test.each([
+    {
+      name: "text only",
+      json: { choices: [{ finish_reason: "stop", message: { content: "Hi there" } }], usage },
+      chunks: { text: ["Hi", " there"], finish: "stop", usage },
+    },
+    {
+      name: "text plus tool calls",
+      json: {
+        choices: [
+          {
+            finish_reason: "tool_calls",
+            message: {
+              content: "ok",
+              tool_calls: [
+                { id: "c1", type: "function", function: { name: "echo", arguments: '{"v":1}' } },
+                { id: "c2", type: "function", function: { name: "echo", arguments: '{"v":2}' } },
+              ],
+            },
+          },
+        ],
+        usage,
+      },
+      chunks: {
+        text: ["o", "k"],
+        toolCalls: [
+          { id: "c1", name: "echo", argPieces: ['{"v":', "1}"] },
+          { id: "c2", name: "echo", argPieces: ['{"v":2}'] },
+        ],
+        finish: "tool_calls",
+        usage,
+      },
+    },
+  ])("$name: streamed equals non-streamed, and only the streamed body has stream", async (c) => {
+    mock.chat = (b) => (b.stream ? { __sse: openaiSSE(openaiChunks(c.chunks)) } : c.json);
+    const p = new OllamaProvider(base);
+    const plain = await p.chat(req);
+    const deltas: string[] = [];
+    const streamed = await p.chat({ ...req, onDelta: (d) => deltas.push(d) });
+    expect(streamed).toEqual(plain);
+    expect(deltas.join("")).toBe(plain.message.text);
+    expect(chatBodies[0]).not.toHaveProperty("stream");
+    expect(chatBodies[0]).not.toHaveProperty("stream_options");
+    expect(chatBodies[1]).toMatchObject({ stream: true, stream_options: { include_usage: true } });
+  });
+  const partial = () =>
+    openaiSSE(openaiChunks({ text: ["par", "tial"], finish: "stop" }).slice(0, 3), false);
+  test("a timeout mid-stream is ollama_timeout", async () => {
+    mock.chat = () => ({ __sse: partial(), after: "hang" });
+    const p = new OllamaProvider(base, 300);
+    const deltas: string[] = [];
+    const err = await p.chat({ ...req, onDelta: (d) => deltas.push(d) }).catch((e) => e);
+    expect(err).toMatchObject({ code: "ollama_timeout" });
+    expect(err.hint).toMatch(/REWIRE_OLLAMA_TIMEOUT_S/);
+    expect(deltas).toEqual(["par", "tial"]);
+  });
+  test("caller abort mid-stream is provider_aborted", async () => {
+    mock.chat = () => ({ __sse: partial(), after: "hang" });
+    const ac = new AbortController();
+    const p = new OllamaProvider(base);
+    const err = await p
+      .chat({ ...req, signal: ac.signal, onDelta: () => ac.abort() })
+      .catch((e) => e);
+    expect(err).toMatchObject({ code: "provider_aborted" });
+  });
+  test("a socket dropped mid-stream while Ollama answers is ollama_request_dropped", async () => {
+    mock.chat = () => ({ __sse: partial(), after: "destroy" });
+    const p = new OllamaProvider(base);
+    const err = await p.chat({ ...req, onDelta: () => {} }).catch((e) => e);
+    expect(err).toMatchObject({ code: "ollama_request_dropped" });
   });
 });
 

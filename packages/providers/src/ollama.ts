@@ -2,7 +2,12 @@ import { RewireError } from "@rewire/core";
 import OpenAI from "openai";
 import { z } from "zod";
 import { providerError } from "./errors.js";
-import { fromOpenAIResponse, toOpenAIParams } from "./openai.js";
+import {
+  collectOpenAIStream,
+  fromOpenAIResponse,
+  toOpenAIParams,
+  toOpenAIStreamParams,
+} from "./openai.js";
 import type { ChatRequest, ChatResponse, Provider } from "./types.js";
 
 /**
@@ -208,15 +213,27 @@ export class OllamaProvider implements Provider {
     const signal = req.signal ? AbortSignal.any([req.signal, timeout]) : timeout;
     const started = Date.now();
     let resp: unknown;
+    // Set once a streamed reply has started: a transport failure after that is a dropped request.
+    let streaming = false;
     try {
-      resp = await this.client.chat.completions.create(
-        // Ollama's OpenAI-compat layer lists `max_tokens` (not `max_completion_tokens`) as supported:
-        // https://github.com/ollama/ollama/blob/main/docs/api/openai-compatibility.mdx
-        toOpenAIParams(req, {
-          maxTokensField: "max_tokens",
-        }) as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
-        { signal },
-      );
+      if (req.onDelta) {
+        const stream = await this.client.chat.completions.create(
+          toOpenAIStreamParams(req, {
+            maxTokensField: "max_tokens",
+          }) as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+          { signal },
+        );
+        streaming = true;
+        resp = await collectOpenAIStream(stream, req.onDelta, signal);
+      } else
+        resp = await this.client.chat.completions.create(
+          // Ollama's OpenAI-compat layer lists `max_tokens` (not `max_completion_tokens`) as supported:
+          // https://github.com/ollama/ollama/blob/main/docs/api/openai-compatibility.mdx
+          toOpenAIParams(req, {
+            maxTokensField: "max_tokens",
+          }) as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
+          { signal },
+        );
     } catch (err) {
       if (req.signal?.aborted) throw providerError("ollama", err, { signal: req.signal });
       if (timeout.aborted) {
@@ -226,7 +243,9 @@ export class OllamaProvider implements Provider {
           `The model may still be loading, or replies slowly on this machine: retry, or set ${OLLAMA_TIMEOUT_ENV} (seconds, e.g. 900)`,
         );
       }
-      if (isConnectionError(err)) {
+      const midStreamDrop =
+        streaming && !(err instanceof OpenAI.APIError) && !(err instanceof RewireError);
+      if (isConnectionError(err) || midStreamDrop) {
         // A broken connection to a server that still answers is a dropped request, not an outage.
         if (!(await answers(this.baseUrl))) throw unreachable(this.baseUrl);
         throw new RewireError(

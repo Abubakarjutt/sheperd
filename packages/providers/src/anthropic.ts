@@ -117,10 +117,21 @@ export class AnthropicProvider implements Provider {
   async chat(req: ChatRequest): Promise<ChatResponse> {
     let resp: unknown;
     try {
-      resp = await this.client.messages.create(
-        toAnthropicParams(req) as unknown as Anthropic.MessageCreateParamsNonStreaming,
-        req.signal ? { signal: req.signal } : undefined,
-      );
+      if (req.onDelta) {
+        // The SDK's MessageStream accumulates content blocks (tool_use input from
+        // input_json_delta included) into the same Message shape `messages.create` returns.
+        const stream = this.client.messages.stream(
+          toAnthropicParams(req) as unknown as Anthropic.MessageStreamParams,
+          req.signal ? { signal: req.signal } : undefined,
+        );
+        const onDelta = req.onDelta;
+        stream.on("text", (delta) => onDelta(delta));
+        resp = await stream.finalMessage();
+      } else
+        resp = await this.client.messages.create(
+          toAnthropicParams(req) as unknown as Anthropic.MessageCreateParamsNonStreaming,
+          req.signal ? { signal: req.signal } : undefined,
+        );
     } catch (err) {
       throw providerError("anthropic", err, { apiKey: this.apiKey, signal: req.signal });
     }
