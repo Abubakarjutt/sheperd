@@ -18,8 +18,13 @@ export {
   STALE_PROMPT,
   TRUSTED_LATER,
 } from "./app.js";
+export { CommandMenu, menuItems, menuQuery, menuWindow, POPUP_ROWS } from "./command-menu.js";
 export {
+  allowedInRun,
+  COMMAND_HELP,
   type Command,
+  type CommandHelp,
+  commandUsage,
   DEFAULT_CHECKPOINTS,
   describeCheckpoints,
   HELP,
@@ -27,6 +32,15 @@ export {
   literalText,
   parseCommand,
 } from "./commands.js";
+export {
+  type AtToken,
+  atToken,
+  FilePicker,
+  insertPath,
+  rankFiles,
+  splitPath,
+} from "./file-picker.js";
+export { listRepoFiles, MAX_REPO_FILES } from "./files.js";
 export { Header, type HeaderInfo, type ModelsInfo, shortPath, TIP, WELCOME } from "./header.js";
 export {
   HIGHLIGHT_MAX_BYTES,

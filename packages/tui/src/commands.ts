@@ -23,20 +23,77 @@ export const DEFAULT_CHECKPOINTS: ReadonlySet<CheckpointKind> = new Set<Checkpoi
 
 const KINDS: readonly CheckpointKind[] = ["contract", "tests", "commit"];
 
+/** One slash command for `/help` and the `/` menu. `args` is shown after the name. */
+export type CommandHelp = {
+  /** Without the slash. */
+  name: string;
+  /** Usage hint after the name; absent when the command takes no arguments. */
+  args?: string;
+  /** Whether the arguments are required (`/run <task>`) or optional (`/resume [id]`). */
+  argsRequired?: boolean;
+  description: string;
+  /** Listed (and allowed) while a gated run is active. */
+  inRun: boolean;
+};
+
+/** The one command table: `/help` and the `/` menu are both built from it, so they cannot drift. */
+export const COMMAND_HELP: readonly CommandHelp[] = [
+  {
+    name: "run",
+    args: "<task>",
+    argsRequired: true,
+    description: "start a gated run directly",
+    inRun: false,
+  },
+  { name: "skills", description: "list skills; review pending repo skills", inRun: true },
+  {
+    name: "checkpoints",
+    args: "[contract] [tests] [commit] | off",
+    description: "show or set where runs pause for approval",
+    inRun: true,
+  },
+  { name: "model", description: "show the model routing", inRun: true },
+  {
+    name: "resume",
+    args: "[id]",
+    description: "list stored sessions, or resume one",
+    inRun: false,
+  },
+  {
+    name: "clear",
+    description: "start a fresh session (the old one stays resumable)",
+    inRun: false,
+  },
+  { name: "doctor", description: "check prerequisites", inRun: false },
+  { name: "skip", description: "decline a run's clarification questions", inRun: true },
+  { name: "help", description: "this list", inRun: true },
+  { name: "exit", description: "quit", inRun: false },
+];
+
+/** `/name args`, as `/help` and the menu show it. */
+export const commandUsage = (c: CommandHelp): string =>
+  c.args === undefined ? `/${c.name}` : `/${c.name} ${c.args}`;
+
+const HELP_COL = 19;
+
 export const HELP = [
-  "/run <task>        start a gated run directly",
-  "/skills            list skills; review pending repo skills",
-  "/checkpoints [contract] [tests] [commit] | off",
-  "                   show or set where runs pause for approval",
-  "/model             show the model routing",
-  "/resume [id]       list stored sessions, or resume one",
-  "/clear             start a fresh session (the old one stays resumable)",
-  "/doctor            check prerequisites",
-  "/skip              decline a run's clarification questions",
-  "/help              this list",
-  "/exit              quit",
-  "//text             send text that starts with a slash",
+  ...COMMAND_HELP.flatMap((c) => {
+    const usage = commandUsage(c);
+    // A usage too long for the column gets the description on its own line.
+    return usage.length < HELP_COL
+      ? [`${usage.padEnd(HELP_COL)}${c.description}`]
+      : [usage, `${"".padEnd(HELP_COL)}${c.description}`];
+  }),
+  `${"//text".padEnd(HELP_COL)}send text that starts with a slash`,
 ].join("\n");
+
+const IN_RUN = new Set(COMMAND_HELP.filter((c) => c.inRun).map((c) => c.name));
+
+/** Commands that work while a run is active (the others would race it or the session). */
+export function allowedInRun(c: Command): boolean {
+  if (c.kind === "checkpoints") return c.set === undefined;
+  return IN_RUN.has(c.kind);
+}
 
 /**
  * True when `line` is a slash command. A line starting with `//` is not: it is chat text with one

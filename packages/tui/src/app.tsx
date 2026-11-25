@@ -18,6 +18,7 @@ import { type RunDone, RunView } from "./board-view.js";
 import { STALE_PROMPT } from "./checkpoint.js";
 import {
   age,
+  allowedInRun,
   type Command,
   DEFAULT_CHECKPOINTS,
   describeCheckpoints,
@@ -25,6 +26,7 @@ import {
   literalText,
   parseCommand,
 } from "./commands.js";
+import { listRepoFiles } from "./files.js";
 import type { HeaderInfo, ModelsInfo } from "./header.js";
 import { InputBox } from "./input.js";
 import {
@@ -114,6 +116,11 @@ export type AppProps = {
   home?: string;
   /** The chat and run models, for the header and the status line. */
   models?: ModelsInfo;
+  /**
+   * The repo's files for the `@` picker (default `listRepoFiles` of `config.repo`, else `cwd`).
+   * Called at most once per session, when an `@` is first typed; `/clear` and `/resume` refresh.
+   */
+  listFiles?: () => Promise<string[]>;
 };
 
 const HIDDEN_NOTES = new Set([PROPOSAL_NOTE, TURN_LIMIT_NOTE]);
@@ -163,12 +170,6 @@ function skillsText(s: SkillsInfo | undefined, trustedLater: boolean): string {
   return lines.join("\n");
 }
 
-/** Commands that work while a run is active (the others would race it or the session). */
-function allowedInRun(c: Command): boolean {
-  if (c.kind === "checkpoints") return c.set === undefined;
-  return c.kind === "help" || c.kind === "model" || c.kind === "skills" || c.kind === "skip";
-}
-
 type Clarify = { prompt: Extract<PendingPrompt, { kind: "clarify" }>; answers: string[] };
 
 /** `contract,tests` (in the canonical order), or `off`. */
@@ -200,6 +201,30 @@ export function App(props: AppProps) {
     };
     return { kind: "header", info };
   }, [skillsNow, cwd, home, models]);
+  const listFilesProp = props.listFiles;
+  const filesRepo = typeof configRepo === "string" ? configRepo : cwd;
+  /** The `@` picker's file list: loaded on first want, per session (a swap resets it). */
+  const [files, setFiles] = useState<readonly string[]>([]);
+  const filesAsked = useRef(false);
+  const filesGen = useRef(0);
+  const wantFiles = useCallback(() => {
+    if (filesAsked.current) return;
+    filesAsked.current = true;
+    const gen = filesGen.current;
+    (listFilesProp ?? (() => listRepoFiles(filesRepo)))().then(
+      (list) => {
+        if (gen === filesGen.current) setFiles(list);
+      },
+      () => {}, // the picker just stays empty
+    );
+  }, [listFilesProp, filesRepo]);
+  const resetFiles = useCallback(() => {
+    filesGen.current++;
+    filesAsked.current = false;
+    setFiles([]);
+  }, []);
+  /** The `/` menu or the `@` picker is open: it owns Esc. */
+  const [popup, setPopup] = useState(false);
   /** The in-flight chat turn's abort, set while `send` runs. */
   const turnAbort = useRef<AbortController | undefined>(undefined);
   const sessionRef = useRef(props.session);
@@ -397,6 +422,7 @@ export function App(props: AppProps) {
           ]);
           setRegion((r) => r + 1);
           setContext(undefined);
+          resetFiles(); // `/clear` and `/resume` list the repo afresh
           // The new session re-resolved the skills: a trust given earlier is now in effect.
           setTrustedLater(false);
           await old.dispose();
@@ -404,7 +430,7 @@ export function App(props: AppProps) {
           add(errorEntry(err));
         }
       }),
-    [exclusive, add, headerEntry],
+    [exclusive, add, headerEntry, resetFiles],
   );
 
   const resume = useCallback(
@@ -602,7 +628,7 @@ export function App(props: AppProps) {
         <LiveTurn
           state={live}
           onInterrupt={abortTurn}
-          interruptible={run === undefined && proposal === undefined && !trustOpen}
+          interruptible={run === undefined && proposal === undefined && !trustOpen && !popup}
         />
       ) : null}
       <InputBox
@@ -611,6 +637,10 @@ export function App(props: AppProps) {
         // A clarification answer is free text: `?` types there.
         helpKey={clarify === undefined}
         onSubmit={submit}
+        inRun={run !== undefined}
+        files={files}
+        onWantFiles={wantFiles}
+        onPopup={setPopup}
       />
       <StatusLine
         model={models?.chat}
