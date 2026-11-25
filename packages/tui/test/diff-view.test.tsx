@@ -379,7 +379,12 @@ describe("checkpoint views", () => {
     await waitText(v, "Commit checkpoint");
     v.stdin.write("v");
     await waitText(v, "esc close");
-    v.stdin.write(KEY.esc);
+    // The view's key handler attaches in an effect after the frame shows: on a slow runner a key
+    // sent at once can land before it, so press again until the view has closed.
+    for (let i = 0; i < 20 && plain(v.lastFrame()).includes("esc close"); i++) {
+      v.stdin.write(KEY.esc);
+      await tick(100);
+    }
     await waitFor(v, (f) => !f.includes("esc close"), "the view to close");
     await tick(60);
     expect(abort).not.toHaveBeenCalled();

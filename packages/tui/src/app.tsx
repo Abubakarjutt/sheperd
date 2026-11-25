@@ -604,7 +604,12 @@ export function App(props: AppProps) {
   );
 
   /** Esc in the live area: aborts the turn's signal, like the Ctrl-C machine's abortTurn. */
-  const abortTurn = useCallback(() => turnAbort.current?.abort(), []);
+  // Reads the synchronous run mirror, not `interruptible` alone: in the render between a run
+  // starting and LiveTurn re-rendering, Esc must already be inert (Ctrl-C owns the run).
+  const abortTurn = useCallback(() => {
+    if (runRef.current !== undefined) return;
+    turnAbort.current?.abort();
+  }, []);
   const trustSkills = trustOpen ? skillsNow() : undefined;
   const inputOff =
     proposal !== undefined || trustOpen || (run !== undefined && pending?.kind === "checkpoint");

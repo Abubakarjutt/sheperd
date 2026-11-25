@@ -250,6 +250,8 @@ describe("terminal size subscription (I2)", () => {
         stdin: new TtyIn() as never,
         stderr: new TtyOut() as never,
         debug: false,
+        // Ink defaults to non-interactive under CI (is-in-ci) and then writes only at exit.
+        interactive: true,
         exitOnCtrlC: false,
         patchConsole: false,
       },
