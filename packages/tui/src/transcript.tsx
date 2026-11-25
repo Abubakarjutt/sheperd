@@ -1,4 +1,4 @@
-import { Box, Text } from "ink";
+import { Box, Static, Text } from "ink";
 import { fit } from "./fit.js";
 import { Safe } from "./safe.js";
 import { sanitize } from "./sanitize.js";
@@ -68,17 +68,31 @@ export function EntryLine({ entry }: { entry: TranscriptEntry }) {
   }
 }
 
-export function Transcript({ entries }: { entries: TranscriptEntry[] }) {
+/**
+ * Finished entries are printed once through Ink's `<Static>` (I3): once the transcript is taller
+ * than the terminal, a dynamic transcript would be rewritten, and pushed into scrollback again,
+ * on every keystroke. The list is append-only; a session swap (`/clear`, `/resume`) replaces it
+ * and changes `region`, which remounts `<Static>` so the new list prints from its start. Lines are
+ * cut to the width at the time they are printed; a later resize does not re-flow them.
+ */
+export function Transcript({
+  entries,
+  region = 0,
+}: {
+  entries: TranscriptEntry[];
+  region?: number;
+}) {
   return (
-    <Box flexDirection="column">
-      {entries.map((e, i) => (
-        // Append-only list: the index is a stable identity.
-        // biome-ignore lint/suspicious/noArrayIndexKey: entries are never reordered
-        <EntryLine key={i} entry={e} />
-      ))}
+    <>
+      <Static key={region} items={entries}>
+        {(e, i) => (
+          // Append-only list: the index is a stable identity.
+          <EntryLine key={i} entry={e} />
+        )}
+      </Static>
       {entries.length === 0 && (
         <Text color={theme.dim}>Ask about this repo, or describe a change.</Text>
       )}
-    </Box>
+    </>
   );
 }

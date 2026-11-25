@@ -319,6 +319,7 @@ describe("sessions", () => {
     expect(resume).toHaveBeenCalledWith("s-old");
     expect(old.dispose).toHaveBeenCalled();
     expect(v.lastFrame()).toContain("earlier answer");
+    expect(v.lastFrame()).toContain("─── resumed session s-old ───");
     await enter(v.stdin, "next");
     expect(next.sent).toEqual(["next"]);
   });
@@ -338,6 +339,7 @@ describe("sessions", () => {
     expect(old.dispose).toHaveBeenCalled();
     expect(create).toHaveBeenCalled();
     expect(v.lastFrame()).not.toContain("first reply");
+    expect(v.lastFrame()).toContain("─── new session ───"); // a fresh <Static> region (I3)
     await enter(v.stdin, "again");
     expect(next.sent).toEqual(["again"]);
   });

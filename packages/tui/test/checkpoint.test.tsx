@@ -260,12 +260,17 @@ describe("narrow terminals and resize (Review Focus 4)", () => {
       { kind: "error", code: "some_code", message: long },
       { kind: "assistant", text: `${"word ".repeat(30)}` },
     ];
-    const v = render(<Transcript entries={entries} />);
+    // I3: finished entries are printed once through <Static>, cut to the width at the time they
+    // are printed (a later resize does not re-flow them). So resize 120 -> 40 first, with an empty
+    // transcript, then append the entries and check they print truncated at 40.
+    const v = render(<Transcript entries={[]} />);
     setColumns(v.stdout, 120);
     v.stdout.emit("resize");
     await tick();
     setColumns(v.stdout, 40);
     expect(() => v.stdout.emit("resize")).not.toThrow();
+    await tick();
+    v.rerender(<Transcript entries={entries} />);
     await tick();
     const ls = lines(v.lastFrame());
     expect(ls[0]?.endsWith("…")).toBe(true); // user echo, first line

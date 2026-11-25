@@ -95,6 +95,7 @@ const HIDDEN_NOTES = new Set([PROPOSAL_NOTE, TURN_LIMIT_NOTE]);
 
 export const RUN_ACTIVE = "a run is active; answer its prompt or press Ctrl-C to abort";
 export const STALE_PROMPT = "that prompt is no longer active";
+const SEPARATOR = "───";
 export const TRUSTED_LATER = "trusted; takes effect in a new session (/clear)";
 
 /** Entries for a resumed session: user and assistant text only, minus the persisted placeholders. */
@@ -157,6 +158,8 @@ export function App(props: AppProps) {
   const turnAbort = useRef<AbortController | undefined>(undefined);
   const sessionRef = useRef(props.session);
   const [entries, setEntries] = useState<TranscriptEntry[]>(() => historyEntries(props.session));
+  /** Bumped on every session swap: a fresh `<Static>` region for the new transcript (I3). */
+  const [region, setRegion] = useState(0);
   const [busy, setBusy] = useState(false);
   const inFlight = useRef(false);
   const [run, setRunState] = useState<RunHandle | undefined>(props.run);
@@ -274,13 +277,22 @@ export function App(props: AppProps) {
   );
 
   const swapSession = useCallback(
-    (make: () => Promise<ChatSession>, entriesOf: (s: ChatSession) => TranscriptEntry[]) =>
+    (
+      make: () => Promise<ChatSession>,
+      entriesOf: (s: ChatSession) => TranscriptEntry[],
+      label: string,
+    ) =>
       exclusive(async () => {
         try {
           const next = await make();
           const old = sessionRef.current;
           sessionRef.current = next;
-          setEntries(entriesOf(next));
+          // The old transcript stays in the terminal's scrollback above this separator.
+          setEntries([
+            { kind: "note", text: `${SEPARATOR} ${label} ${SEPARATOR}` },
+            ...entriesOf(next),
+          ]);
+          setRegion((r) => r + 1);
           // The new session re-resolved the skills: a trust given earlier is now in effect.
           setTrustedLater(false);
           await old.dispose();
@@ -310,13 +322,17 @@ export function App(props: AppProps) {
         );
         return;
       }
-      swapSession(async () => {
-        const known = (await sessions.list()).some((s) => s.id === id);
-        if (!known) {
-          throw new RewireError("session_not_found", `no stored session ${id} in this repo`);
-        }
-        return await sessions.resume(id);
-      }, historyEntries);
+      swapSession(
+        async () => {
+          const known = (await sessions.list()).some((s) => s.id === id);
+          if (!known) {
+            throw new RewireError("session_not_found", `no stored session ${id} in this repo`);
+          }
+          return await sessions.resume(id);
+        },
+        historyEntries,
+        `resumed session ${id}`,
+      );
     },
     [sessions, swapSession, note, add],
   );
@@ -347,6 +363,7 @@ export function App(props: AppProps) {
           return swapSession(
             () => sessions.create(),
             () => [],
+            "new session",
           );
         case "doctor":
           if (!doctor) return note("doctor is not available here", true);
@@ -450,7 +467,7 @@ export function App(props: AppProps) {
 
   return (
     <Box flexDirection="column">
-      <Transcript entries={entries} />
+      <Transcript entries={entries} region={region} />
       {run ? <RunView run={run} onDone={onRunDone} onPending={onPending} /> : null}
       {clarify ? (
         <ClarifyPanel questions={clarify.prompt.questions} index={clarify.answers.length} />
