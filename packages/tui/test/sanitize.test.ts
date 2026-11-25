@@ -34,3 +34,15 @@ describe("sanitize", () => {
     expect(performance.now() - t0).toBeLessThan(2000);
   });
 });
+
+describe("sanitize: bidi, invisibles and aborted strings", () => {
+  it("strips bidi and invisible format characters like core's stripControls", () => {
+    expect(sanitize("a‮b⁦c⁩d​e‏f﻿g‪")).toBe("abcdefg");
+  });
+  it("ends an unterminated OSC at a later ESC, CAN or SUB, keeping the text after it", () => {
+    expect(sanitize("a\x1b]quoted \x1b[31mb")).toBe("ab");
+    expect(sanitize("a\x1b]junk\x18b")).toBe("ab");
+    expect(sanitize("a\x1b]junk\x1ab")).toBe("ab");
+    expect(sanitize("a\x1b]junk\x1b\\b")).toBe("ab");
+  });
+});

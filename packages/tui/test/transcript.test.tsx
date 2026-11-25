@@ -1,9 +1,11 @@
 import { RewireError } from "@rewire/core";
 import type { ChatEvent, ChatSession, ChatTurn, RunController } from "@rewire/session";
 import { PROPOSAL_NOTE, TURN_LIMIT_NOTE } from "@rewire/session";
+import { Text } from "ink";
 import { render } from "ink-testing-library";
 import { describe, expect, it } from "vitest";
 import { App } from "../src/app.js";
+import { Safe } from "../src/safe.js";
 
 const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 
@@ -83,11 +85,35 @@ describe("tui transcript", () => {
     expect(frame).toContain("reply aredb");
     expect(frame).toContain("old aredb");
     expect(frame).toContain("Read aredb");
-    // Ink wraps its own styling in ESC sequences: with an uncolored line none may come from the text.
-    expect(frame).not.toContain("52;c;");
-    expect(frame).not.toContain("\x1b[2J");
-    expect(frame).not.toContain("\x1b]");
+    // ink-testing-library frames carry no styling of their own, so no ESC byte may appear at all.
+    expect(frame).not.toContain("\x1b");
     expect(frame).not.toContain("\x07");
+    expect(frame).not.toContain("52;c;");
+  });
+
+  it("Safe keeps no ESC byte (SGR, C1 and OSC) and a bare Text would", async () => {
+    const evil = "x\x1b[31mred\x1b[0m \u009b2J \u009d52;c;ZXZpbA==\u009c\x1b]52;c;ZXZpbA==\x07y";
+    const safe = render(<Safe>{evil}</Safe>);
+    expect(safe.lastFrame()).not.toContain("\x1b");
+    expect(safe.lastFrame()).not.toContain("\u009b");
+    expect(safe.lastFrame()).toContain("xred");
+    const bare = render(<Text>{evil}</Text>);
+    expect(bare.lastFrame()).toContain("\x1b"); // guards the check: Ink keeps SGR itself
+  });
+
+  it("redacts secrets in error text", async () => {
+    const { session } = fakeSession({
+      send: async () => {
+        throw new Error("boom sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789");
+      },
+    });
+    const { stdin, lastFrame } = mount(session);
+    await tick();
+    await type(stdin, "a");
+    await type(stdin, "\r");
+    await tick();
+    expect(lastFrame()).toContain("boom");
+    expect(lastFrame()).not.toContain("abcdefghijklmnopqrstuvwxyz");
   });
 
   it("shows a send rejection as a red error line with its code and stays usable", async () => {

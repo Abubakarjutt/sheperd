@@ -1,4 +1,4 @@
-import { RewireError } from "@rewire/core";
+import { RewireError, redact } from "@rewire/core";
 import {
   type ChatEvent,
   type ChatSession,
@@ -20,7 +20,7 @@ export type AppProps = {
   config: AppConfig;
   /** Receives the chat events: wire `emit` of the ChatSession to the function it hands out. */
   subscribe?: (listener: (e: ChatEvent) => void) => () => void;
-  /** Resolves the exit code of `renderTui` (`/exit`, Ctrl-C: wired in Tasks 13 and 14). */
+  /** Resolves the exit code of `renderTui` (`/exit`, Ctrl-C: wired in Tasks 13 and 14; Ink runs with exitOnCtrlC false, so Task 14 owns Ctrl-C). */
   onExit?: (code: number) => void;
 };
 
@@ -72,7 +72,7 @@ export function App({ session, subscribe }: AppProps) {
         })
         .catch((err: unknown) => {
           const code = err instanceof RewireError ? err.code : "error";
-          const message = err instanceof Error ? err.message : String(err);
+          const message = redact(err instanceof Error ? err.message : String(err));
           add({ kind: "error", code, message });
         })
         .finally(() => {

@@ -1,8 +1,20 @@
 const ESC = 0x1b;
 const BEL = 0x07;
+const CAN = 0x18;
+const SUB = 0x1a;
 
 /** Introducers of control strings (OSC, DCS, SOS, PM, APC), as the byte after ESC. */
 const STRING_INTRODUCERS = new Set([0x5d, 0x50, 0x58, 0x5e, 0x5f]);
+
+/** Bidi and invisible format characters: the same set as core's `stripControls`. */
+function isInvisible(c: number): boolean {
+  return (
+    (c >= 0x200b && c <= 0x200f) ||
+    (c >= 0x202a && c <= 0x202e) ||
+    (c >= 0x2066 && c <= 0x2069) ||
+    c === 0xfeff
+  );
+}
 
 /** Index just past a CSI sequence whose parameter bytes start at `i`. */
 function skipCsi(text: string, start: number): number {
@@ -19,14 +31,16 @@ function skipCsi(text: string, start: number): number {
 }
 
 /**
- * Index just past a control string whose body starts at `i`: terminated by BEL or ST (ESC \).
- * An unterminated string swallows the rest of the text, so it can never leak into the terminal.
+ * Index just past a control string whose body starts at `i`: ended by BEL, ST (ESC \), CAN or
+ * SUB, or abandoned at a following ESC (as VT parsers do; the ESC then starts a new sequence).
+ * An otherwise unterminated string swallows the rest of the text. Safety does not depend on
+ * where a string ends: only allow-listed characters are ever appended.
  */
 function skipString(text: string, start: number): number {
   for (let i = start; i < text.length; i++) {
     const c = text.charCodeAt(i);
-    if (c === BEL || c === 0x9c) return i + 1;
-    if (c === ESC && text.charCodeAt(i + 1) === 0x5c) return i + 2;
+    if (c === BEL || c === 0x9c || c === CAN || c === SUB) return i + 1;
+    if (c === ESC) return text.charCodeAt(i + 1) === 0x5c ? i + 2 : i; // ST, or a new sequence
   }
   return text.length;
 }
@@ -35,7 +49,8 @@ function skipString(text: string, start: number): number {
  * Makes untrusted text inert for a terminal. Single linear pass (no regex, no backtracking).
  * Strips CSI, OSC, DCS/SOS/PM/APC strings and other ESC sequences; C0 controls except `\n` and
  * `\t` (NUL included); DEL; C1 (U+0080 to U+009F). `\r\n` becomes `\n` and a lone `\r` is
- * dropped (it would otherwise let text overwrite the line it follows).
+ * dropped (it would otherwise let text overwrite the line it follows). Bidi and invisible
+ * format characters (U+200B-200F, U+202A-202E, U+2066-2069, U+FEFF) are dropped too.
  */
 export function sanitize(text: string): string {
   let out = "";
@@ -70,7 +85,9 @@ export function sanitize(text: string): string {
       continue;
     }
     const allowed =
-      c === 0x0a || c === 0x09 || (c >= 0x20 && c !== 0x7f && !(c >= 0x80 && c <= 0x9f));
+      c === 0x0a ||
+      c === 0x09 ||
+      (c >= 0x20 && c !== 0x7f && !(c >= 0x80 && c <= 0x9f) && !isInvisible(c));
     if (allowed) out += text[i];
     i++;
   }
