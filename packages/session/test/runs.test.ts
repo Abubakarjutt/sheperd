@@ -30,8 +30,16 @@ import {
   text,
 } from "@rewire/providers";
 import { sandboxAvailable } from "@rewire/sandbox";
+import { createSkillSet, disposeSkillSet } from "@rewire/skills";
 import { afterAll, describe, expect, test } from "vitest";
-import { outcomeMessage, type PendingPrompt, RunController, type RunHandle } from "../src/index.js";
+import {
+  ChatSession,
+  outcomeMessage,
+  type PendingPrompt,
+  RunController,
+  type RunHandle,
+  SessionStore,
+} from "../src/index.js";
 
 const ROUTING: RoleRouting = {
   spec: { provider: "faux", model: "spec" },
@@ -579,6 +587,38 @@ describe.skipIf(!sandboxAvailable())("RunController (real runPipeline, faux mode
     await until(() => h2.pending(), 30_000);
     h2.abort();
     expect((await h2.done).escalation?.reason).toBe("interrupted");
+  });
+
+  test("a persisted chat turn does not make the next gated run fail preflight (C1)", async () => {
+    // No .gitignore for .rewire/: the repo of a user who never added the sessions dir to it.
+    const repo = makeRepo();
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "rewire-runs-skills-")));
+    dirs.push(base);
+    const set = createSkillSet([], {
+      home: join(base, "home"),
+      xdgConfig: join(base, "config"),
+      cacheDir: join(base, "cache"),
+    });
+    const session = new ChatSession({
+      repo,
+      model: { provider: "faux", model: "chat" },
+      provider: new FauxProvider([text("hello")]),
+      policy: DEFAULT_POLICY,
+      skills: set,
+      store: new SessionStore(),
+      emit: () => {},
+    });
+    try {
+      await session.send("hi");
+      const id = session.id() as string;
+      expect(existsSync(join(repo, ".rewire", "sessions", `${id}.jsonl`))).toBe(true);
+      const o = await realController(repo).start("add sum(a,b)", { checkpoints: NONE }).done;
+      expect(o.escalation?.reason).toBeUndefined();
+      expect(o.status).toBe("verified");
+    } finally {
+      await session.dispose();
+      await disposeSkillSet(set);
+    }
   });
 
   test("approve at the contract continues; tests (not in the set) never pause", async () => {

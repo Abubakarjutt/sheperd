@@ -76,6 +76,13 @@ test("run artifacts under .rewire/runs, worktrees and cache do not make the repo
   await expect(assertCleanRepo(dir)).rejects.toMatchObject({ code: "dirty_tree" });
 });
 
+test("chat sessions under .rewire/sessions do not make the repo dirty (C1)", async () => {
+  const dir = makeRepo();
+  mkdirSync(join(dir, ".rewire", "sessions"), { recursive: true });
+  writeFileSync(join(dir, ".rewire", "sessions", "20261125-000000-abcdef.jsonl"), "{}\n");
+  await expect(assertCleanRepo(dir)).resolves.toMatchObject({ branch: "main" });
+});
+
 test("orchestrator git runs hardened: no hooks, no GIT_* env overrides", async () => {
   const dir = makeRepo();
   const hooks = join(dir, ".hooks");

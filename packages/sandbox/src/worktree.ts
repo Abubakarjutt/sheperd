@@ -112,10 +112,16 @@ export async function trustedGitOk(
 const git = (cwd: string, args: string[]): Promise<GitResult> => trustedGit(cwd, args);
 const gitOk = (cwd: string, args: string[]): Promise<string> => trustedGitOk(cwd, args);
 
-/** Run artifacts rewire itself writes into the target repo; never "uncommitted changes". */
-const RUN_ARTIFACTS = [".rewire/runs", ".rewire/worktrees", ".rewire/cache"].map(
-  (p) => `:(exclude,top)${p}`,
-);
+/**
+ * Artifacts rewire itself writes into the target repo (runs, worktrees, cache, and the TUI's
+ * chat sessions); never "uncommitted changes".
+ */
+const RUN_ARTIFACTS = [
+  ".rewire/runs",
+  ".rewire/worktrees",
+  ".rewire/cache",
+  ".rewire/sessions",
+].map((p) => `:(exclude,top)${p}`);
 
 export async function assertCleanRepo(repo: string): Promise<{ head: string; branch: string }> {
   const top = await git(repo, ["rev-parse", "--show-toplevel"]);
