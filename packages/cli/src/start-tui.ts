@@ -85,6 +85,9 @@ export async function startInteractive(d: StartDeps): Promise<number> {
   let closeUi: ((code: number) => void) | undefined;
   let exiting: number | undefined;
   let activeRun: RunHandle | undefined;
+  const building = new Set<Promise<ChatSession>>();
+  const closing = (): RewireError =>
+    new RewireError("session_disposed", "the interactive session is closing");
 
   const exit = (code: 0 | 130): void => {
     if (exiting !== undefined) {
@@ -161,9 +164,10 @@ export async function startInteractive(d: StartDeps): Promise<number> {
     };
 
     /** A session on freshly discovered and resolved skills (a trust given mid-session applies). */
-    const fresh = async (sessionId?: string): Promise<ChatSession> => {
+    const build = async (sessionId?: string): Promise<ChatSession> => {
       if (activeRun) throw new RewireError("run_in_progress", "a run is active");
       const next = await resolveNow();
+      if (exiting !== undefined) throw closing();
       const nextSet = d.createSkillSet(next.active);
       let s: ChatSession;
       try {
@@ -176,6 +180,12 @@ export async function startInteractive(d: StartDeps): Promise<number> {
         await d.disposeSkillSet(nextSet).catch(() => {});
         throw e;
       }
+      // The TUI exited while this was being built: cleanup is waiting on us, so dispose it here.
+      if (exiting !== undefined) {
+        await s.dispose().catch(() => {});
+        await d.disposeSkillSet(nextSet).catch(() => {});
+        throw closing();
+      }
       track(s);
       const old = set;
       set = nextSet;
@@ -185,6 +195,17 @@ export async function startInteractive(d: StartDeps): Promise<number> {
       sets.splice(sets.indexOf(old), 1);
       await d.disposeSkillSet(old).catch(() => {});
       return s;
+    };
+
+    /** `/clear` and `/resume` in flight; cleanup waits for them (bounded) so nothing leaks. */
+    const fresh = (sessionId?: string): Promise<ChatSession> => {
+      const p = build(sessionId);
+      building.add(p);
+      void p.then(
+        () => building.delete(p),
+        () => building.delete(p),
+      );
+      return p;
     };
 
     if (exiting !== undefined) return exiting;
@@ -217,6 +238,8 @@ export async function startInteractive(d: StartDeps): Promise<number> {
       run?.abort();
       target?.abortTurn();
       const cleanup = (async () => {
+        // A build in flight sees `exiting` and disposes what it made, or registered it already.
+        await Promise.allSettled([...building]);
         await Promise.allSettled([
           ...(run ? [run.done] : []),
           ...[...sessions].map((s) => s.dispose()),

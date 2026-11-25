@@ -1,3 +1,4 @@
+import { RewireError } from "@rewire/core";
 import type { ChatEvent } from "@rewire/session";
 import type { Skill } from "@rewire/skills";
 import { type RenderOptions, render, useInput } from "ink";
@@ -73,6 +74,8 @@ function mount(
     onInterrupt?: (() => void) | undefined;
     bindExit?: ((exit: (code: number) => void) => void) | undefined;
     renderOptions?: TuiRenderOptions | undefined;
+    /** Called with a render-time throw, before `exit(1)`. */
+    onError?: ((e: unknown) => void) | undefined;
   },
 ): Promise<number> {
   return new Promise<number>((resolve) => {
@@ -97,7 +100,16 @@ function mount(
         Fragment,
         null,
         onInterrupt ? createElement(InterruptKeys, { onInterrupt }) : null,
-        createElement(Boundary, { onError: () => exit(1) }, node(exit)),
+        createElement(
+          Boundary,
+          {
+            onError: (e: unknown) => {
+              opts.onError?.(e);
+              exit(1);
+            },
+          },
+          node(exit),
+        ),
       ),
       { ...opts.renderOptions, exitOnCtrlC: false },
     );
@@ -157,10 +169,12 @@ export type TrustPromptRenderDeps = {
 
 /**
  * The startup trust prompt, on its own before the app: resolves `true` once the approval is
- * saved, `false` when declined, and `undefined` when closed by `exit` (Ctrl-C) or a render error.
+ * saved, `false` when declined, and `undefined` when closed by `exit` (Ctrl-C). A render error
+ * rejects with `tui_render_failed` (never a silent close). The message is not sanitized here.
  */
 export async function renderTrustPrompt(deps: TrustPromptRenderDeps): Promise<boolean | undefined> {
   let answer: boolean | undefined;
+  let failure: { error: unknown } | undefined;
   await mount(
     (exit) =>
       createElement(TrustPrompt, {
@@ -173,8 +187,22 @@ export async function renderTrustPrompt(deps: TrustPromptRenderDeps): Promise<bo
           exit(0);
         },
       }),
-    { onInterrupt: deps.onInterrupt, bindExit: deps.bindExit, renderOptions: deps.renderOptions },
+    {
+      onInterrupt: deps.onInterrupt,
+      bindExit: deps.bindExit,
+      renderOptions: deps.renderOptions,
+      onError: (error) => {
+        failure = { error };
+      },
+    },
   );
+  if (failure) {
+    const e = failure.error;
+    throw new RewireError(
+      "tui_render_failed",
+      `the trust prompt failed: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
   return answer;
 }
 

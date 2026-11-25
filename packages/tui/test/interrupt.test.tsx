@@ -251,4 +251,23 @@ describe("renderTrustPrompt", () => {
     expect(await p).toBeUndefined();
     expect(presses).toBe(1);
   });
+
+  it("rejects with tui_render_failed when the prompt throws while rendering", async () => {
+    const s = streams();
+    const bad = {
+      ...found[0],
+      get description(): string {
+        throw new Error("bad description");
+      },
+    } as Skill;
+    await expect(
+      renderTrustPrompt({
+        found: [bad],
+        pendingRepo: [bad],
+        repo: "/r",
+        trustFile: "/t",
+        renderOptions: { ...s.opts, patchConsole: false },
+      }),
+    ).rejects.toMatchObject({ code: "tui_render_failed" });
+  });
 });

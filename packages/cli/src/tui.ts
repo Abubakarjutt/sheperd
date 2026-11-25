@@ -1,4 +1,3 @@
-import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { resolveRouting } from "@rewire/pipeline";
@@ -21,6 +20,7 @@ import { isInteractive, tuiRequiresTty } from "./interactive.js";
 import { effectivePlatform } from "./platform.js";
 import { FAUX_WARNING, providerFactory, resolveModels } from "./run.js";
 import { startInteractive } from "./start-tui.js";
+import { xdgDirs } from "./xdg.js";
 
 export type ChatOptions = { repo?: string | undefined; models?: string | undefined };
 
@@ -70,12 +70,7 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
   if (faux) io.stderr.write(`${FAUX_WARNING}\n`);
 
   const providers = providerFactory(io.env, faux);
-  const home = io.env.HOME && io.env.HOME !== "" ? io.env.HOME : homedir();
-  const xdgConfig =
-    io.env.XDG_CONFIG_HOME && io.env.XDG_CONFIG_HOME !== ""
-      ? io.env.XDG_CONFIG_HOME
-      : join(home, ".config");
-  const xdgCache = io.env.XDG_CACHE_HOME;
+  const { home, xdgConfig, cacheDir } = xdgDirs(io.env);
   const trustFile = join(xdgConfig, "rewire", "trusted-skills.json");
   const store = new SessionStore();
   // The chat model is the author model.
@@ -98,8 +93,7 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
         bindExit: p.bindExit,
         renderOptions,
       }),
-    createSkillSet: (active) =>
-      createSkillSet(active, { home, xdgConfig, ...(xdgCache ? { cacheDir: xdgCache } : {}) }),
+    createSkillSet: (active) => createSkillSet(active, { home, xdgConfig, cacheDir }),
     disposeSkillSet,
     newSession: async ({ skills, emit, sessionId }) => {
       const opts = {

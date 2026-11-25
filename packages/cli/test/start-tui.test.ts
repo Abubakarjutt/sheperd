@@ -3,7 +3,9 @@ import type { ChatEvent, ChatSession, RunHandle } from "@rewire/session";
 import type { Skill, SkillSet } from "@rewire/skills";
 import type { InterruptTarget, SkillsInfo, TuiDeps } from "@rewire/tui";
 import { describe, expect, test } from "vitest";
+import { formatError } from "../src/run.js";
 import { type StartDeps, startInteractive } from "../src/start-tui.js";
+import { xdgDirs } from "../src/xdg.js";
 
 const skill = (name: string, source: "user" | "repo", extra: Partial<Skill> = {}): Skill => ({
   name,
@@ -296,15 +298,26 @@ describe("startInteractive wiring", () => {
     expect(f.log.at(-1)).toBe("restore");
   });
 
-  test("exit waits for an active run's done, bounded", async () => {
+  test("exit aborts an active run and waits for its done (the report) before returning", async () => {
     let resolveDone: (() => void) | undefined;
     const done = new Promise<void>((r) => {
       resolveDone = r;
     });
     const f = fakeDeps({
-      disposeTimeoutMs: 100,
+      disposeTimeoutMs: 1000,
       newRunController: () => ({
-        start: () => ({ abort: () => resolveDone?.(), done }) as unknown as RunHandle,
+        start: () =>
+          ({
+            abort: () => {
+              f.log.push("abort");
+              // The interrupted report is written a little later, then `done` settles.
+              setTimeout(() => {
+                f.log.push("done");
+                resolveDone?.();
+              }, 30);
+            },
+            done,
+          }) as unknown as RunHandle,
       }),
       render: async (d) => {
         d.runController.start("t", { checkpoints: new Set() });
@@ -312,6 +325,80 @@ describe("startInteractive wiring", () => {
       },
     });
     expect(await startInteractive(f.deps)).toBe(130);
+    const at = (s: string) => f.log.indexOf(s);
+    expect(at("abort")).toBeGreaterThan(-1);
+    expect(at("done")).toBeGreaterThan(at("abort"));
+    expect(at("done")).toBeLessThan(at("restore"));
+    expect(at("done")).toBeLessThan(at("dispose /cache/set-1"));
+  });
+
+  test("a run whose done never settles delays exit by the bound, not forever", async () => {
+    const f = fakeDeps({
+      disposeTimeoutMs: 120,
+      newRunController: () => ({
+        start: () => ({ abort: () => {}, done: new Promise(() => {}) }) as unknown as RunHandle,
+      }),
+      render: async (d) => {
+        d.runController.start("t", { checkpoints: new Set() });
+        return 0;
+      },
+    });
+    const t0 = Date.now();
+    await startInteractive(f.deps);
+    const took = Date.now() - t0;
+    expect(took).toBeGreaterThanOrEqual(100);
+    expect(took).toBeLessThan(1000);
+  });
+
+  test("a crash in the startup trust prompt rejects (printed redacted, exit 1), never exits 0", async () => {
+    const secret = `sk-${"B".repeat(30)}`;
+    const f = fakeDeps({
+      found: [[skill("r1", "repo")]],
+      promptTrust: async () => {
+        throw new RewireError(
+          "tui_render_failed",
+          `the trust prompt failed: \x1b]52;c;x\x07 ${secret}`,
+        );
+      },
+    });
+    const err = await startInteractive(f.deps).catch((e: unknown) => e);
+    expect((err as RewireError).code).toBe("tui_render_failed");
+    expect(f.log).not.toContain("render");
+    expect(f.log.at(-1)).toBe("restore");
+    // What `rewire chat` prints for it (stderr, exit 1): sanitized and redacted.
+    const line = formatError(err);
+    expect(line).toContain("tui_render_failed");
+    expect(line).not.toContain("\x1b");
+    expect(line).not.toContain("\x07");
+    expect(line).not.toContain(secret);
+  });
+
+  test("an exit while /clear is still building disposes the new set and session", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const f = fakeDeps({
+      disposeTimeoutMs: 1000,
+      render: async (d) => {
+        void d.sessions?.create().catch(() => {});
+        await new Promise((r) => setTimeout(r, 5));
+        // The session factory finishes only after the TUI has exited.
+        setTimeout(() => release?.(), 30);
+        return 0;
+      },
+    });
+    const base = f.deps.newSession;
+    let n = 0;
+    f.deps.newSession = async (o) => {
+      if (++n === 2) await gate;
+      return base(o);
+    };
+    await startInteractive(f.deps);
+    expect(f.createdSets.map((c) => c.set.root)).toEqual(["/cache/set-1", "/cache/set-2"]);
+    expect(f.disposedSets.map((s) => s.root).sort()).toEqual(["/cache/set-1", "/cache/set-2"]);
+    expect(f.log).toContain("dispose session 2");
+    expect(f.log.indexOf("dispose session 2")).toBeLessThan(f.log.indexOf("restore"));
   });
 
   test("a hung disposal does not block exit beyond the bound", async () => {
@@ -338,5 +425,21 @@ describe("startInteractive wiring", () => {
       },
     });
     await startInteractive(f.deps);
+  });
+});
+
+describe("xdgDirs", () => {
+  test("only absolute XDG values and HOME are used; relative ones fall back under HOME", () => {
+    expect(
+      xdgDirs({ HOME: "/h", XDG_CONFIG_HOME: "/c", XDG_CACHE_HOME: "/k" }, () => "/fallback"),
+    ).toEqual({ home: "/h", xdgConfig: "/c", cacheDir: "/k" });
+    expect(
+      xdgDirs({ HOME: "/h", XDG_CONFIG_HOME: ".config", XDG_CACHE_HOME: "cache" }, () => "/x"),
+    ).toEqual({ home: "/h", xdgConfig: "/h/.config", cacheDir: "/h/.cache" });
+    expect(xdgDirs({ HOME: "rel", XDG_CACHE_HOME: "" }, () => "/real")).toEqual({
+      home: "/real",
+      xdgConfig: "/real/.config",
+      cacheDir: "/real/.cache",
+    });
   });
 });
