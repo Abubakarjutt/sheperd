@@ -1,4 +1,4 @@
-import { type ChatRequest, FauxProvider, TokenEstimator } from "@rewire/providers";
+import { type ChatRequest, FauxProvider, type Provider, TokenEstimator } from "@rewire/providers";
 import { describe, expect, test } from "vitest";
 import {
   ACTIVE_ITEMS_MAX,
@@ -6,6 +6,7 @@ import {
   CompactionOps,
   checkInvariants,
   compact,
+  createRiskyVerifier,
   emptyRecord,
   isRiskyOp,
   type RecordItem,
@@ -435,35 +436,32 @@ describe("invariants (review focus 2)", () => {
   });
 
   test("changing an existing user item may cite only the current window (N2)", async () => {
-    const record = withItems([userItem({ text: "use sqlite" })]);
+    const ids = ["i1", "i2", "i3", "i4", "i5"];
+    const record = withItems(ids.map((id) => userItem({ id, text: `use sqlite ${id}` })));
     const stale = [{ messageId: "m0", quote: "keep the public API stable" }];
+    const ci = [{ messageId: "m4", quote: "never touch the CI config" }];
     const provider = faux(
       json([
         { op: "update", itemId: "i1", text: "keep the public API stable", evidence: stale },
-        { op: "resolve", itemId: "i1", evidence: stale },
+        { op: "resolve", itemId: "i2", evidence: stale },
         {
           op: "supersede",
-          itemId: "i1",
+          itemId: "i3",
           by: { kind: "constraint", text: "keep the API", source: "user", evidence: stale },
           evidence: stale,
         },
         {
           op: "supersede",
-          itemId: "i1",
+          itemId: "i4",
           by: {
             kind: "constraint",
             text: "never touch the CI config",
             source: "user",
-            evidence: [{ messageId: "m4", quote: "never touch the CI config" }],
+            evidence: ci,
           },
           evidence: stale,
         },
-        {
-          op: "update",
-          itemId: "i1",
-          text: "use sqlite; never touch the CI config",
-          evidence: [{ messageId: "m4", quote: "never touch the CI config" }],
-        },
+        { op: "update", itemId: "i5", text: "use sqlite; never touch the CI config", evidence: ci },
       ]),
     );
     const r = await run({ record, messages: base, since: "m3", provider, model: "m" });
@@ -471,6 +469,29 @@ describe("invariants (review focus 2)", () => {
     if (!r.ok) return;
     expect(r.ops.map((o) => o.accepted)).toEqual([false, false, false, false, true]);
     for (const o of r.ops.slice(0, 4)) expect(o.reason).toMatch(/window/);
+  });
+
+  test("a user supersede with the evidence on the op only uses it for the replacement (M2)", async () => {
+    const record = withItems([userItem({ kind: "decision", text: "parse by hand" })]);
+    const provider = faux(
+      json([
+        {
+          op: "supersede",
+          itemId: "i1",
+          by: { kind: "decision", text: "use zod", source: "user" },
+          evidence: [{ messageId: "m4", quote: "Sounds good, use zod." }],
+        },
+      ]),
+    );
+    const r = await run({ record, messages: base, since: "m3", provider, model: "m" });
+    expect(r.ok && r.ops[0]?.accepted).toBe(true);
+    expect(r.ok && r.record.items).toEqual([
+      expect.objectContaining({
+        text: "use zod",
+        source: "user",
+        evidence: [{ messageId: "m4", quote: "Sounds good, use zod." }],
+      }),
+    ]);
   });
 
   test("a user item superseded by an inferred item is rejected (N3)", async () => {
@@ -543,15 +564,20 @@ describe("invariants (review focus 2)", () => {
       kind: "next_step",
       evidence: undefined,
     });
-    const record = withItems([inferred, { ...inferred, id: "i3", text: "read list.ts" }]);
+    const record = withItems([
+      inferred,
+      { ...inferred, id: "i3", text: "read list.ts" },
+      { ...inferred, id: "i4", text: "read list.ts again" },
+      { ...inferred, id: "i5", text: "find the list command" },
+    ]);
     const listQuote = [{ messageId: "m3", quote: "The list command lives in src/list.ts." }];
     const provider = faux(
       json([
         { op: "update", itemId: "i2", text: "add the --json flag" },
         { op: "resolve", itemId: "i3" },
-        { op: "resolve", itemId: "i3", evidence: [] },
-        { op: "resolve", itemId: "i3", evidence: listQuote },
-        { op: "resolve", itemId: "i3", evidence: listQuote },
+        { op: "resolve", itemId: "i4", evidence: [] },
+        { op: "resolve", itemId: "i5", evidence: listQuote },
+        { op: "resolve", itemId: "i5", evidence: listQuote },
         { op: "update", itemId: "nope", text: "x" },
       ]),
     );
@@ -560,10 +586,14 @@ describe("invariants (review focus 2)", () => {
     if (!r.ok) return;
     expect(r.ops.map((o) => o.accepted)).toEqual([true, false, false, true, false, false]);
     expect(r.ops[1]?.reason).toMatch(/resolve needs evidence/);
-    expect(r.record.items).toEqual([
-      expect.objectContaining({ id: "i2", text: "add the --json flag", status: "active" }),
+    expect(r.ops[2]?.reason).toMatch(/resolve needs evidence/);
+    expect(r.ops[4]?.reason).toMatch(/^duplicate_target/);
+    expect(r.record.items.map((i) => [i.id, i.text])).toEqual([
+      ["i2", "add the --json flag"],
+      ["i3", "read list.ts"],
+      ["i4", "read list.ts again"],
     ]);
-    expect(r.record.archive).toEqual([expect.objectContaining({ id: "i3", status: "resolved" })]);
+    expect(r.record.archive).toEqual([expect.objectContaining({ id: "i5", status: "resolved" })]);
   });
 
   test("no evidence-free removal: a goal superseded by 'delete everything', a preserve resolved", async () => {
@@ -1049,6 +1079,10 @@ describe("verifier hook", () => {
     expect(isRiskyOp({ ...add, source: "user" })).toBe(true);
     expect(isRiskyOp({ op: "update", itemId: "i1", text: "x" }, userItem())).toBe(true);
     expect(isRiskyOp({ op: "update", itemId: "i1", text: "x" }, inferred)).toBe(false);
+    // M3: rewriting an open question changes its meaning.
+    expect(
+      isRiskyOp({ op: "update", itemId: "i1", text: "x" }, { ...inferred, kind: "open_question" }),
+    ).toBe(true);
     expect(isRiskyOp({ op: "resolve", itemId: "i1" }, inferred)).toBe(false);
     expect(isRiskyOp({ op: "resolve", itemId: "i1" }, { ...inferred, kind: "open_question" })).toBe(
       true,
@@ -1063,10 +1097,12 @@ describe("verifier hook", () => {
     ).toBe(true);
   });
 
-  test("a throwing verifier rejects the risky ops but the compaction still succeeds", async () => {
+  test("a throwing verifier fails the whole compaction; the record is unchanged (I3)", async () => {
+    const record = withItems([userItem()]);
+    const before = structuredClone(record);
     const provider = faux(json([userAdd, inferredAdd]));
     const r = await run({
-      record: emptyRecord(),
+      record,
       messages: base,
       provider,
       model: "m",
@@ -1074,7 +1110,170 @@ describe("verifier hook", () => {
         throw new Error("boom");
       },
     });
-    expect(r.ok && r.ops.map((o) => o.accepted)).toEqual([false, true]);
+    expect(r).toEqual({
+      ok: false,
+      code: "compaction_rejected",
+      reason: "verifier unavailable: boom",
+    });
+    expect(record).toEqual(before);
+  });
+
+  test("P1: a rejected update cannot launder a resolve of the same user item (C1)", async () => {
+    const msgs: StoredMessage[] = [
+      user("m0", "never push to main, ever."),
+      assistant("m1", "Understood."),
+      user("m2", "the release notes are done, thanks. that's done now."),
+      assistant("m3", "Great."),
+    ];
+    const record = withItems([
+      userItem({
+        text: "never push to main",
+        evidence: [{ messageId: "m0", quote: "never push to main, ever." }],
+      }),
+    ]);
+    const ev = [{ messageId: "m2", quote: "the release notes are done" }];
+    const provider = faux(
+      json([
+        { op: "update", itemId: "i1", text: "write the release notes", evidence: ev },
+        { op: "resolve", itemId: "i1", evidence: ev },
+      ]),
+    );
+    const shown: unknown[] = [];
+    // A correct verifier: the update is unjustified; resolving "release notes" would be fine.
+    const r = await compact({
+      record,
+      messages: msgs,
+      since: "m2",
+      provider,
+      model: "m",
+      verifyRisky: async (ops) => {
+        shown.push(...ops.map((o) => [o.index, o.op.op, o.target?.text]));
+        return ops.map((o) =>
+          o.op.op === "update"
+            ? { accept: false, reason: "update unjustified" }
+            : { accept: /release notes/.test(o.target?.text ?? "") },
+        );
+      },
+    });
+    expect(shown).toEqual([[0, "update", "never push to main"]]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.ops.map((o) => o.accepted)).toEqual([false, false]);
+    expect(r.ops[1]?.reason).toMatch(/^duplicate_target/);
+    expect(r.record.items).toEqual([
+      expect.objectContaining({ id: "i1", text: "never push to main", status: "active" }),
+    ]);
+    expect(r.record.archive).toEqual([]);
+  });
+
+  test("an item created in the batch cannot be changed in the same batch (duplicate_target)", async () => {
+    const provider = faux(
+      json([
+        inferredAdd,
+        { op: "update", itemId: "i0", text: "changed" },
+        {
+          op: "supersede",
+          itemId: "i0",
+          by: { kind: "note", text: "other", source: "inferred" },
+          evidence: [{ messageId: "m3", quote: "I suggest we use zod for parsing." }],
+        },
+      ]),
+    );
+    const r = await run({ record: emptyRecord(), messages: base, provider, model: "m" });
+    expect(r.ok && r.ops.map((o) => o.accepted)).toEqual([true, false, false]);
+    expect(r.ok && r.ops[1]?.reason).toMatch(/^duplicate_target/);
+    expect(r.ok && r.ops[2]?.reason).toMatch(/^duplicate_target/);
+    expect(r.ok && r.record.items.map((i) => i.text)).toEqual(["n"]);
+  });
+
+  test("an accepted op whose target differs from what the verifier judged is state_changed", async () => {
+    const record = withItems([userItem()]);
+    const provider = faux(
+      json([
+        {
+          op: "update",
+          itemId: "i1",
+          text: "keep the public API stable; never touch the CI config",
+          evidence: [{ messageId: "m4", quote: "never touch the CI config" }],
+        },
+      ]),
+    );
+    const r = await compact({
+      record,
+      messages: base,
+      provider,
+      model: "m",
+      verifyRisky: async (ops) =>
+        ops.map((o) => {
+          // The verifier judged a different state of the item than the one applied.
+          if (o.target) o.target.text = "something else";
+          return { accept: true };
+        }),
+    });
+    expect(r.ok && r.ops[0]?.accepted).toBe(false);
+    expect(r.ok && r.ops[0]?.reason).toMatch(/^state_changed/);
+    expect(r.ok && r.record.items).toEqual([userItem()]);
+  });
+
+  test("P5: an abort during verification returns at once with nothing changed (I2)", async () => {
+    const record = withItems([userItem()]);
+    const before = structuredClone(record);
+    let verifierAborted = false;
+    const hanging = {
+      chat: (req: ChatRequest) =>
+        new Promise<never>(() => {
+          req.signal?.addEventListener("abort", () => {
+            verifierAborted = true;
+          });
+        }),
+    } as unknown as Provider;
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(), 50);
+    const t0 = Date.now();
+    const r = await compact({
+      record,
+      messages: base,
+      provider: faux(json([userAdd])),
+      model: "m",
+      signal: ctl.signal,
+      verifyRisky: createRiskyVerifier({ provider: hanging, model: "v", timeoutMs: 10_000 }),
+    });
+    expect(Date.now() - t0).toBeLessThan(150);
+    expect(r).toEqual({ ok: false, code: "compaction_invalid", reason: "aborted" });
+    expect(verifierAborted).toBe(true);
+    expect(record).toEqual(before);
+  });
+
+  test("an already aborted compaction calls no model", async () => {
+    const provider = faux(json([userAdd]));
+    const ctl = new AbortController();
+    ctl.abort();
+    const r = await run({
+      record: emptyRecord(),
+      messages: base,
+      provider,
+      model: "m",
+      signal: ctl.signal,
+    });
+    expect(r).toEqual({ ok: false, code: "compaction_invalid", reason: "aborted" });
+    expect(provider.callCount).toBe(0);
+  });
+
+  test("the compaction's signal reaches the verifier hook", async () => {
+    const ctl = new AbortController();
+    let got: AbortSignal | undefined;
+    await run({
+      record: emptyRecord(),
+      messages: base,
+      provider: faux(json([userAdd])),
+      model: "m",
+      signal: ctl.signal,
+      verifyRisky: async (ops, _ev, signal) => {
+        got = signal;
+        return ops.map(() => ({ accept: true }));
+      },
+    });
+    expect(got).toBe(ctl.signal);
   });
 
   test("an inferred note superseding an open question is sent to the verifier (N1)", async () => {
@@ -1142,7 +1341,7 @@ describe("verifier hook", () => {
     });
   });
 
-  test("an op the verifier never saw (cap reflow) is rejected as not verified", async () => {
+  test("an op the verifier never saw (it became valid after a rejection) is rejected", async () => {
     const full = Array.from({ length: ACTIVE_ITEMS_MAX - 1 }, (_, k) =>
       userItem({ id: `i${k + 10}`, source: "inferred", kind: "note", text: `note ${k}` }),
     );
@@ -1165,7 +1364,7 @@ describe("verifier hook", () => {
     });
     expect(asked).toEqual([0]);
     expect(r.ok && r.ops.map((o) => o.accepted)).toEqual([false, false]);
-    expect(r.ok && r.ops[1]?.reason).toBe("not verified (cap reflow)");
+    expect(r.ok && r.ops[1]?.reason).toBe("not verified (became valid after a rejection)");
   });
 
   test("an op the verifier was asked about but left out is rejected", async () => {
@@ -1179,6 +1378,6 @@ describe("verifier hook", () => {
     });
     expect(r.ok && r.ops[0]?.accepted).toBe(false);
     expect(r.ok && r.ops[0]?.reason).toMatch(/verifier/);
-    expect(r.ok && r.ops[0]?.reason).not.toMatch(/cap reflow/);
+    expect(r.ok && r.ops[0]?.reason).not.toMatch(/became valid/);
   });
 });

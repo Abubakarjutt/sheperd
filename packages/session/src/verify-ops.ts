@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { assetRoot, fenceUntrusted, redact, sanitizeTerminal } from "@rewire/core";
-import type { Provider } from "@rewire/providers";
+import type { ModelRef, Provider } from "@rewire/providers";
 import { z } from "zod";
 import {
   type CitedMessage,
@@ -15,21 +15,32 @@ import {
 /**
  * The independent check of risky compaction operations (`isRiskyOp`): one non-streaming call to
  * the run's verifier model (cross-family from the chat author when the routing allows it),
- * batching every risky op of one compaction. It fails safe: a missing decision rejects that op;
- * invalid output after one retry, a provider error or a timeout rejects them all. It never
- * throws.
+ * batching every risky op of one compaction that fits the prompt budget.
+ *
+ * - An explicit `reject`, a missing decision, or an op over the prompt budget
+ *   (`verification_budget`) rejects that op only.
+ * - When the check cannot be made (a timeout, a provider error, a reply cut off at the output
+ *   limit, invalid or ambiguous output after one retry, an abort) it throws
+ *   `VerifierUnavailable`, and `compact()` fails as a whole: the record and the window stay as
+ *   they were, so the next compaction can still cite the same messages.
  */
 
 const PACKAGE_ROOT = assetRoot("session", import.meta.url);
 
 /** Characters of a cited message shown to the verifier. */
 export const VERIFY_MESSAGE_CHARS = 2000;
-/** Output budget of one verifier call. */
+/** The whole verifier prompt (the retry included) stays within this many characters. */
+export const VERIFY_PROMPT_CHARS = 60_000;
+/** Output budget of one verifier call; it grows with the batch, up to `VERIFY_MAX_TOKENS_CAP`. */
 export const VERIFY_MAX_TOKENS = 2000;
-/** How long one verifier call may take. */
+const VERIFY_MAX_TOKENS_CAP = 8000;
+const TOKENS_PER_DECISION = 100;
+/** How long the check may take, both attempts together. */
 export const VERIFY_TIMEOUT_MS = 180_000;
 /** Characters of a verifier's reason kept in the op log. */
 const REASON_MAX = 300;
+/** Room kept for the instructions, the fences and the retry's validation error. */
+const PROMPT_OVERHEAD = 3000;
 
 const VerifyReply = z.object({
   decisions: z
@@ -43,12 +54,22 @@ const VerifyReply = z.object({
     .max(1000),
 });
 
+/** The check could not be made; the compaction must fail, not apply a partial result. */
+export class VerifierUnavailable extends Error {}
+
 export type RiskyVerifierOptions = {
   provider: Provider;
   model: string;
-  /** Per-call timeout; `VERIFY_TIMEOUT_MS` when absent. */
+  /** The verifier's provider name, for `independent`. */
+  providerName?: string;
+  /** The chat author's model; `independent` is false when the verifier is the same model. */
+  author?: ModelRef;
+  /** Deadline for the whole check (both attempts); `VERIFY_TIMEOUT_MS` when absent. */
   timeoutMs?: number;
 };
+
+/** The hook, plus whether it is a different model from the author (a dim notice when not). */
+export type RiskyVerifier = VerifyRisky & { readonly independent: boolean };
 
 let promptCache: string | undefined;
 function verifyPrompt(): string {
@@ -105,8 +126,41 @@ function messageLine(id: string, m: CitedMessage | undefined): string {
   return `[${cleanText(id)} ${m.role}, ${where}] ${cut(cleanText(m.content), VERIFY_MESSAGE_CHARS)}`;
 }
 
-function buildPrompt(ops: readonly RiskyOp[], evidence: Record<string, CitedMessage>): string {
-  const ids = [...new Set(ops.flatMap(citedIds))];
+/**
+ * Fit ops into the prompt budget, in order: an op fits when its block and the cited messages not
+ * yet listed fit in what is left. Ops that do not fit are skipped; later, smaller ones may fit.
+ */
+function fitBudget(
+  ops: readonly RiskyOp[],
+  evidence: Record<string, CitedMessage>,
+): { sent: number[]; ids: string[] } {
+  const budget = VERIFY_PROMPT_CHARS - PROMPT_OVERHEAD;
+  const sent: number[] = [];
+  const ids: string[] = [];
+  const listed = new Set<string>();
+  let used = 0;
+  ops.forEach((r, k) => {
+    const fresh = citedIds(r).filter((id) => !listed.has(id));
+    const size =
+      opBlock(r, sent.length).length +
+      1 +
+      fresh.reduce((n, id) => n + messageLine(id, evidence[id]).length + 1, 0);
+    if (used + size > budget) return;
+    used += size;
+    sent.push(k);
+    for (const id of fresh) {
+      listed.add(id);
+      ids.push(id);
+    }
+  });
+  return { sent, ids };
+}
+
+function buildPrompt(
+  ops: readonly RiskyOp[],
+  ids: readonly string[],
+  evidence: Record<string, CitedMessage>,
+): string {
   return [
     `There are ${ops.length} operations to check, indexed 0 to ${ops.length - 1}.`,
     "The operations, each with the item it changes (if any) and the messages it cites:",
@@ -123,21 +177,40 @@ function buildPrompt(ops: readonly RiskyOp[], evidence: Record<string, CitedMess
 const errorText = (e: unknown): string =>
   cleanText(e instanceof Error ? e.message : String(e)).slice(0, 300);
 
-class Timeout extends Error {}
-
-async function withTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+/**
+ * Run one call against the overall deadline and the caller's signal. Either one aborts the call
+ * at once and rejects, even when the provider ignores its signal; timers and listeners are
+ * always cleared.
+ */
+async function guarded<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+  deadline: number,
+  timeoutMs: number,
+  outer: AbortSignal | undefined,
+): Promise<T> {
   const ctl = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const expired = new Promise<never>((_, rej) => {
-    timer = setTimeout(() => {
+  let onAbort: (() => void) | undefined;
+  const stop = new Promise<never>((_, rej) => {
+    const left = deadline - Date.now();
+    const expire = () => {
       ctl.abort();
-      rej(new Timeout(`the verifier timed out after ${Math.round(ms / 1000)}s`));
-    }, ms);
+      rej(new VerifierUnavailable(`timed out after ${Math.round(timeoutMs / 1000)}s`));
+    };
+    if (left <= 0) expire();
+    else timer = setTimeout(expire, left);
+    onAbort = () => {
+      ctl.abort();
+      rej(new VerifierUnavailable("aborted"));
+    };
+    if (outer?.aborted) onAbort();
+    else outer?.addEventListener("abort", onAbort, { once: true });
   });
   try {
-    return await Promise.race([run(ctl.signal), expired]);
+    return await Promise.race([run(ctl.signal), stop]);
   } finally {
     clearTimeout(timer);
+    if (onAbort) outer?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -153,48 +226,74 @@ function toDecisions(n: number, reply: z.infer<typeof VerifyReply>): VerifyDecis
   });
 }
 
-export function createRiskyVerifier(o: RiskyVerifierOptions): VerifyRisky {
+export function createRiskyVerifier(o: RiskyVerifierOptions): RiskyVerifier {
   const timeoutMs = o.timeoutMs ?? VERIFY_TIMEOUT_MS;
-  return async (ops, evidence) => {
-    if (ops.length === 0) return [];
-    const all = (reason: string): VerifyDecision[] => ops.map(() => ({ accept: false, reason }));
-    try {
-      const system = verifyPrompt();
-      const prompt = buildPrompt(ops, evidence);
-      let problem = "";
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const content =
-          attempt === 0
-            ? prompt
-            : `${prompt}\n\nYour previous reply was rejected:\n${fenceUntrusted("untrusted_validation_error", redact(sanitizeTerminal(problem)))}\n\nReply again with the JSON object {"decisions": [...]} only.`;
-        const resp = await withTimeout(
-          (signal) =>
+  const independent = !(
+    o.author !== undefined &&
+    o.author.model === o.model &&
+    (o.providerName === undefined || o.author.provider === o.providerName)
+  );
+  const verify: VerifyRisky = async (ops, evidence, signal) => {
+    if (signal?.aborted) throw new VerifierUnavailable("aborted");
+    const { sent, ids } = fitBudget(ops, evidence);
+    const out: VerifyDecision[] = ops.map(() => ({
+      accept: false,
+      reason: "verification_budget: the op did not fit the verifier prompt",
+    }));
+    if (sent.length === 0) return out;
+    const batch = sent.map((k) => ops[k] as RiskyOp);
+    const deadline = Date.now() + timeoutMs;
+    const system = verifyPrompt();
+    const prompt = buildPrompt(batch, ids, evidence);
+    const maxTokens = Math.min(
+      VERIFY_MAX_TOKENS_CAP,
+      Math.max(VERIFY_MAX_TOKENS, TOKENS_PER_DECISION * batch.length),
+    );
+    let problem = "";
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const content =
+        attempt === 0
+          ? prompt
+          : `${prompt}\n\nYour previous reply was rejected:\n${fenceUntrusted("untrusted_validation_error", redact(sanitizeTerminal(problem)).slice(0, 500))}\n\nReply again with exactly one JSON object {"decisions": [...]} and nothing else.`;
+      let resp: Awaited<ReturnType<Provider["chat"]>>;
+      try {
+        resp = await guarded(
+          (s) =>
             o.provider.chat({
               model: o.model,
               system,
               messages: [{ role: "user", content }],
-              maxTokens: VERIFY_MAX_TOKENS,
-              signal,
+              maxTokens,
+              signal: s,
             }),
+          deadline,
           timeoutMs,
+          signal,
         );
-        if (resp.stopReason === "length") {
-          problem = "the reply was cut off at the output limit; keep each reason short";
-          continue;
-        }
-        if (resp.stopReason === "error") {
-          problem = "the provider reported an error for the reply";
-          continue;
-        }
-        const parsed = parseJsonReply(resp.message.text, VerifyReply);
-        if (parsed.ok) return toDecisions(ops.length, parsed.value);
-        problem = parsed.problem;
+      } catch (e) {
+        if (e instanceof VerifierUnavailable) throw e;
+        throw new VerifierUnavailable(errorText(e));
       }
-      return all(
-        `the verifier gave invalid output after one retry: ${cleanText(problem).slice(0, 200)}`,
-      );
-    } catch (e) {
-      return all(`the verifier failed (${errorText(e)})`);
+      // A retry with the same batch and budget would be cut off again.
+      if (resp.stopReason === "length") {
+        throw new VerifierUnavailable("the reply was cut off at the output limit");
+      }
+      if (resp.stopReason === "error") {
+        problem = "the provider reported an error for the reply";
+        continue;
+      }
+      const parsed = parseJsonReply(resp.message.text, VerifyReply, { strict: true });
+      if (parsed.ok) {
+        toDecisions(batch.length, parsed.value).forEach((d, j) => {
+          out[sent[j] as number] = d;
+        });
+        return out;
+      }
+      problem = parsed.problem;
     }
+    throw new VerifierUnavailable(
+      `invalid output after one retry: ${cleanText(problem).slice(0, 200)}`,
+    );
   };
+  return Object.assign(verify, { independent });
 }
