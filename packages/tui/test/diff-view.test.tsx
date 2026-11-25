@@ -50,6 +50,25 @@ async function waitFor(v: View, ok: (plainFrame: string) => boolean, what: strin
 }
 const waitText = (v: View, needle: string) => waitFor(v, (f) => f.includes(needle), needle);
 
+/**
+ * Presses `key` until `ok` holds. A panel's key handler attaches in an effect after its frame is
+ * drawn, so on a slow runner a key sent at once can arrive before anything listens; a key that
+ * was handled shows its effect well within one attempt, so a toggle is never pressed twice.
+ */
+async function pressUntil(v: View, key: string, ok: (plainFrame: string) => boolean, what: string) {
+  for (let i = 0; i < 10; i++) {
+    v.stdin.write(key);
+    const end = Date.now() + 1500;
+    while (Date.now() < end) {
+      if (ok(plain(v.lastFrame()))) return;
+      await tick(25);
+    }
+  }
+  await waitFor(v, ok, what);
+}
+const pressFor = (v: View, key: string, needle: string) =>
+  pressUntil(v, key, (f) => f.includes(needle), needle);
+
 const KEY = {
   up: "\x1b[A",
   down: "\x1b[B",
@@ -323,8 +342,7 @@ describe("checkpoint views", () => {
     const { handle, answer } = fakeRun(commit);
     const v = render(<CheckpointPanel run={handle} prompt={commit} />);
     expect(plain(v.lastFrame())).not.toContain("esc close");
-    v.stdin.write("v");
-    await waitText(v, "esc close");
+    await pressFor(v, "v", "esc close");
     expect(sgrBefore(rawLine(v.lastFrame(), "+new"), "+new")).toContain("\x1b[32m");
     v.stdin.write(KEY.esc);
     await waitFor(v, (f) => !f.includes("esc close"), "the view to close");
@@ -347,8 +365,7 @@ describe("checkpoint views", () => {
     };
     current = prompt;
     const v = render(<CheckpointPanel run={handle} prompt={prompt} />);
-    v.stdin.write("v");
-    await waitText(v, "esc close");
+    await pressFor(v, "v", "esc close");
     current = { kind: "clarify", questions: [] };
     v.stdin.write("G");
     await tick(60);
@@ -377,8 +394,7 @@ describe("checkpoint views", () => {
     } as unknown as RunHandle;
     const v = render(<RunView run={run} />);
     await waitText(v, "Commit checkpoint");
-    v.stdin.write("v");
-    await waitText(v, "esc close");
+    await pressFor(v, "v", "esc close");
     // The view's key handler attaches in an effect after the frame shows: on a slow runner a key
     // sent at once can land before it, so press again until the view has closed.
     for (let i = 0; i < 20 && plain(v.lastFrame()).includes("esc close"); i++) {
@@ -446,8 +462,7 @@ describe("cards and board at 40 columns", () => {
       expect(plain(v.lastFrame())).toMatch(/^╭─+╮$/m);
       expect(plain(v.lastFrame())).toContain("a approve");
       if (name !== "contract") {
-        v.stdin.write("v");
-        await waitFor(v, (f) => /lines 1–\d+ of \d+/.test(f), "the view footer");
+        await pressUntil(v, "v", (f) => /lines 1–\d+ of \d+/.test(f), "the view footer");
         expect(maxWidth(v.lastFrame())).toBeLessThanOrEqual(40);
       }
       v.unmount();
@@ -651,8 +666,7 @@ describe("fix round 1", () => {
     expect(plain(v.lastFrame())).toContain("a approve");
     expect(plain(v.lastFrame())).not.toContain("AC-11");
     // v opens every criterion in the scroll frame; the last one is reachable.
-    v.stdin.write("v");
-    await waitText(v, "of 12 · ↑↓ scroll");
+    await pressFor(v, "v", "of 12 · ↑↓ scroll");
     expect(height(v.lastFrame())).toBeLessThanOrEqual(11);
     v.stdin.write("G");
     await waitText(v, "AC-11 [change] s11");
@@ -687,8 +701,7 @@ describe("fix round 1", () => {
     };
     const { handle, answer } = fakeRun(prompt);
     const v = render(<CheckpointPanel run={handle} prompt={prompt} />);
-    v.stdin.write("v");
-    await waitText(v, "of 40 · ↑↓ scroll");
+    await pressFor(v, "v", "of 40 · ↑↓ scroll");
     v.stdin.write("e");
     await waitText(v, "revise: ");
     v.stdin.write("G g");
@@ -709,8 +722,7 @@ describe("fix round 1", () => {
     await waitText(v, "Commit checkpoint");
     setRows(v.stdout, 12);
     v.stdout.emit("resize");
-    v.stdin.write("v");
-    await waitText(v, "esc close");
+    await pressFor(v, "v", "esc close");
     expect(height(v.lastFrame())).toBeLessThanOrEqual(11);
     v.stdin.write("G");
     await waitText(v, "of 82");
