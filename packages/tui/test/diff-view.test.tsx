@@ -13,7 +13,15 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { type BoardState, initialBoard } from "../src/board.js";
 import { Board, RunView } from "../src/board-view.js";
 import { CheckpointPanel, type CheckpointPrompt } from "../src/checkpoint.js";
-import { DiffView, parseDiff, TestsView } from "../src/diff-view.js";
+import {
+  cleanView,
+  DiffView,
+  GUTTER_MAX_DIGITS,
+  parseDiff,
+  TestsView,
+  VIEW_MAX_TEXT,
+} from "../src/diff-view.js";
+import { SPINNER_TICK_MS } from "../src/spinner.js";
 
 afterAll(() => {
   if (previousForceColor === undefined) delete process.env.FORCE_COLOR;
@@ -132,7 +140,7 @@ describe("DiffView colours and gutter", () => {
 
   it("parseDiff: a --- or +++ line inside a hunk is content, not a header", () => {
     const lines = parseDiff("diff --git a/x b/x\n@@ -1,2 +1,2 @@\n--- removed dashes\n+++ added\n");
-    expect(lines.map((l) => l.kind)).toEqual(["file", "hunk", "del", "add", "ctx"]);
+    expect(lines.map((l) => l.kind)).toEqual(["file", "hunk", "del", "add"]);
   });
 
   it("tabs become 4 spaces and long lines are cut with an ellipsis, never wrapped", () => {
@@ -476,6 +484,209 @@ describe("cards and board at 40 columns", () => {
     expect(rawLine(f, "Tests")).toContain("\x1b[31m✗");
     expect(plain(rawLine(f, "Review"))).toContain("○ Review");
     expect(sgrBefore(rawLine(f, "boom"), "boom")).toContain("\x1b[2m");
+    v.unmount();
+  });
+});
+
+describe("fix round 1", () => {
+  it("a secret straddling the 200k cap is redacted whole, not cut to a prefix", () => {
+    const key = `sk-ant-api03-${"Q".repeat(40)}`;
+    for (const before of [8, 13, 20, 30]) {
+      const text = `${"x".repeat(VIEW_MAX_TEXT - before)}${key} tail`;
+      const out = cleanView(text);
+      expect(out.length).toBeLessThanOrEqual(VIEW_MAX_TEXT);
+      expect(out).not.toContain("sk-ant");
+      expect(out).not.toContain("QQQ");
+    }
+  });
+
+  it("a truncated hunk adds no trailing blank context row", () => {
+    const lines = parseDiff("diff --git a/x b/x\n@@ -1,5 +1,5 @@\n a\n-b\n+c\n");
+    expect(lines.map((l) => l.kind)).toEqual(["file", "hunk", "ctx", "del", "add"]);
+    const v = render(
+      <DiffView diff={"diff --git a/x b/x\n@@ -1,5 +1,5 @@\n a\n-b\n+c\n"} width={60} rows={20} />,
+    );
+    expect(plain(v.lastFrame())).toContain("lines 1–5 of 5");
+    v.unmount();
+  });
+
+  it("malformed hunk headers: no NaN, no Infinity, and a capped gutter", () => {
+    for (const header of [
+      "@@ -a,b +c,d @@",
+      "@@ -1,x +1,y @@",
+      `@@ -${"9".repeat(30)},2 +${"9".repeat(400)},2 @@`,
+      "@@ -1000000,2 +1000000,2 @@",
+    ]) {
+      const diff = `diff --git a/x b/x\n${header}\n ctx\n-old\n+new\nnot diff`;
+      const lines = parseDiff(diff);
+      for (const l of lines) {
+        if ("old" in l && l.old !== undefined) expect(Number.isSafeInteger(l.old)).toBe(true);
+        if ("new" in l && l.new !== undefined) expect(Number.isSafeInteger(l.new)).toBe(true);
+      }
+      const v = render(<DiffView diff={diff} width={80} rows={20} />);
+      const f = plain(v.lastFrame());
+      expect(f).not.toContain("NaN");
+      expect(f).not.toContain("Infinity");
+      expect(f).not.toContain("e+");
+      // unnumbered: the content starts the line, with no gutter
+      expect(f).toMatch(/^\+new$/m);
+      expect(f).toMatch(/^-old$/m);
+      v.unmount();
+    }
+    // The largest numbered header keeps the gutter within its digit cap.
+    const big = parseDiff("diff --git a/x b/x\n@@ -999999,2 +999999,2 @@\n a\n b");
+    const v = render(
+      <DiffView
+        diff={"diff --git a/x b/x\n@@ -999999,2 +999999,2 @@\n a\n b"}
+        width={80}
+        rows={20}
+      />,
+    );
+    expect(big.some((l) => "new" in l && l.new === 1_000_000)).toBe(true);
+    const row =
+      plain(v.lastFrame())
+        .split("\n")
+        .find((l) => l.endsWith(" b")) ?? "";
+    expect(row).toBe("1000000 1000000  b");
+    expect(row.split(" ")[0]?.length).toBeLessThanOrEqual(GUTTER_MAX_DIGITS);
+    v.unmount();
+  });
+
+  it("the board spinner interval is cleared on unmount and when nothing is running", async () => {
+    const set = vi.spyOn(globalThis, "setInterval");
+    const clear = vi.spyOn(globalThis, "clearInterval");
+    try {
+      const s = initialBoard();
+      s.rows.Implement = { status: "running", detail: "" };
+      const v = render(<Board state={s} />);
+      await tick();
+      const ids = set.mock.results
+        .filter((_, i) => set.mock.calls[i]?.[1] === SPINNER_TICK_MS)
+        .map((r) => r.value);
+      expect(ids).toHaveLength(1);
+      const idle = initialBoard();
+      idle.rows.Implement = { status: "done", detail: "" };
+      v.rerender(<Board state={idle} />);
+      await tick();
+      expect(clear.mock.calls.map((c) => c[0])).toContain(ids[0]);
+      v.rerender(<Board state={s} />);
+      await tick();
+      const again = set.mock.results
+        .filter((_, i) => set.mock.calls[i]?.[1] === SPINNER_TICK_MS)
+        .map((r) => r.value);
+      expect(again).toHaveLength(2);
+      v.unmount();
+      expect(clear.mock.calls.map((c) => c[0])).toContain(again[1]);
+    } finally {
+      set.mockRestore();
+      clear.mockRestore();
+    }
+  });
+
+  function setRows(stdout: unknown, n: number) {
+    Object.defineProperty(stdout, "rows", { value: n, writable: true, configurable: true });
+  }
+
+  function runWith(prompt: CheckpointPrompt) {
+    let finish: (o: unknown) => void = () => {};
+    const done = new Promise<unknown>((r) => {
+      finish = r;
+    });
+    const run = {
+      events: {
+        // biome-ignore lint/correctness/useYield: an event stream with no events until done
+        [Symbol.asyncIterator]: async function* () {
+          await done;
+        },
+      },
+      pending: () => prompt,
+      answer: vi.fn(() => true),
+      abort: vi.fn(),
+      done,
+    } as unknown as RunHandle;
+    return { run, finish };
+  }
+
+  const height = (f: string | undefined) => (f ?? "").split("\n").length;
+
+  it("at 12 rows the board folds to one line and a card never exceeds the height", async () => {
+    const many: CheckpointPrompt = {
+      kind: "checkpoint",
+      checkpoint: {
+        kind: "contract",
+        contract: {
+          id: "C",
+          title: "t",
+          criteria: Array.from({ length: 12 }, (_, i) => ({
+            id: `AC-${i}`,
+            kind: "change" as const,
+            statement: `s${i}`,
+          })),
+          nonGoals: [],
+          affectedAreas: [],
+          openQuestions: [],
+        },
+      },
+    };
+    const { run, finish } = runWith(many);
+    const v = render(<RunView run={run} />);
+    await waitText(v, "Contract checkpoint");
+    expect(plain(v.lastFrame())).toContain("╭"); // full board at the default 24 rows
+    expect(plain(v.lastFrame()).match(/╭/g)).toHaveLength(2);
+    setRows(v.stdout, 12);
+    v.stdout.emit("resize");
+    await waitFor(v, (f) => (f.match(/╭/g) ?? []).length === 1, "the one-line board");
+    // one row is left for the App's status line
+    expect(height(v.lastFrame())).toBeLessThanOrEqual(11);
+    expect(plain(v.lastFrame())).toMatch(/○ Spec\s+○ Tests/);
+    expect(plain(v.lastFrame())).toContain("more criteria");
+    expect(plain(v.lastFrame())).toContain("a approve");
+    finish({});
+    v.unmount();
+  });
+
+  it("at 12 rows an open diff view keeps the frame within the height", async () => {
+    const diff = `diff --git a/x b/x\n@@ -1,0 +1,80 @@\n${Array.from({ length: 80 }, (_, i) => `+l${i}`).join("\n")}`;
+    const prompt: CheckpointPrompt = { kind: "checkpoint", checkpoint: { kind: "commit", diff } };
+    const { run, finish } = runWith(prompt);
+    const v = render(<RunView run={run} />);
+    await waitText(v, "Commit checkpoint");
+    setRows(v.stdout, 12);
+    v.stdout.emit("resize");
+    v.stdin.write("v");
+    await waitText(v, "esc close");
+    expect(height(v.lastFrame())).toBeLessThanOrEqual(11);
+    v.stdin.write("G");
+    await waitText(v, "of 82");
+    await waitFor(v, (f) => f.includes("+l79"), "the last line");
+    expect(height(v.lastFrame())).toBeLessThanOrEqual(11);
+    finish({});
+    v.unmount();
+  });
+
+  it("a 200k diff renders, and jumps to the end, within 500 ms", async () => {
+    const body: string[] = [];
+    let n = 0;
+    let file = 0;
+    while (n < VIEW_MAX_TEXT) {
+      const head = `diff --git a/src/f${file}.ts b/src/f${file}.ts\n@@ -1,40 +1,40 @@`;
+      body.push(head);
+      n += head.length + 1;
+      for (let i = 0; i < 40; i++) {
+        const l = `${i % 3 === 0 ? "+" : i % 3 === 1 ? "-" : " "}\tconst v${i} = "${"z".repeat(40)}";`;
+        body.push(l);
+        n += l.length + 1;
+      }
+      file++;
+    }
+    const diff = body.join("\n");
+    expect(diff.length).toBeGreaterThanOrEqual(VIEW_MAX_TEXT);
+    const t0 = performance.now();
+    const v = render(<DiffView diff={diff} width={100} rows={30} />);
+    expect(plain(v.lastFrame())).toContain("lines 1–30 of");
+    v.stdin.write("G");
+    await waitFor(v, (f) => !f.includes("lines 1–30 of"), "the jump to the end");
+    expect(performance.now() - t0).toBeLessThan(500);
     v.unmount();
   });
 });

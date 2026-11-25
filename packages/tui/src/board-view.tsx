@@ -16,7 +16,7 @@ import { sanitize } from "./sanitize.js";
 import { SPINNER_GLYPHS, SPINNER_TICK_MS } from "./spinner.js";
 import { Card, cardInner, cutStyled, type Styled, StyledLine } from "./styled.js";
 import { theme } from "./theme.js";
-import { useColumns } from "./use-columns.js";
+import { useColumns, useRows } from "./use-columns.js";
 
 const GLYPH: Record<Exclude<StageStatus, "running">, string> = {
   pending: "○",
@@ -68,6 +68,28 @@ export function Board({ state }: { state: BoardState }) {
   );
 }
 
+/**
+ * The board on one line (`✓ Spec ✓ Tests ○ Implement …`), cut to the width: shown instead of
+ * the full board while a checkpoint card is open on a short terminal.
+ */
+export function BoardLine({ state }: { state: BoardState }) {
+  const cols = useColumns();
+  const segs: Styled[] = [];
+  for (const name of STAGES) {
+    const st = state.rows[name].status;
+    if (segs.length > 0) segs.push({ text: "  " });
+    segs.push({ text: st === "running" ? SPINNER_GLYPHS[0] : GLYPH[st], color: COLOR[st] });
+    segs.push({ text: ` ${name}`, ...(st === "pending" ? { dim: true } : {}) });
+  }
+  return <StyledLine segs={cutStyled(segs, cols)} />;
+}
+
+/** Below this many rows, an open checkpoint card shows the board as one line ({@link BoardLine}). */
+export const FULL_BOARD_MIN_ROWS = 20;
+/** Rows outside the card with the full board (8) or the board line (1), plus the status line. */
+const OUTSIDE_FULL = 9;
+const OUTSIDE_COMPACT = 2;
+
 function isCheckpoint(p: PendingPrompt | undefined): p is CheckpointPrompt {
   return p?.kind === "checkpoint";
 }
@@ -106,6 +128,7 @@ export function RunView({
   /** Hears the current stage ({@link currentStage}) whenever it changes (the status line). */
   onStage?: (stage: string | undefined) => void;
 }) {
+  const rows = useRows();
   const [board, setBoard] = useState(initialBoard);
   const [pending, setPending] = useState<PendingPrompt | undefined>(undefined);
   // Remounts the panel for each new prompt, so its message/edit state never carries over.
@@ -164,15 +187,17 @@ export function RunView({
     };
   }, [run]);
 
+  const compact = isCheckpoint(pending) && rows < FULL_BOARD_MIN_ROWS;
   return (
     <Box flexDirection="column">
-      <Board state={board} />
+      {compact ? <BoardLine state={board} /> : <Board state={board} />}
       {isCheckpoint(pending) ? (
         <CheckpointPanel
           key={promptKey}
           run={run}
           prompt={pending}
           revisionLimitReached={board.revisions >= MAX_REVISIONS}
+          outside={compact ? OUTSIDE_COMPACT : OUTSIDE_FULL}
         />
       ) : null}
     </Box>

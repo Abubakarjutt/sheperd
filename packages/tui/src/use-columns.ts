@@ -20,8 +20,21 @@ export function useColumns(): number {
   return cols;
 }
 
-/** Terminal height, with the same fallback behaviour (24). */
+const readRows = (s?: { rows?: number }): number =>
+  typeof s?.rows === "number" && s.rows > 0 ? s.rows : 24;
+
+/** Terminal height, re-read on every resize, with the same fallback behaviour (24). */
 export function useRows(): number {
-  const { stdout } = useStdout() as unknown as { stdout?: Partial<NodeJS.WriteStream> };
-  return typeof stdout?.rows === "number" && stdout.rows > 0 ? stdout.rows : 24;
+  const { stdout } = useStdout() as unknown as {
+    stdout?: Partial<NodeJS.WriteStream> & NodeJS.EventEmitter;
+  };
+  const [rows, setRows] = useState(() => readRows(stdout));
+  useEffect(() => {
+    const onResize = (): void => setRows(readRows(stdout));
+    stdout?.on("resize", onResize);
+    return () => {
+      stdout?.off("resize", onResize);
+    };
+  }, [stdout]);
+  return rows;
 }

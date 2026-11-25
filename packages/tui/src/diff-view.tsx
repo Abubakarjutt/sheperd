@@ -7,21 +7,35 @@ import { sanitize } from "./sanitize.js";
 import { cutStyled, type Styled, StyledLine } from "./styled.js";
 import { theme } from "./theme.js";
 
-/** Untrusted view content is cut here before cleaning; sanitize copes with a split escape. */
+/** Untrusted view content is shown up to this many UTF-16 units. */
 export const VIEW_MAX_TEXT = 200_000;
+/**
+ * Extra input cleaned past {@link VIEW_MAX_TEXT} before the final cut, so a secret straddling
+ * the cap is redacted whole rather than cut to a prefix the patterns no longer match.
+ */
+const VIEW_SLACK = 4096;
 const TAB = "    ";
 
 /**
  * Untrusted text made safe for display, once over the whole text before it is split into lines:
- * capped, sanitized, then redacted (in that order, so a key split by an escape is still caught).
+ * cut to the cap plus some slack, sanitized, then redacted (in that order, so a key split by an
+ * escape is still caught), and only then cut to the cap.
  */
-export const cleanView = (s: string): string => redact(sanitize(s.slice(0, VIEW_MAX_TEXT)));
+export const cleanView = (s: string): string =>
+  redact(sanitize(s.slice(0, VIEW_MAX_TEXT + VIEW_SLACK))).slice(0, VIEW_MAX_TEXT);
 
 export type DiffLine =
   | { kind: "file" | "hunk" | "meta" | "binary"; text: string }
   | { kind: "add" | "del" | "ctx"; text: string; old?: number; new?: number };
 
 const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+/**
+ * A hunk start or count above this is treated as a header without numbers: the gutter then
+ * never needs more than 7 digits (this plus the lines a capped diff can hold).
+ */
+const MAX_LINE_NO = 999_999;
+/** The gutter's widest number column. */
+export const GUTTER_MAX_DIGITS = 7;
 
 /**
  * Classifies the lines of an already-cleaned unified diff. Hunk bodies are counted from the
@@ -39,7 +53,10 @@ export function parseDiff(diff: string): DiffLine[] {
   let oldLeft = 0;
   let newLeft = 0;
   let headed = false;
-  for (const raw of diff.split("\n")) {
+  const all = diff.split("\n");
+  // A diff ending in "\n" (or cut short) leaves a final "": an artifact, not a context line.
+  if (all.length > 1 && all[all.length - 1] === "") all.pop();
+  for (const raw of all) {
     const line = raw.includes("\t") ? raw.replace(/\t/g, TAB) : raw;
     if (inHunk && (oldLeft > 0 || newLeft > 0)) {
       const c = line[0];
@@ -76,11 +93,13 @@ export function parseDiff(diff: string): DiffLine[] {
       headed = true;
     } else if (line.startsWith("@@")) {
       const m = HUNK.exec(line);
-      numbered = m !== null;
-      oldN = Number(m?.[1] ?? 0);
-      newN = Number(m?.[3] ?? 0);
-      oldLeft = m ? Number(m[2] ?? 1) : Number.POSITIVE_INFINITY;
-      newLeft = m ? Number(m[4] ?? 1) : Number.POSITIVE_INFINITY;
+      const nums = m ? [m[1], m[2] ?? "1", m[3], m[4] ?? "1"].map(Number) : [];
+      numbered =
+        nums.length === 4 && nums.every((n) => Number.isSafeInteger(n) && n <= MAX_LINE_NO);
+      oldN = numbered ? (nums[0] ?? 0) : 0;
+      newN = numbered ? (nums[2] ?? 0) : 0;
+      oldLeft = numbered ? (nums[1] ?? 0) : Number.POSITIVE_INFINITY;
+      newLeft = numbered ? (nums[3] ?? 0) : Number.POSITIVE_INFINITY;
       inHunk = true;
       headed = false;
       out.push({ kind: "hunk", text: line });
@@ -188,7 +207,7 @@ export function DiffView({ diff, width, rows, isActive, onClose }: ViewProps & {
       if ("old" in l && l.old !== undefined) n = Math.max(n, l.old);
       if ("new" in l && l.new !== undefined) n = Math.max(n, l.new);
     }
-    return n > 0 ? digits(n) : 0;
+    return n > 0 ? Math.min(GUTTER_MAX_DIGITS, digits(n)) : 0;
   }, [lines]);
   const page = Math.max(1, Math.floor(rows));
   const top = useScroll(lines.length, page, { isActive, onClose });

@@ -14,10 +14,13 @@ const LIMIT = "revision limit reached; [a]pprove or [s]top";
 /** Shown when a prompt was answered or replaced before this key arrived. */
 export const STALE_PROMPT = "that prompt is no longer active";
 /**
- * Rows a `[v]iew` leaves for the rest of the screen: the board (8), the card's border, title and
- * key line (4), the view's footer, a message line and the status line.
+ * Screen rows outside the panel when none is given: the full board (8) and the status line.
  */
-const VIEW_RESERVED = 16;
+export const DEFAULT_OUTSIDE_ROWS = 9;
+/** A card's lines besides its list: border (2), title, "… more", keys, revise box, message. */
+const CARD_FIXED = 7;
+/** A card's lines besides an open view's page: border (2), title, the view footer, keys, message. */
+const VIEW_FIXED = 6;
 
 /** Untrusted text made safe for display: capped, sanitized, then redacted. */
 const clean = cleanView;
@@ -61,6 +64,11 @@ export type CheckpointPanelProps = {
   prompt: CheckpointPrompt;
   /** True once the contract has been revised the pipeline's maximum (3) times: a further revise stops the run. */
   revisionLimitReached?: boolean;
+  /**
+   * Screen rows used by everything else in the live frame (the board, the status line). Lists and
+   * views are sized so the card plus these rows fit in the terminal's height.
+   */
+  outside?: number;
 };
 
 /**
@@ -71,6 +79,7 @@ export function CheckpointPanel({
   run,
   prompt,
   revisionLimitReached = false,
+  outside = DEFAULT_OUTSIDE_ROWS,
 }: CheckpointPanelProps) {
   const cols = useColumns();
   const rows = useRows();
@@ -142,7 +151,9 @@ export function CheckpointPanel({
       { text: ` ${word}`, dim: true },
     ]);
   const isCurrent = (): boolean => run.pending() === prompt;
-  const viewRows = Math.max(3, rows - VIEW_RESERVED);
+  const viewRows = Math.max(1, rows - VIEW_FIXED - outside);
+  /** List lines (criteria, files) that fit; the rest are summed up in a "… more" line. */
+  const cap = Math.max(1, Math.min(10, rows - CARD_FIXED - outside));
   const closeView = (): void => setViewing(false);
   let color: string;
   let body: ReactNode = null;
@@ -150,13 +161,22 @@ export function CheckpointPanel({
   if (cp.kind === "contract") {
     color = theme.accent;
     add("h", [{ text: one(`Contract checkpoint: ${cp.contract.title}`), bold: true, color }]);
-    cp.contract.criteria.forEach((c, i) => {
+    // Every criterion that fits: a contract is approved on all of them, so no fixed cap of 10.
+    const ccap = Math.max(1, rows - CARD_FIXED - outside);
+    cp.contract.criteria.slice(0, ccap).forEach((c, i) => {
       add(`c${i}`, [
         { text: `${one(c.id)} ` },
         { text: `[${c.kind}]`, color: c.kind === "change" ? theme.busy : theme.user },
         { text: ` ${one(c.statement)}` },
       ]);
     });
+    if (cp.contract.criteria.length > ccap)
+      add("cm", [
+        {
+          text: `  … ${cp.contract.criteria.length - ccap} more criteria (a taller terminal shows all)`,
+          dim: true,
+        },
+      ]);
     if (revisionLimitReached) add("lim", [{ text: LIMIT, color: theme.busy }]);
     else
       add(
@@ -187,7 +207,6 @@ export function CheckpointPanel({
         />
       );
     } else {
-      const cap = Math.max(3, Math.min(10, rows - 10));
       cp.files.slice(0, cap).forEach((f, i) => {
         add(`f${i}`, [{ text: `  ${one(f.path)}` }]);
       });
@@ -211,7 +230,6 @@ export function CheckpointPanel({
         />
       );
     } else {
-      const cap = Math.max(3, Math.min(10, rows - 10));
       stat.files.slice(0, cap).forEach((f, i) => {
         const path = f.path.replace(/[\n\t]+/g, " ");
         add(
