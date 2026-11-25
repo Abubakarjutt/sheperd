@@ -100,6 +100,23 @@ function fakeDeps(
 }
 
 describe("startInteractive wiring", () => {
+  test("the header and status line get the repo, the home dir and the models", async () => {
+    let seen: TuiDeps | undefined;
+    const models = { chat: "c", spec: "s", implementer: "i", reviewers: ["r", "v"] };
+    const f = fakeDeps({
+      home: "/home/dev",
+      models,
+      render: async (d) => {
+        seen = d;
+        return 0;
+      },
+    });
+    await startInteractive(f.deps);
+    expect(seen?.cwd).toBe("/repo");
+    expect(seen?.home).toBe("/home/dev");
+    expect(seen?.models).toEqual(models);
+  });
+
   test("discovery problems reach the TUI as warning lines (M1)", async () => {
     let seen: TuiDeps | undefined;
     const f = fakeDeps({

@@ -142,5 +142,12 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
       return out.join("").trimEnd();
     },
     routing: routingText(routing),
+    models: {
+      chat: chatModel.model,
+      spec: routing.spec.model,
+      implementer: routing.implementer.model,
+      reviewers: [routing.reviewer.model, routing.verifier.model],
+    },
+    home,
   });
 }

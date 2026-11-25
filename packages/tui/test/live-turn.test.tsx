@@ -231,7 +231,7 @@ describe("live turn", () => {
     const verb = /([A-Z][a-z]+)… \(/.exec(live)?.[1];
     expect(SPINNER_VERBS).toContain(verb);
     finish({ text: "Here is **bold** text" });
-    const done = await waitFor(m.v, (f) => !f.includes("esc to interrupt"), "the turn to end");
+    const done = await waitFor(m.v, (f) => !f.includes("esc to interrupt)"), "the turn to end");
     // Streamed text is not repeated by the turn's final text.
     expect(done.split("Here is bold text")).toHaveLength(2);
     expect(done).not.toContain("**");
@@ -261,7 +261,7 @@ describe("live turn", () => {
     expect(live).not.toContain("eHg=");
     for (const f of m.v.frames) expectOnlySgr(f);
     finish({ text: "" });
-    const done = await waitFor(m.v, (f) => !f.includes("esc to interrupt"), "the turn to end");
+    const done = await waitFor(m.v, (f) => !f.includes("esc to interrupt)"), "the turn to end");
     expect(done).toContain("[redacted]");
     expect(done).not.toContain(tail.slice(0, 10));
     expect(done).not.toContain("eHg=");
@@ -323,7 +323,7 @@ describe("live turn", () => {
     expect(raw).toMatch(new RegExp(`${ESC}\\[1mRead`));
     expect(raw).toMatch(new RegExp(`${ESC}\\[31m✗`));
     finish({ text: "Found it." });
-    const done = await waitFor(m.v, (f) => !f.includes("esc to interrupt"), "the turn to end");
+    const done = await waitFor(m.v, (f) => !f.includes("esc to interrupt)"), "the turn to end");
     for (const s of [...order, "✗ Bash(false)", "⎿  exit 1", "Found it."]) {
       expect(done).toContain(s);
     }
@@ -357,12 +357,12 @@ describe("live turn", () => {
     );
     await send(m.v, "first");
     await waitText(m.v, "partial answer");
-    await waitText(m.v, "esc to interrupt");
+    await waitText(m.v, "esc to interrupt)");
     await pressEsc(m.v, () => m.signals[0]?.aborted === true);
     expect(stopped).toBe(true);
     const f = await waitText(m.v, "⎿ Interrupted by user");
     expect(f).toContain("partial answer");
-    expect(f).not.toContain("esc to interrupt");
+    expect(f).not.toContain("esc to interrupt)");
     expect(f).not.toContain("aborted"); // no error line for a user interrupt
     expect(f.indexOf("partial answer")).toBeLessThan(f.indexOf("Interrupted by user"));
     await new Promise((r) => setTimeout(r, 60));
@@ -402,7 +402,7 @@ describe("live turn", () => {
     // now be inert. Without the `interruptible` gating it would abort the turn's signal.
     const m = track(mount(hold((emit) => emit({ type: "assistant_delta", text: "streaming" }))));
     await send(m.v, "q");
-    await waitText(m.v, "esc to interrupt");
+    await waitText(m.v, "esc to interrupt)");
     m.handRun(run);
     await until(() => m.target()?.activity() === "run", "the run");
     for (let i = 0; i < 3; i++) {
@@ -433,7 +433,7 @@ describe("live turn", () => {
     expect(live).not.toContain("check.The");
     expect(live).toContain("Let me check.");
     finish({ text: "The answer." });
-    const done = await waitFor(m.v, (f) => !f.includes("esc to interrupt"), "the turn to end");
+    const done = await waitFor(m.v, (f) => !f.includes("esc to interrupt)"), "the turn to end");
     expect(done).not.toContain("check.The");
     expect(done).toContain("Let me check.");
     expect(done.split("The answer.")).toHaveLength(2);
@@ -453,7 +453,7 @@ describe("live turn", () => {
     await waitText(m.v, "↓ ~100 tokens");
     emitNow({ type: "usage", inputTokens: 1, outputTokens: 1234 });
     const f = await waitText(m.v, "↓ 1.2k tokens");
-    expect(f).not.toContain("~");
+    expect(f).not.toContain("↓ ~");
     emitNow({ type: "assistant_delta", text: "y".repeat(400) });
     await waitText(m.v, "↓ ~1.3k tokens");
   });
@@ -561,9 +561,17 @@ describe("live turn", () => {
     setColumns(m.v.stdout, 40);
     m.v.stdout.emit("resize");
     await send(m.v, "q");
-    await waitText(m.v, "tokens");
+    await waitText(m.v, "↓ 123.5k tokens");
+    // The welcome header was printed (through <Static>) at the width before the resize, and is
+    // never re-flowed: check what follows its bottom border.
+    const afterHeader = (f: string) => {
+      const i = f.indexOf("╰");
+      return i < 0 ? f : f.slice(f.indexOf("\n", i) + 1);
+    };
     const fits = (f: string) => {
-      for (const line of plain(f).split("\n")) expect(stringWidth(line)).toBeLessThanOrEqual(40);
+      for (const line of afterHeader(plain(f)).split("\n")) {
+        expect(stringWidth(line)).toBeLessThanOrEqual(40);
+      }
     };
     const live = m.v.lastFrame() ?? "";
     fits(live);
@@ -575,7 +583,7 @@ describe("live turn", () => {
     }
     fits(m.v.lastFrame() ?? "");
     finish({ text: "" });
-    const done = await waitFor(m.v, (f) => !f.includes("esc to interrupt"), "the turn to end");
+    const done = await waitFor(m.v, (f) => !f.includes("esc to interrupt)"), "the turn to end");
     fits(done);
   });
 });

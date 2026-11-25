@@ -27,6 +27,7 @@ export {
   literalText,
   parseCommand,
 } from "./commands.js";
+export { Header, type HeaderInfo, type ModelsInfo, shortPath, TIP, WELCOME } from "./header.js";
 export {
   HIGHLIGHT_MAX_BYTES,
   HIGHLIGHT_MAX_LINE,
@@ -34,6 +35,7 @@ export {
   highlight,
   type Segment,
 } from "./highlight.js";
+export { InputBox, PLACEHOLDER, SHORTCUTS } from "./input.js";
 export { type InputAction, type InputState, initialInput, reduceInput } from "./input-state.js";
 export {
   applyEvent,
@@ -48,6 +50,7 @@ export { cleanForMarkdown, Markdown } from "./markdown.js";
 export { Safe } from "./safe.js";
 export { sanitize } from "./sanitize.js";
 export { formatTokens, SPINNER_GLYPHS, SPINNER_VERBS, Spinner } from "./spinner.js";
+export { SHORTCUTS_HINT, StatusLine, type StatusParts, statusText } from "./status-line.js";
 export { theme } from "./theme.js";
 export {
   EntryLine,
@@ -250,7 +253,14 @@ export async function renderTrustPrompt(deps: TrustPromptRenderDeps): Promise<bo
   return answer;
 }
 
-export { type BoardState, initialBoard, reduceBoard, STAGES, withCheckpoint } from "./board.js";
+export {
+  type BoardState,
+  currentStage,
+  initialBoard,
+  reduceBoard,
+  STAGES,
+  withCheckpoint,
+} from "./board.js";
 export { Board, RunView } from "./board-view.js";
 export { CheckpointPanel, type CheckpointPrompt, diffStat } from "./checkpoint.js";
 export { fit } from "./fit.js";

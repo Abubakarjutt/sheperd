@@ -4,6 +4,7 @@ import { Box } from "ink";
 import { useEffect, useRef, useState } from "react";
 import {
   type BoardState,
+  currentStage,
   initialBoard,
   reduceBoard,
   STAGES,
@@ -76,10 +77,13 @@ export function RunView({
   run,
   onDone,
   onPending,
+  onStage,
 }: {
   run: RunHandle;
   onDone?: (outcome: RunDone) => void;
   onPending?: (p: PendingPrompt | undefined) => void;
+  /** Hears the current stage ({@link currentStage}) whenever it changes (the status line). */
+  onStage?: (stage: string | undefined) => void;
 }) {
   const [board, setBoard] = useState(initialBoard);
   const [pending, setPending] = useState<PendingPrompt | undefined>(undefined);
@@ -91,6 +95,12 @@ export function RunView({
   doneRef.current = onDone;
   const pendingRef = useRef(onPending);
   pendingRef.current = onPending;
+  const stageRef = useRef(onStage);
+  stageRef.current = onStage;
+  const stage = currentStage(board);
+  useEffect(() => {
+    stageRef.current?.(stage);
+  }, [stage]);
 
   useEffect(() => {
     let live = true;

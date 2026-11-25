@@ -241,3 +241,15 @@ export function withCheckpoint(state: BoardState, f: CheckpointFacts): BoardStat
   const s = { ...state, testCount: f.files };
   return set(s, "Tests", { detail: testsDetail(s) });
 }
+
+/**
+ * The stage a run is in, lower-cased for the status line: the last row that is running, else the
+ * last row that has started; undefined before any stage starts.
+ */
+export function currentStage(state: BoardState): string | undefined {
+  const rows = [...STAGES].reverse();
+  const name =
+    rows.find((n) => state.rows[n].status === "running") ??
+    rows.find((n) => state.rows[n].status !== "pending");
+  return name?.toLowerCase();
+}

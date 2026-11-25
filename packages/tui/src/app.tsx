@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { type CheckpointKind, RewireError, redact } from "@rewire/core";
 import {
   type ChatEvent,
@@ -24,6 +25,7 @@ import {
   literalText,
   parseCommand,
 } from "./commands.js";
+import type { HeaderInfo, ModelsInfo } from "./header.js";
 import { InputBox } from "./input.js";
 import {
   applyEvent,
@@ -38,6 +40,7 @@ import {
 import { ClarifyPanel, ProposalCard } from "./proposal.js";
 import { sanitize } from "./sanitize.js";
 import { pickVerb } from "./spinner.js";
+import { StatusLine } from "./status-line.js";
 import { Transcript, type TranscriptEntry } from "./transcript.js";
 import { TrustPrompt } from "./trust-prompt.js";
 
@@ -105,6 +108,12 @@ export type AppProps = {
   warnings?: string[];
   /** Hands out the {@link InterruptTarget} once, on mount. */
   bindInterrupt?: (target: InterruptTarget) => void;
+  /** The repo shown in the header (default: `config.repo`, else the process cwd). */
+  cwd?: string;
+  /** Shown as `~` in the header (default: the OS home directory). */
+  home?: string;
+  /** The chat and run models, for the header and the status line. */
+  models?: ModelsInfo;
 };
 
 const HIDDEN_NOTES = new Set([PROPOSAL_NOTE, TURN_LIMIT_NOTE]);
@@ -162,6 +171,13 @@ function allowedInRun(c: Command): boolean {
 
 type Clarify = { prompt: Extract<PendingPrompt, { kind: "clarify" }>; answers: string[] };
 
+/** `contract,tests` (in the canonical order), or `off`. */
+function checkpointsShort(set: ReadonlySet<CheckpointKind>): string {
+  const order: CheckpointKind[] = ["contract", "tests", "commit"];
+  const on = [...order.filter((k) => set.has(k)), ...[...set].filter((k) => !order.includes(k))];
+  return on.length > 0 ? on.join(",") : "off";
+}
+
 export function App(props: AppProps) {
   const { subscribe, runController, sessions, doctor, routing, onExit, bindInterrupt } = props;
   const skillsProp = props.skills;
@@ -169,10 +185,26 @@ export function App(props: AppProps) {
     (): SkillsInfo | undefined => (typeof skillsProp === "function" ? skillsProp() : skillsProp),
     [skillsProp],
   );
+  const configRepo = props.config.repo;
+  const cwd = props.cwd ?? (typeof configRepo === "string" ? configRepo : process.cwd());
+  const home = props.home ?? homedir();
+  const models = props.models;
+  /** The welcome box as of now (the skills getter is re-read, so `/clear` shows the new counts). */
+  const headerEntry = useCallback((): TranscriptEntry => {
+    const s = skillsNow();
+    const info: HeaderInfo = {
+      cwd,
+      home,
+      models,
+      ...(s ? { skills: { active: s.active.length, pending: s.pendingRepo.length } } : {}),
+    };
+    return { kind: "header", info };
+  }, [skillsNow, cwd, home, models]);
   /** The in-flight chat turn's abort, set while `send` runs. */
   const turnAbort = useRef<AbortController | undefined>(undefined);
   const sessionRef = useRef(props.session);
   const [entries, setEntries] = useState<TranscriptEntry[]>(() => [
+    headerEntry(),
     ...(props.warnings ?? []).map((text): TranscriptEntry => ({ kind: "note", text })),
     ...historyEntries(props.session),
   ]);
@@ -200,6 +232,10 @@ export function App(props: AppProps) {
     () => props.checkpoints ?? DEFAULT_CHECKPOINTS,
   );
   const [trustOpen, setTrustOpen] = useState(false);
+  /** Input plus output tokens of this session's model calls (`usage` events). */
+  const [tokens, setTokens] = useState(0);
+  /** The active run's stage, from its board (status line). */
+  const [stage, setStage] = useState<string | undefined>(undefined);
   const [trustedLater, setTrustedLater] = useState(false);
   /**
    * The in-flight chat turn's live area. Events fold into `liveRef` at once; the rendered copy
@@ -253,6 +289,7 @@ export function App(props: AppProps) {
       setRun(undefined);
       setPending(undefined);
       setClarify(undefined);
+      setStage(undefined);
     },
     [add, setRun, setClarify],
   );
@@ -267,6 +304,10 @@ export function App(props: AppProps) {
   useEffect(() => {
     if (!subscribe) return;
     return subscribe((e) => {
+      if (e.type === "usage") {
+        const n = (x: number): number => (Number.isFinite(x) && x > 0 ? x : 0);
+        setTokens((t) => t + n(e.inputTokens) + n(e.outputTokens));
+      }
       if (liveRef.current) {
         liveRef.current = applyEvent(liveRef.current, e);
         scheduleLive();
@@ -328,6 +369,7 @@ export function App(props: AppProps) {
         const handle = runController.start(task, { checkpoints: new Set(checkpoints) });
         setPending(undefined);
         setClarify(undefined);
+        setStage(undefined);
         setRun(handle);
       } catch (err) {
         add(errorEntry(err));
@@ -350,9 +392,11 @@ export function App(props: AppProps) {
           // The old transcript stays in the terminal's scrollback above this separator.
           setEntries([
             { kind: "note", text: `${SEPARATOR} ${label} ${SEPARATOR}` },
+            headerEntry(),
             ...entriesOf(next),
           ]);
           setRegion((r) => r + 1);
+          setTokens(0);
           // The new session re-resolved the skills: a trust given earlier is now in effect.
           setTrustedLater(false);
           await old.dispose();
@@ -360,7 +404,7 @@ export function App(props: AppProps) {
           add(errorEntry(err));
         }
       }),
-    [exclusive, add],
+    [exclusive, add, headerEntry],
   );
 
   const resume = useCallback(
@@ -526,11 +570,21 @@ export function App(props: AppProps) {
   const trustSkills = trustOpen ? skillsNow() : undefined;
   const inputOff =
     proposal !== undefined || trustOpen || (run !== undefined && pending?.kind === "checkpoint");
+  const mode =
+    run !== undefined && pending?.kind === "checkpoint"
+      ? `checkpoint: ${pending.checkpoint.kind}`
+      : run !== undefined
+        ? `run: ${stage ?? "starting"}`
+        : live !== undefined
+          ? "thinking"
+          : "chat";
 
   return (
     <Box flexDirection="column">
       <Transcript entries={entries} region={region} />
-      {run ? <RunView run={run} onDone={onRunDone} onPending={onPending} /> : null}
+      {run ? (
+        <RunView run={run} onDone={onRunDone} onPending={onPending} onStage={setStage} />
+      ) : null}
       {clarify ? (
         <ClarifyPanel questions={clarify.prompt.questions} index={clarify.answers.length} />
       ) : null}
@@ -552,6 +606,12 @@ export function App(props: AppProps) {
         />
       ) : null}
       <InputBox busy={busy} disabled={inputOff || live !== undefined} onSubmit={submit} />
+      <StatusLine
+        model={models?.chat}
+        tokens={tokens}
+        checkpoints={checkpointsShort(checkpoints)}
+        mode={mode}
+      />
     </Box>
   );
 }

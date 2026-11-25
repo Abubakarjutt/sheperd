@@ -1,6 +1,7 @@
 import { redact } from "@rewire/core";
 import { Box, Static, Text } from "ink";
 import { fit } from "./fit.js";
+import { Header, type HeaderInfo } from "./header.js";
 import { cleanForMarkdown, Markdown } from "./markdown.js";
 import { Safe } from "./safe.js";
 import { sanitize } from "./sanitize.js";
@@ -21,7 +22,9 @@ export type TranscriptEntry =
     }
   | { kind: "skill"; name: string }
   | { kind: "error"; code: string; message: string }
-  | { kind: "note"; text: string; error?: boolean };
+  | { kind: "note"; text: string; error?: boolean }
+  /** The welcome box, first in every transcript region (startup, `/clear`, `/resume`). */
+  | { kind: "header"; info: HeaderInfo };
 
 /** `read src/x.ts` renders as `Read src/x.ts`. */
 export function toolLabel(summary: string): string {
@@ -143,6 +146,8 @@ export function EntryLine({ entry }: { entry: TranscriptEntry }) {
       );
     case "note":
       return <Safe color={entry.error ? theme.error : theme.dim}>{entry.text}</Safe>;
+    case "header":
+      return <Header info={entry.info} />;
   }
 }
 

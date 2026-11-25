@@ -147,14 +147,14 @@ describe("tui transcript", () => {
     await tick();
     await type(stdin, "one");
     await type(stdin, "\r");
-    expect(lastFrame()).toContain("esc to interrupt");
+    expect(lastFrame()).toContain("esc to interrupt)");
     await type(stdin, "two");
     await type(stdin, "\r");
     expect(sent).toEqual(["one"]);
     release({ text: "done" });
     await tick();
     expect(lastFrame()).toContain("done");
-    expect(lastFrame()).not.toContain("esc to interrupt");
+    expect(lastFrame()).not.toContain("esc to interrupt)");
   });
 
   it("a trailing backslash plus Enter inserts a newline instead of sending", async () => {

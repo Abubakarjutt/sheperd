@@ -8,7 +8,9 @@ export const theme = {
   dim: "gray",
   /** Markdown accent: h1/h2 headings and inline code. */
   accent: "blueBright",
-  glyph: { user: ">", tool: "●", toolError: "✗" },
+  /** The input box border while idle (empty or busy); it turns `accent` while typing. */
+  border: "gray",
+  glyph: { user: ">", tool: "●", toolError: "✗", welcome: "✻" },
   /**
    * Syntax colours for highlight.js scopes (the part after `hljs-`, first word). A scope that is
    * not listed (attr, variable, params, ...) renders in the default colour. `gray` is the dim one.

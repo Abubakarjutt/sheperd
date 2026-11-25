@@ -78,12 +78,12 @@ describe("App interrupt target", () => {
     v.stdin.write("\r");
     await tick(80);
     expect(target?.activity()).toBe("turn");
-    expect(v.lastFrame()).toContain("esc to interrupt");
+    expect(v.lastFrame()).toContain("esc to interrupt)");
     target?.abortTurn();
     await tick(80);
     expect(signal?.aborted).toBe(true);
     expect(target?.activity()).toBe("idle");
-    expect(v.lastFrame()).not.toContain("esc to interrupt");
+    expect(v.lastFrame()).not.toContain("esc to interrupt)");
     expect(v.lastFrame()).toContain("Interrupted by user");
     v.unmount();
   });
@@ -120,7 +120,7 @@ describe("App interrupt target", () => {
   });
 
   it("re-reads a skills getter on /skills", async () => {
-    let n = 0;
+    let name = "first";
     const info = (name: string) => ({
       found: [{ name, source: "user" } as Skill],
       active: [{ name, source: "user" } as Skill],
@@ -133,11 +133,12 @@ describe("App interrupt target", () => {
         session={session(async () => ({ text: "" }))}
         runController={{} as RunController}
         config={{}}
-        skills={() => info(n++ === 0 ? "first" : "second")}
+        skills={() => info(name)}
       />,
     );
     await tick();
-    for (const _ of [0, 1]) {
+    for (const next of ["first", "second"]) {
+      name = next;
       v.stdin.write("/skills");
       await tick();
       v.stdin.write("\r");
