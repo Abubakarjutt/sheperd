@@ -28,7 +28,8 @@ describe("sanitize", () => {
     const n = 2_000_000;
     const t0 = performance.now();
     expect(sanitize(`ok\x1b]52;c;${"\x1b".repeat(n)}`)).toBe("ok");
-    expect(sanitize(`ok\x1b]${"x".repeat(n)}`)).toBe("ok");
+    // Unterminated before the end: only the introducer goes (N2).
+    expect(sanitize(`ok\x1b]${"x".repeat(n)}`)).toBe(`ok${"x".repeat(n)}`);
     expect(sanitize(`${"\x1b[".repeat(n / 2)}z`)).toBe(""); // the final "z" closes the last CSI
     expect(sanitize("\x1b[;".repeat(n / 3))).toBe("");
     expect(performance.now() - t0).toBeLessThan(2000);
