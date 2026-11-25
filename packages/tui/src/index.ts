@@ -18,8 +18,13 @@ export {
   STALE_PROMPT,
   TRUSTED_LATER,
 } from "./app.js";
+export { CommandMenu, menuItems, menuQuery, menuWindow, POPUP_ROWS } from "./command-menu.js";
 export {
+  allowedInRun,
+  COMMAND_HELP,
   type Command,
+  type CommandHelp,
+  commandUsage,
   DEFAULT_CHECKPOINTS,
   describeCheckpoints,
   HELP,
@@ -27,11 +32,50 @@ export {
   literalText,
   parseCommand,
 } from "./commands.js";
+export {
+  type AtToken,
+  atToken,
+  FilePicker,
+  insertPath,
+  rankFiles,
+  splitPath,
+} from "./file-picker.js";
+export { listRepoFiles, MAX_REPO_FILES } from "./files.js";
+export { Header, type HeaderInfo, type ModelsInfo, shortPath, TIP, WELCOME } from "./header.js";
+export {
+  HIGHLIGHT_MAX_BYTES,
+  HIGHLIGHT_MAX_LINE,
+  HIGHLIGHT_MAX_LINES,
+  highlight,
+  type Segment,
+} from "./highlight.js";
+export { InputBox, PLACEHOLDER, SHORTCUTS } from "./input.js";
 export { type InputAction, type InputState, initialInput, reduceInput } from "./input-state.js";
+export {
+  applyEvent,
+  INTERRUPTED,
+  LIVE_THROTTLE_MS,
+  type LiveItem,
+  type LiveState,
+  LiveTurn,
+  liveEntries,
+  splitBlocks,
+  takeFinished,
+} from "./live-turn.js";
+export { cleanForMarkdown, Markdown } from "./markdown.js";
 export { Safe } from "./safe.js";
 export { sanitize } from "./sanitize.js";
+export { formatTokens, SPINNER_GLYPHS, SPINNER_VERBS, Spinner } from "./spinner.js";
+export { SHORTCUTS_HINT, StatusLine, type StatusParts, statusText } from "./status-line.js";
 export { theme } from "./theme.js";
-export { EntryLine, Transcript, type TranscriptEntry, toolLabel } from "./transcript.js";
+export {
+  EntryLine,
+  ToolLine,
+  Transcript,
+  type TranscriptEntry,
+  toolLabel,
+  toolParts,
+} from "./transcript.js";
 
 /** Turns a render-time throw into a settled `renderTui` (exit 1) instead of a hung promise. */
 class Boundary extends Component<
@@ -225,10 +269,17 @@ export async function renderTrustPrompt(deps: TrustPromptRenderDeps): Promise<bo
   return answer;
 }
 
-export { type BoardState, initialBoard, reduceBoard, STAGES, withCheckpoint } from "./board.js";
+export {
+  type BoardState,
+  currentStage,
+  initialBoard,
+  reduceBoard,
+  STAGES,
+  withCheckpoint,
+} from "./board.js";
 export { Board, RunView } from "./board-view.js";
 export { CheckpointPanel, type CheckpointPrompt, diffStat } from "./checkpoint.js";
-export { fit } from "./fit.js";
+export { fit, fitClean, fitStartClean } from "./fit.js";
 export { ClarifyPanel, ProposalCard } from "./proposal.js";
 export {
   listSkillFiles,

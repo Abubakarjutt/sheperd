@@ -9,7 +9,7 @@ import type {
 } from "@rewire/session";
 import { resolveSkills, type Skill, type SkillProblem, type SkillSet } from "@rewire/skills";
 // Type-only: the TUI (Ink, React) is loaded by the caller, only on the interactive path.
-import type { InterruptTarget, SkillsInfo, TuiDeps } from "@rewire/tui";
+import type { InterruptTarget, ModelsInfo, SkillsInfo, TuiDeps } from "@rewire/tui";
 import { type Activity, Interrupter } from "./interactive.js";
 
 /** Cleanup on exit (run done, session and skill-set disposal) never waits longer than this. */
@@ -54,6 +54,10 @@ export type StartDeps = {
   restoreTerminal: () => void;
   doctor?: () => Promise<string>;
   routing?: string;
+  /** The chat and run models, for the TUI's header and status line. */
+  models?: ModelsInfo;
+  /** The home directory, shown as `~` in the header. */
+  home?: string;
   disposeTimeoutMs?: number;
   now?: () => number;
 };
@@ -247,6 +251,9 @@ export async function startInteractive(d: StartDeps): Promise<number> {
       session,
       runController,
       config: { repo: d.repo },
+      cwd: d.repo,
+      ...(d.home !== undefined ? { home: d.home } : {}),
+      ...(d.models ? { models: d.models } : {}),
       sessions: {
         create: () => fresh(),
         resume: (id) => fresh(id),

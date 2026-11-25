@@ -92,7 +92,10 @@ describe("slash commands", () => {
   it("/run with no task shows the usage", async () => {
     const { session } = fakeSession();
     const v = mount({ session });
+    // Enter on `/run` (which needs a task) completes it to `/run ` in the menu; the next sends it.
     await enter(v.stdin, "/run");
+    expect(v.lastFrame()).not.toContain("usage: /run <task>");
+    await enter(v.stdin, "");
     expect(v.lastFrame()).toContain("usage: /run <task>");
   });
 

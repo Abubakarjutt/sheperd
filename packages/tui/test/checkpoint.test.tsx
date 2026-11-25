@@ -52,7 +52,7 @@ describe("CheckpointPanel keys", () => {
     const { handle, answer } = fakeRun(contractPrompt);
     const { stdin, lastFrame } = render(<CheckpointPanel run={handle} prompt={contractPrompt} />);
     expect(lastFrame()).toContain("AC-1 [change] parse() returns tokens");
-    expect(lastFrame()).toContain("[a]pprove [e] revise [s]top");
+    expect(lastFrame()).toContain("a approve · e revise · s stop");
     await type(stdin, "a");
     expect(answer).toHaveBeenCalledWith(contractPrompt, { action: "approve" });
   });
@@ -130,7 +130,7 @@ describe("CheckpointPanel keys", () => {
     const { handle, answer } = fakeRun(prompt);
     const { stdin, lastFrame } = render(<CheckpointPanel run={handle} prompt={prompt} />);
     expect(lastFrame()).toContain("1 frozen test file");
-    expect(lastFrame()).toContain("[a]pprove [v]iew [s]top");
+    expect(lastFrame()).toContain("a approve · v view · s stop");
     expect(lastFrame()).not.toContain("expect(1)");
     await type(stdin, "v");
     const f = lastFrame() ?? "";
@@ -162,10 +162,10 @@ describe("CheckpointPanel keys", () => {
     const { handle, answer } = fakeRun(prompt);
     const { stdin, lastFrame } = render(<CheckpointPanel run={handle} prompt={prompt} />);
     const f = lastFrame() ?? "";
-    expect(f).toContain("src/a.ts +2 -1");
-    expect(f).toContain("img/logo.png (binary, omitted)");
+    expect(f).toContain("src/a.ts  +2 −1");
+    expect(f).toContain("img/logo.png  binary, omitted");
     expect(f).not.toContain("\x1b");
-    expect(f).toContain("[a]pprove [v]iew [s]top");
+    expect(f).toContain("a approve · v view · s stop");
     await type(stdin, "e");
     expect(lastFrame()).not.toContain("revise:");
     await type(stdin, "s");
@@ -189,7 +189,7 @@ describe("CheckpointPanel keys", () => {
     expect(f).toContain("+const k = '[redacted]';");
     expect(f).toContain("+line 0");
     expect(f).not.toContain("+line 59");
-    expect(f).toContain("… (truncated");
+    expect(f).toMatch(/lines 1–\d+ of \d+ · ↑↓ scroll · esc close/);
     expect(f).not.toContain("\x1b");
     await type(v.stdin, "v");
     expect(v.lastFrame()).not.toContain("+line 0");
@@ -225,9 +225,9 @@ describe("narrow terminals and resize (Review Focus 4)", () => {
     setColumns(v.stdout, 40);
     v.rerender(<Board state={busy()} />);
     const ls = lines(v.lastFrame());
-    expect(ls).toHaveLength(6); // nothing wrapped
+    expect(ls).toHaveLength(8); // a border line above and below, one line per stage: nothing wrapped
     expect(maxWidth(v.lastFrame())).toBeLessThanOrEqual(40);
-    for (const i of [0, 2, 3]) expect(ls[i]?.trimEnd().endsWith("…")).toBe(true);
+    for (const i of [1, 3, 4]) expect(ls[i]).toMatch(/…\s*│$/);
     expect(v.lastFrame()).not.toContain("\x1b]52");
   });
 
@@ -236,14 +236,14 @@ describe("narrow terminals and resize (Review Focus 4)", () => {
     setColumns(v.stdout, 120);
     v.stdout.emit("resize");
     await tick();
-    expect(lines(v.lastFrame())).toHaveLength(6);
+    expect(lines(v.lastFrame())).toHaveLength(8);
     expect(maxWidth(v.lastFrame())).toBeLessThanOrEqual(120);
     setColumns(v.stdout, 40);
     expect(() => v.stdout.emit("resize")).not.toThrow();
     await tick();
-    expect(lines(v.lastFrame())).toHaveLength(6);
+    expect(lines(v.lastFrame())).toHaveLength(8);
     expect(maxWidth(v.lastFrame())).toBeLessThanOrEqual(40);
-    expect(lines(v.lastFrame())[2]?.trimEnd().endsWith("…")).toBe(true);
+    expect(lines(v.lastFrame())[3]).toMatch(/…\s*│$/);
     for (const n of [5, 1, 0]) {
       setColumns(v.stdout, n);
       expect(() => v.stdout.emit("resize")).not.toThrow();
@@ -267,14 +267,15 @@ describe("narrow terminals and resize (Review Focus 4)", () => {
     setColumns(v.stdout, 40);
     v.stdout.emit("resize");
     await tick();
-    expect(lines(v.lastFrame())).toHaveLength(3); // title, one criterion, keys
-    expect(lines(v.lastFrame())[1]?.trimEnd().endsWith("…")).toBe(true);
+    // border, title, one criterion, keys, border
+    expect(lines(v.lastFrame())).toHaveLength(5);
+    expect(lines(v.lastFrame())[2]).toMatch(/…\s*│$/);
     await type(v.stdin, "e");
     await type(v.stdin, "z".repeat(100));
     const ls = lines(v.lastFrame());
-    expect(ls).toHaveLength(4);
+    expect(ls).toHaveLength(6);
     expect(maxWidth(v.lastFrame())).toBeLessThanOrEqual(40);
-    expect(ls[3]?.trimEnd().endsWith("…")).toBe(true);
+    expect(ls[4]).toMatch(/…\s*│$/);
   });
 
   it("transcript one-line entries are truncated, not wrapped, at 40 columns and across a resize", async () => {
@@ -341,7 +342,7 @@ describe("RunView", () => {
     const f = v.lastFrame() ?? "";
     expect(f).toContain("✓ Spec");
     expect(f).toContain("1 change · 1 preserve");
-    expect(f).toContain("[a]pprove [e] revise [s]top");
+    expect(f).toContain("a approve · e revise · s stop");
     await type(v.stdin, "a");
     expect(answer).toHaveBeenCalledWith(contractPrompt, { action: "approve" });
     release();
@@ -429,7 +430,7 @@ describe("RunView", () => {
     const v = render(<RunView run={run} />);
     await tick(120);
     expect(v.lastFrame()).toContain("revision limit reached; [a]pprove or [s]top");
-    expect(v.lastFrame()).not.toContain("[e] revise");
+    expect(v.lastFrame()).not.toContain("e revise");
     await type(v.stdin, "e");
     expect(v.lastFrame()).not.toContain("revise:");
     // a message on the first panel must not survive onto the next prompt

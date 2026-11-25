@@ -1,10 +1,9 @@
-import { CHECKPOINT_NOTE_MAX, redact } from "@rewire/core";
+import { CHECKPOINT_NOTE_MAX } from "@rewire/core";
 import type { PendingPrompt, RunHandle } from "@rewire/session";
-import { Box, useInput } from "ink";
-import { type ReactElement, useRef, useState } from "react";
-import { fit } from "./fit.js";
-import { Safe } from "./safe.js";
-import { sanitize } from "./sanitize.js";
+import { useInput } from "ink";
+import { type ReactElement, type ReactNode, useMemo, useRef, useState } from "react";
+import { cleanView, DiffView, ListView, TestsView } from "./diff-view.js";
+import { Card, cardInner, cutStyled, type Styled, StyledLine } from "./styled.js";
 import { theme } from "./theme.js";
 import { useColumns, useRows } from "./use-columns.js";
 
@@ -14,11 +13,17 @@ export const NOTE_MAX = CHECKPOINT_NOTE_MAX;
 const LIMIT = "revision limit reached; [a]pprove or [s]top";
 /** Shown when a prompt was answered or replaced before this key arrived. */
 export const STALE_PROMPT = "that prompt is no longer active";
-/** Content shown by `[v]iew` and the diff are cut here before processing; sanitize copes with a split escape. */
-const MAX_TEXT = 200_000;
+/**
+ * Screen rows outside the panel when none is given: the full board (8) and the status line.
+ */
+export const DEFAULT_OUTSIDE_ROWS = 9;
+/** A card's lines besides its list: border (2), title, "… more", keys, revise box, message. */
+const CARD_FIXED = 7;
+/** A card's lines besides an open view's page: border (2), title, the view footer, keys, message. */
+const VIEW_FIXED = 6;
 
-/** Untrusted text made safe for display: sanitized first, then redacted. */
-const clean = (s: string): string => redact(sanitize(s.slice(0, MAX_TEXT)));
+/** Untrusted text made safe for display: capped, sanitized, then redacted. */
+const clean = cleanView;
 
 export type DiffStat = {
   files: Array<{ path: string; added: number; removed: number; binary: boolean }>;
@@ -59,6 +64,11 @@ export type CheckpointPanelProps = {
   prompt: CheckpointPrompt;
   /** True once the contract has been revised the pipeline's maximum (3) times: a further revise stops the run. */
   revisionLimitReached?: boolean;
+  /**
+   * Screen rows used by everything else in the live frame (the board, the status line). Lists and
+   * views are sized so the card plus these rows fit in the terminal's height.
+   */
+  outside?: number;
 };
 
 /**
@@ -69,6 +79,7 @@ export function CheckpointPanel({
   run,
   prompt,
   revisionLimitReached = false,
+  outside = DEFAULT_OUTSIDE_ROWS,
 }: CheckpointPanelProps) {
   const cols = useColumns();
   const rows = useRows();
@@ -76,7 +87,17 @@ export function CheckpointPanel({
   const [viewing, setViewing] = useState(false);
   const [message, setMessage] = useState<string | undefined>();
   const modeRef = useRef<Mode>(mode);
+  /**
+   * True for the rest of the key event that closed the revise box: the view's own key handler
+   * may run after this panel's, and must not also take that Esc (or Enter) as its own.
+   */
+  const keyTaken = useRef(false);
   const cp = prompt.checkpoint;
+  // Cleaning a 200 KB diff is not free: once per prompt, not on every key.
+  const commitStat = useMemo(
+    () => (cp.kind === "commit" ? diffStat(clean(cp.diff)) : undefined),
+    [cp],
+  );
 
   const setM = (m: Mode): void => {
     modeRef.current = m;
@@ -91,6 +112,10 @@ export function CheckpointPanel({
   useInput((input, key) => {
     const m = modeRef.current;
     if (m.kind === "edit") {
+      keyTaken.current = true;
+      queueMicrotask(() => {
+        keyTaken.current = false;
+      });
       if (key.escape) {
         setM({ kind: "keys" });
         setMessage(undefined);
@@ -117,72 +142,154 @@ export function CheckpointPanel({
       if (run.pending() !== prompt) setMessage(STALE_PROMPT);
       else if (revisionLimitReached) setMessage(LIMIT);
       else setM({ kind: "edit", value: "" });
-    } else if (k === "v" && cp.kind !== "contract") setViewing((v) => !v);
+    } else if (k === "v") setViewing((v) => !v);
   });
 
-  const line = (
-    text: string,
-    props: { color?: string; bold?: boolean; dimColor?: boolean } = {},
-  ) => (
-    <Safe wrap="truncate" {...props}>
-      {fit(clean(text), cols)}
-    </Safe>
-  );
+  const inner = cardInner(cols);
   const out: ReactElement[] = [];
-  const add = (key: string, el: ReactElement): void => {
-    out.push(<Box key={key}>{el}</Box>);
+  /** One card line of styled runs, cut to the card's content width. */
+  const add = (key: string, segs: Styled[]): void => {
+    out.push(<StyledLine key={key} segs={cutStyled(segs, inner)} />);
   };
-  /** `[v]iew`: already-cleaned lines, capped to what fits on screen. */
-  const view = (lines: string[], more: string): void => {
-    const budget = Math.max(3, Math.min(20, rows - 10));
-    lines.slice(0, budget).forEach((l, i) => {
-      add(`v${i}`, line(l, { dimColor: true }));
-    });
-    if (lines.length > budget) add("vm", line(more, { dimColor: true }));
-  };
+  /** One cleaned, flattened line of untrusted text. */
+  const one = (s: string): string => clean(s).replace(/[\n\t]+/g, " ");
+  const hints = (keys: Array<[string, string]>): Styled[] =>
+    keys.flatMap(([k, word], i) => [
+      ...(i > 0 ? [{ text: " · ", dim: true }] : []),
+      { text: k, bold: true, color: theme.user },
+      { text: ` ${word}`, dim: true },
+    ]);
+  // View keys act only for the current prompt, and never while the revise box takes text.
+  const isCurrent = (): boolean =>
+    run.pending() === prompt && modeRef.current.kind !== "edit" && !keyTaken.current;
+  const viewRows = Math.max(1, rows - VIEW_FIXED - outside);
+  /** List lines (criteria, files) that fit; the rest are summed up in a "… more" line. */
+  const cap = Math.max(1, Math.min(10, rows - CARD_FIXED - outside));
+  const closeView = (): void => setViewing(false);
+  let color: string;
+  let body: ReactNode = null;
 
+  const tail: ReactElement[] = [];
+  const addTail = (key: string, segs: Styled[]): void => {
+    tail.push(<StyledLine key={key} segs={cutStyled(segs, inner)} />);
+  };
   if (cp.kind === "contract") {
-    add("h", line(`Contract checkpoint: ${cp.contract.title}`, { bold: true }));
-    cp.contract.criteria.forEach((c, i) => {
-      add(`c${i}`, line(`  ${c.id} [${c.kind}] ${c.statement}`));
-    });
-    if (revisionLimitReached) add("lim", line(LIMIT, { color: theme.busy }));
-    else add("k", line("[a]pprove [e] revise [s]top", { color: theme.user }));
-  } else if (cp.kind === "tests") {
-    add(
-      "h",
-      line(`Tests checkpoint: ${cp.manifest.files.length} frozen test file(s)`, { bold: true }),
-    );
-    for (const [i, f] of cp.files.entries()) add(`f${i}`, line(`  ${f.path}`));
+    color = theme.accent;
+    add("h", [{ text: one(`Contract checkpoint: ${cp.contract.title}`), bold: true, color }]);
+    const crit: Styled[][] = cp.contract.criteria.map((c) => [
+      { text: `${one(c.id)} ` },
+      { text: `[${c.kind}]`, color: c.kind === "change" ? theme.busy : theme.user },
+      { text: ` ${one(c.statement)}` },
+    ]);
     if (viewing) {
-      const lines: string[] = [];
-      for (const f of cp.files) {
-        lines.push(`--- ${f.path}`, ...clean(f.content).split("\n"));
-        if (lines.length > rows) break; // already more than `view` can show
-      }
-      view(lines, "… (truncated; the full tests are frozen in the worktree)");
-    }
-    add("k", line("[a]pprove [v]iew [s]top", { color: theme.user }));
-  } else {
-    const diff = clean(cp.diff);
-    const stat = diffStat(diff);
-    add("h", line(`Commit checkpoint: ${stat.files.length} file(s) changed`, { bold: true }));
-    const cap = Math.max(3, Math.min(10, rows - 10));
-    stat.files.slice(0, cap).forEach((f, i) => {
-      add(
-        `d${i}`,
-        line(`  ${f.path} ${f.binary ? "(binary, omitted)" : `+${f.added} -${f.removed}`}`),
+      // Every criterion, scrollable: a contract is never approved on criteria it could not show.
+      body = (
+        <ListView
+          lines={crit}
+          width={inner}
+          rows={viewRows}
+          isActive={isCurrent}
+          onClose={closeView}
+        />
       );
-    });
-    if (stat.files.length > cap)
-      add("dm", line(`  … ${stat.files.length - cap} more`, { dimColor: true }));
-    if (viewing) view(diff.split("\n"), "… (truncated; the full diff is in the worktree)");
-    add("k", line("[a]pprove [v]iew [s]top", { color: theme.user }));
+    } else {
+      // Every criterion that fits (no fixed cap of 10); `v` shows the rest.
+      const ccap = Math.max(1, rows - CARD_FIXED - outside);
+      crit.slice(0, ccap).forEach((segs, i) => {
+        add(`c${i}`, segs);
+      });
+      if (crit.length > ccap)
+        add("cm", [{ text: `  … ${crit.length - ccap} more criteria · v view all`, dim: true }]);
+    }
+    if (revisionLimitReached) addTail("lim", [{ text: LIMIT, color: theme.busy }]);
+    else
+      addTail(
+        "k",
+        hints([
+          ["a", "approve"],
+          ["e", "revise"],
+          ["s", "stop"],
+        ]),
+      );
+  } else if (cp.kind === "tests") {
+    color = theme.busy;
+    add("h", [
+      {
+        text: `Tests checkpoint: ${cp.manifest.files.length} frozen test file(s)`,
+        bold: true,
+        color,
+      },
+    ]);
+    if (viewing) {
+      body = (
+        <TestsView
+          files={cp.files}
+          width={inner}
+          rows={viewRows}
+          isActive={isCurrent}
+          onClose={closeView}
+        />
+      );
+    } else {
+      cp.files.slice(0, cap).forEach((f, i) => {
+        add(`f${i}`, [{ text: `  ${one(f.path)}` }]);
+      });
+      if (cp.files.length > cap)
+        add("fm", [{ text: `  … ${cp.files.length - cap} more`, dim: true }]);
+    }
+  } else {
+    color = "green";
+    const stat = commitStat ?? { files: [] };
+    add("h", [
+      { text: `Commit checkpoint: ${stat.files.length} file(s) changed`, bold: true, color },
+    ]);
+    if (viewing) {
+      body = (
+        <DiffView
+          diff={cp.diff}
+          width={inner}
+          rows={viewRows}
+          isActive={isCurrent}
+          onClose={closeView}
+        />
+      );
+    } else {
+      stat.files.slice(0, cap).forEach((f, i) => {
+        const path = f.path.replace(/[\n\t]+/g, " ");
+        add(
+          `d${i}`,
+          f.binary
+            ? [{ text: `  ${path}  ` }, { text: "binary, omitted", dim: true }]
+            : [
+                { text: `  ${path}  ` },
+                { text: `+${f.added}`, color: "green" },
+                { text: " " },
+                { text: `−${f.removed}`, color: "red" },
+              ],
+        );
+      });
+      if (stat.files.length > cap)
+        add("dm", [{ text: `  … ${stat.files.length - cap} more`, dim: true }]);
+    }
   }
-
+  if (cp.kind !== "contract")
+    addTail(
+      "k",
+      hints([
+        ["a", "approve"],
+        ["v", "view"],
+        ["s", "stop"],
+      ]),
+    );
   if (mode.kind === "edit") {
-    add("e", line(`revise: ${mode.value}▌  (Enter sends, Esc cancels)`));
+    addTail("e", [{ text: one(`revise: ${mode.value}▌  (Enter sends, Esc cancels)`) }]);
   }
-  if (message) add("m", line(message, { color: theme.error }));
-  return <Box flexDirection="column">{out}</Box>;
+  if (message) addTail("m", [{ text: one(message), color: theme.error }]);
+  return (
+    <Card color={color} cols={cols}>
+      {out}
+      {body}
+      {tail}
+    </Card>
+  );
 }

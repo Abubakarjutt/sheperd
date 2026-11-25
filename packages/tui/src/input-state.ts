@@ -14,7 +14,9 @@ export type InputAction =
   | { type: "newline" }
   | { type: "submit" }
   | { type: "up" }
-  | { type: "down" };
+  | { type: "down" }
+  /** Replace the text (a `/` menu or `@` picker completion); leaves history browsing. */
+  | { type: "set"; value: string };
 
 export const initialInput: InputState = { value: "", history: [], draft: "" };
 
@@ -32,6 +34,8 @@ export function reduceInput(
       return { state: { ...s, value: s.value + a.text, cursor: undefined } };
     case "backspace":
       return { state: { ...s, value: s.value.slice(0, -1), cursor: undefined } };
+    case "set":
+      return { state: { ...s, value: a.value, cursor: undefined } };
     case "newline":
       return { state: { ...s, value: `${s.value}\n`, cursor: undefined } };
     case "submit": {

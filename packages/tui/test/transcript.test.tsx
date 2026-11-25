@@ -59,32 +59,47 @@ describe("tui transcript", () => {
   });
 
   it("renders a tool-call event as a bullet line, and a red cross on error", async () => {
-    const { session } = fakeSession({});
-    const { emit, lastFrame } = mount(session);
+    // Chat events arrive during a turn (events outside one are dropped as late).
+    let emit: (e: ChatEvent) => void = () => {};
+    const { session } = fakeSession({
+      send: async () => {
+        emit({ type: "tool_call", tool: "read", summary: "read src/math.ts", isError: false });
+        emit({ type: "tool_call", tool: "bash", summary: "bash rm x", isError: true });
+        return { text: "" };
+      },
+    });
+    const view = mount(session);
+    emit = view.emit;
+    const { stdin, lastFrame } = view;
     await tick();
-    emit({ type: "tool_call", tool: "read", summary: "read src/math.ts", isError: false });
-    emit({ type: "tool_call", tool: "bash", summary: "bash rm x", isError: true });
+    await type(stdin, "q");
+    await type(stdin, "\r");
     await tick();
-    expect(lastFrame()).toContain("● Read src/math.ts");
-    expect(lastFrame()).toContain("✗ Bash rm x");
+    expect(lastFrame()).toContain("● Read(src/math.ts)");
+    expect(lastFrame()).toContain("✗ Bash(rm x)");
   });
 
   it("renders escape sequences in assistant text, tool summaries, errors and history inert", async () => {
     const evil = "a\x1b[31mred\x1b]52;c;ZXZpbA==\x07\x1b[2Jb\x1b";
+    let emit: (e: ChatEvent) => void = () => {};
     const { session } = fakeSession({
-      send: async () => ({ text: `reply ${evil}` }),
+      send: async () => {
+        emit({ type: "tool_call", tool: "read", summary: `read ${evil}`, isError: false });
+        return { text: `reply ${evil}` };
+      },
       history: [{ role: "assistant", content: `old ${evil}` }],
     });
-    const { stdin, emit, lastFrame } = mount(session);
+    const view = mount(session);
+    emit = view.emit;
+    const { stdin, lastFrame } = view;
     await tick();
-    emit({ type: "tool_call", tool: "read", summary: `read ${evil}`, isError: false });
     await type(stdin, "q");
     await type(stdin, "\r");
     await tick();
     const frame = lastFrame() ?? "";
     expect(frame).toContain("reply aredb");
     expect(frame).toContain("old aredb");
-    expect(frame).toContain("Read aredb");
+    expect(frame).toContain("Read(aredb)");
     // ink-testing-library frames carry no styling of their own, so no ESC byte may appear at all.
     expect(frame).not.toContain("\x1b");
     expect(frame).not.toContain("\x07");
@@ -147,14 +162,14 @@ describe("tui transcript", () => {
     await tick();
     await type(stdin, "one");
     await type(stdin, "\r");
-    expect(lastFrame()).toContain("working");
+    expect(lastFrame()).toContain("esc to interrupt)");
     await type(stdin, "two");
     await type(stdin, "\r");
     expect(sent).toEqual(["one"]);
     release({ text: "done" });
     await tick();
     expect(lastFrame()).toContain("done");
-    expect(lastFrame()).not.toContain("working");
+    expect(lastFrame()).not.toContain("esc to interrupt)");
   });
 
   it("a trailing backslash plus Enter inserts a newline instead of sending", async () => {

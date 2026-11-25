@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { type CheckpointKind, RewireError, redact } from "@rewire/core";
 import {
   type ChatEvent,
@@ -17,6 +18,7 @@ import { type RunDone, RunView } from "./board-view.js";
 import { STALE_PROMPT } from "./checkpoint.js";
 import {
   age,
+  allowedInRun,
   type Command,
   DEFAULT_CHECKPOINTS,
   describeCheckpoints,
@@ -24,11 +26,26 @@ import {
   literalText,
   parseCommand,
 } from "./commands.js";
+import { listRepoFiles } from "./files.js";
+import type { HeaderInfo, ModelsInfo } from "./header.js";
 import { InputBox } from "./input.js";
+import {
+  applyEvent,
+  INTERRUPTED,
+  LIVE_RESERVED_ROWS,
+  LIVE_THROTTLE_MS,
+  type LiveState,
+  LiveTurn,
+  newLive,
+  takeFinished,
+} from "./live-turn.js";
 import { ClarifyPanel, ProposalCard } from "./proposal.js";
 import { sanitize } from "./sanitize.js";
+import { pickVerb } from "./spinner.js";
+import { StatusLine } from "./status-line.js";
 import { Transcript, type TranscriptEntry } from "./transcript.js";
 import { TrustPrompt } from "./trust-prompt.js";
+import { useRows } from "./use-columns.js";
 
 export { STALE_PROMPT };
 
@@ -94,6 +111,17 @@ export type AppProps = {
   warnings?: string[];
   /** Hands out the {@link InterruptTarget} once, on mount. */
   bindInterrupt?: (target: InterruptTarget) => void;
+  /** The repo shown in the header (default: `config.repo`, else the process cwd). */
+  cwd?: string;
+  /** Shown as `~` in the header (default: the OS home directory). */
+  home?: string;
+  /** The chat and run models, for the header and the status line. */
+  models?: ModelsInfo;
+  /**
+   * The repo's files for the `@` picker (default `listRepoFiles` of `config.repo`, else `cwd`).
+   * Called at most once per session, when an `@` is first typed; `/clear` and `/resume` refresh.
+   */
+  listFiles?: () => Promise<string[]>;
 };
 
 const HIDDEN_NOTES = new Set([PROPOSAL_NOTE, TURN_LIMIT_NOTE]);
@@ -112,12 +140,6 @@ export function historyEntries(session: ChatSession): TranscriptEntry[] {
     }
   }
   return out;
-}
-
-function eventEntry(e: ChatEvent): TranscriptEntry | undefined {
-  if (e.type === "tool_call") return { kind: "tool", summary: e.summary, isError: e.isError };
-  if (e.type === "skill_loaded") return { kind: "skill", name: e.name };
-  return undefined; // assistant_text: the turn's final text is appended from ChatTurn.text
 }
 
 function errorEntry(err: unknown): TranscriptEntry {
@@ -143,13 +165,14 @@ function skillsText(s: SkillsInfo | undefined, trustedLater: boolean): string {
   return lines.join("\n");
 }
 
-/** Commands that work while a run is active (the others would race it or the session). */
-function allowedInRun(c: Command): boolean {
-  if (c.kind === "checkpoints") return c.set === undefined;
-  return c.kind === "help" || c.kind === "model" || c.kind === "skills" || c.kind === "skip";
-}
-
 type Clarify = { prompt: Extract<PendingPrompt, { kind: "clarify" }>; answers: string[] };
+
+/** `contract,tests` (in the canonical order), or `off`. */
+function checkpointsShort(set: ReadonlySet<CheckpointKind>): string {
+  const order: CheckpointKind[] = ["contract", "tests", "commit"];
+  const on = [...order.filter((k) => set.has(k)), ...[...set].filter((k) => !order.includes(k))];
+  return on.length > 0 ? on.join(",") : "off";
+}
 
 export function App(props: AppProps) {
   const { subscribe, runController, sessions, doctor, routing, onExit, bindInterrupt } = props;
@@ -158,10 +181,50 @@ export function App(props: AppProps) {
     (): SkillsInfo | undefined => (typeof skillsProp === "function" ? skillsProp() : skillsProp),
     [skillsProp],
   );
+  const configRepo = props.config.repo;
+  const cwd = props.cwd ?? (typeof configRepo === "string" ? configRepo : process.cwd());
+  const home = props.home ?? homedir();
+  const models = props.models;
+  /** The welcome box as of now (the skills getter is re-read, so `/clear` shows the new counts). */
+  const headerEntry = useCallback((): TranscriptEntry => {
+    const s = skillsNow();
+    const info: HeaderInfo = {
+      cwd,
+      home,
+      models,
+      ...(s ? { skills: { active: s.active.length, pending: s.pendingRepo.length } } : {}),
+    };
+    return { kind: "header", info };
+  }, [skillsNow, cwd, home, models]);
+  const listFilesProp = props.listFiles;
+  const filesRepo = typeof configRepo === "string" ? configRepo : cwd;
+  /** The `@` picker's file list: loaded on first want, per session (a swap resets it). */
+  const [files, setFiles] = useState<readonly string[]>([]);
+  const filesAsked = useRef(false);
+  const filesGen = useRef(0);
+  const wantFiles = useCallback(() => {
+    if (filesAsked.current) return;
+    filesAsked.current = true;
+    const gen = filesGen.current;
+    (listFilesProp ?? (() => listRepoFiles(filesRepo)))().then(
+      (list) => {
+        if (gen === filesGen.current) setFiles(list);
+      },
+      () => {}, // the picker just stays empty
+    );
+  }, [listFilesProp, filesRepo]);
+  const resetFiles = useCallback(() => {
+    filesGen.current++;
+    filesAsked.current = false;
+    setFiles([]);
+  }, []);
+  /** The `/` menu or the `@` picker is open: it owns Esc. */
+  const [popup, setPopup] = useState(false);
   /** The in-flight chat turn's abort, set while `send` runs. */
   const turnAbort = useRef<AbortController | undefined>(undefined);
   const sessionRef = useRef(props.session);
   const [entries, setEntries] = useState<TranscriptEntry[]>(() => [
+    headerEntry(),
     ...(props.warnings ?? []).map((text): TranscriptEntry => ({ kind: "note", text })),
     ...historyEntries(props.session),
   ]);
@@ -189,7 +252,53 @@ export function App(props: AppProps) {
     () => props.checkpoints ?? DEFAULT_CHECKPOINTS,
   );
   const [trustOpen, setTrustOpen] = useState(false);
+  /** Context size: the last chat model call's input plus output tokens; none before the first. */
+  const [context, setContext] = useState<number | undefined>(undefined);
+  /** The active run's stage, from its board (status line). */
+  const [stage, setStage] = useState<string | undefined>(undefined);
   const [trustedLater, setTrustedLater] = useState(false);
+  /**
+   * The in-flight chat turn's live area. Events fold into `liveRef` at once. Finished items (a
+   * tool with its result, closed text, complete Markdown blocks) move to the `<Static>`
+   * transcript as they finish (I1), together with the re-render that drops them from the live
+   * area, so nothing shows twice. The rendered copy (`live`) follows at most every
+   * LIVE_THROTTLE_MS for streamed text and tool calls, at once for the other events.
+   */
+  const liveRef = useRef<LiveState | undefined>(undefined);
+  const [live, setLive] = useState<LiveState | undefined>(undefined);
+  const liveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const flushLive = useCallback(() => {
+    clearTimeout(liveTimer.current);
+    liveTimer.current = undefined;
+    const s = liveRef.current;
+    if (!s) return;
+    const { state, entries: done } = takeFinished(s);
+    liveRef.current = state;
+    // Ink's legacy root does not batch these: drop the items from `live` first, then print them
+    // through <Static>, so no frame shows them in both places.
+    setLive(state);
+    if (done.length > 0) setEntries((cur) => [...cur, ...done]);
+  }, []);
+  const scheduleLive = useCallback(() => {
+    if (liveTimer.current !== undefined) return;
+    liveTimer.current = setTimeout(flushLive, LIVE_THROTTLE_MS);
+  }, [flushLive]);
+  /**
+   * Ends the live area (no timer left behind): its remaining entries, and whether the turn
+   * showed any streamed text at all.
+   */
+  const endLive = useCallback((): { rest: TranscriptEntry[]; streamed: boolean } => {
+    clearTimeout(liveTimer.current);
+    liveTimer.current = undefined;
+    const s = liveRef.current;
+    liveRef.current = undefined;
+    setLive(undefined);
+    if (!s) return { rest: [], streamed: false };
+    const { state, entries: rest } = takeFinished(s, true);
+    return { rest, streamed: state.shownText };
+  }, []);
+  useEffect(() => () => clearTimeout(liveTimer.current), []);
+  const rows = useRows();
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: bound once; the target reads refs
   useEffect(() => {
@@ -218,6 +327,7 @@ export function App(props: AppProps) {
       setRun(undefined);
       setPending(undefined);
       setClarify(undefined);
+      setStage(undefined);
     },
     [add, setRun, setClarify],
   );
@@ -232,10 +342,23 @@ export function App(props: AppProps) {
   useEffect(() => {
     if (!subscribe) return;
     return subscribe((e) => {
-      const entry = eventEntry(e);
-      if (entry) add(entry);
+      // Chat events belong to the turn live when they arrive. With none live (a late event of a
+      // turn that already ended or was interrupted) they are dropped (M4): printed now, they
+      // would land after the turn's last line, without their context.
+      if (!liveRef.current) return;
+      if (e.type === "usage") {
+        const n = (x: number): number => (Number.isFinite(x) && x > 0 ? x : 0);
+        const ctx = n(e.inputTokens) + n(e.outputTokens);
+        // A server that reports no usage sends 0/0: keep the last known size (M6).
+        if (ctx > 0) setContext(ctx);
+      }
+      liveRef.current = applyEvent(liveRef.current, e);
+      // A tool_call is followed at once by its tool_result (the session emits both after the tool
+      // ran): wait for the result rather than draw the line live and then print it again.
+      if (e.type === "assistant_delta" || e.type === "tool_call") scheduleLive();
+      else flushLive();
     });
-  }, [subscribe, add]);
+  }, [subscribe, scheduleLive, flushLive]);
 
   /** Runs `work` with the input busy; one at a time (chat turns, session swaps). */
   const exclusive = useCallback((work: () => Promise<void>) => {
@@ -253,20 +376,28 @@ export function App(props: AppProps) {
       exclusive(async () => {
         const ac = new AbortController();
         turnAbort.current = ac;
+        liveRef.current = newLive(pickVerb(), Date.now());
+        setLive(liveRef.current);
         try {
           const turn = await sessionRef.current.send(text, ac.signal);
-          if (turn.text.trim() !== "") add({ kind: "assistant", text: turn.text });
+          const { rest, streamed } = endLive();
+          // Streamed text is the turn's text (its last part is the final answer): shown once.
+          const final: TranscriptEntry[] =
+            !streamed && turn.text.trim() !== "" ? [{ kind: "assistant", text: turn.text }] : [];
+          add(...rest, ...final);
           if (turn.proposal) setProposal(turn.proposal.task);
           else if (turn.endedBy === "turn_limit") {
             note("(the turn stopped at its tool-call limit; send a message to continue)");
           }
         } catch (err) {
-          add(errorEntry(err));
+          // What already streamed stays, then why the turn ended: Esc or Ctrl-C, or an error.
+          const { rest } = endLive();
+          add(...rest, ac.signal.aborted ? { kind: "note", text: INTERRUPTED } : errorEntry(err));
         } finally {
           if (turnAbort.current === ac) turnAbort.current = undefined;
         }
       }),
-    [exclusive, add, note],
+    [exclusive, add, note, endLive],
   );
 
   const startRun = useCallback(
@@ -275,6 +406,7 @@ export function App(props: AppProps) {
         const handle = runController.start(task, { checkpoints: new Set(checkpoints) });
         setPending(undefined);
         setClarify(undefined);
+        setStage(undefined);
         setRun(handle);
       } catch (err) {
         add(errorEntry(err));
@@ -297,9 +429,12 @@ export function App(props: AppProps) {
           // The old transcript stays in the terminal's scrollback above this separator.
           setEntries([
             { kind: "note", text: `${SEPARATOR} ${label} ${SEPARATOR}` },
+            headerEntry(),
             ...entriesOf(next),
           ]);
           setRegion((r) => r + 1);
+          setContext(undefined);
+          resetFiles(); // `/clear` and `/resume` list the repo afresh
           // The new session re-resolved the skills: a trust given earlier is now in effect.
           setTrustedLater(false);
           await old.dispose();
@@ -307,7 +442,7 @@ export function App(props: AppProps) {
           add(errorEntry(err));
         }
       }),
-    [exclusive, add],
+    [exclusive, add, headerEntry, resetFiles],
   );
 
   const resume = useCallback(
@@ -468,14 +603,31 @@ export function App(props: AppProps) {
     [note],
   );
 
+  /** Esc in the live area: aborts the turn's signal, like the Ctrl-C machine's abortTurn. */
+  // Reads the synchronous run mirror, not `interruptible` alone: in the render between a run
+  // starting and LiveTurn re-rendering, Esc must already be inert (Ctrl-C owns the run).
+  const abortTurn = useCallback(() => {
+    if (runRef.current !== undefined) return;
+    turnAbort.current?.abort();
+  }, []);
   const trustSkills = trustOpen ? skillsNow() : undefined;
   const inputOff =
     proposal !== undefined || trustOpen || (run !== undefined && pending?.kind === "checkpoint");
+  const mode =
+    run !== undefined && pending?.kind === "checkpoint"
+      ? `checkpoint: ${pending.checkpoint.kind}`
+      : run !== undefined
+        ? `run: ${stage ?? "starting"}`
+        : live !== undefined
+          ? "thinking"
+          : "chat";
 
   return (
     <Box flexDirection="column">
       <Transcript entries={entries} region={region} />
-      {run ? <RunView run={run} onDone={onRunDone} onPending={onPending} /> : null}
+      {run ? (
+        <RunView run={run} onDone={onRunDone} onPending={onPending} onStage={setStage} />
+      ) : null}
       {clarify ? (
         <ClarifyPanel questions={clarify.prompt.questions} index={clarify.answers.length} />
       ) : null}
@@ -489,7 +641,33 @@ export function App(props: AppProps) {
           onDone={onTrust}
         />
       ) : null}
-      <InputBox busy={busy} disabled={inputOff} onSubmit={submit} />
+      {live ? (
+        <LiveTurn
+          state={live}
+          onInterrupt={abortTurn}
+          interruptible={run === undefined && proposal === undefined && !trustOpen && !popup}
+          maxRows={rows - LIVE_RESERVED_ROWS}
+        />
+      ) : null}
+      <InputBox
+        busy={busy}
+        disabled={inputOff || live !== undefined}
+        // A clarification answer is free text: `?` types there.
+        helpKey={clarify === undefined}
+        // ...and so do `/` and `@`: no command menu or file picker there.
+        popups={clarify === undefined}
+        onSubmit={submit}
+        inRun={run !== undefined}
+        files={files}
+        onWantFiles={wantFiles}
+        onPopup={setPopup}
+      />
+      <StatusLine
+        model={models?.chat}
+        context={context}
+        checkpoints={checkpointsShort(checkpoints)}
+        mode={mode}
+      />
     </Box>
   );
 }

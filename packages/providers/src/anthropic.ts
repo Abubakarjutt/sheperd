@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { RewireError } from "@rewire/core";
-import { providerError } from "./errors.js";
+import { providerError, streamCallbackFailed } from "./errors.js";
 import type { ChatRequest, ChatResponse, Provider, StopReason, ToolCall } from "./types.js";
 
 type Block =
@@ -117,10 +117,43 @@ export class AnthropicProvider implements Provider {
   async chat(req: ChatRequest): Promise<ChatResponse> {
     let resp: unknown;
     try {
-      resp = await this.client.messages.create(
-        toAnthropicParams(req) as unknown as Anthropic.MessageCreateParamsNonStreaming,
-        req.signal ? { signal: req.signal } : undefined,
-      );
+      if (req.onDelta) {
+        // The SDK's MessageStream accumulates content blocks (tool_use input from
+        // input_json_delta included) into the same Message shape `messages.create` returns.
+        const stream = this.client.messages.stream(
+          toAnthropicParams(req) as unknown as Anthropic.MessageStreamParams,
+          req.signal ? { signal: req.signal } : undefined,
+        );
+        const onDelta = req.onDelta;
+        let callbackError: RewireError | undefined;
+        let stopped = false;
+        stream.on("streamEvent", (event) => {
+          if (event.type === "message_stop") stopped = true;
+        });
+        stream.on("text", (delta) => {
+          if (callbackError) return;
+          try {
+            onDelta(delta);
+          } catch (err) {
+            // Surface the caller's throw as-is: stop the request and rethrow it below.
+            callbackError = streamCallbackFailed(err);
+            stream.abort();
+          }
+        });
+        try {
+          resp = await stream.finalMessage();
+        } catch (err) {
+          if (callbackError) throw callbackError;
+          throw err;
+        }
+        if (callbackError) throw callbackError;
+        // A stream that closes before message_stop is a failed request, never a partial reply.
+        if (!stopped) throw new Error("stream ended before message_stop");
+      } else
+        resp = await this.client.messages.create(
+          toAnthropicParams(req) as unknown as Anthropic.MessageCreateParamsNonStreaming,
+          req.signal ? { signal: req.signal } : undefined,
+        );
     } catch (err) {
       throw providerError("anthropic", err, { apiKey: this.apiKey, signal: req.signal });
     }

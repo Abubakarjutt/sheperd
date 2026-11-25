@@ -1,6 +1,6 @@
 import { RewireError } from "@rewire/core";
 import OpenAI from "openai";
-import { providerError } from "./errors.js";
+import { providerError, streamCallbackFailed } from "./errors.js";
 import type { ChatRequest, ChatResponse, Provider, StopReason, ToolCall } from "./types.js";
 
 type OMessage =
@@ -140,6 +140,108 @@ export function fromOpenAIResponse(resp: OResponse, provider = "openai"): ChatRe
   };
 }
 
+type OChunk = {
+  choices?: ReadonlyArray<{
+    index?: number;
+    finish_reason?: string | null;
+    delta?: {
+      content?: string | null;
+      tool_calls?: ReadonlyArray<{
+        index: number;
+        id?: string | null;
+        type?: string | null;
+        function?: { name?: string | null; arguments?: string | null } | null;
+      }> | null;
+    } | null;
+  }> | null;
+  usage?: { prompt_tokens?: number | null; completion_tokens?: number | null } | null;
+};
+
+/** Streaming params: the non-streamed params plus `stream` and a final usage chunk. */
+export function toOpenAIStreamParams(req: ChatRequest, opts: OpenAIParamOptions = {}) {
+  return {
+    ...toOpenAIParams(req, opts),
+    stream: true as const,
+    stream_options: { include_usage: true },
+  };
+}
+
+/**
+ * A streamed reply whose connection closed cleanly before the server sent a finish reason.
+ * It is a transport failure, never a partial success: Ollama maps it like a dropped request.
+ */
+export class StreamTruncatedError extends Error {
+  constructor() {
+    super("stream ended before a finish reason");
+    this.name = "StreamTruncatedError";
+  }
+}
+
+/** Call the caller's stream callback; its throw surfaces as-is, never as a transport error. */
+export function callOnDelta(onDelta: (text: string) => void, text: string): void {
+  try {
+    onDelta(text);
+  } catch (err) {
+    throw streamCallbackFailed(err);
+  }
+}
+
+/**
+ * Consume a chat-completions chunk stream: call `onDelta` per text delta and rebuild the
+ * response a non-streamed call would have returned, for `fromOpenAIResponse` to parse.
+ * Tool calls arrive as indexed deltas: id/name are set when present, argument fragments joined.
+ * The SDK ends iteration quietly when the request is aborted, so an aborted signal is rethrown;
+ * a stream that ends without a finish reason throws StreamTruncatedError.
+ */
+export async function collectOpenAIStream(
+  stream: AsyncIterable<unknown>,
+  onDelta: (text: string) => void,
+  signal?: AbortSignal,
+): Promise<OResponse> {
+  let text = "";
+  let finish: string | null = null;
+  let usage: OResponse["usage"] = null;
+  const calls = new Map<number, { id: string; name: string; arguments: string }>();
+  for await (const raw of stream) {
+    if (signal?.aborted) break;
+    const chunk = raw as OChunk;
+    if (chunk.usage) usage = chunk.usage;
+    const choice = chunk.choices?.find((c) => (c.index ?? 0) === 0);
+    if (!choice) continue;
+    if (choice.finish_reason) finish = choice.finish_reason;
+    const delta = choice.delta;
+    if (typeof delta?.content === "string" && delta.content !== "") {
+      text += delta.content;
+      callOnDelta(onDelta, delta.content);
+    }
+    for (const tc of delta?.tool_calls ?? []) {
+      const cur = calls.get(tc.index) ?? { id: "", name: "", arguments: "" };
+      if (tc.id) cur.id = tc.id;
+      if (tc.function?.name) cur.name = tc.function.name;
+      if (tc.function?.arguments) cur.arguments += tc.function.arguments;
+      calls.set(tc.index, cur);
+    }
+  }
+  signal?.throwIfAborted();
+  if (finish === null) throw new StreamTruncatedError();
+  const toolCalls = [...calls.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([, c]) => ({
+      id: c.id,
+      type: "function",
+      function: { name: c.name, arguments: c.arguments },
+    }));
+  return {
+    choices: [
+      {
+        finish_reason: finish,
+        message: { content: text, tool_calls: toolCalls.length > 0 ? toolCalls : null },
+      },
+    ],
+    usage,
+  };
+}
+
 export class OpenAIProvider implements Provider {
   private readonly client: OpenAI;
   private readonly apiKey: string;
@@ -150,12 +252,21 @@ export class OpenAIProvider implements Provider {
   async chat(req: ChatRequest): Promise<ChatResponse> {
     let resp: unknown;
     try {
-      resp = await this.client.chat.completions.create(
-        toOpenAIParams(
-          req,
-        ) as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
-        req.signal ? { signal: req.signal } : undefined,
-      );
+      if (req.onDelta) {
+        const stream = await this.client.chat.completions.create(
+          toOpenAIStreamParams(
+            req,
+          ) as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+          req.signal ? { signal: req.signal } : undefined,
+        );
+        resp = await collectOpenAIStream(stream, req.onDelta, req.signal);
+      } else
+        resp = await this.client.chat.completions.create(
+          toOpenAIParams(
+            req,
+          ) as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
+          req.signal ? { signal: req.signal } : undefined,
+        );
     } catch (err) {
       throw providerError("openai", err, { apiKey: this.apiKey, signal: req.signal });
     }

@@ -43,4 +43,15 @@ describe("FauxProvider", () => {
       code: "faux_script_exhausted",
     });
   });
+  test("onDelta gets the scripted text once and is not recorded in requests", async () => {
+    const faux = new FauxProvider([text("hello"), call("read", {}), text("")]);
+    const deltas: string[] = [];
+    const onDelta = (d: string) => deltas.push(d);
+    const r = await faux.chat({ ...base, messages: [], onDelta });
+    expect(r.message.text).toBe("hello");
+    await faux.chat({ ...base, messages: [], onDelta });
+    await faux.chat({ ...base, messages: [], onDelta });
+    expect(deltas).toEqual(["hello"]);
+    for (const q of faux.requests) expect(q).not.toHaveProperty("onDelta");
+  });
 });

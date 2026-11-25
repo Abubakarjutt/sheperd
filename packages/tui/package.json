@@ -23,7 +23,9 @@
     "@rewire/core": "workspace:*",
     "@rewire/session": "workspace:*",
     "@rewire/skills": "workspace:*",
+    "highlight.js": "11.12.0",
     "ink": "8.0.0",
+    "marked": "18.2.0",
     "react": "19.3.1",
     "string-width": "8.3.0"
   },
