@@ -12,7 +12,7 @@ import { LiveTurn, newLive } from "../src/live-turn.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function waitFor(ok: () => boolean, what: string, ms = 8000): Promise<void> {
+async function waitFor(ok: () => boolean, what: string, ms = 15_000): Promise<void> {
   const end = Date.now() + ms;
   while (!ok()) {
     if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);

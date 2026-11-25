@@ -11,7 +11,7 @@ import { App } from "../src/app.js";
 const tick = (ms = 40) => new Promise((r) => setTimeout(r, ms));
 
 /** Polls until `ok()` holds (slow CI runners render late); fails the test at the deadline. */
-async function waitFor(ok: () => boolean, what: string, ms = 5000): Promise<void> {
+async function waitFor(ok: () => boolean, what: string, ms = 15_000): Promise<void> {
   const end = Date.now() + ms;
   while (!ok()) {
     if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);

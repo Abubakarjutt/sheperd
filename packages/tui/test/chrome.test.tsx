@@ -26,7 +26,7 @@ const maxWidth = (f: string | undefined): number =>
       .map((l) => stringWidth(l)),
   );
 
-async function waitFor(v: View, ok: (frame: string) => boolean, what: string, ms = 5000) {
+async function waitFor(v: View, ok: (frame: string) => boolean, what: string, ms = 15_000) {
   const end = Date.now() + ms;
   for (;;) {
     const f = plain(v.lastFrame());

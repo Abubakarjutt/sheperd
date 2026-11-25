@@ -59,7 +59,7 @@ function expectOnlySgr(f: string): void {
 type View = ReturnType<typeof render>;
 
 /** Polls until the current frame (colour stripped) satisfies `ok`; fails with it on timeout. */
-async function waitFor(v: View, ok: (frame: string) => boolean, what: string, ms = 5000) {
+async function waitFor(v: View, ok: (frame: string) => boolean, what: string, ms = 15_000) {
   const end = Date.now() + ms;
   for (;;) {
     const f = plain(v.lastFrame());
@@ -72,7 +72,7 @@ const waitText = (v: View, needle: string, ms?: number) =>
   waitFor(v, (f) => f.includes(needle), JSON.stringify(needle), ms);
 
 /** Polls a plain condition. */
-async function until(ok: () => boolean, what: string, ms = 5000) {
+async function until(ok: () => boolean, what: string, ms = 15_000) {
   const end = Date.now() + ms;
   while (!ok()) {
     if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);

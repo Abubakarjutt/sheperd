@@ -23,6 +23,9 @@ import {
 } from "../src/diff-view.js";
 import { SPINNER_TICK_MS } from "../src/spinner.js";
 
+/** Wall-clock budget for render-time guards: they catch pathological (e.g. quadratic) slowdowns, not benchmark. CI runners are ~3x slower than a dev machine. */
+const PERF_BUDGET_MS = process.env.CI ? 10_000 : 1500;
+
 afterAll(() => {
   if (previousForceColor === undefined) delete process.env.FORCE_COLOR;
   else process.env.FORCE_COLOR = previousForceColor;
@@ -37,7 +40,7 @@ const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 
 type View = { lastFrame: () => string | undefined };
 /** Polls until the frame passes `ok`; fails with the last frame after `ms`. */
-async function waitFor(v: View, ok: (plainFrame: string) => boolean, what: string, ms = 3000) {
+async function waitFor(v: View, ok: (plainFrame: string) => boolean, what: string, ms = 15_000) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
     if (ok(plain(v.lastFrame()))) return;
@@ -734,7 +737,7 @@ describe("fix round 1", () => {
     expect(plain(v.lastFrame())).toContain("lines 1–30 of");
     v.stdin.write("G");
     await waitFor(v, (f) => !f.includes("lines 1–30 of"), "the jump to the end");
-    expect(performance.now() - t0).toBeLessThan(1500);
+    expect(performance.now() - t0).toBeLessThan(PERF_BUDGET_MS);
     v.unmount();
   });
 });

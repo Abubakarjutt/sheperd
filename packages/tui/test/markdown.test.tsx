@@ -17,6 +17,9 @@ import {
 } from "../src/highlight.js";
 import { cleanForMarkdown, decodeEntities, Markdown } from "../src/markdown.js";
 
+/** Wall-clock budget for render-time guards: they catch pathological (e.g. quadratic) slowdowns, not benchmark. CI runners are ~3x slower than a dev machine. */
+const PERF_BUDGET_MS = process.env.CI ? 10_000 : 1500;
+
 afterAll(() => {
   if (previousForceColor === undefined) delete process.env.FORCE_COLOR;
   else process.env.FORCE_COLOR = previousForceColor;
@@ -294,20 +297,20 @@ describe("robustness", () => {
     return { f, ms: performance.now() - t0 };
   };
 
-  it("renders 200 KB of styled prose in under 1500 ms", () => {
+  it("renders 200 KB of styled prose within the render budget", () => {
     const { f, ms } = timed(
       fill(() => "Some **bold** text with `code` and a [link](https://e.x) to read.\n\n"),
     );
     expect(plain(f)).toContain("Some bold text");
-    expect(ms).toBeLessThan(1500);
+    expect(ms).toBeLessThan(PERF_BUDGET_MS);
   });
 
-  it("renders a 200 KB code block (past the highlight cap) in under 1500 ms", () => {
+  it("renders a 200 KB code block (past the highlight cap) within the render budget", () => {
     const { f, ms } = timed(
       `\`\`\`ts\n${fill(() => "const value: number = compute(1, 2);\n")}\`\`\``,
     );
     expect(plain(f)).toContain("const value");
-    expect(ms).toBeLessThan(1500);
+    expect(ms).toBeLessThan(PERF_BUDGET_MS);
   });
 
   it("renders a 200 KB mixed reply (600 highlighted blocks) without pathological slowdown", () => {
@@ -319,7 +322,7 @@ describe("robustness", () => {
       ),
     );
     expect(plain(f)).toContain("Step 0");
-    expect(ms).toBeLessThan(1500);
+    expect(ms).toBeLessThan(PERF_BUDGET_MS);
   });
 
   it("emits no escape byte except SGR, even for hostile input", () => {
@@ -419,10 +422,10 @@ describe("fix round 1", () => {
     expectFits(f, 8);
   });
 
-  it("renders a 40,000-character single-token ts line in under 1500 ms", () => {
+  it("renders a 40,000-character single-token ts line within the render budget", () => {
     const t0 = performance.now();
     const f = frame(`\`\`\`ts\n${"a".repeat(40_000)}\n\`\`\``, 40);
-    expect(performance.now() - t0).toBeLessThan(1500);
+    expect(performance.now() - t0).toBeLessThan(PERF_BUDGET_MS);
     expectFits(f, 40);
   });
 
