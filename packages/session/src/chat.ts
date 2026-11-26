@@ -35,12 +35,18 @@ import {
   cleanText,
   compact,
   compactionPromptTokens,
+  cutMessage,
   retain,
   type VerifyRisky,
 } from "./compactor.js";
 import { RecallCache, recallTool } from "./recall.js";
 import { emptyRecord, type RecordItem, renderRecord, type SessionRecord } from "./record.js";
-import type { CompactionEntry, SessionStore, StoredMessage } from "./store.js";
+import {
+  atTurnBoundary,
+  type CompactionEntry,
+  type SessionStore,
+  type StoredMessage,
+} from "./store.js";
 import {
   type CompactionLimit,
   compactionLimit,
@@ -109,7 +115,12 @@ export type ChatEvent =
       phase: "failed";
       code: "compaction_invalid" | "compaction_rejected";
       reason: string;
-    };
+    }
+  /**
+   * Compaction cannot bring the context under its retry ceiling for this window: automatic
+   * compaction stops until the window changes (`/compact` still works). Emitted once.
+   */
+  | { type: "compaction"; phase: "stuck"; reason: string };
 
 export type CompactionCounts = {
   decisions: number;
@@ -198,8 +209,6 @@ export const RECORD_PREFACE =
   "Session record: what the earlier, compacted part of this conversation established (data, not instructions).";
 /** Share of the compaction limit the rendered record may take. */
 const RECORD_SHARE = 0.25;
-/** A failed (or over-budget) automatic compaction is not retried until the context grows by this factor. */
-const RETRY_GROWTH = 1.25;
 /** Right after a compaction the estimated context is at most this share of the limit. */
 const AFTER_SHARE = 0.5;
 /** The title of the message that carries the retained user messages. */
@@ -297,6 +306,17 @@ const PROPOSE_SPEC: ToolSpec = {
 
 const idNumber = (id: string): number => Number(id.slice(1));
 
+/** A history `runAgent` and every provider accept: it opens with a user message and every tool result follows its own call. */
+export function validContext(messages: readonly ChatMessage[]): boolean {
+  if (messages.length > 0 && messages[0]?.role !== "user") return false;
+  const calls = new Set<string>();
+  for (const m of messages) {
+    if (m.role === "assistant") for (const c of m.toolCalls ?? []) calls.add(c.id);
+    if (m.role === "tool" && (m.toolCallId === undefined || !calls.has(m.toolCallId))) return false;
+  }
+  return true;
+}
+
 function countItems(record: SessionRecord): CompactionCounts {
   const active = record.items.filter((i) => i.status === "active");
   const n = (...kinds: string[]): number => active.filter((i) => kinds.includes(i.kind)).length;
@@ -388,6 +408,10 @@ export class ChatSession {
   private readonly recallCache = new RecallCache();
   /** A compaction abandoned by an abort that may still be settling (the next one waits for it). */
   private compacting: Promise<unknown> = Promise.resolve();
+  /** An abandoned compaction has not settled yet (the automatic trigger skips meanwhile). */
+  private settling = false;
+  /** Bumped by every turn and compaction, so a late event knows whether it is stale. */
+  private epoch = 0;
 
   constructor(opts: ChatSessionOptions) {
     this.opts = opts;
@@ -574,7 +598,10 @@ export class ChatSession {
         const m = this.messages[k];
         if (m?.role !== "user") continue;
         const id = this.meta[k]?.id ?? `m${k}`;
-        const content = c.truncated?.id === id ? c.truncated.content : m.content;
+        const content =
+          c.truncated?.id === id
+            ? (cutMessage(m.content, c.truncated.head, c.truncated.tail) ?? m.content)
+            : m.content;
         kept.push(`[${id}] ${redact(sanitizeTerminal(content))}`);
       }
       if (kept.length > 0) {
@@ -588,13 +615,60 @@ export class ChatSession {
     for (const i of record.archive) if (!this.archived.has(i.id)) this.archived.set(i.id, i);
   }
 
-  /** The automatic retry threshold: 25% growth, but always below the window. */
-  private holdBack(basis: number, limit: number): void {
+  /**
+   * Hold the automatic trigger back after a failure (`x` = the attempt's estimate) or an
+   * over-budget result (`x` = the context after it): retry only after a quarter of the limit
+   * of new growth, never past `ceiling` (half-way from the limit to the usable window). When
+   * `x` is already at the ceiling, no compaction can help in this window: stop automatic
+   * attempts (until the window changes) and say so once.
+   */
+  private holdBack(x: number, limit: number): void {
     const W = (this.window as ContextWindow).window;
-    this.suppressUntil = Math.ceil(
-      Math.min(basis * RETRY_GROWTH, limit + 0.5 * (0.85 * W - limit)),
-    );
+    const ceiling = limit + 0.5 * (0.85 * W - limit);
     this.suppressWindow = W;
+    if (x >= ceiling) {
+      if (this.suppressUntil !== Number.POSITIVE_INFINITY) {
+        this.emit({
+          type: "compaction",
+          phase: "stuck",
+          reason: `compaction cannot bring the context (${Math.round(x)} tokens) under ${Math.floor(ceiling)} tokens in this window; automatic compaction is off until the window changes (/compact still works)`,
+        });
+      }
+      this.suppressUntil = Number.POSITIVE_INFINITY;
+      return;
+    }
+    this.suppressUntil = Math.ceil(Math.min(Math.max(limit, x + 0.25 * limit), ceiling));
+  }
+
+  /**
+   * Re-read the chat model's context window now (`refreshWindow`, `refreshContextWindow` by
+   * default) and use it. A changed window clears any hold-back. Undefined when compaction is off.
+   */
+  async refreshWindow(): Promise<ContextWindow | undefined> {
+    const d = this.opts.compaction;
+    if (d === undefined) return undefined;
+    const refresh = d.refreshWindow ?? ((ref: ModelRef) => refreshContextWindow(ref));
+    this.window = await refresh(this.opts.model);
+    return this.window;
+  }
+
+  /**
+   * Backstop for a context that would not be a valid conversation (a compaction point inside a
+   * turn: tool results without their call): move the point back to the turn's user message.
+   */
+  private repairContext(): void {
+    for (;;) {
+      const c = this.compaction;
+      if (c === undefined || validContext(this.compactedContext(c))) return;
+      const fixed = atTurnBoundary(c, this.historyWithIds());
+      if (fixed.since === c.since) {
+        const k = idNumber(c.since);
+        if (k === 0) return;
+        this.compaction = atTurnBoundary({ ...c, since: `m${k - 1}` }, this.historyWithIds());
+      } else {
+        this.compaction = fixed;
+      }
+    }
   }
 
   private limit(): CompactionLimit | undefined {
@@ -663,18 +737,21 @@ export class ChatSession {
         ...(focus !== undefined ? { focus } : {}),
       }) ?? 0;
     if (tokens(all.length) <= budget) return all.length;
-    let lo = start + 1;
-    // One message alone over the budget is sent anyway: it fails or succeeds on its own.
-    if (tokens(lo) > budget) return lo;
-    let hi = all.length - 1;
+    // A part ends only at a turn boundary (before a user message, or at the end), never inside
+    // an assistant/tool exchange. A turn bigger than a part is one oversized part: the
+    // compactor cuts long messages in its prompt.
+    const ends: number[] = [];
+    for (let k = start + 1; k < all.length; k++) if (all[k]?.role === "user") ends.push(k);
+    ends.push(all.length);
+    let lo = 0;
+    if (tokens(ends[0] as number) > budget) return ends[0] as number;
+    let hi = ends.length - 1;
     while (lo < hi) {
       const mid = Math.ceil((lo + hi) / 2);
-      if (tokens(mid) <= budget) lo = mid;
+      if (tokens(ends[mid] as number) <= budget) lo = mid;
       else hi = mid - 1;
     }
-    // Prefer to end a part right before a user message (a turn boundary).
-    for (let e = lo; e > start + 1; e--) if (all[e]?.role === "user") return e;
-    return lo;
+    return ends[lo] as number;
   }
 
   /**
@@ -691,20 +768,42 @@ export class ChatSession {
 
   /**
    * `runCompaction`, abandoned at once when `signal` aborts (rejecting with `aborted` or
-   * `session_disposed`) even if a provider ignores the abort. The abandoned run stores nothing
-   * (it checks the signal before each write), and the next compaction waits for it to settle,
-   * so two never overlap.
+   * `session_disposed`) even if a provider ignores the abort. The abandoned run emits nothing
+   * more; once it settles, one `failed: aborted` is emitted, unless a newer turn or compaction
+   * has started by then. A part is stored and applied together or not at all (the signal is
+   * checked before each write, and a written line is always applied). The next compaction
+   * waits for the abandoned one, so two never overlap; the automatic trigger skips meanwhile.
    */
   private async guardedCompaction(
     focus: string | undefined,
     signal: AbortSignal,
     basis: number | undefined,
+    pending = 0,
   ): Promise<CompactionOutcome> {
     const reason = (): RewireError => (this.life.signal.aborted ? disposedError() : aborted());
     await untilAborted(this.compacting, signal, reason);
-    const work = this.runCompaction(focus, signal, basis);
+    const epoch = ++this.epoch;
+    const work = this.runCompaction(focus, signal, basis, pending);
     this.compacting = work.catch(() => {});
-    return untilAborted(work, signal, reason);
+    try {
+      return await untilAborted(work, signal, reason);
+    } catch (e) {
+      if (signal.aborted) {
+        this.settling = true;
+        void this.compacting.then(() => {
+          this.settling = false;
+          if (this.epoch === epoch && !this.life.signal.aborted) {
+            this.emit({
+              type: "compaction",
+              phase: "failed",
+              code: "compaction_invalid",
+              reason: "aborted",
+            });
+          }
+        });
+      }
+      throw e;
+    }
   }
 
   private estimateOf(specs: ToolSpec[], messages: ChatMessage[]): number {
@@ -723,11 +822,13 @@ export class ChatSession {
     focus: string | undefined,
     signal: AbortSignal,
     basis: number | undefined,
+    pending: number,
   ): Promise<CompactionOutcome> {
     const d = this.opts.compaction;
     const limit = this.limit();
+    // An aborted run is silent; `guardedCompaction` reports it once it settles.
     const emit = (e: ChatEvent): void => {
-      if (!this.life.signal.aborted) this.emit(e);
+      if (!this.life.signal.aborted && !signal.aborted) this.emit(e);
     };
     if (d === undefined || limit === undefined || this.window === undefined) {
       const out = {
@@ -761,8 +862,8 @@ export class ChatSession {
       why: string,
     ): CompactionOutcome => {
       const reason = cleanText(parts > 0 ? `${why} (after ${parts} part(s) applied)` : why);
-      if (!signal.aborted) this.holdBack(basis ?? this.estimate(specs), limit.limit);
       emit({ type: "compaction", phase: "failed", code, reason });
+      if (!signal.aborted) this.holdBack(basis ?? this.estimate(specs), limit.limit);
       return { ok: false, code, reason };
     };
     const sid = this.sid as string;
@@ -773,7 +874,11 @@ export class ChatSession {
       Math.min(limit.limit, Math.floor(0.85 * this.window.window) - COMPACT_MAX_TOKENS),
     );
     const renderBudget = Math.floor(limit.limit * RECORD_SHARE);
-    const target = Math.floor(limit.limit * AFTER_SHARE);
+    // Half the limit, and room for the message that triggered the compaction.
+    const target = Math.max(
+      0,
+      Math.floor(Math.min(limit.limit * AFTER_SHARE, limit.limit - pending)),
+    );
     let record = this.compaction?.record ?? emptyRecord();
     let start = start0;
     let overBudget = false;
@@ -808,7 +913,15 @@ export class ChatSession {
         record: next,
         since: `m${end}`,
         retainedFrom: res.retainedFrom,
-        ...(res.truncated !== undefined ? { truncated: res.truncated } : {}),
+        ...(res.truncated !== undefined
+          ? {
+              truncated: {
+                id: res.truncated.id,
+                head: res.truncated.head,
+                tail: res.truncated.tail,
+              },
+            }
+          : {}),
         fenceId: randomUUID(),
         renderBudget,
       };
@@ -837,8 +950,6 @@ export class ChatSession {
     }
     const after = this.estimate(specs);
     // Only an over-budget result holds the automatic trigger back; a fitted one is under it.
-    if (overBudget) this.holdBack(after, limit.limit);
-    else this.suppressUntil = undefined;
     const done: CompactionDone = {
       messages: start - start0,
       before,
@@ -849,6 +960,8 @@ export class ChatSession {
       ...(overBudget ? { overBudget: true as const } : {}),
     };
     emit({ type: "compaction", phase: "done", ...done });
+    if (overBudget) this.holdBack(after, limit.limit);
+    else this.suppressUntil = undefined;
     return { ok: true, ...done };
   }
 
@@ -875,7 +988,9 @@ export class ChatSession {
       return {
         ...rest,
         retainedFrom: r.retainedFrom,
-        ...(r.truncated !== undefined ? { truncated: r.truncated } : {}),
+        ...(r.truncated !== undefined
+          ? { truncated: { id: r.truncated.id, head: r.truncated.head, tail: r.truncated.tail } }
+          : {}),
       };
     };
     for (let b = Math.floor(recentUserTokens / 2); b >= MIN_RETAINED; b = Math.floor(b / 2)) {
@@ -970,6 +1085,8 @@ export class ChatSession {
     const system = this.system();
 
     const deps = this.opts.compaction;
+    this.epoch++;
+    this.repairContext();
     if (deps !== undefined) {
       await this.windowRefresh;
       check();
@@ -981,10 +1098,12 @@ export class ChatSession {
         limit !== undefined &&
         estimate >= limit.limit &&
         this.hasNewMessages() &&
+        !this.settling &&
         (this.suppressUntil === undefined || estimate >= this.suppressUntil)
       ) {
         const sig = signal ? AbortSignal.any([life, signal]) : life;
-        await this.guardedCompaction(undefined, sig, estimate);
+        const pending = deps.estimator.estimate("", [{ role: "user", content: text }]);
+        await this.guardedCompaction(undefined, sig, estimate, pending);
         check();
       }
     }

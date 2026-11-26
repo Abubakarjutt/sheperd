@@ -180,7 +180,7 @@ export type CompactResult =
        */
       retainedFrom: string | null;
       /** Set when the newest user message alone was over budget: its cut content. */
-      truncated?: { id: string; content: string };
+      truncated?: Truncation & { content: string };
     }
   | {
       ok: false;
@@ -726,15 +726,33 @@ export function checkInvariants(
 // Retained messages
 // ---------------------------------------------------------------------------------------------
 
-function truncateToBudget(content: string, budget: number, est: TokenEstimator): string {
+/** Where a retained message was cut: its first `head` and last `tail` characters are kept. */
+export type Truncation = { id: string; head: number; tail: number };
+
+/**
+ * `content` cut to its first `head` and last `tail` characters with an omission marker between;
+ * undefined unless `head + tail` is less than its length (a cut of exactly that message).
+ */
+export function cutMessage(content: string, head: number, tail: number): string | undefined {
+  if (!(Number.isInteger(head) && Number.isInteger(tail) && head >= 0 && tail >= 0))
+    return undefined;
+  if (head + tail >= content.length) return undefined;
+  const marker = `\n[… ${content.length - head - tail} characters omitted by compaction …]\n`;
+  return `${content.slice(0, head)}${marker}${tail > 0 ? content.slice(-tail) : ""}`;
+}
+
+function truncateToBudget(
+  content: string,
+  budget: number,
+  est: TokenEstimator,
+): { content: string; head: number; tail: number } {
   const size = (s: string) => est.estimate("", [{ role: "user", content: s }]);
-  let keep = Math.max(0, Math.floor((budget * 4) / est.ratio) - 100);
+  let keep = Math.min(content.length - 1, Math.max(0, Math.floor((budget * 4) / est.ratio) - 100));
   for (;;) {
     const head = Math.ceil(keep / 2);
     const tail = keep - head;
-    const marker = `\n[… ${content.length - keep} characters omitted by compaction …]\n`;
-    const s = `${content.slice(0, head)}${marker}${tail > 0 ? content.slice(-tail) : ""}`;
-    if (size(s) <= budget || keep === 0) return s;
+    const s = cutMessage(content, head, tail) as string;
+    if (size(s) <= budget || keep === 0) return { content: s, head, tail };
     keep = Math.max(0, keep - Math.max(16, Math.ceil(keep / 10)));
   }
 }
@@ -748,7 +766,7 @@ export function retain(
   messages: readonly StoredMessage[],
   budget: number,
   est: TokenEstimator,
-): { retainedFrom: string | null; truncated?: { id: string; content: string } } {
+): { retainedFrom: string | null; truncated?: Truncation & { content: string } } {
   let used = 0;
   let from: string | null = null;
   for (let k = messages.length - 1; k >= 0; k--) {
@@ -763,7 +781,7 @@ export function retain(
     if (from === null) {
       return {
         retainedFrom: m.id,
-        truncated: { id: m.id, content: truncateToBudget(m.content, budget, est) },
+        truncated: { id: m.id, ...truncateToBudget(m.content, budget, est) },
       };
     }
     break;

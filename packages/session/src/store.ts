@@ -15,6 +15,7 @@ import { join, resolve } from "node:path";
 import { FENCE_ID, newRunId, RewireError, redact } from "@rewire/core";
 import type { ChatMessage } from "@rewire/providers";
 import { z } from "zod";
+import { cutMessage, type Truncation } from "./compactor.js";
 import { MessageId, SessionRecord } from "./record.js";
 
 /** `<repo>/.rewire/sessions`, relative to the repo root. */
@@ -85,8 +86,12 @@ export type CompactionEntry = {
   since: string;
   /** The oldest user message kept verbatim (before `since`), or null when none is kept. */
   retainedFrom: string | null;
-  /** The cut content of `retainedFrom` when it alone was over the retained budget. */
-  truncated?: { id: string; content: string };
+  /**
+   * Where `retainedFrom` was cut when it alone was over the retained budget: its first `head`
+   * and last `tail` characters are kept. Only counts are stored; the cut is rebuilt from the
+   * stored message (`cutMessage`), so no stored text reaches the model.
+   */
+  truncated?: Truncation;
   /** The record fence's id (a random UUID chosen once), so a resume renders the same bytes. */
   fenceId: string;
   /** Tokens the rendered record may take (`renderRecord`'s budget). */
@@ -100,7 +105,16 @@ const CompactionLine = z
     record: SessionRecord,
     since: MessageId,
     retainedFrom: MessageId.nullable(),
-    truncated: z.object({ id: MessageId, content: z.string() }).strict().optional(),
+    truncated: z
+      .object({
+        id: MessageId,
+        head: z.number().int().nonnegative(),
+        tail: z.number().int().nonnegative(),
+        /** Never trusted: cut text from older or forged files is ignored. */
+        content: z.unknown().optional(),
+      })
+      .strict()
+      .optional(),
     fenceId: z.string().regex(FENCE_ID),
     renderBudget: z.number().int().nonnegative().max(10_000_000),
     /** Never trusted: pre-rendered text from older or forged files is ignored. */
@@ -162,12 +176,19 @@ function checkCompaction(
   if (e.truncated !== undefined && e.truncated.id !== e.retainedFrom) {
     return { why: "truncates a message it does not keep" };
   }
+  // A cut that does not fit the message it names is dropped (the message is kept whole).
+  const t = e.truncated;
+  const cut =
+    t !== undefined &&
+    cutMessage(before[idNumber(t.id)]?.content ?? "", t.head, t.tail) !== undefined
+      ? { id: t.id, head: t.head, tail: t.tail }
+      : undefined;
   const entry: CompactionEntry = {
     at: e.at,
     record: e.record,
     since: e.since,
     retainedFrom: e.retainedFrom,
-    ...(e.truncated !== undefined ? { truncated: e.truncated } : {}),
+    ...(cut !== undefined ? { truncated: cut } : {}),
     fenceId: e.fenceId,
     renderBudget: e.renderBudget,
   };
@@ -211,7 +232,26 @@ function parseSession(id: string, raw: string): LoadedSession {
       }
       out.push({ id: expected, ...message });
     });
-  return { messages: out, compactions };
+  return { messages: out, compactions: compactions.map((c) => atTurnBoundary(c, out)) };
+}
+
+/**
+ * A compaction point inside a turn (its message is not a user message) would leave tool results
+ * without their call: move it back to the turn's user message, keeping those messages verbatim
+ * (they are also in the record, which is harmless). Retention that is no longer before the
+ * point is dropped.
+ */
+export function atTurnBoundary(
+  c: CompactionEntry,
+  messages: readonly StoredMessage[],
+): CompactionEntry {
+  let k = idNumber(c.since);
+  if (k >= messages.length || messages[k]?.role === "user") return c;
+  while (k > 0 && messages[k]?.role !== "user") k--;
+  const since = `m${k}`;
+  if (c.retainedFrom !== null && idNumber(c.retainedFrom) < k) return { ...c, since };
+  const { truncated: _t, ...rest } = c;
+  return { ...rest, since, retainedFrom: null };
 }
 
 export type SessionSummary = {
@@ -499,6 +539,13 @@ export class SessionStore {
         }
         const json = { type: "compaction", ...(redactDeep(entry) as CompactionEntry) };
         const checked = checkCompaction(json, messages);
+        const at = messages[idNumber(entry.since)];
+        if (!("why" in checked) && at !== undefined && at.role !== "user") {
+          throw new RewireError(
+            "compaction_invalid",
+            "refusing to store a compaction whose point is inside a turn",
+          );
+        }
         if ("why" in checked) {
           throw new RewireError(
             "compaction_invalid",

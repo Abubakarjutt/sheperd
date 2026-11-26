@@ -37,6 +37,7 @@ import {
   type RecordItem,
   SessionStore,
   type VerifyRisky,
+  validContext,
 } from "../src/index.js";
 
 const CACHE_BASE = resolve(
@@ -268,11 +269,12 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
     expect(req.messages[0]?.content).toContain("keep the public API stable");
     expect(req.messages.every((m) => m.role === "user")).toBe(true);
     expect(req.messages.at(-1)?.content).toBe("next");
-    if (req.messages.length === 3) {
-      expect(req.messages[1]?.content.startsWith(`${RECENT_TITLE}\n\n[m`)).toBe(true);
-    } else {
-      expect(req.messages).toHaveLength(2);
-    }
+    // Exactly: the record, the recent block (only m2, the newest, cut to the retained budget:
+    // a quarter of the limit), then the new message.
+    expect(req.messages).toHaveLength(3);
+    expect(req.messages[1]?.content.startsWith(`${RECENT_TITLE}\n\n[m2] aaa`)).toBe(true);
+    expect(req.messages[1]?.content).toContain("characters omitted by compaction");
+    expect(req.messages[1]?.content).not.toContain("[m0]");
     // The stored history keeps everything; the file has the compaction line.
     expect(session.history()).toHaveLength(6);
     const loaded = await store.loadSession(session.id() as string);
@@ -868,5 +870,184 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
     const ctx = session.context();
     expect(ctx).toHaveLength(1);
     for (let k = 0; k < 7; k++) expect(ctx[0]?.content).toContain(`rule ${k}:`);
+  });
+
+  test("a turn bigger than a part is never split: points stay at user messages, and the next turn is valid (orphan3)", async () => {
+    const repo = makeRepo();
+    writeFileSync(
+      join(repo, "big.txt"),
+      Array.from({ length: 400 }, (_, i) => `line ${i} alpha beta gamma delta epsilon zeta`).join(
+        "\n",
+      ),
+    );
+    const reads = Array.from({ length: 12 }, (_, k) => ({
+      id: `c${k}`,
+      name: "read",
+      arguments: { path: "big.txt" },
+    }));
+    const p = model({
+      chat: [{ text: "reading", toolCalls: reads }, text("done 1"), text("done 2"), text("done 3")],
+      compact: [
+        ops({ op: "add", kind: "note", text: "part one", source: "inferred" }),
+        "not json",
+        "still not json",
+      ],
+    });
+    const { deps: d } = deps({
+      window: { window: 8192, source: "model", provisional: true },
+      limit: 100_000,
+    });
+    const { session, store } = await setup(p, d, { repo });
+    await session.send("please read big.txt");
+    await session.send("second question");
+    const h = session.history();
+    expect(h.map((m) => m.role)).toEqual([
+      "user",
+      "assistant",
+      ...Array.from({ length: 12 }, () => "tool"),
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+    const out = await session.compact();
+    expect(out).toMatchObject({ ok: false });
+    if (out.ok) throw new Error("ok");
+    expect(out.reason).toMatch(/after 1 part\(s\) applied/);
+    // The first part was the whole oversized turn; its point is the next user message.
+    const loaded = await store.loadSession(session.id() as string);
+    expect(loaded.compactions.map((c) => c.since)).toEqual(["m15"]);
+    expect(session.record().items.map((i) => i.text)).toEqual(["part one"]);
+    const ctx = session.context();
+    expect(validContext(ctx)).toBe(true);
+    expect(ctx.some((m) => m.role === "tool")).toBe(false);
+    await session.send("next question");
+    const req = p.chats.at(-1) as ChatRequest;
+    expect(validContext(req.messages)).toBe(true);
+    expect(req.messages.slice(-3).map((m) => [m.role, m.content])).toEqual([
+      ["user", "second question"],
+      ["assistant", "done 2"],
+      ["user", "next question"],
+    ]);
+  });
+
+  test("the fit leaves room for the message that triggered the compaction", async () => {
+    const p = model({
+      chat: [text("a"), text("b"), text("c")],
+      compact: Array.from({ length: 8 }, () => ops()),
+    });
+    const { deps: d } = deps({ limit: 12_000 });
+    const { session, events } = await setup(p, d);
+    await session.send(`one ${"q".repeat(6000)}`);
+    await session.send(`two ${"r".repeat(6000)}`);
+    // ~10,000 tokens: half the limit would leave no room for it.
+    const big = "s".repeat(40_000);
+    const pending = d.estimator.estimate("", [{ role: "user", content: big }]);
+    await session.send(big);
+    const done = events.find((e) => e.type === "compaction" && e.phase === "done");
+    if (done?.type !== "compaction" || done.phase !== "done") throw new Error("no done");
+    expect(done.after).toBeLessThanOrEqual(12_000 - pending);
+    // The request that carried the big message fits the limit.
+    const req = p.chats.at(-1) as ChatRequest;
+    expect(d.estimator.estimate(req.system, req.messages, req.tools)).toBeLessThanOrEqual(
+      12_000 + 10,
+    );
+  });
+
+  test("a failure at or past the retry ceiling stops automatic compaction for the window (stuck), once", async () => {
+    const p = model({
+      chat: Array.from({ length: 4 }, (_, k) => text(`r${k}`)),
+      compact: ["nope", "nope", ...Array.from({ length: 8 }, () => ops())],
+    });
+    const { deps: d } = deps({ window: { window: 8192, source: "model", provisional: true } });
+    const { session, events } = await setup(p, d);
+    await session.send("hello");
+    // Ceiling at 8K: 6000 + 0.5 x (6963 - 6000) = 6481.5.
+    await session.send("b".repeat(await lengthAt(session, 6600)));
+    expect(phases(events)).toEqual(["start", "failed", "stuck"]);
+    const stuck = events.find((e) => e.type === "compaction" && e.phase === "stuck");
+    expect(stuck).toMatchObject({ reason: expect.stringMatching(/\/compact still works/) });
+    await session.send("c".repeat(await lengthAt(session, 9000)));
+    expect(p.compactions).toHaveLength(2);
+    expect(phases(events).filter((x) => x === "stuck")).toHaveLength(1);
+    expect((await session.compact()).ok).toBe(true);
+  });
+
+  test("a refreshed window clears the hold-back", async () => {
+    const W8: ContextWindow = { window: 8192, source: "model", provisional: true };
+    const W7: ContextWindow = { window: 7000, source: "loaded", provisional: false };
+    const windows = [W8, W7];
+    const p = model({
+      chat: Array.from({ length: 4 }, (_, k) => text(`r${k}`)),
+      compact: ["nope", "nope", ...Array.from({ length: 8 }, () => ops())],
+    });
+    const { deps: d } = deps({ window: W8 });
+    d.refreshWindow = async () => windows.shift() ?? W7;
+    const { session, events } = await setup(p, d);
+    await session.send("hello");
+    await session.send("b".repeat(await lengthAt(session, 6000)));
+    expect(phases(events)).toEqual(["start", "failed"]);
+    await session.send("x"); // held back (retry at 6482)
+    expect(p.compactions).toHaveLength(2);
+    expect(await session.refreshWindow()).toEqual(W7); // limit 5000 now
+    await session.send("y");
+    expect(p.compactions.length).toBeGreaterThan(2);
+  });
+
+  test("an abandoned compaction reports one late failed: aborted, unless a newer turn started", async () => {
+    for (const newer of [false, true]) {
+      const p = model({ chat: [text("a"), text("b")] });
+      const slow: Provider = {
+        chat: (req) =>
+          (req.tools ?? []).length === 0
+            ? new Promise((r) =>
+                setTimeout(
+                  () =>
+                    r({
+                      message: { text: "not json", toolCalls: [] },
+                      stopReason: "end",
+                      usage: { inputTokens: 0, outputTokens: 0 },
+                    }),
+                  300,
+                ),
+              )
+            : p.chat(req),
+      };
+      const { deps: d } = deps({ limit: 6000 });
+      const { session, events } = await setup(slow, d);
+      await session.send("hello");
+      const ac = new AbortController();
+      const pending = session.send("p".repeat(await lengthAt(session, 6000)), ac.signal);
+      await new Promise((r) => setTimeout(r, 50));
+      ac.abort();
+      await expect(pending).rejects.toMatchObject({ code: "aborted" });
+      if (newer) await session.send("small");
+      await new Promise((r) => setTimeout(r, 500));
+      const late = events.filter((e) => e.type === "compaction" && e.phase === "failed");
+      if (newer) expect(late).toEqual([]);
+      else
+        expect(late).toEqual([
+          { type: "compaction", phase: "failed", code: "compaction_invalid", reason: "aborted" },
+        ]);
+      expect(phases(events)[0]).toBe("start");
+      expect(phases(events).filter((x) => x === "start")).toHaveLength(1);
+    }
+  });
+
+  test("after a failure the retry needs a quarter of the limit of growth, not 25% of the estimate", async () => {
+    const p = model({
+      chat: Array.from({ length: 4 }, (_, k) => text(`r${k}`)),
+      compact: ["nope", "nope", ...Array.from({ length: 8 }, () => ops())],
+    });
+    const { deps: d } = deps({ limit: 6000 }); // window 32768: ceiling 6000 + 0.5 x 21852
+    const { session } = await setup(p, d);
+    await session.send("hello");
+    const big = "b".repeat(await lengthAt(session, 12_000));
+    const basis = (await session.contextStatus(big))?.estimate ?? 0;
+    await session.send(big); // fails at ~12,000: retry from basis + 1500, not 1.25 x basis
+    expect(p.compactions).toHaveLength(2);
+    const n = await lengthAt(session, basis + 1500);
+    expect((await session.contextStatus("c".repeat(n)))?.estimate).toBeLessThan(basis * 1.25);
+    await session.send("c".repeat(n));
+    expect(p.compactions.length).toBeGreaterThan(2);
   });
 });
