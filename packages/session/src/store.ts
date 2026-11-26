@@ -12,7 +12,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { newRunId, RewireError, redact } from "@rewire/core";
+import { FENCE_ID, newRunId, RewireError, redact } from "@rewire/core";
 import type { ChatMessage } from "@rewire/providers";
 import { z } from "zod";
 import { MessageId, SessionRecord } from "./record.js";
@@ -72,8 +72,10 @@ const NON_MESSAGE_TYPES = new Set(["compaction"]);
 
 /**
  * One compaction of a chat session, as `appendCompaction` stores it and `loadSession` returns it.
- * The latest one defines the model-visible context: `recordMessage`, then the stored messages
- * from `retainedFrom` on (with `truncated` in place of that message's content when set).
+ * The latest one defines the model-visible context, which is always rebuilt from these fields
+ * (never from stored text): the record rendered with `renderBudget` in a fence with `fenceId`,
+ * the user messages from `retainedFrom` up to `since` (with `truncated` in place of that
+ * message's content when set), then every message from `since` on.
  */
 export type CompactionEntry = {
   /** When it was applied (ISO 8601). */
@@ -81,16 +83,14 @@ export type CompactionEntry = {
   record: SessionRecord;
   /** The first message not yet compacted (`m<n>`, n at most the message count: none yet). */
   since: string;
-  /** The oldest message kept verbatim (a user message), or null when none is kept. */
+  /** The oldest user message kept verbatim (before `since`), or null when none is kept. */
   retainedFrom: string | null;
   /** The cut content of `retainedFrom` when it alone was over the retained budget. */
   truncated?: { id: string; content: string };
-  /**
-   * The user-role message that carries the rendered record, exactly as the model sees it. Its
-   * fence ids are random, so it is stored rather than re-rendered: a resumed session sends the
-   * same bytes.
-   */
-  recordMessage: string;
+  /** The record fence's id (a random UUID chosen once), so a resume renders the same bytes. */
+  fenceId: string;
+  /** Tokens the rendered record may take (`renderRecord`'s budget). */
+  renderBudget: number;
 };
 
 const CompactionLine = z
@@ -101,7 +101,10 @@ const CompactionLine = z
     since: MessageId,
     retainedFrom: MessageId.nullable(),
     truncated: z.object({ id: MessageId, content: z.string() }).strict().optional(),
-    recordMessage: z.string(),
+    fenceId: z.string().regex(FENCE_ID),
+    renderBudget: z.number().int().nonnegative().max(10_000_000),
+    /** Never trusted: pre-rendered text from older or forged files is ignored. */
+    recordMessage: z.unknown().optional(),
   })
   .strict();
 
@@ -148,8 +151,12 @@ function checkCompaction(
   if (idNumber(e.since) > before.length) return { why: "compacts messages it does not follow" };
   if (e.retainedFrom !== null) {
     const kept = before[idNumber(e.retainedFrom)];
-    if (kept === undefined || kept.role !== "user") {
-      return { why: "keeps a message that is not a stored user message" };
+    if (
+      kept === undefined ||
+      kept.role !== "user" ||
+      idNumber(e.retainedFrom) >= idNumber(e.since)
+    ) {
+      return { why: "keeps a message that is not a compacted user message" };
     }
   }
   if (e.truncated !== undefined && e.truncated.id !== e.retainedFrom) {
@@ -161,7 +168,8 @@ function checkCompaction(
     since: e.since,
     retainedFrom: e.retainedFrom,
     ...(e.truncated !== undefined ? { truncated: e.truncated } : {}),
-    recordMessage: e.recordMessage,
+    fenceId: e.fenceId,
+    renderBudget: e.renderBudget,
   };
   return { entry };
 }

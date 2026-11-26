@@ -739,7 +739,12 @@ function truncateToBudget(content: string, budget: number, est: TokenEstimator):
   }
 }
 
-function retain(
+/**
+ * The recent user messages kept verbatim: newest first while their tokens fit `budget`; the
+ * newest alone over budget is cut (`truncated`). `retainedFrom` is the oldest one kept, null
+ * when there is no user message.
+ */
+export function retain(
   messages: readonly StoredMessage[],
   budget: number,
   est: TokenEstimator,

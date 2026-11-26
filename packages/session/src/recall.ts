@@ -21,17 +21,54 @@ const LABEL = "untrusted_recall";
 export type RecallSource = {
   /** Every stored message of the session, with ids. */
   messages: readonly StoredMessage[];
-  /** Resolved and superseded record items. */
+  /**
+   * Resolved and superseded record items: those of every stored compaction (an item the current
+   * record's 500-entry cap dropped is still in an older compaction line), one per item id.
+   */
   archive: readonly RecordItem[];
 };
+
+/**
+ * Lowercase each code point whose lowercase form has the same length (almost all), keeping the
+ * others as they are, so an index into the folded text is an index into the original.
+ */
+export function fold(s: string): string {
+  let out = "";
+  for (const c of s) {
+    const l = c.toLowerCase();
+    out += l.length === c.length ? l : c;
+  }
+  return out;
+}
+
+type Cleaned = { text: string; folded: string };
+
+/**
+ * Cleaned and folded text per stored message and archive item, so each `recall` cleans only
+ * what it has not seen. Keyed by id: stored messages and archived items never change (an
+ * archived item id is never reused). One cache per session.
+ */
+export class RecallCache {
+  private readonly entries = new Map<string, Cleaned>();
+
+  get(key: string, raw: () => string): Cleaned {
+    let e = this.entries.get(key);
+    if (e === undefined) {
+      const text = clean(raw());
+      e = { text, folded: fold(text) };
+      this.entries.set(key, e);
+    }
+    return e;
+  }
+}
 
 /** Sanitize, then redact the whole text, then collapse whitespace: what is searched and shown. */
 const clean = (s: string): string => flatten(redact(sanitizeTerminal(s)));
 
-type Entry = { tag: string; text: string };
+type Entry = { tag: string } & Cleaned;
 
 /** Searchable entries, newest first: messages (earlier recall results left out), then the archive. */
-function entries(src: RecallSource): Entry[] {
+function entries(src: RecallSource, cache: RecallCache): Entry[] {
   const recallCalls = new Set<string>();
   for (const m of src.messages) {
     for (const c of m.toolCalls ?? []) if (c.name === "recall") recallCalls.add(c.id);
@@ -40,18 +77,18 @@ function entries(src: RecallSource): Entry[] {
   for (let k = src.messages.length - 1; k >= 0; k--) {
     const m = src.messages[k] as StoredMessage;
     if (m.role === "tool" && m.toolCallId !== undefined && recallCalls.has(m.toolCallId)) continue;
-    const calls = (m.toolCalls ?? [])
-      .map((c) => `${c.name} ${JSON.stringify(c.arguments ?? {})}`)
-      .join("; ");
-    const text = clean(calls === "" ? m.content : `${m.content} (tool calls: ${calls})`);
-    out.push({ tag: `${m.id} ${m.role}`, text });
+    const cleaned = cache.get(`m:${m.id}`, () => {
+      const calls = (m.toolCalls ?? [])
+        .map((c) => `${c.name} ${JSON.stringify(c.arguments ?? {})}`)
+        .join("; ");
+      return calls === "" ? m.content : `${m.content} (tool calls: ${calls})`;
+    });
+    out.push({ tag: `${m.id} ${m.role}`, ...cleaned });
   }
   for (let k = src.archive.length - 1; k >= 0; k--) {
     const i = src.archive[k] as RecordItem;
-    out.push({
-      tag: `${i.id} archived ${i.kind} ${i.status}`,
-      text: clean(i.reason ? `${i.text} — ${i.reason}` : i.text),
-    });
+    const cleaned = cache.get(`a:${i.id}`, () => (i.reason ? `${i.text} — ${i.reason}` : i.text));
+    out.push({ tag: `${i.id} archived ${i.kind} ${i.status}`, ...cleaned });
   }
   return out;
 }
@@ -71,7 +108,11 @@ const bytes = (s: string): number => Buffer.byteLength(s, "utf8");
 const error = (content: string): ToolResult => ({ content, isError: true });
 
 /** One `recall` call: up to `limit` (at most 10) matches, cleaned, capped at 4 KB and fenced. */
-export function recall(src: RecallSource, args: { query?: unknown; limit?: unknown }): ToolResult {
+export function recall(
+  src: RecallSource,
+  args: { query?: unknown; limit?: unknown },
+  cache: RecallCache = new RecallCache(),
+): ToolResult {
   if (typeof args.query !== "string" || args.query.trim() === "") {
     return error("recall needs a non-empty query");
   }
@@ -83,11 +124,11 @@ export function recall(src: RecallSource, args: { query?: unknown; limit?: unkno
     typeof args.limit === "number" && Number.isFinite(args.limit) && args.limit >= 1
       ? Math.min(RECALL_MAX_MATCHES, Math.floor(args.limit))
       : RECALL_MAX_MATCHES;
-  const needle = query.toLowerCase();
+  const needle = fold(query);
   const found: string[] = [];
-  for (const e of entries(src)) {
+  for (const e of entries(src, cache)) {
     if (found.length >= limit) break;
-    const at = e.text.toLowerCase().indexOf(needle);
+    const at = e.folded.indexOf(needle);
     if (at < 0) continue;
     found.push(defangUntrustedClosers(`[${e.tag}] ${snippet(e.text, at, needle.length)}`));
   }
@@ -119,7 +160,7 @@ export function recall(src: RecallSource, args: { query?: unknown; limit?: unkno
 }
 
 /** The `recall` tool over `source()` (read at each call, so it sees the latest history). */
-export function recallTool(source: () => RecallSource): AgentTool {
+export function recallTool(source: () => RecallSource, cache = new RecallCache()): AgentTool {
   return {
     spec: {
       name: "recall",
@@ -135,7 +176,7 @@ export function recallTool(source: () => RecallSource): AgentTool {
       },
     },
     async execute(args) {
-      return recall(source(), args);
+      return recall(source(), args, cache);
     },
   };
 }

@@ -1,8 +1,10 @@
 import { describe, expect, test } from "vitest";
 import {
+  fold,
   RECALL_MAX_MATCHES,
   RECALL_OUTPUT_BYTES,
   RECALL_SNIPPET_CHARS,
+  RecallCache,
   recall,
   recallTool,
 } from "../src/recall.js";
@@ -164,5 +166,29 @@ describe("recall", () => {
     expect(inner((await tool.execute({ query: "beta" })).content)).toMatch(/no matches/i);
     messages = [...messages, u(1, "beta")];
     expect(inner((await tool.execute({ query: "beta" })).content)).toContain("[m1 user] beta");
+  });
+
+  test("case folding keeps indexes aligned, so the snippet stays on the match (M7)", () => {
+    expect(fold("İSTANBUL Ab")).toHaveLength("İSTANBUL Ab".length);
+    const text = `${"İ".repeat(600)} the NEEDLE here ${"z".repeat(600)}`;
+    const body = inner(
+      recall({ messages: [u(0, text)], archive: [] }, { query: "needle" }).content,
+    );
+    expect(body).toContain("the NEEDLE here");
+  });
+
+  test("a cache cleans each message once across calls (M1)", () => {
+    const cache = new RecallCache();
+    let reads = 0;
+    const msg = {
+      id: "m0",
+      role: "user" as const,
+      get content() {
+        reads++;
+        return "alpha beta";
+      },
+    } as StoredMessage;
+    for (let k = 0; k < 5; k++) recall({ messages: [msg], archive: [] }, { query: "beta" }, cache);
+    expect(reads).toBe(1);
   });
 });
