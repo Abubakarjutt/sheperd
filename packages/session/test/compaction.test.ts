@@ -11,6 +11,7 @@ import {
   type ChatResponse,
   type ContextWindow,
   FauxProvider,
+  OLLAMA_TRUNCATION_HINT,
   type Provider,
   type ScriptedTurn,
   TokenEstimator,
@@ -171,14 +172,19 @@ function deps(o: Partial<CompactionDeps> & { limit?: number; recentUserTokens?: 
 async function setup(
   provider: Provider,
   compaction: CompactionDeps | undefined,
-  o: { repo?: string; store?: SessionStore; sessionId?: string } = {},
+  o: {
+    repo?: string;
+    store?: SessionStore;
+    sessionId?: string;
+    provider?: "faux" | "ollama";
+  } = {},
 ) {
   const repo = o.repo ?? makeRepo();
   const events: ChatEvent[] = [];
   const store = o.store ?? new SessionStore();
   const opts = {
     repo,
-    model: { provider: "faux" as const, model: "chat" },
+    model: { provider: o.provider ?? ("faux" as const), model: "chat" },
     provider,
     policy: DEFAULT_POLICY,
     skills: await makeSet(),
@@ -969,7 +975,9 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
     await session.send("c".repeat(await lengthAt(session, 9000)));
     expect(p.compactions).toHaveLength(2);
     expect(phases(events).filter((x) => x === "stuck")).toHaveLength(1);
+    expect((await session.contextStatus())?.hold).toBe("stuck");
     expect((await session.compact()).ok).toBe(true);
+    expect((await session.contextStatus())?.hold).toBeUndefined();
   });
 
   test("a refreshed window clears the hold-back", async () => {
@@ -988,7 +996,10 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
     expect(phases(events)).toEqual(["start", "failed"]);
     await session.send("x"); // held back (retry at 6482)
     expect(p.compactions).toHaveLength(2);
+    expect((await session.contextStatus())?.hold).toBe("held");
     expect(await session.refreshWindow()).toEqual(W7); // limit 5000 now
+    // The hold-back was for the 8K window: not shown for the new one.
+    expect((await session.contextStatus())?.hold).toBeUndefined();
     await session.send("y");
     expect(p.compactions.length).toBeGreaterThan(2);
   });
@@ -1049,5 +1060,42 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
     expect((await session.contextStatus("c".repeat(n)))?.estimate).toBeLessThan(basis * 1.25);
     await session.send("c".repeat(n));
     expect(p.compactions.length).toBeGreaterThan(2);
+  });
+
+  test("compactionView: independence, the record, and its model-visible render (unfenced)", async () => {
+    const p = model({
+      chat: [text("noted"), text("ok")],
+      compact: [ops(userAdd("constraint", "keep the API stable", "m0", "keep the API stable"))],
+    });
+    const { deps: d } = deps({ independence: "same-family" });
+    const { session } = await setup(p, d);
+    expect(session.compactionView()).toMatchObject({ independence: "same-family", rendered: "" });
+    await session.send("keep the API stable");
+    expect((await session.compact()).ok).toBe(true);
+    const view = session.compactionView();
+    expect(view?.record.items.map((i) => i.text)).toEqual(["keep the API stable"]);
+    expect(view?.rendered).toContain("keep the API stable");
+    // Exactly the text inside the model's fence.
+    expect(session.context()[0]?.content).toContain(view?.rendered as string);
+    const off = await setup(model({ chat: [] }), undefined);
+    expect(off.session.compactionView()).toBeUndefined();
+  });
+
+  test("suspected truncation on Ollama is reported once per session, with the hint; never on other providers", async () => {
+    const big = "z".repeat(60_000); // ~15K estimated tokens
+    const mk = () =>
+      model({
+        chat: [text("a"), text("b"), text("c")],
+        usage: () => 2048, // the server read far less than it was sent
+      });
+    const { session, events } = await setup(mk(), deps().deps, { provider: "ollama" });
+    await session.send(big);
+    await session.send("again");
+    const hits = events.filter((e) => e.type === "truncation_suspected");
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({ actual: 2048, hint: OLLAMA_TRUNCATION_HINT });
+    const faux = await setup(mk(), deps().deps);
+    await faux.session.send(big);
+    expect(faux.events.filter((e) => e.type === "truncation_suspected")).toHaveLength(0);
   });
 });

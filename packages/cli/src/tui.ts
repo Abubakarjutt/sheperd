@@ -1,9 +1,21 @@
 import { join, resolve } from "node:path";
 import { Writable } from "node:stream";
-import { resolveRouting } from "@rewire/pipeline";
-import { loadPolicy } from "@rewire/policy";
+import { type CompactionConfig, type RoleRouting, resolveRouting } from "@rewire/pipeline";
+import { loadPolicy, type Policy } from "@rewire/policy";
+import {
+  type ContextWindowOptions,
+  type ModelRef,
+  type Provider,
+  TokenEstimator,
+} from "@rewire/providers";
 import { locateSandboxBinary } from "@rewire/sandbox";
-import { ChatSession, RunController, SessionStore } from "@rewire/session";
+import {
+  ChatSession,
+  compactionDeps,
+  PrefillMeter,
+  RunController,
+  SessionStore,
+} from "@rewire/session";
 import {
   createSkillSet,
   discoverSkills,
@@ -19,7 +31,7 @@ import { loadFauxScript } from "./faux.js";
 import { isInteractive, tuiRequiresTty } from "./interactive.js";
 import { effectivePlatform } from "./platform.js";
 import { FAUX_WARNING, providerFactory, resolveModels } from "./run.js";
-import { startInteractive } from "./start-tui.js";
+import { type StartDeps, startInteractive } from "./start-tui.js";
 import { xdgDirs } from "./xdg.js";
 
 export type ChatOptions = { repo?: string | undefined; models?: string | undefined };
@@ -50,6 +62,57 @@ function routingText(r: ReturnType<typeof resolveRouting>): string {
   const lines = roles.map((role) => `${role}: ${r[role].provider}:${r[role].model}`);
   lines.push(`independence: ${r.independence}`);
   return lines.join("\n");
+}
+
+export type ChatSessionsOptions = {
+  repo: string;
+  routing: RoleRouting;
+  providers: (ref: ModelRef) => Provider;
+  policy: Policy;
+  store: SessionStore;
+  /** `[compaction]` of the models file (the defaults without one). */
+  compaction: CompactionConfig;
+  /** For the chat model's context window (`env` carries OLLAMA_HOST and REWIRE_FAUX_WINDOW). */
+  windowOptions: ContextWindowOptions;
+  /** Test seam: builds each session's compaction deps (default `compactionDeps`). */
+  buildCompaction?: typeof compactionDeps;
+};
+
+/**
+ * Builds every ChatSession of the TUI (the first, `/clear` and `/resume`) on the chat model
+ * (`routing.spec`), each with compaction on: `compactionDeps` from the routing (the verifier on
+ * `routing.verifier`, routing's independence), the `[compaction]` config and the window. One
+ * token estimator and one prompt-reading meter are shared by the sessions: they describe the
+ * model, not the conversation.
+ */
+export function chatSessions(o: ChatSessionsOptions): StartDeps["newSession"] {
+  const estimator = new TokenEstimator();
+  const prefillMeter = new PrefillMeter();
+  const build = o.buildCompaction ?? compactionDeps;
+  const chatModel = o.routing.spec;
+  return async ({ skills, emit, sessionId }) => {
+    const compaction = await build({
+      routing: o.routing,
+      providers: o.providers,
+      config: o.compaction,
+      estimator,
+      windowOptions: o.windowOptions,
+    });
+    const opts = {
+      repo: o.repo,
+      model: chatModel,
+      provider: o.providers(chatModel),
+      policy: o.policy,
+      skills,
+      store: o.store,
+      emit,
+      prefillMeter,
+      compaction,
+    };
+    return sessionId === undefined
+      ? new ChatSession(opts)
+      : await ChatSession.resume({ ...opts, sessionId });
+  };
 }
 
 /**
@@ -95,20 +158,15 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
       }),
     createSkillSet: (active) => createSkillSet(active, { home, xdgConfig, cacheDir }),
     disposeSkillSet,
-    newSession: async ({ skills, emit, sessionId }) => {
-      const opts = {
-        repo,
-        model: chatModel,
-        provider: providers(chatModel),
-        policy,
-        skills,
-        store,
-        emit,
-      };
-      return sessionId === undefined
-        ? new ChatSession(opts)
-        : await ChatSession.resume({ ...opts, sessionId });
-    },
+    newSession: chatSessions({
+      repo,
+      routing,
+      providers,
+      policy,
+      store,
+      compaction: models.compaction,
+      windowOptions: { env: io.env },
+    }),
     listSessions: () => store.list(repo),
     newRunController: (skills) =>
       new RunController({

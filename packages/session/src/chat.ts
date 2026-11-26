@@ -21,8 +21,10 @@ import {
   type ContextWindowOptions,
   contextWindow,
   type ModelRef,
+  OLLAMA_TRUNCATION_HINT,
   type Provider,
   refreshContextWindow,
+  suspectTruncation,
   type TokenEstimator,
   type ToolCall,
   type ToolSpec,
@@ -120,7 +122,13 @@ export type ChatEvent =
    * Compaction cannot bring the context under its retry ceiling for this window: automatic
    * compaction stops until the window changes (`/compact` still works). Emitted once.
    */
-  | { type: "compaction"; phase: "stuck"; reason: string };
+  | { type: "compaction"; phase: "stuck"; reason: string }
+  /**
+   * The chat model (on Ollama) reported far fewer input tokens than estimated on a large prompt
+   * (`suspectTruncation`): the server probably cut the prompt to a smaller runtime context.
+   * Emitted at most once per session; `hint` is `OLLAMA_TRUNCATION_HINT`.
+   */
+  | { type: "truncation_suspected"; estimated: number; actual: number; hint: string };
 
 export type CompactionCounts = {
   decisions: number;
@@ -203,6 +211,23 @@ export async function compactionDeps(o: {
     refreshWindow: (ref) => refreshContextWindow(ref, o.windowOptions),
   };
 }
+
+/** `ChatSession.contextStatus()`: the next request's estimate against the compaction limit. */
+export type ContextStatus = {
+  estimate: number;
+  limit: CompactionLimit;
+  window: ContextWindow;
+  /** Set while automatic compaction is held back (`held`) or off for this window (`stuck`). */
+  hold?: "held" | "stuck";
+};
+
+/** `ChatSession.compactionView()`. */
+export type CompactionView = {
+  independence: RoleRouting["independence"];
+  record: SessionRecord;
+  /** The record's model-visible render (unfenced, uncleaned); empty before a compaction. */
+  rendered: string;
+};
 
 /** The one-line preface of the model-visible record message. */
 export const RECORD_PREFACE =
@@ -412,6 +437,8 @@ export class ChatSession {
   private settling = false;
   /** Bumped by every turn and compaction, so a late event knows whether it is stale. */
   private epoch = 0;
+  /** `truncation_suspected` was already emitted (once per session). */
+  private truncationShown = false;
 
   constructor(opts: ChatSessionOptions) {
     this.opts = opts;
@@ -496,15 +523,43 @@ export class ChatSession {
    * the tools, `context()` and, when given, the next user text), the compaction limit, and the
    * window it came from. Undefined when compaction is off.
    */
-  async contextStatus(
-    next?: string,
-  ): Promise<{ estimate: number; limit: CompactionLimit; window: ContextWindow } | undefined> {
+  async contextStatus(next?: string): Promise<ContextStatus | undefined> {
     const limit = this.limit();
     if (limit === undefined || this.window === undefined) return undefined;
     if (this.life.signal.aborted) throw disposedError();
     await this.open();
     const specs = await this.specs();
-    return { estimate: this.estimate(specs, next), limit, window: this.window };
+    const estimate = this.estimate(specs, next);
+    const hold = this.holdState(estimate, limit.limit);
+    return { estimate, limit, window: this.window, ...(hold ? { hold } : {}) };
+  }
+
+  /**
+   * Whether the automatic trigger is held back now: `stuck` once compaction cannot help in this
+   * window, `held` while the estimate is at or over the limit but under the retry threshold.
+   */
+  private holdState(estimate: number, limit: number): "held" | "stuck" | undefined {
+    const until = this.suppressUntil;
+    if (until === undefined || this.suppressWindow !== this.window?.window) return undefined;
+    if (until === Number.POSITIVE_INFINITY) return "stuck";
+    return estimate >= limit && estimate < until ? "held" : undefined;
+  }
+
+  /**
+   * With compaction enabled, what `/context` shows besides the numbers: routing's verifier
+   * independence, the current record, and its text as the model sees it inside the fence
+   * (the same deterministic render, unfenced and NOT cleaned for a terminal: the UI cleans it).
+   * `rendered` is empty before the first compaction.
+   */
+  compactionView(): CompactionView | undefined {
+    const d = this.opts.compaction;
+    if (d === undefined) return undefined;
+    const c = this.compaction;
+    return {
+      independence: d.independence,
+      record: this.record(),
+      rendered: c === undefined ? "" : renderRecord(c.record, c.renderBudget).text,
+    };
   }
 
   /**
@@ -1135,7 +1190,22 @@ export class ChatSession {
             }
           : req;
         const res = await inner.chat(timed);
-        if (estimated !== undefined) deps?.estimator.observe(estimated, res.usage.inputTokens);
+        if (estimated !== undefined) {
+          deps?.estimator.observe(estimated, res.usage.inputTokens);
+          if (
+            !this.truncationShown &&
+            this.opts.model.provider === "ollama" &&
+            suspectTruncation(estimated, res.usage.inputTokens)
+          ) {
+            this.truncationShown = true;
+            this.emit({
+              type: "truncation_suspected",
+              estimated,
+              actual: res.usage.inputTokens,
+              hint: OLLAMA_TRUNCATION_HINT,
+            });
+          }
+        }
         if (ttftMs !== undefined) {
           // The first call of a session, or one far slower than this model reads, includes a
           // model load: its time is not a reading speed.

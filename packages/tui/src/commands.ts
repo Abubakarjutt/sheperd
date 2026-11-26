@@ -8,6 +8,8 @@ export type Command =
   | { kind: "model" }
   | { kind: "resume"; id?: string }
   | { kind: "clear" }
+  | { kind: "compact"; focus?: string }
+  | { kind: "context" }
   | { kind: "doctor" }
   | { kind: "help" }
   | { kind: "exit" }
@@ -63,6 +65,17 @@ export const COMMAND_HELP: readonly CommandHelp[] = [
     name: "clear",
     description: "start a fresh session (the old one stays resumable)",
     inRun: false,
+  },
+  {
+    name: "compact",
+    args: "[focus]",
+    description: "compact the chat context now (optionally on a focus)",
+    inRun: false,
+  },
+  {
+    name: "context",
+    description: "show the context size, its limit and the session record",
+    inRun: true,
   },
   { name: "doctor", description: "check prerequisites", inRun: false },
   { name: "skip", description: "decline a run's clarification questions", inRun: true },
@@ -140,6 +153,9 @@ export function parseCommand(line: string): Command | undefined {
       return checkpoints(args);
     case "/resume":
       return args[0] === undefined ? { kind: "resume" } : { kind: "resume", id: args[0] };
+    case "/compact":
+      return rest === "" ? { kind: "compact" } : { kind: "compact", focus: rest };
+    case "/context":
     case "/skills":
     case "/model":
     case "/clear":
