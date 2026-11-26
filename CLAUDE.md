@@ -78,6 +78,7 @@ Package dependency direction, from bottom to top: `core`, then `policy` and `pro
   - Skills reach only the chat, spec, test-writer and implementer. Reviewers and the verifier never get them (design decision #30).
 - **`session`**: the chat agent (`read`, `grep`, `find`, `bash` under the sandbox `chat` profile, no writes), session persistence in `.rewire/sessions/`, and the controller that runs one gated pipeline at a time.
   - The chat model is the author model (`routing.spec`).
+  - Chat context compaction (design decision #34): a code-checked structured record (`record.ts`, `compactor.ts`, `verify-ops.ts`) replaces old turns past the limit from `trigger.ts`, a read-only `recall` tool searches the full history, and the pipeline never compacts.
 - **`tui`**: the Ink app: transcript, run board, checkpoints and slash commands, rendered from the `RunEvent` stream. All displayed text goes through `sanitize`.
   - Streaming is opt-in via `onDelta`, and only the chat uses it; the pipeline never streams. Streamed text is sanitized and redacted over the whole buffer on every render, never per delta (design decision #33).
   - `REWIRE_TUI_SELFCHECK=1` is an internal smoke-test switch.
@@ -85,6 +86,7 @@ Package dependency direction, from bottom to top: `core`, then `policy` and `pro
 - **`cli`**: the `run`, `doctor` and `chat` commands (bare `rewire` on a TTY opens the TUI), plus wiring.
   - Exit codes: 0 only when verified, 1 for usage or prerequisite errors, 2 when the run escalates, 130 on a forced quit.
   - `--headless` writes events to stdout and the summary to stderr.
+  - `rewire calibrate <model> [--max] [--yes] [--fresh]` measures a model's effective context with planted-fact probes (`calibrate.ts`). It is resumable, never automatic, and needs `--yes` on paid providers.
 - **`bench`**: 20 trap tasks (`bench/tasks/<id>/{fixture,hidden-tests,task.md}`).
   - Hidden tests are copied in only after the run, and run inside `rewire-sandbox`.
   - `bench/tasks/**` fixtures are deliberately not workspace members.
