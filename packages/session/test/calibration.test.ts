@@ -16,6 +16,7 @@ import {
   calibratedLimit,
   calibrationKey,
   calibrationPath,
+  calibrationState,
   loadCalibration,
   saveCalibration,
 } from "../src/calibration-cache.js";
@@ -151,6 +152,11 @@ describe("score", () => {
     expect(score(JSON.stringify({ codes, room: String(right.room) }), p.answers)).toBe(5);
   });
 
+  test("a stray object in reasoning prose before the answer does not hide it", () => {
+    expect(score(`Let me think {} about it... ${answerJson(right)}`, p.answers)).toBe(5);
+    expect(score(`thinking {"x": 1}\n\`\`\`json\n${answerJson(right)}\n\`\`\``, p.answers)).toBe(5);
+  });
+
   test("anything that is not a JSON object scores 0", () => {
     expect(score("I could not find them.", p.answers)).toBe(0);
     expect(score("", p.answers)).toBe(0);
@@ -184,6 +190,16 @@ describe("planLengths and decide", () => {
       stop: false,
     });
     expect(decide({ 8192: { score: 2 } })).toEqual({ stop: false });
+  });
+
+  test("an errored length is not a score: it breaks effective but never counts toward the stop", () => {
+    const e = { error: "timeout: x" };
+    expect(decide({ 8192: { score: 5 }, 16384: e, 32768: { score: 5 } })).toEqual({
+      effective: 8192,
+      stop: false,
+    });
+    expect(decide({ 8192: e, 16384: e })).toEqual({ stop: false });
+    expect(decide({ 8192: { score: 1 }, 16384: e, 32768: { score: 1 } }).stop).toBe(true);
   });
 
   test("stops after two consecutive lengths under 4/5", () => {
@@ -269,6 +285,51 @@ describe("calibration cache", () => {
     expect(got?.effective).toBe(8192);
     expect(calibratedLimit(got)).toBe(8192);
     expect(warnings.join("\n")).toMatch(/effective/);
+  });
+
+  test("errored or truncated entries are never used; a score and an error together are malformed", async () => {
+    const err = { error: "x", ms: 1, at: "x" };
+    expect(
+      calibratedLimit({
+        results: { 8192: result(5), 16384: err },
+        window: 65536,
+        completedAt: "x",
+      }),
+    ).toBeUndefined();
+    expect(
+      calibratedLimit({
+        results: { 8192: result(5) },
+        window: 65536,
+        completedAt: "x",
+        truncated: { length: 16384, inputTokens: 4096, estimated: 16384 },
+      }),
+    ).toBeUndefined();
+    const cacheDir = await tmp();
+    await mkdir(join(cacheDir, "rewire"), { recursive: true });
+    await writeFile(
+      calibrationPath(cacheDir),
+      JSON.stringify({
+        [calibrationKey(ref, "d")]: {
+          results: { 8192: { score: 5, error: "x", ms: 1, at: "x" } },
+          window: 65536,
+        },
+      }),
+    );
+    expect(await loadCalibration(ref, "d", { cacheDir })).toBeUndefined();
+  });
+
+  test("a calibration measured at another window (over 10% either way) is stale", () => {
+    const e = { results: { 8192: result(5) }, window: 65536, completedAt: "x", effective: 8192 };
+    const at = (window: number, provisional = false) =>
+      calibrationState(e, { window, provisional });
+    expect(at(65536)).toEqual({ calibrated: 8192 });
+    expect(at(70000)).toEqual({ calibrated: 8192 });
+    expect(at(60000)).toEqual({ calibrated: 8192 });
+    expect(at(131072)).toEqual({ stale: { measured: 65536, current: 131072 } });
+    expect(at(4096)).toEqual({ stale: { measured: 65536, current: 4096 } });
+    // A provisional window is not compared (re-checked once the loaded window is known).
+    expect(at(131072, true)).toEqual({ calibrated: 8192 });
+    expect(calibrationState(undefined, { window: 1, provisional: false })).toEqual({});
   });
 
   test("a completed run where nothing passed calibrates to the floor", () => {

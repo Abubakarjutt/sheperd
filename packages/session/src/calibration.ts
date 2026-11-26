@@ -406,37 +406,49 @@ export function buildProbe(
   return { system: SYSTEM, user, answers, planted };
 }
 
-/** The first JSON object in `s`: inside a ``` fence, or the first balanced `{...}`. */
-function firstObject(s: string): unknown {
-  const candidates: string[] = [];
-  const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(s);
-  if (fence?.[1] !== undefined) candidates.push(fence[1]);
-  const start = s.indexOf("{");
-  if (start >= 0) {
-    let depth = 0;
-    let inString = false;
-    for (let i = start; i < s.length; i++) {
-      const c = s[i];
-      if (inString) {
-        if (c === "\\") i++;
-        else if (c === '"') inString = false;
-      } else if (c === '"') inString = true;
-      else if (c === "{") depth++;
-      else if (c === "}" && --depth === 0) {
-        candidates.push(s.slice(start, i + 1));
-        break;
-      }
-    }
+/** Every top-level balanced `{...}` in `s`, in order (string-aware). */
+function balancedObjects(s: string): string[] {
+  const out: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (depth > 0 && inString) {
+      if (c === "\\") i++;
+      else if (c === '"') inString = false;
+    } else if (depth > 0 && c === '"') inString = true;
+    else if (c === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (c === "}" && depth > 0 && --depth === 0) out.push(s.slice(start, i + 1));
   }
+  return out;
+}
+
+/**
+ * The answer object in `s`: the JSON objects inside ``` fences, then every balanced `{...}`, in
+ * that order. The first one with a `codes` or `room` key wins (so a stray `{}` in reasoning prose
+ * before the answer does not hide it); otherwise the first object.
+ */
+function answerObject(s: string): Record<string, unknown> | undefined {
+  const candidates: string[] = [];
+  for (const m of s.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
+    if (m[1] !== undefined) candidates.push(m[1]);
+  }
+  candidates.push(...balancedObjects(s));
+  const objects: Record<string, unknown>[] = [];
   for (const c of candidates) {
     try {
       const v: unknown = JSON.parse(c.trim());
-      if (v !== null && typeof v === "object" && !Array.isArray(v)) return v;
+      if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+        objects.push(v as Record<string, unknown>);
+      }
     } catch {
       // try the next candidate
     }
   }
-  return undefined;
+  return objects.find((o) => Object.hasOwn(o, "codes") || Object.hasOwn(o, "room")) ?? objects[0];
 }
 
 const norm = (v: unknown): string => (typeof v === "string" ? v.trim().toLowerCase() : "");
@@ -446,7 +458,7 @@ const norm = (v: unknown): string => (typeof v === "string" ? v.trim().toLowerCa
  * prose, case and whitespace; anything that is not a JSON object scores 0.
  */
 export function score(reply: string, answers: ProbeAnswers): number {
-  const obj = firstObject(reply) as { codes?: unknown; room?: unknown } | undefined;
+  const obj = answerObject(reply) as { codes?: unknown; room?: unknown } | undefined;
   if (obj === undefined) return 0;
   let points = 0;
   if (obj.codes !== null && typeof obj.codes === "object" && !Array.isArray(obj.codes)) {
@@ -475,27 +487,33 @@ export function planLengths(window: number, max: number = Number.POSITIVE_INFINI
 }
 
 export type Decision = {
-  /** The largest length that passed with every shorter tested length passing. */
+  /**
+   * The largest length that passed with every shorter tested length passing. An errored length
+   * (no score) breaks the run of passes: it was not measured.
+   */
   effective?: number;
-  /** Two consecutive tested lengths scored under PASS_SCORE: measure no further. */
+  /** Two consecutive scored lengths under PASS_SCORE (errors skipped): measure no further. */
   stop: boolean;
 };
 
-export function decide(results: Record<number | string, { score: number }>): Decision {
+/** A length's outcome: a score, or an error (not a measurement: retried by the next run). */
+export type ScoredOrError = { score?: number | undefined; error?: string | undefined };
+
+export function decide(results: Record<number | string, ScoredOrError>): Decision {
   const lens = Object.keys(results)
     .map(Number)
     .sort((x, y) => x - y);
-  const scoreOf = (l: number) => (results[l] as { score: number }).score;
+  const scoreOf = (l: number) => (results[l] as ScoredOrError).score;
   let effective: number | undefined;
   for (const l of lens) {
-    if (scoreOf(l) < PASS_SCORE) break;
+    const s = scoreOf(l);
+    if (s === undefined || s < PASS_SCORE) break;
     effective = l;
   }
+  const scored = lens.map(scoreOf).filter((s): s is number => s !== undefined);
   let stop = false;
-  for (let i = 1; i < lens.length; i++) {
-    if (scoreOf(lens[i - 1] as number) < PASS_SCORE && scoreOf(lens[i] as number) < PASS_SCORE) {
-      stop = true;
-    }
+  for (let i = 1; i < scored.length; i++) {
+    if ((scored[i - 1] as number) < PASS_SCORE && (scored[i] as number) < PASS_SCORE) stop = true;
   }
   return effective !== undefined ? { effective, stop } : { stop };
 }

@@ -37,6 +37,7 @@ import {
   RECORD_PREFACE,
   type RecordItem,
   SessionStore,
+  saveCalibration,
   type VerifyRisky,
   validContext,
 } from "../src/index.js";
@@ -664,6 +665,54 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
     await session.send("three");
     expect(session.prefill()?.samples).toBe(1);
     expect(refreshed).toHaveLength(2);
+  });
+
+  test("the calibration is re-read after the first-turn window refresh: a digest learned late finds it, a changed window marks it stale", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "rewire-calib-session-"));
+    try {
+      const chat = { provider: "faux" as const, model: "chat" };
+      const r = { score: 5, ms: 1, at: "x" };
+      await saveCalibration(
+        chat,
+        "d1",
+        { results: { 8192: r, 16384: r }, window: 65536, completedAt: "x", effective: 16384 },
+        { cacheDir },
+      );
+      // The startup lookup gives no digest (e.g. the Ollama lookup timed out).
+      const built = await compactionDeps({
+        routing: resolveRouting([chat]),
+        providers: () => new FauxProvider([]),
+        config: defaultCompactionConfig(),
+        estimator: new TokenEstimator(),
+        windowOptions: { fauxWindow: 65536 },
+        calibrationCacheDir: cacheDir,
+      });
+      expect(built.calibrated).toBeUndefined();
+      let next: ContextWindow = {
+        window: 65536,
+        source: "loaded",
+        provisional: false,
+        digest: "d1",
+      };
+      built.refreshWindow = async () => next;
+      const { session } = await setup(new FauxProvider([{ text: "hi" }, { text: "again" }]), built);
+      expect(session.compactionView()?.calibrated).toBeUndefined();
+      await session.send("one"); // the first turn refreshes the window (now with its digest)
+      const status = await session.contextStatus();
+      expect(status?.limit).toMatchObject({ limit: 16384, reason: "calibrated" });
+      expect(session.compactionView()?.calibrated).toBe(16384);
+      // The runtime window grows past the tolerance: the calibration is stale and not used.
+      next = { window: 131072, source: "loaded", provisional: false, digest: "d1" };
+      await session.refreshWindow();
+      expect(session.compactionView()?.calibrationStale).toEqual({
+        measured: 65536,
+        current: 131072,
+      });
+      expect(session.compactionView()?.calibrated).toBeUndefined();
+      expect((await session.contextStatus())?.limit.reason).not.toBe("calibrated");
+    } finally {
+      rmSync(cacheDir, { recursive: true, force: true });
+    }
   });
 
   test("compactionDeps wires the verifier from routing, with independence and the window", async () => {

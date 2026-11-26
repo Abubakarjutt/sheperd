@@ -558,6 +558,41 @@ describe("/context", () => {
     expect(text).toContain("  rejected: nope");
   });
 
+  it("shows a stale calibration (window changed) and the calibrated reason when it wins", () => {
+    const stale = contextLines(
+      info({
+        view: {
+          independence: "cross-family",
+          record: record([]),
+          rendered: "",
+          calibrationStale: { measured: 4096, current: 65_536 },
+        },
+      }),
+    );
+    const line = stale.find((l) => l.text.startsWith("calibration stale"));
+    expect(line?.tone).toBe("warn");
+    expect(line?.text).toBe(
+      "calibration stale: window changed (measured at 4,096, now 65,536); re-run rewire calibrate --fresh",
+    );
+    const used = contextLines(
+      info({
+        status: {
+          ...STATUS,
+          limit: {
+            limit: 32_768,
+            reason: "calibrated",
+            candidates: [
+              { reason: "calibrated", value: 32_768 },
+              { reason: "window", value: 111_000 },
+            ],
+          },
+        },
+      }),
+    ).map((l) => l.text);
+    expect(used.find((l) => l.startsWith("limit "))).toMatch(/\(calibrated, c\)$/);
+    expect(used.some((l) => l.startsWith("calibration stale"))).toBe(false);
+  });
+
   it("warns when an override exceeds the window, and notes when the floor applied", () => {
     const over = contextLines(
       info({

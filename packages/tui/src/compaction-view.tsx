@@ -151,6 +151,12 @@ export function contextLines(info: ContextInfo): Line[] {
   lines.push({
     text: `window ${num(w.window)} (${w.source})${w.provisional ? " · provisional" : ""}`,
   });
+  if (view.calibrationStale !== undefined) {
+    lines.push({
+      text: `calibration stale: window changed (measured at ${num(view.calibrationStale.measured)}, now ${num(view.calibrationStale.current)}); re-run rewire calibrate --fresh`,
+      tone: "warn",
+    });
+  }
   if (limit.reason === "override" && chosen !== undefined && chosen.value > w.window) {
     lines.push({
       text: `⚠ the configured limit (${num(chosen.value)}) is larger than the context window (${num(w.window)}): requests can overflow before compaction runs`,

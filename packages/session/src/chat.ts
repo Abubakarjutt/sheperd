@@ -34,7 +34,7 @@ import {
 import { profileFor, SandboxClient } from "@rewire/sandbox";
 import { type SkillSet, skillIndex, skillTool } from "@rewire/skills";
 import { createTools } from "@rewire/tools";
-import { calibratedLimit, loadCalibration } from "./calibration-cache.js";
+import { type CalibrationState, calibrationState, loadCalibration } from "./calibration-cache.js";
 import {
   COMPACT_MAX_TOKENS,
   cleanText,
@@ -177,6 +177,14 @@ export type CompactionDeps = {
   independence: RoleRouting["independence"];
   /** A calibrated limit for the chat model (replaces the formula). */
   calibrated?: number;
+  /** The cached calibration exists but was measured at another window (not used). */
+  calibrationStale?: { measured: number; current: number };
+  /**
+   * Re-reads the cached calibration for a refreshed window (its digest and size): the session
+   * calls it after each window refresh, so a digest learned only after the first turn still
+   * finds the calibration, and a changed window marks it stale. Absent: `calibrated` is fixed.
+   */
+  calibration?: (window: ContextWindow) => Promise<CalibrationState>;
   /** Re-reads the window; `refreshContextWindow` when absent. */
   refreshWindow?: (ref: ModelRef) => Promise<ContextWindow>;
 };
@@ -211,12 +219,23 @@ export async function compactionDeps(o: {
     contextWindow(routing.spec, o.windowOptions),
     o.windowTimeoutMs,
   );
-  let calibrated = o.calibrated;
-  if (calibrated === undefined && o.calibrationCacheDir !== undefined) {
-    calibrated = calibratedLimit(
-      await loadCalibration(routing.spec, window.digest, { cacheDir: o.calibrationCacheDir }),
-    );
-  }
+  const cacheDir = o.calibrationCacheDir;
+  const calibration =
+    o.calibrated === undefined && cacheDir !== undefined
+      ? async (w: ContextWindow): Promise<CalibrationState> => {
+          try {
+            return calibrationState(await loadCalibration(routing.spec, w.digest, { cacheDir }), w);
+          } catch {
+            return {};
+          }
+        }
+      : undefined;
+  const state: CalibrationState =
+    o.calibrated !== undefined
+      ? { calibrated: o.calibrated }
+      : calibration !== undefined
+        ? await calibration(window)
+        : {};
   const verifier = createRiskyVerifier({
     provider: o.providers(routing.verifier),
     model: routing.verifier.model,
@@ -233,7 +252,9 @@ export async function compactionDeps(o: {
     // the family of the chat model, not the implementer's that routing's flag compares.
     independence:
       modelFamily(routing.verifier) !== modelFamily(routing.spec) ? "cross-family" : "same-family",
-    ...(calibrated !== undefined ? { calibrated } : {}),
+    ...(state.calibrated !== undefined ? { calibrated: state.calibrated } : {}),
+    ...(state.stale !== undefined ? { calibrationStale: state.stale } : {}),
+    ...(calibration !== undefined ? { calibration } : {}),
     refreshWindow: (ref) => refreshContextWindow(ref, o.windowOptions),
   };
 }
@@ -253,6 +274,10 @@ export type CompactionView = {
   record: SessionRecord;
   /** The record's model-visible render (unfenced, uncleaned); empty before a compaction. */
   rendered: string;
+  /** The calibrated limit in use, if any. */
+  calibrated?: number;
+  /** A cached calibration measured at another window: not used (`rewire calibrate --fresh`). */
+  calibrationStale?: { measured: number; current: number };
 };
 
 /** The window assumed when the lookup does not answer in time (re-read after the first turn). */
@@ -470,6 +495,8 @@ export class ChatSession {
   private compaction: CompactionEntry | undefined;
   /** The chat model's window, as last read. */
   private window: ContextWindow | undefined;
+  /** The calibration in use (from the deps, re-read after each window refresh). */
+  private calib: CalibrationState = {};
   private windowRefresh: Promise<void> = Promise.resolve();
   private refreshedOnce = false;
   /** Model calls made by this session's turns. */
@@ -495,6 +522,11 @@ export class ChatSession {
     this.opts = opts;
     this.meter = opts.prefillMeter ?? new PrefillMeter();
     this.window = opts.compaction?.window;
+    const dc = opts.compaction;
+    this.calib = {
+      ...(dc?.calibrated !== undefined ? { calibrated: dc.calibrated } : {}),
+      ...(dc?.calibrationStale !== undefined ? { stale: dc.calibrationStale } : {}),
+    };
     this.sid = opts.sessionId;
     this.resumed = opts.sessionId === undefined;
     // One skill tool per session. Its loads are reported per turn by the wrapper in `turn`, so
@@ -575,6 +607,8 @@ export class ChatSession {
    * window it came from. Undefined when compaction is off.
    */
   async contextStatus(next?: string): Promise<ContextStatus | undefined> {
+    // A refresh after the last turn (window, then the calibration for it) settles first.
+    await this.windowRefresh;
     const limit = this.limit();
     if (limit === undefined || this.window === undefined) return undefined;
     if (this.life.signal.aborted) throw disposedError();
@@ -615,6 +649,8 @@ export class ChatSession {
       independence: d.independence,
       record: this.record(),
       rendered: c === undefined ? "" : renderRecord(c.record, c.renderBudget).text,
+      ...(this.calib.calibrated !== undefined ? { calibrated: this.calib.calibrated } : {}),
+      ...(this.calib.stale !== undefined ? { calibrationStale: this.calib.stale } : {}),
     };
   }
 
@@ -765,7 +801,19 @@ export class ChatSession {
     if (d === undefined) return undefined;
     const refresh = d.refreshWindow ?? ((ref: ModelRef) => refreshContextWindow(ref));
     this.window = await refresh(this.opts.model);
+    await this.reloadCalibration(this.window);
     return this.window;
+  }
+
+  /** After a window refresh: re-read the cached calibration for this window (digest, size). */
+  private async reloadCalibration(w: ContextWindow): Promise<void> {
+    const load = this.opts.compaction?.calibration;
+    if (load === undefined) return;
+    try {
+      this.calib = await load(w);
+    } catch {
+      // Keep the previous state: a cache read never breaks the session.
+    }
   }
 
   /**
@@ -797,7 +845,7 @@ export class ChatSession {
       latencyBudgetS: d.config.latencyBudgetS,
       ...(prefill !== undefined ? { prefill } : {}),
       ...(override !== undefined ? { override } : {}),
-      ...(d.calibrated !== undefined ? { calibrated: d.calibrated } : {}),
+      ...(this.calib.calibrated !== undefined ? { calibrated: this.calib.calibrated } : {}),
     });
   }
 
@@ -1400,6 +1448,7 @@ export class ChatSession {
       this.windowRefresh = refresh(this.opts.model).then(
         (w) => {
           this.window = w;
+          return this.reloadCalibration(w);
         },
         () => {},
       );

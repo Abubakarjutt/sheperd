@@ -18,17 +18,32 @@ import { COMPACTION_FLOOR } from "./trigger.js";
 
 export const CALIBRATION_FILE_MAX_BYTES = 1024 * 1024;
 
-const LengthResultSchema = z.strictObject({
-  score: z.number().int().min(0).max(MAX_SCORE),
-  ms: z.number().finite().nonnegative(),
-  at: z.string().max(64),
-  error: z.string().max(500).optional(),
+/** A measured score, or a provider error (no score: not a measurement, retried next run). */
+const LengthResultSchema = z.union([
+  z.strictObject({
+    score: z.number().int().min(0).max(MAX_SCORE),
+    ms: z.number().finite().nonnegative(),
+    at: z.string().max(64),
+  }),
+  z.strictObject({
+    error: z.string().max(500),
+    ms: z.number().finite().nonnegative(),
+    at: z.string().max(64),
+  }),
+]);
+const TruncatedSchema = z.strictObject({
+  length: z.number().int().positive(),
+  inputTokens: z.number().int().nonnegative(),
+  estimated: z.number().int().positive(),
 });
 const EntrySchema = z.strictObject({
   effective: z.number().int().positive().optional(),
   results: z.record(z.string().regex(/^[1-9]\d{0,9}$/), LengthResultSchema),
+  /** The window the run measured with (for Ollama the loaded runtime window when known). */
   window: z.number().int().positive(),
   completedAt: z.string().max(64).optional(),
+  /** The provider read far fewer tokens than sent: the run stopped and is never used. */
+  truncated: TruncatedSchema.optional(),
 });
 
 export type LengthResult = z.infer<typeof LengthResultSchema>;
@@ -37,7 +52,11 @@ export type CalibrationEntry = {
   results: Record<string, LengthResult>;
   window: number;
   completedAt?: string;
+  truncated?: z.infer<typeof TruncatedSchema>;
 };
+
+/** A calibration whose measured window differs from the current one by more than this share is stale. */
+export const CALIBRATION_WINDOW_TOLERANCE = 0.1;
 export type CalibrationCacheOptions = { cacheDir: string; warn?: (message: string) => void };
 
 export function calibrationKey(ref: ModelRef, digest: string | undefined): string {
@@ -134,8 +153,39 @@ export async function loadCalibration(
  * window, or the floor when no length passed.
  */
 export function calibratedLimit(entry: CalibrationEntry | undefined): number | undefined {
-  if (entry?.completedAt === undefined) return undefined;
+  if (entry?.completedAt === undefined || entry.truncated !== undefined) return undefined;
+  // A completed run never has errored lengths; a file claiming otherwise is not used.
+  if (Object.values(entry.results).some((r) => !("score" in r))) return undefined;
   return entry.effective ?? COMPACTION_FLOOR;
+}
+
+/** Whether `current` is more than CALIBRATION_WINDOW_TOLERANCE away from the measured window. */
+export function windowChanged(measured: number, current: number): boolean {
+  return Math.abs(current - measured) > CALIBRATION_WINDOW_TOLERANCE * measured;
+}
+
+/** What the chat trigger takes from a cached calibration at the current window. */
+export type CalibrationState = {
+  calibrated?: number;
+  /** A completed calibration exists but was measured at another window: not used. */
+  stale?: { measured: number; current: number };
+};
+
+/**
+ * `calibrated` from a completed, usable entry measured at about the current window. A
+ * provisional current window (Ollama before its first request, faux) is not compared: the
+ * session re-checks once the loaded window is known.
+ */
+export function calibrationState(
+  entry: CalibrationEntry | undefined,
+  current: { window: number; provisional: boolean },
+): CalibrationState {
+  const limit = calibratedLimit(entry);
+  if (entry === undefined || limit === undefined) return {};
+  if (!current.provisional && windowChanged(entry.window, current.window)) {
+    return { stale: { measured: entry.window, current: current.window } };
+  }
+  return { calibrated: limit };
 }
 
 /** `<cacheDir>/rewire`, a real directory (created 0700 when `create`); never a symlink. */
@@ -167,7 +217,7 @@ const cleanEntry = (e: CalibrationEntry): CalibrationEntry => ({
   results: Object.fromEntries(
     Object.entries(e.results).map(([len, r]) => [
       len,
-      r.error !== undefined ? { ...r, error: redact(r.error).slice(0, 500) } : r,
+      "error" in r ? { ...r, error: redact(r.error).slice(0, 500) } : r,
     ]),
   ),
 });

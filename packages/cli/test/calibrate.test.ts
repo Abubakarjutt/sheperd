@@ -13,11 +13,13 @@ import {
   estimateTokens,
   FauxProvider,
   type ModelRef,
+  OLLAMA_TRUNCATION_HINT,
   type Provider,
 } from "@rewire/providers";
 import {
   buildProbe,
   type CompactionDeps,
+  calibratedLimit,
   calibrationPath,
   compactionDeps,
   compactionLimit,
@@ -55,7 +57,8 @@ const sink = () => {
 };
 
 /** A model that reads the prompt: right answers up to `goodUpTo` tokens, wrong ones beyond. */
-function oracle(goodUpTo: number) {
+/** `readCap`: the provider reports at most this many input tokens (a runtime context that truncates). */
+function oracle(goodUpTo: number, readCap?: number) {
   const lengths: number[] = [];
   const provider: Provider & { lengths: number[] } = {
     lengths,
@@ -80,7 +83,10 @@ function oracle(goodUpTo: number) {
           toolCalls: [],
         },
         stopReason: "end",
-        usage: { inputTokens: 0, outputTokens: 0 },
+        usage: {
+          inputTokens: readCap !== undefined ? Math.min(tokens, readCap) : 0,
+          outputTokens: 0,
+        },
       };
     },
   };
@@ -90,7 +96,9 @@ function oracle(goodUpTo: number) {
 /** The nearest planned length of each request (estimates land just under the target). */
 const asLengths = (tokens: number[]) => tokens.map((t) => 2 ** Math.round(Math.log2(t)));
 
-function setup(over: { models?: string[]; window?: ContextWindow } = {}) {
+function setup(
+  over: { models?: string[]; window?: ContextWindow; refresh?: () => Promise<ContextWindow> } = {},
+) {
   const home = tmp();
   const script = join(home, "faux.json");
   writeFileSync(script, JSON.stringify({ scripts: { probe: [] } }));
@@ -126,6 +134,7 @@ function setup(over: { models?: string[]; window?: ContextWindow } = {}) {
           return provider;
         },
         window: async () => window,
+        ...(over.refresh ? { refreshWindow: over.refresh } : {}),
       },
       signal,
     );
@@ -258,25 +267,237 @@ describe("rewire calibrate (faux)", () => {
     expect((await loadCalibration(ref, "d2", { cacheDir: s.cacheDir }))?.effective).toBe(8192);
   });
 
-  test("a provider error on one length records score 0 with a note and continues", async () => {
+  test("a provider error is not a score: recorded as an error, the run is incomplete, the next run retries it", async () => {
     const s = setup({ window: { window: 60_000, source: "model", provisional: true } });
     const good = oracle(1e9);
     let calls = 0;
     const flaky: Provider = {
       chat: async (req) => {
-        if (++calls === 2) throw new Error("connection reset by peer");
+        if (++calls === 2)
+          throw Object.assign(
+            new Error("connect ECONNREFUSED sk-ant-abcdefghijklmnopqrstuvwxyz0123"),
+            { code: "ECONNREFUSED" },
+          );
         return good.chat(req);
       },
     };
-    const r = await s.run({}, flaky);
+    await expect(s.run({}, flaky)).rejects.toMatchObject({
+      code: "calibration_failed",
+      message: expect.stringMatching(/incomplete: 16K/),
+      hint: "run the same command again to retry it",
+    });
+    expect(calls).toBe(3); // one error does not stop the run
+    const ref: ModelRef = { provider: "faux", model: "probe" };
+    const entry = await loadCalibration(ref, undefined, { cacheDir: s.cacheDir });
+    expect(entry?.results["16384"]).not.toHaveProperty("score");
+    expect(entry?.results["16384"]).toMatchObject({
+      error: expect.stringMatching(/^ECONNREFUSED: /),
+    });
+    expect(JSON.stringify(entry)).not.toContain("sk-ant-abcdefghij"); // redacted
+    expect(entry?.completedAt).toBeUndefined();
+
+    // The re-run sends only the errored length, then completes.
+    const retry = oracle(1e9);
+    const out = sink();
+    const r = await s.run({}, retry);
+    expect(asLengths(retry.lengths)).toEqual([16384]);
     expect(r.code).toBe(0);
-    expect(calls).toBe(3);
-    expect(r.stdout).toMatch(/^16K {2}✗ 0\/5 {2}· \d+s {2}\(connection reset by peer\)$/m);
-    expect(r.stdout).toContain("effective context: 8K");
+    expect(r.stdout).toContain("effective context: 32K");
+    void out;
+  });
+
+  test("the progress line for an error says it will be retried (redacted)", async () => {
+    const s = setup({ window: { window: 9000, source: "model", provisional: true } });
+    let calls = 0;
+    const down: Provider = {
+      chat: async () => {
+        calls++;
+        throw new Error("boom sk-ant-abcdefghijklmnopqrstuvwxyz0123");
+      },
+    };
+    const lines: string[] = [];
+    await s.run({}, down).catch((e) => lines.push(String(e.message)));
+    expect(calls).toBe(1);
+    expect(lines[0]).toMatch(/incomplete: 8K/);
+  });
+
+  test("two errors in a row end the run with a hint; nothing is completed", async () => {
+    const s = setup({ window: { window: 600_000, source: "model", provisional: true } });
+    let calls = 0;
+    const down: Provider = {
+      chat: async () => {
+        calls++;
+        throw Object.assign(new Error("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+      },
+    };
+    const out = sink();
+    const p = calibrateCommand(
+      { model: "faux:probe", yes: false, fresh: false },
+      {
+        stdout: out.stream,
+        stderr: sink().stream,
+        env: s.env,
+        cwd: s.home,
+        providers: () => down,
+        window: async () => ({ window: 600_000, source: "model", provisional: true }),
+      },
+      new AbortController().signal,
+    );
+    await expect(p).rejects.toMatchObject({
+      code: "calibration_failed",
+      message: expect.stringMatching(/2 probes in a row failed/),
+      hint: expect.stringMatching(/faux script/),
+    });
+    expect(calls).toBe(2);
+    expect(out.text()).toMatch(/^8K {3}⚠ error: ECONNREFUSED: fetch failed \(will retry\)$/m);
+    expect(out.text()).toMatch(/^16K {2}⚠ error: ECONNREFUSED/m);
     const entry = await loadCalibration({ provider: "faux", model: "probe" }, undefined, {
       cacheDir: s.cacheDir,
     });
-    expect(entry?.results["16384"]).toMatchObject({ score: 0, error: "connection reset by peer" });
+    expect(entry?.completedAt).toBeUndefined();
+    expect(Object.values(entry?.results ?? {}).every((r) => !("score" in r))).toBe(true);
+  });
+
+  test("Ollama errors hint at the server", async () => {
+    const s = setup();
+    const models = join(s.home, "models.toml");
+    writeFileSync(models, 'available = ["ollama:qwen3:8b"]\n');
+    s.setWindow({ window: 60_000, source: "loaded", provisional: false, digest: "sha256:x" });
+    const down: Provider = {
+      chat: async () => {
+        throw new Error("fetch failed");
+      },
+    };
+    await expect(
+      s.run({ model: "ollama:qwen3:8b", models }, down, undefined, { REWIRE_FAUX_SCRIPT: "" }),
+    ).rejects.toMatchObject({ hint: expect.stringMatching(/is Ollama running\?/) });
+  });
+
+  test("a 4K runtime context: the 8K probe is truncated, the run stops with the Ollama hint, nothing is scored", async () => {
+    const s = setup();
+    const models = join(s.home, "models.toml");
+    writeFileSync(models, 'available = ["ollama:qwen3:8b"]\n');
+    s.setWindow({ window: 131_072, source: "model", provisional: true, digest: "sha256:x" });
+    const model = oracle(1e9, 4096);
+    const out: string[] = [];
+    await expect(
+      s.run({ model: "ollama:qwen3:8b", models }, model, undefined, { REWIRE_FAUX_SCRIPT: "" }),
+    ).rejects.toMatchObject({
+      code: "calibration_failed",
+      message: expect.stringMatching(/truncated the 8K probe/),
+      hint: OLLAMA_TRUNCATION_HINT,
+    });
+    void out;
+    expect(model.lengths).toHaveLength(1);
+    const entry = await loadCalibration({ provider: "ollama", model: "qwen3:8b" }, "sha256:x", {
+      cacheDir: s.cacheDir,
+    });
+    expect(entry?.results).toEqual({});
+    expect(entry?.truncated).toMatchObject({ length: 8192, inputTokens: 4096 });
+    expect(calibratedLimit(entry)).toBeUndefined();
+
+    // After the context is raised, the re-run measures from 8K and completes.
+    const fixed = oracle(32768, 1e9);
+    const r = await s.run({ model: "ollama:qwen3:8b", models }, fixed, undefined, {
+      REWIRE_FAUX_SCRIPT: "",
+    });
+    expect(r.code).toBe(0);
+    expect(asLengths(fixed.lengths)[0]).toBe(8192);
+    const done = await loadCalibration({ provider: "ollama", model: "qwen3:8b" }, "sha256:x", {
+      cacheDir: s.cacheDir,
+    });
+    expect(done?.truncated).toBeUndefined();
+    expect(done?.effective).toBe(32768);
+  });
+
+  test("the run stores the loaded window learned after the first probe, and a digest it lacked", async () => {
+    const s = setup({
+      window: { window: 131_072, source: "model", provisional: true },
+      refresh: async () => ({ window: 40_000, source: "loaded", provisional: false, digest: "d9" }),
+    });
+    const r = await s.run({}, oracle(1e9));
+    expect(r.code).toBe(0);
+    const ref: ModelRef = { provider: "faux", model: "probe" };
+    const entry = await loadCalibration(ref, "d9", { cacheDir: s.cacheDir });
+    expect(entry?.window).toBe(40_000);
+    expect(entry?.completedAt).toBeDefined();
+  });
+
+  test("a cached calibration measured at another window is stale: re-measured, with a note", async () => {
+    const s = setup({ window: { window: 60_000, source: "loaded", provisional: false } });
+    expect((await s.run({}, oracle(16384))).code).toBe(0);
+    s.setWindow({ window: 131_072, source: "loaded", provisional: false });
+    const again = oracle(1e9);
+    const r = await s.run({}, again);
+    expect(r.stderr).toContain(
+      "calibration stale: window changed (measured at 60,000, now 131,072)",
+    );
+    expect(asLengths(again.lengths)).toEqual([8192, 16384, 32768, 65536]);
+    expect(r.stdout).toContain("effective context: 64K");
+    // Within 10%: reused.
+    s.setWindow({ window: 125_000, source: "loaded", provisional: false });
+    const same = oracle(1e9);
+    await s.run({}, same);
+    expect(same.lengths).toEqual([]);
+  });
+
+  test("lowering --max on a completed calibration never reports beyond it", async () => {
+    const s = setup({ window: { window: 60_000, source: "model", provisional: true } });
+    expect((await s.run({}, oracle(1e9))).code).toBe(0);
+    const r = await s.run({ max: "20000" }, oracle(1e9));
+    expect(r.stdout).toContain("effective context: 16K");
+  });
+
+  test("an errored length still needs --yes on a paid provider (it will be retried)", async () => {
+    const s = setup();
+    const models = join(s.home, "models.toml");
+    writeFileSync(models, 'available = ["anthropic:claude-sonnet-4-5"]\n');
+    s.setWindow({ window: 9000, source: "model", provisional: false });
+    const ref: ModelRef = { provider: "anthropic", model: "claude-sonnet-4-5" };
+    await saveCalibration(
+      ref,
+      undefined,
+      { results: { 8192: { error: "timeout: x", ms: 1, at: "x" } }, window: 9000 },
+      { cacheDir: s.cacheDir },
+    );
+    const never: Provider = {
+      chat: () => {
+        throw new Error("spent");
+      },
+    };
+    await expect(
+      s.run({ model: "anthropic:claude-sonnet-4-5", models }, never, undefined, {
+        REWIRE_FAUX_SCRIPT: "",
+      }),
+    ).rejects.toMatchObject({ code: "calibration_failed", hint: "re-run with --yes to spend" });
+  });
+
+  test("a stopped cached run costs nothing: the paid gate does not fire", async () => {
+    const s = setup();
+    const models = join(s.home, "models.toml");
+    writeFileSync(models, 'available = ["anthropic:claude-sonnet-4-5"]\n');
+    s.setWindow({ window: 600_000, source: "model", provisional: false });
+    const ref: ModelRef = { provider: "anthropic", model: "claude-sonnet-4-5" };
+    const r0 = { score: 0, ms: 1, at: "x" };
+    await saveCalibration(
+      ref,
+      undefined,
+      { results: { 8192: r0, 16384: r0 }, window: 600_000 },
+      {
+        cacheDir: s.cacheDir,
+      },
+    );
+    const never: Provider = {
+      chat: () => {
+        throw new Error("spent");
+      },
+    };
+    const r = await s.run({ model: "anthropic:claude-sonnet-4-5", models }, never, undefined, {
+      REWIRE_FAUX_SCRIPT: "",
+    });
+    expect(r.code).toBe(0);
+    expect(r.made).toBe(0);
+    expect(r.stdout).toContain("effective context: below 8K");
   });
 
   test("--max caps the plan", async () => {
