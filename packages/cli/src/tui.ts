@@ -77,6 +77,8 @@ export type ChatSessionsOptions = {
   compaction: CompactionConfig;
   /** For the chat model's context window (`env` carries OLLAMA_HOST and REWIRE_FAUX_WINDOW). */
   windowOptions: ContextWindowOptions;
+  /** The XDG cache dir: a completed `rewire calibrate` of the chat model sets its compaction limit. */
+  cacheDir?: string;
   /** Test seam: builds each session's compaction deps (default `compactionDeps`). */
   buildCompaction?: typeof compactionDeps;
 };
@@ -100,6 +102,7 @@ export function chatSessions(o: ChatSessionsOptions): StartDeps["newSession"] {
       config: o.compaction,
       estimator,
       windowOptions: o.windowOptions,
+      ...(o.cacheDir !== undefined ? { calibrationCacheDir: o.cacheDir } : {}),
       // Start, `/clear` and `/resume` wait for this: an unresponsive Ollama host must not hold
       // the UI. The session re-reads the window after its first turn.
       windowTimeoutMs: WINDOW_LOOKUP_TIMEOUT_MS,
@@ -172,6 +175,7 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
       store,
       compaction: models.compaction,
       windowOptions: { env: io.env },
+      cacheDir,
     }),
     listSessions: () => store.list(repo),
     newRunController: (skills) =>

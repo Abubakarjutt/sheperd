@@ -34,6 +34,7 @@ import {
 import { profileFor, SandboxClient } from "@rewire/sandbox";
 import { type SkillSet, skillIndex, skillTool } from "@rewire/skills";
 import { createTools } from "@rewire/tools";
+import { calibratedLimit, loadCalibration } from "./calibration-cache.js";
 import {
   COMPACT_MAX_TOKENS,
   cleanText,
@@ -191,7 +192,13 @@ export async function compactionDeps(o: {
   config: CompactionConfig;
   estimator: TokenEstimator;
   windowOptions?: ContextWindowOptions;
+  /** A calibrated limit; when absent, read from the calibration cache in `calibrationCacheDir`. */
   calibrated?: number;
+  /**
+   * The XDG cache dir holding `rewire/calibration.json`: a completed `rewire calibrate` of the
+   * chat model at the window's digest gives `calibrated`. A missing or bad cache gives none.
+   */
+  calibrationCacheDir?: string;
   verifierTimeoutMs?: number;
   /**
    * Give up on the window lookup after this long (an unresponsive Ollama host) and start with
@@ -204,6 +211,12 @@ export async function compactionDeps(o: {
     contextWindow(routing.spec, o.windowOptions),
     o.windowTimeoutMs,
   );
+  let calibrated = o.calibrated;
+  if (calibrated === undefined && o.calibrationCacheDir !== undefined) {
+    calibrated = calibratedLimit(
+      await loadCalibration(routing.spec, window.digest, { cacheDir: o.calibrationCacheDir }),
+    );
+  }
   const verifier = createRiskyVerifier({
     provider: o.providers(routing.verifier),
     model: routing.verifier.model,
@@ -220,7 +233,7 @@ export async function compactionDeps(o: {
     // the family of the chat model, not the implementer's that routing's flag compares.
     independence:
       modelFamily(routing.verifier) !== modelFamily(routing.spec) ? "cross-family" : "same-family",
-    ...(o.calibrated !== undefined ? { calibrated: o.calibrated } : {}),
+    ...(calibrated !== undefined ? { calibrated } : {}),
     refreshWindow: (ref) => refreshContextWindow(ref, o.windowOptions),
   };
 }
