@@ -20,7 +20,9 @@ import {
   type ContextWindow,
   type ContextWindowOptions,
   contextWindow,
+  DEFAULT_CONTEXT_WINDOW,
   type ModelRef,
+  modelFamily,
   OLLAMA_TRUNCATION_HINT,
   type Provider,
   refreshContextWindow,
@@ -170,7 +172,7 @@ export type CompactionDeps = {
   estimator: TokenEstimator;
   /** The independent check of risky operations (`createRiskyVerifier` on `routing.verifier`). */
   verifier: VerifyRisky;
-  /** From routing: whether the verifier is of another model family than the chat model. */
+  /** Whether the verifier is of another model family than the chat model (`routing.spec`). */
   independence: RoleRouting["independence"];
   /** A calibrated limit for the chat model (replaces the formula). */
   calibrated?: number;
@@ -191,9 +193,17 @@ export async function compactionDeps(o: {
   windowOptions?: ContextWindowOptions;
   calibrated?: number;
   verifierTimeoutMs?: number;
+  /**
+   * Give up on the window lookup after this long (an unresponsive Ollama host) and start with
+   * the provisional default; the session re-reads the window after its first turn.
+   */
+  windowTimeoutMs?: number;
 }): Promise<CompactionDeps> {
   const { routing } = o;
-  const window = await contextWindow(routing.spec, o.windowOptions);
+  const window = await windowWithin(
+    contextWindow(routing.spec, o.windowOptions),
+    o.windowTimeoutMs,
+  );
   const verifier = createRiskyVerifier({
     provider: o.providers(routing.verifier),
     model: routing.verifier.model,
@@ -206,7 +216,10 @@ export async function compactionDeps(o: {
     config: o.config,
     estimator: o.estimator,
     verifier,
-    independence: routing.independence,
+    // Compaction's verifier checks the chat model's (the author's) proposals: what matters is
+    // the family of the chat model, not the implementer's that routing's flag compares.
+    independence:
+      modelFamily(routing.verifier) !== modelFamily(routing.spec) ? "cross-family" : "same-family",
     ...(o.calibrated !== undefined ? { calibrated: o.calibrated } : {}),
     refreshWindow: (ref) => refreshContextWindow(ref, o.windowOptions),
   };
@@ -228,6 +241,31 @@ export type CompactionView = {
   /** The record's model-visible render (unfenced, uncleaned); empty before a compaction. */
   rendered: string;
 };
+
+/** The window assumed when the lookup does not answer in time (re-read after the first turn). */
+const FALLBACK_WINDOW: ContextWindow = {
+  window: DEFAULT_CONTEXT_WINDOW,
+  source: "default",
+  provisional: true,
+};
+
+/** `lookup`, or {@link FALLBACK_WINDOW} once `ms` have passed (no timer is left behind). */
+async function windowWithin(
+  lookup: Promise<ContextWindow>,
+  ms: number | undefined,
+): Promise<ContextWindow> {
+  if (ms === undefined || !(ms > 0)) return lookup;
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<ContextWindow>((r) => {
+    timer = setTimeout(() => r(FALLBACK_WINDOW), ms);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([lookup, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** The one-line preface of the model-visible record message. */
 export const RECORD_PREFACE =
@@ -529,6 +567,11 @@ export class ChatSession {
     if (this.life.signal.aborted) throw disposedError();
     await this.open();
     const specs = await this.specs();
+    // `dispose()` may have run while the client was being made: it saw no client to clean up.
+    if (this.life.signal.aborted) {
+      await this.releaseSandbox();
+      throw disposedError();
+    }
     const estimate = this.estimate(specs, next);
     const hold = this.holdState(estimate, limit.limit);
     return { estimate, limit, window: this.window, ...(hold ? { hold } : {}) };
@@ -610,6 +653,11 @@ export class ChatSession {
     // The in-flight send rejects promptly (session_disposed); wait so it cannot create a client
     // or store anything after the cleanup below.
     await this.queue;
+    await this.releaseSandbox();
+  }
+
+  /** Dispose the sandbox client and remove its scratch dir (no-op without one). */
+  private async releaseSandbox(): Promise<void> {
     const s = this.sandbox;
     this.sandbox = undefined;
     if (s === undefined) return;
@@ -1060,8 +1108,18 @@ export class ChatSession {
     }
   }
 
-  private async client(): Promise<SandboxClient> {
-    if (this.sandbox) return this.sandbox.client;
+  /** The client being made, so concurrent callers (a turn, status reads) share one. */
+  private clientMaking: Promise<SandboxClient> | undefined;
+
+  private client(): Promise<SandboxClient> {
+    if (this.sandbox) return Promise.resolve(this.sandbox.client);
+    this.clientMaking ??= this.makeClient().finally(() => {
+      this.clientMaking = undefined;
+    });
+    return this.clientMaking;
+  }
+
+  private async makeClient(): Promise<SandboxClient> {
     const root = await realpath(resolve(this.opts.repo));
     const scratch = await realpath(await mkdtemp(join(tmpdir(), "rewire-chat-")));
     try {

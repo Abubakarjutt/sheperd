@@ -581,6 +581,9 @@ describe("chatSessions: every TUI session gets compactionDeps (Task 7)", () => {
         expect(c.routing).toBe(routing);
         expect(c.config).toBe(config);
         expect(c.windowOptions).toEqual({ env });
+        // The Ollama probes must not hold the UI: a 2-3 s cap, then the provisional default.
+        expect(c.windowTimeoutMs).toBeGreaterThanOrEqual(2000);
+        expect(c.windowTimeoutMs).toBeLessThanOrEqual(3000);
         expect(typeof c.providers).toBe("function");
       }
       // One estimator for the chat model, shared by its sessions.

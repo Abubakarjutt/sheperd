@@ -14,7 +14,7 @@ import {
   TURN_LIMIT_NOTE,
 } from "@rewire/session";
 import type { Skill } from "@rewire/skills";
-import { Box } from "ink";
+import { Box, type DOMElement, measureElement } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type RunDone, RunView } from "./board-view.js";
 import { STALE_PROMPT } from "./checkpoint.js";
@@ -296,10 +296,13 @@ export function App(props: AppProps) {
   const truncationShown = useRef(false);
   /** Bumped on every session swap: a status read for the old session is dropped. */
   const sessionGen = useRef(0);
+  /** Bumped by every status read: only the newest one may set the status line. */
+  const statusRead = useRef(0);
   const refreshStatus = useCallback(() => {
     const gen = sessionGen.current;
+    const read = ++statusRead.current;
     void statusOf(sessionRef.current).then((st) => {
-      if (gen !== sessionGen.current) return;
+      if (gen !== sessionGen.current || read !== statusRead.current) return;
       setCtx(
         st === undefined
           ? undefined
@@ -361,6 +364,20 @@ export function App(props: AppProps) {
   }, []);
   useEffect(() => () => clearTimeout(liveTimer.current), []);
   const rows = useRows();
+  /**
+   * The rows of the dynamic frame around the `/context` card (the run board and clarify panel
+   * above it, the input and status line below), measured after each render so the card is
+   * sized to what is left of the terminal.
+   */
+  const aboveRef = useRef<DOMElement>(null);
+  const belowRef = useRef<DOMElement>(null);
+  const [around, setAround] = useState(0);
+  useEffect(() => {
+    const h = (r: { current: DOMElement | null }): number =>
+      r.current ? measureElement(r.current).height : 0;
+    const next = h(aboveRef) + h(belowRef);
+    if (next !== around) setAround(next);
+  });
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: bound once; the target reads refs
   useEffect(() => {
@@ -496,7 +513,8 @@ export function App(props: AppProps) {
         try {
           const out = await sessionRef.current.compact(focus, ac.signal);
           const { rest } = endLive();
-          const cancelled = ac.signal.aborted || (!out.ok && out.reason === "aborted");
+          // A result that arrived before a late Esc stands: only an aborted outcome is a cancel.
+          const cancelled = !out.ok && out.reason === "aborted";
           add(...rest, ...(cancelled ? [{ kind: "note", text: COMPACT_CANCELLED } as const] : []));
         } catch (err) {
           const { rest } = endLive();
@@ -767,12 +785,14 @@ export function App(props: AppProps) {
   return (
     <Box flexDirection="column">
       <Transcript entries={entries} region={region} />
-      {run ? (
-        <RunView run={run} onDone={onRunDone} onPending={onPending} onStage={setStage} />
-      ) : null}
-      {clarify ? (
-        <ClarifyPanel questions={clarify.prompt.questions} index={clarify.answers.length} />
-      ) : null}
+      <Box ref={aboveRef} flexDirection="column">
+        {run ? (
+          <RunView run={run} onDone={onRunDone} onPending={onPending} onStage={setStage} />
+        ) : null}
+        {clarify ? (
+          <ClarifyPanel questions={clarify.prompt.questions} index={clarify.answers.length} />
+        ) : null}
+      </Box>
       {proposal !== undefined ? <ProposalCard task={proposal} onAnswer={onProposal} /> : null}
       {trustOpen && trustSkills ? (
         <TrustPrompt
@@ -788,6 +808,7 @@ export function App(props: AppProps) {
           info={contextInfo}
           onClose={() => setContextInfo(undefined)}
           isActive={contextOpen}
+          reserved={around}
         />
       ) : null}
       {live ? (
@@ -800,26 +821,28 @@ export function App(props: AppProps) {
           maxRows={rows - LIVE_RESERVED_ROWS}
         />
       ) : null}
-      <InputBox
-        busy={busy}
-        disabled={inputOff || live !== undefined}
-        // A clarification answer is free text: `?` types there.
-        helpKey={clarify === undefined}
-        // ...and so do `/` and `@`: no command menu or file picker there.
-        popups={clarify === undefined}
-        onSubmit={submit}
-        inRun={run !== undefined}
-        files={files}
-        onWantFiles={wantFiles}
-        onPopup={setPopup}
-      />
-      <StatusLine
-        model={models?.chat}
-        context={context}
-        ctx={ctx}
-        checkpoints={checkpointsShort(checkpoints)}
-        mode={mode}
-      />
+      <Box ref={belowRef} flexDirection="column">
+        <InputBox
+          busy={busy}
+          disabled={inputOff || live !== undefined}
+          // A clarification answer is free text: `?` types there.
+          helpKey={clarify === undefined}
+          // ...and so do `/` and `@`: no command menu or file picker there.
+          popups={clarify === undefined}
+          onSubmit={submit}
+          inRun={run !== undefined}
+          files={files}
+          onWantFiles={wantFiles}
+          onPopup={setPopup}
+        />
+        <StatusLine
+          model={models?.chat}
+          context={context}
+          ctx={ctx}
+          checkpoints={checkpointsShort(checkpoints)}
+          mode={mode}
+        />
+      </Box>
     </Box>
   );
 }

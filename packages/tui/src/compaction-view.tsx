@@ -208,8 +208,23 @@ export function ContextBody({ info, width }: { info: ContextInfo; width: number 
   );
 }
 
-/** Rows around the panel's scroll area: the card border, its title, its footer and the input. */
-const PANEL_OUTSIDE_ROWS = 13;
+/** The card's own rows around its scroll area: two border rows, the title and the footer. */
+const CARD_CHROME_ROWS = 4;
+/** One spare row, so a frame one row taller than measured still fits the screen. */
+const SPARE_ROWS = 1;
+/** With fewer scroll rows than this, the card shrinks to a two-line summary. */
+export const CONTEXT_MIN_ROWS = 6;
+/** What the summary says instead of the card. */
+export const CONTEXT_SEE_MORE = "close the run view to see more · esc close";
+/** Rows assumed under the card (the input box and the status line) before they are measured. */
+export const DEFAULT_RESERVED_ROWS = 5;
+
+/** The summary line of a card too short to show: the size, the limit and the record counts. */
+export function contextSummary(info: ContextInfo): string {
+  const { estimate, limit } = info.status;
+  const r = REASON_INITIAL[limit.reason] ?? "?";
+  return `context ${kTokens(estimate)}/${kTokens(limit.limit)} (${r}) · ${recordCounts(info.view.record)}`;
+}
 
 /**
  * `/context` as a card above the input. Content taller than the screen scrolls (the shared
@@ -219,15 +234,23 @@ export function ContextPanel({
   info,
   onClose,
   isActive,
+  reserved = DEFAULT_RESERVED_ROWS,
 }: {
   info: ContextInfo;
   onClose: () => void;
   isActive: boolean;
+  /**
+   * Rows the rest of the dynamic frame takes (a run board and clarify panel above, the input
+   * and status line below), so card and all stay within the terminal rows.
+   */
+  reserved?: number;
 }): ReactNode {
   const cols = useColumns();
   const rows = useRows();
   const inner = cardInner(cols);
-  const page = Math.max(3, rows - PANEL_OUTSIDE_ROWS);
+  const room = Math.floor(rows - (Number.isFinite(reserved) ? reserved : 0)) - SPARE_ROWS;
+  const page = room - CARD_CHROME_ROWS;
+  const summary = page < CONTEXT_MIN_ROWS;
   const ref = useRef<DOMElement>(null);
   const [height, setHeight] = useState(0);
   useEffect(() => {
@@ -235,7 +258,25 @@ export function ContextPanel({
     const h = measureElement(ref.current).height;
     if (h !== height) setHeight(h);
   });
-  const top = useScroll(height, page, { isActive: () => isActive, onClose });
+  const top = useScroll(summary ? 0 : height, Math.max(1, page), {
+    isActive: () => isActive,
+    onClose,
+  });
+  if (summary) {
+    // Too little room (a tall run board): two lines, or one when even that does not fit.
+    return (
+      <Box flexDirection="column">
+        <Text wrap="truncate">
+          <Safe color={theme.accent}>{fit(contextSummary(info), cols)}</Safe>
+        </Text>
+        {room >= 2 ? (
+          <Text color={theme.dim} wrap="truncate">
+            {fit(CONTEXT_SEE_MORE, cols)}
+          </Text>
+        ) : null}
+      </Box>
+    );
+  }
   const scrolls = height > page;
   const end = Math.min(height, top + page);
   const footer = scrolls

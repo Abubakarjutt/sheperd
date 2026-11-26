@@ -64,6 +64,9 @@ function routingText(r: ReturnType<typeof resolveRouting>): string {
   return lines.join("\n");
 }
 
+/** How long a new chat session waits for its model's context window before using the default. */
+export const WINDOW_LOOKUP_TIMEOUT_MS = 2500;
+
 export type ChatSessionsOptions = {
   repo: string;
   routing: RoleRouting;
@@ -97,6 +100,9 @@ export function chatSessions(o: ChatSessionsOptions): StartDeps["newSession"] {
       config: o.compaction,
       estimator,
       windowOptions: o.windowOptions,
+      // Start, `/clear` and `/resume` wait for this: an unresponsive Ollama host must not hold
+      // the UI. The session re-reads the window after its first turn.
+      windowTimeoutMs: WINDOW_LOOKUP_TIMEOUT_MS,
     });
     const opts = {
       repo: o.repo,

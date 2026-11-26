@@ -12,6 +12,7 @@ import type {
   CompactionOutcome,
   CompactionView,
   ContextStatus,
+  PendingPrompt,
   RunController,
   RunHandle,
   SessionRecord,
@@ -677,7 +678,8 @@ describe("/context", () => {
       ),
     );
     setSize(v.stdout, 80, 24);
-    const first = await waitFor(v, (f) => /lines 1–11 of \d+/.test(f), "the scroll footer");
+    // 24 rows - 5 below (input, status) - 1 spare - 4 card rows = 14 lines.
+    const first = await waitFor(v, (f) => /lines 1–14 of \d+/.test(f), "the scroll footer");
     expect(first).not.toContain("note 59");
     v.stdin.write("G");
     const last = await waitText(v, "note 59");
@@ -734,5 +736,100 @@ describe("/context", () => {
     expect(region).toContain("compaction checks use");
     expect(region).toContain("larger than the");
     expect(v.frames.length).toBeGreaterThan(from);
+  });
+
+  /** The dynamic frame: every line after the static echo of the last `/context`. */
+  const dynamicRows = (frame: string): number => {
+    const lines = plain(frame).split("\n");
+    const at = lines.map((l) => l.trim()).lastIndexOf("> /context");
+    return lines.length - at - 1;
+  };
+  const longRecord = (n: number) =>
+    ["## Notes", ...Array.from({ length: n }, (_, k) => `- [model m${k}] note ${k}`)].join("\n");
+  const pendingRun = (prompt?: () => PendingPrompt | undefined) =>
+    ({
+      events: { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }) },
+      pending: prompt ?? (() => undefined),
+      answer: () => true,
+      abort: () => {},
+      done: new Promise(() => {}),
+    }) as unknown as RunHandle;
+
+  it("during a run at 24 rows the card is sized to what the run board leaves: the frame fits", async () => {
+    const fake = fakeSession({
+      view: { record: record(), rendered: longRecord(60) },
+    });
+    const v = mount({ session: fake.session, run: pendingRun() });
+    setSize(v.stdout, 100, 24);
+    await enter(v, "/context");
+    const f = await waitFor(v, (x) => /lines 1–\d+ of \d+/.test(x), "the scrolling card");
+    await tick(100);
+    const last = v.lastFrame() ?? "";
+    expect(plain(last)).toContain("○ Spec"); // the run board is above the card
+    expect(dynamicRows(last)).toBeLessThanOrEqual(24);
+    // The board's 8 rows came off the page: fewer lines than the idle 14.
+    const shown = Number(/lines 1–(\d+) of/.exec(plain(last))?.[1]);
+    expect(shown).toBeLessThan(14);
+    expect(f).toContain("Context");
+  });
+
+  it("with a tall run board and a clarify panel, too little room shows a two-line summary", async () => {
+    const prompt: PendingPrompt = {
+      kind: "clarify",
+      questions: ["Which file?", "Which name?", "Which test?"],
+    };
+    const fake = fakeSession({ view: { record: record(), rendered: longRecord(60) } });
+    const v = mount({ session: fake.session, run: pendingRun(() => prompt) });
+    setSize(v.stdout, 100, 18);
+    await waitText(v, "Which file?");
+    await enter(v, "/context");
+    const f = await waitText(v, "close the run view to see more");
+    expect(f).toContain("context 61k/74k (f) · 0 decisions");
+    expect(f).not.toContain("Session record");
+    await tick(100);
+    expect(dynamicRows(v.lastFrame() ?? "")).toBeLessThanOrEqual(18);
+    v.stdin.write(ESC);
+    await waitFor(v, (x) => !x.includes("close the run view"), "the summary to close");
+  });
+
+  it("M4: a result that came back before a late Esc is not reported as cancelled", async () => {
+    const em = emitter();
+    const { type: _t, phase: _p, ...done } = DONE as Extract<ChatEvent, { phase: "done" }>;
+    const fake = fakeSession({
+      // Finishes, but only once the Esc has landed: the outcome is a success.
+      compact: (_f, signal) =>
+        new Promise<CompactionOutcome>((r) => {
+          signal?.addEventListener("abort", () => {
+            em.emit(DONE);
+            r({ ok: true, ...done });
+          });
+        }),
+    });
+    const v = mount({ session: fake.session, subscribe: em.subscribe });
+    await enter(v, "/compact");
+    await waitText(v, "Compacting context…");
+    v.stdin.write(ESC);
+    const f = await waitFor(v, (x) => !x.includes("Compacting context…"), "the spinner to go");
+    await tick(60);
+    expect(f).toContain("compacted 41 messages");
+    expect(plain(v.lastFrame())).not.toContain(COMPACT_CANCELLED.trim());
+  });
+
+  it("M6: an older status read that resolves late does not overwrite a newer one", async () => {
+    const em = emitter();
+    const resolvers: ((s: ContextStatus) => void)[] = [];
+    const fake = fakeSession();
+    (fake.session as unknown as { contextStatus: () => Promise<ContextStatus> }).contextStatus =
+      () => new Promise<ContextStatus>((r) => resolvers.push(r));
+    const v = mount({ session: fake.session, subscribe: em.subscribe });
+    await tick();
+    em.emit(DONE); // a second read
+    await tick();
+    expect(resolvers).toHaveLength(2);
+    resolvers[1]?.({ ...STATUS, estimate: 9_000 });
+    await waitText(v, "ctx 9k/74k");
+    resolvers[0]?.({ ...STATUS, estimate: 70_000 });
+    await tick(80);
+    expect(plain(v.lastFrame())).toContain("ctx 9k/74k");
   });
 });

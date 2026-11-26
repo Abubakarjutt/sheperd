@@ -1098,4 +1098,70 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
     await faux.session.send(big);
     expect(faux.events.filter((e) => e.type === "truncation_suspected")).toHaveLength(0);
   });
+
+  test("compactionDeps: independence compares the verifier with the chat model's family, not the implementer's", async () => {
+    const claude = { provider: "anthropic" as const, model: "claude-sonnet-4-5" };
+    const gpt = { provider: "openai" as const, model: "gpt-5" };
+    const base = {
+      providers: () => new FauxProvider([]),
+      config: defaultCompactionConfig(),
+      estimator: new TokenEstimator(),
+    };
+    const cross = resolveRouting([claude, gpt]);
+    expect((await compactionDeps({ ...base, routing: cross })).independence).toBe("cross-family");
+    // An implementer of another family: routing calls it cross-family, but the verifier is then
+    // of the chat model's own family.
+    const skewed = resolveRouting([claude, gpt], { implementer: gpt });
+    expect(skewed.independence).toBe("cross-family");
+    expect(skewed.verifier).toEqual(claude);
+    expect((await compactionDeps({ ...base, routing: skewed })).independence).toBe("same-family");
+  });
+
+  test("compactionDeps gives up on an unresponsive window lookup within windowTimeoutMs", async () => {
+    const { createServer } = await import("node:http");
+    const held: import("node:http").ServerResponse[] = [];
+    const server = createServer((_req, res) => {
+      held.push(res); // never answers
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const port = (server.address() as import("node:net").AddressInfo).port;
+    try {
+      const started = Date.now();
+      const built = await compactionDeps({
+        routing: resolveRouting([{ provider: "ollama", model: "qwen3:8b" }]),
+        providers: () => new FauxProvider([]),
+        config: defaultCompactionConfig(),
+        estimator: new TokenEstimator(),
+        windowOptions: { baseUrl: `http://127.0.0.1:${port}` },
+        windowTimeoutMs: 200,
+      });
+      expect(Date.now() - started).toBeLessThan(1500);
+      expect(built.window).toEqual({ window: 32_768, source: "default", provisional: true });
+    } finally {
+      for (const r of held) r.destroy();
+      server.closeAllConnections();
+      await new Promise((r) => server.close(r));
+    }
+  });
+
+  test("a status read racing dispose leaves no sandbox client or scratch dir behind", async () => {
+    const { session } = await setup(model({ chat: [] }), deps().deps);
+    const status = session.contextStatus();
+    await session.dispose();
+    await expect(status).rejects.toMatchObject({ code: "session_disposed" });
+    expect((session as unknown as { sandbox?: unknown }).sandbox).toBeUndefined();
+  });
+
+  test("concurrent status reads share one sandbox client", async () => {
+    const { session } = await setup(model({ chat: [] }), deps().deps);
+    const made: string[] = [];
+    const s = session as unknown as { makeClient: () => Promise<unknown> };
+    const make = s.makeClient.bind(session);
+    s.makeClient = async () => {
+      made.push("client");
+      return make();
+    };
+    await Promise.all([session.contextStatus(), session.contextStatus(), session.contextStatus()]);
+    expect(made).toEqual(["client"]);
+  });
 });
