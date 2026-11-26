@@ -233,6 +233,11 @@ describe.skipIf(!sandboxAvailable)("skills in the author stages", { timeout: 240
         expect(toolNames(r)).toContain("skill");
       }
     }
+    // The chat session's `recall` tool is never available to a pipeline stage.
+    for (const k of ["spec", "tw", "impl", "rev", "ver"] as const) {
+      for (const r of (by[k] as FauxProvider).requests)
+        expect(toolNames(r)).not.toContain("recall");
+    }
     for (const k of ["rev", "ver"] as const) {
       // non-vacuous: the verifier only runs when a finding exists
       expect((by[k] as FauxProvider).requests.length).toBeGreaterThan(0);

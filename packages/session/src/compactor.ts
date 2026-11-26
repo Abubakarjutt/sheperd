@@ -788,9 +788,28 @@ export async function compact(input: CompactInput): Promise<CompactResult> {
 
 const ABORTED = { ok: false, code: "compaction_invalid", reason: "aborted" } as const;
 
-async function compactInner(input: CompactInput): Promise<CompactResult> {
-  const { record, messages, provider, model } = input;
-  if (input.signal?.aborted) return ABORTED;
+type Prepared = {
+  window: StoredMessage[];
+  last: StoredMessage;
+  kept: ReturnType<typeof retain>;
+  windowIds: Set<string>;
+  recent: Set<string>;
+  pendingIds: Set<string>;
+  userCitable: Set<string>;
+  system: string;
+  prompt: string;
+};
+
+type PrepareInput = Pick<
+  CompactInput,
+  "record" | "messages" | "since" | "focus" | "recentUserTokens" | "estimator"
+>;
+
+/** The window, the retained messages and the first prompt; a failure when there is nothing to ask. */
+function prepare(
+  input: PrepareInput,
+): Prepared | { ok: false; code: "compaction_invalid"; reason: string } {
+  const { record, messages } = input;
   const start = input.since === undefined ? 0 : messages.findIndex((m) => m.id === input.since);
   if (start < 0) {
     return { ok: false, code: "compaction_invalid", reason: `unknown message ${input.since}` };
@@ -820,9 +839,29 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
   const earlier = messages.filter(
     (m) => m.role === "user" && !windowIds.has(m.id) && (recent.has(m.id) || pendingIds.has(m.id)),
   );
-
   const system = compactPrompt();
   const prompt = buildPrompt(record, window, earlier, input.focus);
+  return { window, last, kept, windowIds, recent, pendingIds, userCitable, system, prompt };
+}
+
+/**
+ * Estimated input tokens of the first request `compact(input)` would send (its system prompt and
+ * its one user message), or undefined when it would fail before asking the model (an unknown
+ * `since`, an empty window). Lets the caller split a window that is too big for the model.
+ */
+export function compactionPromptTokens(input: PrepareInput): number | undefined {
+  const p = prepare(input);
+  if (!("prompt" in p)) return undefined;
+  const est = input.estimator ?? new TokenEstimator();
+  return est.estimate(p.system, [{ role: "user", content: p.prompt }]);
+}
+
+async function compactInner(input: CompactInput): Promise<CompactResult> {
+  const { record, messages, provider, model } = input;
+  if (input.signal?.aborted) return ABORTED;
+  const prepared = prepare(input);
+  if (!("prompt" in prepared)) return prepared;
+  const { last, kept, windowIds, recent, pendingIds, userCitable, system, prompt } = prepared;
   let ops: CompactionOp[] | undefined;
   let problem = "";
   for (let attempt = 0; attempt < 2 && ops === undefined; attempt++) {

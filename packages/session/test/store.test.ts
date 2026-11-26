@@ -16,7 +16,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessage } from "@rewire/providers";
 import { afterAll, describe, expect, test } from "vitest";
-import { SessionStore } from "../src/index.js";
+import { type CompactionEntry, emptyRecord, SessionStore } from "../src/index.js";
+
+const entry = (o: Partial<CompactionEntry> = {}): CompactionEntry => ({
+  at: "2026-11-26T00:00:00.000Z",
+  record: emptyRecord(),
+  since: "m1",
+  retainedFrom: "m0",
+  recordMessage: "Session record:\n<untrusted_session_record>x</untrusted_session_record>",
+  ...o,
+});
 
 const dirs: string[] = [];
 afterAll(() => {
@@ -291,7 +300,7 @@ describe("stable message ids", () => {
     ]);
     appendFileSync(
       sessionFile(repo, id),
-      `${JSON.stringify({ type: "compaction", record: {}, retainedFrom: "m0", at: "x" })}\n`,
+      `${JSON.stringify({ type: "compaction", ...entry({ since: "m2", retainedFrom: "m0" }) })}\n`,
     );
     expect(await store.append(id, { role: "user", content: "c" })).toEqual(["m2"]);
     const loaded = await store.load(id);
@@ -441,4 +450,113 @@ describe("append lock", () => {
     });
     expect(readFileSync(victim, "utf8")).toBe("keep");
   }, 10_000);
+});
+
+describe("compaction lines", () => {
+  async function twoTurns() {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const id = await store.create(repo);
+    await store.append(id, [
+      { role: "user", content: "first" },
+      { role: "assistant", content: "one" },
+      { role: "user", content: "second" },
+      { role: "assistant", content: "two" },
+    ]);
+    return { repo, store, id };
+  }
+
+  test("old files without compaction lines load with compactions: []", async () => {
+    const { store, id } = await twoTurns();
+    const s = await store.loadSession(id);
+    expect(s.messages).toHaveLength(4);
+    expect(s.compactions).toEqual([]);
+  });
+
+  test("appendCompaction round-trips through loadSession, in order, without shifting ids", async () => {
+    const { repo, store, id } = await twoTurns();
+    const record = {
+      ...emptyRecord(),
+      compactions: 1,
+      pending: [{ messageId: "m2", compactionsLeft: 3 }],
+    };
+    const first = entry({ record, since: "m2", retainedFrom: "m0" });
+    expect(await store.appendCompaction(id, first)).toEqual(first);
+    const second = entry({
+      record: { ...record, compactions: 2 },
+      since: "m4",
+      retainedFrom: "m2",
+      truncated: { id: "m2", content: "sec[…]" },
+    });
+    await store.appendCompaction(id, second);
+    expect(await store.append(id, { role: "user", content: "third" })).toEqual(["m4"]);
+    const fresh = new SessionStore();
+    await fresh.list(repo);
+    const s = await fresh.loadSession(id);
+    expect(s.messages.map((m) => m.id)).toEqual(["m0", "m1", "m2", "m3", "m4"]);
+    expect(s.compactions).toEqual([first, second]);
+    // pending is persisted with the record
+    expect(s.compactions[0]?.record.pending).toEqual([{ messageId: "m2", compactionsLeft: 3 }]);
+    const lines = readFileSync(sessionFile(repo, id), "utf8").trim().split("\n");
+    expect(JSON.parse(lines[4] as string)).toMatchObject({ type: "compaction", since: "m2" });
+  });
+
+  test("appendCompaction redacts every string", async () => {
+    const { repo, store, id } = await twoTurns();
+    const stored = await store.appendCompaction(
+      id,
+      entry({ recordMessage: "key sk-ant-abc123DEF456789 here" }),
+    );
+    expect(stored.recordMessage).toBe("key [redacted] here");
+    expect(readFileSync(sessionFile(repo, id), "utf8")).not.toContain("sk-ant-abc");
+  });
+
+  test("appendCompaction refuses an entry that would not load, and writes nothing", async () => {
+    const { repo, store, id } = await twoTurns();
+    const before = readFileSync(sessionFile(repo, id), "utf8");
+    for (const bad of [
+      entry({ since: "m9" }),
+      entry({ retainedFrom: "m1" }), // an assistant message
+      entry({ retainedFrom: "m8" }),
+      entry({ truncated: { id: "m2", content: "x" } }), // not the kept message
+    ]) {
+      await expect(store.appendCompaction(id, bad)).rejects.toMatchObject({
+        code: "compaction_invalid",
+      });
+    }
+    expect(readFileSync(sessionFile(repo, id), "utf8")).toBe(before);
+  });
+
+  test("an invalid compaction line makes loadSession throw session_corrupt", async () => {
+    for (const line of [
+      { type: "compaction", record: {}, retainedFrom: "m0", at: "x" },
+      { type: "compaction", ...entry({ since: "m7" }) },
+      { type: "compaction", ...entry({ retainedFrom: "m1" }) },
+      { type: "compaction", ...entry(), extra: 1 },
+    ]) {
+      const { repo, store, id } = await twoTurns();
+      appendFileSync(sessionFile(repo, id), `${JSON.stringify(line)}\n`);
+      await expect(store.loadSession(id)).rejects.toMatchObject({ code: "session_corrupt" });
+    }
+  });
+
+  test("a compaction line may refer only to messages before it", async () => {
+    const repo = tempRepo();
+    const store = new SessionStore();
+    const id = await store.create(repo);
+    await store.append(id, { role: "user", content: "a" });
+    appendFileSync(
+      sessionFile(repo, id),
+      `${JSON.stringify({ type: "compaction", ...entry({ since: "m1", retainedFrom: "m2" }) })}\n`,
+    );
+    appendFileSync(
+      sessionFile(repo, id),
+      `${JSON.stringify({ role: "assistant", content: "b" })}\n${JSON.stringify({ role: "user", content: "c" })}\n`,
+    );
+    await expect(store.loadSession(id)).rejects.toMatchObject({ code: "session_corrupt" });
+    // append refuses to extend it too
+    await expect(store.append(id, { role: "user", content: "d" })).rejects.toMatchObject({
+      code: "session_corrupt",
+    });
+  });
 });

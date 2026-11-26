@@ -281,7 +281,7 @@ describe.skipIf(!sandboxAvailable())("ChatSession", () => {
     const { session } = await setup(p);
     await session.send("hello");
     const names = (p.requests[0]?.tools ?? []).map((t) => t.name).sort();
-    expect(names).toEqual(["bash", "find", "grep", "propose_run", "read", "skill"]);
+    expect(names).toEqual(["bash", "find", "grep", "propose_run", "read", "recall", "skill"]);
   });
 
   test("the system prompt carries the skills index and the skill tool loads a skill", async () => {
@@ -582,6 +582,13 @@ function streaming(turns: StreamTurn[], stream = true): Provider & { requests: C
   };
 }
 
+/** A first turn: the session's first model call is never a prefill sample (it may load the model). */
+const WARM_UP: StreamTurn = {
+  chunks: ["loaded"],
+  delayMs: 400,
+  usage: { inputTokens: 4000, outputTokens: 1 },
+};
+
 const deltas = (events: ChatEvent[]): string[] =>
   events.flatMap((e) => (e.type === "assistant_delta" ? [e.text] : []));
 
@@ -813,12 +820,16 @@ describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
 
   test("prefill() measures prompt reading: input tokens over the time to the first chunk", async () => {
     const p = streaming([
+      // The session's first call includes a model load: never a sample.
+      WARM_UP,
       { chunks: ["slow"], delayMs: 400, usage: { inputTokens: 4000, outputTokens: 1 } },
       // A prefix-cache hit (first delta at once) and a tiny prompt are not reading speeds.
       { chunks: ["cached"], usage: { inputTokens: 4000, outputTokens: 1 } },
       { chunks: ["tiny"], delayMs: 400, usage: { inputTokens: 500, outputTokens: 1 } },
     ]);
     const { session } = await setup(p);
+    expect(session.prefill()).toBeUndefined();
+    await session.send("load");
     expect(session.prefill()).toBeUndefined();
     await session.send("one");
     const r = session.prefill();
@@ -833,6 +844,7 @@ describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
 
   test("prefill() stops at the first chunk, so a thinking model's reasoning is not counted as reading", async () => {
     const p = streaming([
+      WARM_UP,
       {
         chunks: ["answer"],
         delayMs: 400,
@@ -841,6 +853,7 @@ describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
       },
     ]);
     const { session } = await setup(p);
+    await session.send("load");
     await session.send("think");
     const r = session.prefill();
     expect(r?.samples).toBe(1);
@@ -851,6 +864,7 @@ describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
 
   test("prefill() takes one sample per model call, tool-call-only calls included", async () => {
     const p = streaming([
+      WARM_UP,
       {
         toolCalls: [{ id: "c1", name: "find", arguments: { pattern: "*.ts" } }],
         delayMs: 400,
@@ -859,6 +873,7 @@ describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
       { chunks: ["done"], delayMs: 400, usage: { inputTokens: 6000, outputTokens: 1 } },
     ]);
     const { session } = await setup(p);
+    await session.send("load");
     await session.send("look");
     expect(session.prefill()?.samples).toBe(2);
   });

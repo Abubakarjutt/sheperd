@@ -15,6 +15,7 @@ import { join, resolve } from "node:path";
 import { newRunId, RewireError, redact } from "@rewire/core";
 import type { ChatMessage } from "@rewire/providers";
 import { z } from "zod";
+import { MessageId, SessionRecord } from "./record.js";
 
 /** `<repo>/.rewire/sessions`, relative to the repo root. */
 export const SESSIONS_DIR = join(".rewire", "sessions");
@@ -64,14 +65,49 @@ export type StoredMessage = ChatMessage & { id: string; isError?: boolean };
 export type AppendMessage = ChatMessage & { isError?: boolean };
 
 /**
- * Lines that are not chat messages (Task 6 appends `{type:"compaction",...}`). They are skipped
- * by `load` and never shift message numbering. Any other `type` is corruption.
+ * Lines that are not chat messages: `{type:"compaction",...}` (`appendCompaction`). They are
+ * skipped by `load` and never shift message numbering. Any other `type` is corruption.
  */
 const NON_MESSAGE_TYPES = new Set(["compaction"]);
 
+/**
+ * One compaction of a chat session, as `appendCompaction` stores it and `loadSession` returns it.
+ * The latest one defines the model-visible context: `recordMessage`, then the stored messages
+ * from `retainedFrom` on (with `truncated` in place of that message's content when set).
+ */
+export type CompactionEntry = {
+  /** When it was applied (ISO 8601). */
+  at: string;
+  record: SessionRecord;
+  /** The first message not yet compacted (`m<n>`, n at most the message count: none yet). */
+  since: string;
+  /** The oldest message kept verbatim (a user message), or null when none is kept. */
+  retainedFrom: string | null;
+  /** The cut content of `retainedFrom` when it alone was over the retained budget. */
+  truncated?: { id: string; content: string };
+  /**
+   * The user-role message that carries the rendered record, exactly as the model sees it. Its
+   * fence ids are random, so it is stored rather than re-rendered: a resumed session sends the
+   * same bytes.
+   */
+  recordMessage: string;
+};
+
+const CompactionLine = z
+  .object({
+    type: z.literal("compaction"),
+    at: z.string().min(1).max(64),
+    record: SessionRecord,
+    since: MessageId,
+    retainedFrom: MessageId.nullable(),
+    truncated: z.object({ id: MessageId, content: z.string() }).strict().optional(),
+    recordMessage: z.string(),
+  })
+  .strict();
+
 type Line =
   | { kind: "message"; message: ChatMessage & { id?: string; isError?: boolean } }
-  | { kind: "other" };
+  | { kind: "other"; json: Record<string, unknown> };
 
 /** Classify one JSONL line; undefined when it is neither a chat message nor a known record. */
 function parseLine(line: string): Line | "invalid_json" | "unknown_type" | undefined {
@@ -84,7 +120,9 @@ function parseLine(line: string): Line | "invalid_json" | "unknown_type" | undef
   if (json !== null && typeof json === "object" && !Array.isArray(json) && !("role" in json)) {
     const type = (json as { type?: unknown }).type;
     if (typeof type === "string")
-      return NON_MESSAGE_TYPES.has(type) ? { kind: "other" } : "unknown_type";
+      return NON_MESSAGE_TYPES.has(type)
+        ? { kind: "other", json: json as Record<string, unknown> }
+        : "unknown_type";
     return undefined;
   }
   const m = Message.safeParse(json);
@@ -93,12 +131,52 @@ function parseLine(line: string): Line | "invalid_json" | "unknown_type" | undef
     : undefined;
 }
 
+const idNumber = (id: string): number => Number(id.slice(1));
+
 /**
- * Every message of a session's raw text with its id, checked: a malformed or truncated line, an
- * unknown line type, or a stored id that disagrees with its position throws `session_corrupt`.
+ * A compaction line checked against the messages before it: `since` at most their count,
+ * `retainedFrom` one of them and a user message, `truncated` about `retainedFrom`. The reason it
+ * is not valid otherwise.
  */
-function parseSession(id: string, raw: string): StoredMessage[] {
-  if (raw === "") return [];
+function checkCompaction(
+  json: unknown,
+  before: readonly StoredMessage[],
+): { entry: CompactionEntry } | { why: string } {
+  const parsed = CompactionLine.safeParse(json);
+  if (!parsed.success) return { why: "is not a valid compaction record" };
+  const { type: _type, ...e } = parsed.data;
+  if (idNumber(e.since) > before.length) return { why: "compacts messages it does not follow" };
+  if (e.retainedFrom !== null) {
+    const kept = before[idNumber(e.retainedFrom)];
+    if (kept === undefined || kept.role !== "user") {
+      return { why: "keeps a message that is not a stored user message" };
+    }
+  }
+  if (e.truncated !== undefined && e.truncated.id !== e.retainedFrom) {
+    return { why: "truncates a message it does not keep" };
+  }
+  const entry: CompactionEntry = {
+    at: e.at,
+    record: e.record,
+    since: e.since,
+    retainedFrom: e.retainedFrom,
+    ...(e.truncated !== undefined ? { truncated: e.truncated } : {}),
+    recordMessage: e.recordMessage,
+  };
+  return { entry };
+}
+
+/** What `loadSession` returns: every message, and every compaction in file order. */
+export type LoadedSession = { messages: StoredMessage[]; compactions: CompactionEntry[] };
+
+/**
+ * Every message of a session's raw text with its id, and its compaction lines, checked: a
+ * malformed or truncated line, an unknown line type, an invalid compaction line, or a stored id
+ * that disagrees with its position throws `session_corrupt`.
+ */
+function parseSession(id: string, raw: string): LoadedSession {
+  const compactions: CompactionEntry[] = [];
+  if (raw === "") return { messages: [], compactions };
   if (!raw.endsWith("\n")) throw corrupt(id, "the last line is truncated");
   const out: StoredMessage[] = [];
   raw
@@ -109,7 +187,12 @@ function parseSession(id: string, raw: string): StoredMessage[] {
       if (parsed === "invalid_json") throw corrupt(id, `line ${i + 1} is not valid JSON`);
       if (parsed === undefined) throw corrupt(id, `line ${i + 1} is not a chat message`);
       if (parsed === "unknown_type") throw corrupt(id, `line ${i + 1} has an unknown line type`);
-      if (parsed.kind !== "message") return;
+      if (parsed.kind !== "message") {
+        const c = checkCompaction(parsed.json, out);
+        if ("why" in c) throw corrupt(id, `line ${i + 1} ${c.why}`);
+        compactions.push(c.entry);
+        return;
+      }
       const expected = `m${out.length}`;
       const { id: stored, ...message } = parsed.message;
       if (stored !== undefined && stored !== expected) {
@@ -120,7 +203,7 @@ function parseSession(id: string, raw: string): StoredMessage[] {
       }
       out.push({ id: expected, ...message });
     });
-  return out;
+  return { messages: out, compactions };
 }
 
 export type SessionSummary = {
@@ -352,7 +435,7 @@ export class SessionStore {
           base = cached.count;
         } else {
           try {
-            base = parseSession(id, await fh.readFile("utf8")).length;
+            base = parseSession(id, await fh.readFile("utf8")).messages.length;
           } catch (e) {
             if (e instanceof RewireError && e.code === "session_corrupt") {
               throw new RewireError(e.code, e.message, APPEND_CORRUPT_HINT);
@@ -374,6 +457,53 @@ export class SessionStore {
           count: base + list.length,
         });
         return ids;
+      } finally {
+        await fh.close();
+      }
+    } finally {
+      await releaseLock(lock, token);
+    }
+  }
+
+  /**
+   * Append one compaction line (`{type:"compaction", ...entry}`, every string redacted) under the
+   * same lock as `append`. The entry is checked against the stored messages exactly as
+   * `loadSession` will check it, so a written line always loads (`compaction_invalid` otherwise,
+   * and nothing is written). Message numbering is unchanged. Returns the entry as stored.
+   */
+  async appendCompaction(id: string, entry: CompactionEntry): Promise<CompactionEntry> {
+    const path = await this.path(id);
+    const lock = `${path}.lock`;
+    const token = await acquireLock(lock);
+    try {
+      const fh = await openFile(path, O_RDWR | O_APPEND | O_NOFOLLOW | O_NONBLOCK);
+      try {
+        const st = await fh.stat();
+        if (!st.isFile()) throw unsafe(`${path} is not a regular file`);
+        let messages: StoredMessage[];
+        try {
+          messages = parseSession(id, await fh.readFile("utf8")).messages;
+        } catch (e) {
+          if (e instanceof RewireError && e.code === "session_corrupt") {
+            throw new RewireError(e.code, e.message, APPEND_CORRUPT_HINT);
+          }
+          throw e;
+        }
+        const json = { type: "compaction", ...(redactDeep(entry) as CompactionEntry) };
+        const checked = checkCompaction(json, messages);
+        if ("why" in checked) {
+          throw new RewireError(
+            "compaction_invalid",
+            `refusing to store a compaction that ${checked.why}`,
+          );
+        }
+        const line = `${JSON.stringify(json)}\n`;
+        await fh.appendFile(line, "utf8");
+        this.counts.set(id, {
+          size: st.size + Buffer.byteLength(line, "utf8"),
+          count: messages.length,
+        });
+        return checked.entry;
       } finally {
         await fh.close();
       }
@@ -417,15 +547,24 @@ export class SessionStore {
    * unknown line type, or an id that disagrees with its position throws `session_corrupt`.
    */
   async load(id: string): Promise<StoredMessage[]> {
+    return (await this.loadSession(id)).messages;
+  }
+
+  /**
+   * `load`, plus the session's compaction lines in file order (the last one is current). Files
+   * without compaction lines give `compactions: []`. An invalid compaction line (bad shape, or
+   * one that refers to messages that are not before it) throws `session_corrupt`.
+   */
+  async loadSession(id: string): Promise<LoadedSession> {
     const path = await this.path(id);
     const fh = await openFile(path, READ_FLAGS);
     try {
       const st = await fh.stat();
       if (!st.isFile()) throw unsafe(`${path} is not a regular file`);
       const raw = await fh.readFile("utf8");
-      const messages = parseSession(id, raw);
-      this.counts.set(id, { size: Buffer.byteLength(raw, "utf8"), count: messages.length });
-      return messages;
+      const loaded = parseSession(id, raw);
+      this.counts.set(id, { size: Buffer.byteLength(raw, "utf8"), count: loaded.messages.length });
+      return loaded;
     } finally {
       await fh.close();
     }
