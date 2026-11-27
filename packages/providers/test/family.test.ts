@@ -205,6 +205,27 @@ describe("cloud providers and endpoints", () => {
     }
   });
 
+  test("segments are trimmed and a :suffix is ignored for meta ids and vendor segments", () => {
+    const undo = registerEndpoints({ openrouter: { baseUrl: "https://openrouter.ai/api/v1" } });
+    try {
+      for (const model of ["auto:floor", "openrouter/auto:floor", " auto ", "x/ default "]) {
+        expect(() => modelFamily({ provider: "openrouter", model })).toThrowError(
+          expect.objectContaining({ code: "model_ref_invalid" }),
+        );
+      }
+      expect(() => modelFamily({ provider: "openrouter", model: " openrouter /x" })).toThrowError(
+        expect.objectContaining({ code: "model_ref_invalid" }),
+      );
+      expect(modelFamily({ provider: "openrouter", model: " anthropic /opus-next" })).toBe(
+        "claude",
+      );
+      expect(modelFamily({ provider: "openrouter", model: "openai:beta/thing" })).toBe("gpt");
+      expect(modelFamily({ provider: "openrouter", model: "google/ gemma-3 " })).toBe("gemma");
+    } finally {
+      undo();
+    }
+  });
+
   test("an unregistered endpoint ref throws model_ref_invalid", () => {
     expect(() => modelFamily({ provider: "openrouter", model: "gpt-5" })).toThrowError(
       expect.objectContaining({ code: "model_ref_invalid" }),

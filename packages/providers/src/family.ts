@@ -48,10 +48,15 @@ const ROUTER_VENDORS: ReadonlySet<string> = new Set(["openrouter"]);
  * inferred from an id that names no model: a router or meta id needs an explicit `family`.
  */
 function endpointFamily(ref: ModelRef): string {
-  const segs = ref.model.toLowerCase().split("/");
+  const segs = ref.model
+    .toLowerCase()
+    .split("/")
+    .map((s) => s.trim());
   const last = segs[segs.length - 1] ?? "";
-  const path = segs.slice(0, -1);
-  if (META_IDS.has(last) || path.some((s) => ROUTER_VENDORS.has(s))) {
+  // Meta ids and vendor segments match without a ":suffix" ("auto:floor", "openai:beta").
+  const bare = (s: string) => s.replace(/:.*$/, "").trim();
+  const path = segs.slice(0, -1).map(bare);
+  if (META_IDS.has(bare(last)) || path.some((s) => ROUTER_VENDORS.has(s))) {
     throw new RewireError(
       "model_ref_invalid",
       `cannot tell the model family of "${ref.provider}:${ref.model}": it names a router or default, not a model`,

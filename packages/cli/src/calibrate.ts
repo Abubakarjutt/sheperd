@@ -5,6 +5,7 @@ import {
   builtinProvider,
   type ContextWindow,
   contextWindow,
+  endpointConfig,
   type ModelRef,
   OLLAMA_TRUNCATION_HINT,
   ollamaChatTimeoutMs,
@@ -44,7 +45,7 @@ up to 95% of its window (or --max), and caches the result in $XDG_CACHE_HOME/rew
 The chat session's compaction then triggers at the calibrated size. Never runs automatically.
 
   --max <tokens>   largest probe length
-  --yes            required for paid providers (anthropic, openai): the probes cost input tokens
+  --yes            required for paid providers (all but ollama and a loopback endpoint): the probes cost input tokens
   --models <file>  the models file (default: models.toml discovery, as rewire run)
   --fresh          ignore cached results for this model and measure again
 `;
@@ -52,7 +53,24 @@ The chat session's compaction then triggers at the calibrated size. Never runs a
 /** Wall-clock cap of one probe call for providers without their own (Ollama has REWIRE_OLLAMA_TIMEOUT_S). */
 export const PROBE_TIMEOUT_MS = 600_000;
 
-const PAID = new Set<ModelRef["provider"]>(["anthropic", "openai"]);
+const isLoopbackHost = (host: string): boolean =>
+  host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
+
+/**
+ * Paid providers need `--yes`: every provider except Ollama, faux and an endpoint whose
+ * `base_url` is loopback. An unknown name fails closed (paid).
+ */
+export function isPaidProvider(provider: string): boolean {
+  const builtin = builtinProvider(provider);
+  if (builtin !== undefined) return builtin !== "ollama" && builtin !== "faux";
+  const endpoint = endpointConfig(provider);
+  if (endpoint === undefined) return true;
+  try {
+    return !isLoopbackHost(new URL(endpoint.baseUrl).hostname);
+  } catch {
+    return true;
+  }
+}
 
 export type CalibrateOptions = {
   model?: string | undefined;
@@ -211,7 +229,7 @@ export async function calibrateCommand(
   const todo = decide(inPlan()).stop ? [] : plan.filter(needs);
 
   // Paid gate: before any provider exists, so nothing can be spent.
-  if (PAID.has(ref.provider) && !o.yes && todo.length > 0) {
+  if (isPaidProvider(ref.provider) && !o.yes && todo.length > 0) {
     const tokens = todo.reduce((n, l) => n + l, 0);
     io.stderr.write(
       `calibrating ${name} sends up to ${todo.length} probes (${todo.map(lengthLabel).join(", ")}): at most about ${tokens.toLocaleString("en-US")} input tokens billed by ${ref.provider} (a token count, not a price: rewire has no price table)\n`,
