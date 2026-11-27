@@ -64,6 +64,8 @@ export async function runDoctor(
 ): Promise<number> {
   let failed = false;
   const ok = (name: string, detail: string) => io.stdout.write(`✓ ${name} ${detail}\n`);
+  const note = (name: string, why: string, hint: string | undefined) =>
+    io.stdout.write(`! ${name} — ${why}${hint ? ` — ${hint}` : ""}\n`);
   const bad = (name: string, why: string, hint: string | undefined) => {
     failed = true;
     io.stdout.write(`✗ ${name} — ${why}${hint ? ` — ${hint}` : ""}\n`);
@@ -119,9 +121,11 @@ export async function runDoctor(
     }
     // Cloud providers and endpoints: what each resolved, credentials by env var name only.
     for (const l of providerLines(models, io.env)) {
+      const hint = !l.ok && l.hint !== undefined ? oneLine(l.hint, 300) : undefined;
       if (l.ok) ok(l.name, oneLine(l.detail, 300));
-      else
-        bad(l.name, oneLine(l.why, 300), l.hint !== undefined ? oneLine(l.hint, 300) : undefined);
+      else if (l.used) bad(l.name, oneLine(l.why, 300), hint);
+      // A table nothing routes to cannot break a run: a note, not a failure.
+      else note(`${l.name} (no model uses it)`, oneLine(l.why, 300), hint);
     }
   } catch (e) {
     bad(

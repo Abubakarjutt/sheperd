@@ -1,6 +1,7 @@
 import { RewireError, redact } from "@rewire/core";
 import { type AnthropicMessagesClient, AnthropicProvider } from "./anthropic.js";
 import { providerError } from "./errors.js";
+import { firstSet, type ValueSources } from "./sources.js";
 import type { ChatRequest, ChatResponse, Provider, ProviderSettings } from "./types.js";
 import { baseUrlProblem } from "./url.js";
 
@@ -25,9 +26,21 @@ type BedrockAuth =
 
 /** Where a cloud client will send requests, resolved from models.toml and env. No secrets but auth. */
 export type ClaudeCloudTarget =
-  | { provider: "bedrock"; region: string; baseUrl: string; auth: BedrockAuth }
-  | { provider: "vertex"; project: string; region: string; baseUrl?: string }
-  | { provider: "foundry"; apiKey: string; resource?: string; baseUrl?: string };
+  | {
+      provider: "bedrock";
+      region: string;
+      baseUrl: string;
+      auth: BedrockAuth;
+      sources: ValueSources;
+    }
+  | { provider: "vertex"; project: string; region: string; baseUrl?: string; sources: ValueSources }
+  | {
+      provider: "foundry";
+      apiKey: string;
+      resource?: string;
+      baseUrl?: string;
+      sources: ValueSources;
+    };
 
 const set = (v: string | undefined): string | undefined =>
   v !== undefined && v.trim() !== "" ? v.trim() : undefined;
@@ -86,9 +99,12 @@ export function resolveClaudeCloud(
 ): ClaudeCloudTarget {
   switch (provider) {
     case "bedrock": {
-      const region =
-        set(settings.bedrock?.region) ?? set(env.AWS_REGION) ?? set(env.AWS_DEFAULT_REGION);
-      if (region === undefined) {
+      const picked = firstSet([
+        ["[providers.bedrock] region", settings.bedrock?.region],
+        ["AWS_REGION", env.AWS_REGION],
+        ["AWS_DEFAULT_REGION", env.AWS_DEFAULT_REGION],
+      ]);
+      if (picked === undefined) {
         throw new RewireError(
           "provider_auth_missing",
           "no AWS region for bedrock",
@@ -113,18 +129,20 @@ export function resolveClaudeCloud(
             : profile !== undefined
               ? { kind: "profile", profile }
               : { kind: "chain" };
-      const checked = label(region, "AWS region", BEDROCK_REGION_HINT);
+      const checked = label(picked.value, "AWS region", BEDROCK_REGION_HINT);
       // Passed explicitly: the SDK would otherwise read its override from process.env.
-      const baseUrl =
-        envBaseUrl(env, "ANTHROPIC_BEDROCK_MANTLE_BASE_URL") ??
-        `https://bedrock-mantle.${checked}.api.aws/anthropic`;
-      return { provider, region: checked, auth, baseUrl };
+      const override = envBaseUrl(env, "ANTHROPIC_BEDROCK_MANTLE_BASE_URL");
+      const baseUrl = override ?? `https://bedrock-mantle.${checked}.api.aws/anthropic`;
+      const sources: Record<string, string> = { region: picked.source };
+      if (override !== undefined) sources.baseUrl = "ANTHROPIC_BEDROCK_MANTLE_BASE_URL";
+      return { provider, region: checked, auth, baseUrl, sources };
     }
     case "vertex": {
-      const project =
-        set(settings.vertex?.project) ??
-        set(env.ANTHROPIC_VERTEX_PROJECT_ID) ??
-        set(env.GOOGLE_CLOUD_PROJECT);
+      const project = firstSet([
+        ["[providers.vertex] project", settings.vertex?.project],
+        ["ANTHROPIC_VERTEX_PROJECT_ID", env.ANTHROPIC_VERTEX_PROJECT_ID],
+        ["GOOGLE_CLOUD_PROJECT", env.GOOGLE_CLOUD_PROJECT],
+      ]);
       if (project === undefined) {
         throw new RewireError(
           "provider_auth_missing",
@@ -132,13 +150,19 @@ export function resolveClaudeCloud(
           VERTEX_PROJECT_HINT,
         );
       }
-      const region = set(settings.vertex?.region) ?? set(env.CLOUD_ML_REGION) ?? "global";
+      const region = firstSet([
+        ["[providers.vertex] region", settings.vertex?.region],
+        ["CLOUD_ML_REGION", env.CLOUD_ML_REGION],
+      ]) ?? { value: "global", source: "default" };
       const baseUrl = envBaseUrl(env, "ANTHROPIC_VERTEX_BASE_URL");
+      const sources: Record<string, string> = { project: project.source, region: region.source };
+      if (baseUrl !== undefined) sources.baseUrl = "ANTHROPIC_VERTEX_BASE_URL";
       return {
         provider,
-        project,
-        region: label(region, "Vertex region", VERTEX_REGION_HINT),
+        project: project.value,
+        region: label(region.value, "Vertex region", VERTEX_REGION_HINT),
         ...(baseUrl !== undefined ? { baseUrl } : {}),
+        sources,
       };
     }
     case "foundry": {
@@ -152,13 +176,30 @@ export function resolveClaudeCloud(
       }
       // models.toml wins over env; within one source a base URL wins over a resource.
       const fromToml = settings.foundry;
-      const baseUrl =
-        set(fromToml?.baseUrl) ??
-        (set(fromToml?.resource) === undefined
-          ? envBaseUrl(env, "ANTHROPIC_FOUNDRY_BASE_URL")
-          : undefined);
-      if (baseUrl !== undefined) return { provider, apiKey, baseUrl };
-      const resource = set(fromToml?.resource) ?? set(env.ANTHROPIC_FOUNDRY_RESOURCE);
+      const tomlBase = set(fromToml?.baseUrl);
+      if (tomlBase !== undefined) {
+        return {
+          provider,
+          apiKey,
+          baseUrl: tomlBase,
+          sources: { baseUrl: "[providers.foundry] base_url" },
+        };
+      }
+      if (set(fromToml?.resource) === undefined) {
+        const envBase = envBaseUrl(env, "ANTHROPIC_FOUNDRY_BASE_URL");
+        if (envBase !== undefined) {
+          return {
+            provider,
+            apiKey,
+            baseUrl: envBase,
+            sources: { baseUrl: "ANTHROPIC_FOUNDRY_BASE_URL" },
+          };
+        }
+      }
+      const resource = firstSet([
+        ["[providers.foundry] resource", fromToml?.resource],
+        ["ANTHROPIC_FOUNDRY_RESOURCE", env.ANTHROPIC_FOUNDRY_RESOURCE],
+      ]);
       if (resource === undefined) {
         throw new RewireError(
           "provider_auth_missing",
@@ -169,7 +210,8 @@ export function resolveClaudeCloud(
       return {
         provider,
         apiKey,
-        resource: label(resource, "Foundry resource", FOUNDRY_TARGET_HINT),
+        resource: label(resource.value, "Foundry resource", FOUNDRY_TARGET_HINT),
+        sources: { resource: resource.source },
       };
     }
   }

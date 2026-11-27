@@ -1,6 +1,7 @@
 import { RewireError } from "@rewire/core";
 import OpenAI, { AzureOpenAI } from "openai";
 import { OpenAIProvider } from "./openai.js";
+import { firstSet } from "./sources.js";
 import { endpointConfig, type ProviderSettings } from "./types.js";
 import { baseUrlProblem, isLoopbackUrl } from "./url.js";
 
@@ -86,6 +87,32 @@ export const AZURE_VERSION_HINT =
   'set [providers.azure] api_version in models.toml, or OPENAI_API_VERSION (for example "2024-10-21")';
 
 /**
+ * Azure's key, endpoint and API version, each with its source (a toml key or env var name), in
+ * the precedence `createAzureProvider` uses; an absent one is undefined. `rewire doctor` reads only
+ * the sources and the non-secret values.
+ */
+export function azureSettings(settings: ProviderSettings, env: NodeJS.ProcessEnv) {
+  return {
+    apiKey: firstSet([["AZURE_OPENAI_API_KEY", env.AZURE_OPENAI_API_KEY]]),
+    endpoint: firstSet([
+      ["[providers.azure] endpoint", settings.azure?.endpoint],
+      ["AZURE_OPENAI_ENDPOINT", env.AZURE_OPENAI_ENDPOINT],
+    ]),
+    apiVersion: firstSet([
+      ["[providers.azure] api_version", settings.azure?.apiVersion],
+      ["OPENAI_API_VERSION", env.OPENAI_API_VERSION],
+    ]),
+  };
+}
+
+/** Gemini's key and the env var it came from (`GEMINI_API_KEY`, else `GOOGLE_API_KEY`). */
+export const geminiKey = (env: NodeJS.ProcessEnv) =>
+  firstSet([
+    ["GEMINI_API_KEY", env.GEMINI_API_KEY],
+    ["GOOGLE_API_KEY", env.GOOGLE_API_KEY],
+  ]);
+
+/**
  * GPT on Azure OpenAI. The model ref is the deployment name; the SDK sends
  * `<endpoint>/openai/deployments/<deployment>/chat/completions?api-version=<v>` with an `api-key`
  * header. Endpoint and API version come from `[providers.azure]` first, then env; the key only
@@ -97,7 +124,8 @@ export function createAzureProvider(
   env: NodeJS.ProcessEnv,
   opts: OpenAICompatibleOptions = {},
 ): OpenAIProvider {
-  const apiKey = set(env.AZURE_OPENAI_API_KEY);
+  const { apiKey: key, endpoint: picked, apiVersion: version } = azureSettings(settings, env);
+  const apiKey = key?.value;
   if (apiKey === undefined) {
     throw new RewireError(
       "provider_auth_missing",
@@ -105,26 +133,21 @@ export function createAzureProvider(
       AZURE_KEY_HINT,
     );
   }
-  const fromToml = set(settings.azure?.endpoint);
-  const endpoint = fromToml ?? set(env.AZURE_OPENAI_ENDPOINT);
-  if (endpoint === undefined) {
+  if (picked === undefined) {
     throw new RewireError("provider_auth_missing", "no Azure OpenAI endpoint", AZURE_ENDPOINT_HINT);
   }
-  checkedUrl(
-    endpoint,
-    fromToml !== undefined ? "[providers.azure] endpoint" : "AZURE_OPENAI_ENDPOINT",
-    AZURE_ENDPOINT_HINT,
-  );
+  const endpoint = picked.value;
+  checkedUrl(endpoint, picked.source, AZURE_ENDPOINT_HINT);
   // The resource root only: a path (".../openai/deployments/x") would make the SDK build a URL
   // that never names the deployment.
   if (new URL(endpoint).pathname.replace(/\/+$/, "") !== "") {
     throw new RewireError(
       "provider_auth_missing",
-      `${fromToml !== undefined ? "[providers.azure] endpoint" : "AZURE_OPENAI_ENDPOINT"} must be the resource root, with no path`,
+      `${picked.source} must be the resource root, with no path`,
       AZURE_ENDPOINT_HINT,
     );
   }
-  const apiVersion = set(settings.azure?.apiVersion) ?? set(env.OPENAI_API_VERSION);
+  const apiVersion = version?.value;
   if (apiVersion === undefined) {
     throw new RewireError(
       "provider_auth_missing",
@@ -158,7 +181,7 @@ export function createGeminiProvider(
   env: NodeJS.ProcessEnv,
   opts: OpenAICompatibleOptions = {},
 ): OpenAIProvider {
-  const apiKey = set(env.GEMINI_API_KEY) ?? set(env.GOOGLE_API_KEY);
+  const apiKey = geminiKey(env)?.value;
   if (apiKey === undefined) {
     throw new RewireError(
       "provider_auth_missing",

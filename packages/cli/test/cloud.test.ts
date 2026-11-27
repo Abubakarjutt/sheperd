@@ -259,6 +259,77 @@ api_key_env = "GROQ_API_KEY"
     expect(out).not.toContain(FAKE);
   });
 
+  test("values of an unusual shape are never echoed (a secret pasted into the wrong key)", async () => {
+    const f = toml(
+      `available = ["vertex:claude-opus-5-5", "azure:dep", "bedrock:anthropic.claude-opus-5-5", "foundry:claude-opus-5-5"]
+[providers.vertex]
+project = "Proj${FAKE}Q"
+[providers.azure]
+endpoint = "https://myres.openai.azure.com"
+api_version = "v${FAKE}"
+`,
+    );
+    const [, out] = await doctor(f, {
+      AZURE_OPENAI_API_KEY: "k",
+      AWS_REGION: `Us${FAKE}`,
+      CLOUD_ML_REGION: `R${FAKE}`,
+      ANTHROPIC_FOUNDRY_API_KEY: "k",
+      ANTHROPIC_FOUNDRY_RESOURCE: `9${FAKE}`,
+    });
+    expect(out).not.toContain(FAKE);
+    expect(out).toMatch(
+      /^✓ vertex project \(set, unusual format\) \(\[providers\.vertex\] project\), region \(set, unusual format\) \(CLOUD_ML_REGION\)/m,
+    );
+    expect(out).toMatch(/api version \(set, unusual format\) \(\[providers\.azure\] api_version\)/);
+    expect(out).toMatch(/^✓ bedrock region \(set, unusual format\) \(AWS_REGION\)/m);
+    expect(out).toMatch(
+      /^✓ foundry resource \(set, unusual format\) \(ANTHROPIC_FOUNDRY_RESOURCE\)/m,
+    );
+  });
+
+  test("a failing table no model uses is a note, not a failure; a used one fails", async () => {
+    const [, out] = await doctor(
+      toml(
+        `available = ["anthropic:claude-opus-5-5", "groq:llama-3.3-70b"]
+[providers.bedrock]
+region = "us-east-1"
+[providers.azure]
+endpoint = "https://myres.openai.azure.com"
+[endpoints.spare]
+base_url = "https://spare.example/v1"
+api_key_env = "SPARE_KEY"
+[endpoints.groq]
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+`,
+      ),
+      {},
+    );
+    expect(out).toMatch(/^✓ bedrock region us-east-1/m);
+    expect(out).toMatch(/^! azure \(no model uses it\) — AZURE_OPENAI_API_KEY is not set/m);
+    expect(out).toMatch(/^! endpoint spare \(no model uses it\) — SPARE_KEY is not set/m);
+    expect(out).not.toMatch(/^✗ (azure|endpoint spare)/m);
+    expect(out).toMatch(/^✗ endpoint groq — GROQ_API_KEY is not set/m);
+  });
+
+  test("an unused failing table leaves the exit code as it would be without it", async () => {
+    const code = (body: string) =>
+      runDoctor(toml(body), process.platform, {
+        stdout: { write: () => true } as unknown as NodeJS.WritableStream,
+        env: { ...process.env, GOOGLE_CLOUD_PROJECT: "", ANTHROPIC_VERTEX_PROJECT_ID: "" },
+        cwd: tmp(),
+      } as Parameters<typeof runDoctor>[2]);
+    const baseline = await code(`available = ["anthropic:claude-opus-5-5"]\n`);
+    const unused = await code(
+      `available = ["anthropic:claude-opus-5-5"]\n[providers.vertex]\nregion = "us-east5"\n`,
+    );
+    const used = await code(
+      `available = ["vertex:claude-opus-5-5"]\n[providers.vertex]\nregion = "us-east5"\n`,
+    );
+    expect(unused).toBe(baseline);
+    expect(used).toBe(1);
+  });
+
   test("an env value with a terminal escape is printed sanitized", async () => {
     const [, out] = await doctor(toml(`available = ["vertex:claude-opus-5-5"]\n`), {
       ANTHROPIC_VERTEX_PROJECT_ID: "p\x1b[2Jq",

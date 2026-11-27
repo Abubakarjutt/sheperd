@@ -7,6 +7,7 @@ export * from "./ollama.js";
 export * from "./openai.js";
 export * from "./openai-compatible.js";
 export * from "./registry.js";
+export * from "./sources.js";
 export * from "./structured.js";
 export * from "./types.js";
 export * from "./url.js";

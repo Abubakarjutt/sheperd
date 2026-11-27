@@ -4,6 +4,7 @@ import {
   AZURE_ENDPOINT_HINT,
   AZURE_KEY_HINT,
   AZURE_VERSION_HINT,
+  azureSettings,
   type ClaudeCloudTarget,
   createAzureProvider,
   createEndpointProvider,
@@ -11,27 +12,45 @@ import {
   derivedFamily,
   endpointConfig,
   GEMINI_BASE_URL,
+  geminiKey,
   type ModelRef,
   type ProviderSettings,
   resolveClaudeCloud,
 } from "@rewire/providers";
 
-/** One doctor line: what a configured cloud provider or endpoint resolved to, or why it cannot. */
+/**
+ * One doctor line: what a configured cloud provider or endpoint resolved to, or why it cannot.
+ * `used`: some model ref routes to it; a failing table nothing uses is a note, not a failure.
+ */
 export type ProviderLine =
-  | { name: string; ok: true; detail: string }
-  | { name: string; ok: false; why: string; hint?: string | undefined };
+  | { name: string; used: boolean; ok: true; detail: string }
+  | { name: string; used: boolean; ok: false; why: string; hint?: string | undefined };
 
 type Target<P> = Extract<ClaudeCloudTarget, { provider: P }>;
 
 const CLOUDS = ["bedrock", "vertex", "foundry", "azure", "gemini"] as const;
 type Cloud = (typeof CLOUDS)[number];
 
-const set = (v: string | undefined): string | undefined =>
-  v !== undefined && v.trim() !== "" ? v.trim() : undefined;
+/** Printed in place of a value that does not look like what it should be (it may be a pasted secret). */
+export const UNUSUAL = "(set, unusual format)";
 
-/** The label of the first source that has a value, in the providers' own precedence. */
-const sourceOf = (sources: [label: string, value: string | undefined][]): string =>
-  sources.find(([, v]) => set(v) !== undefined)?.[0] ?? "default";
+/**
+ * Conservative shapes of the non-secret values doctor prints. Anything else is shown as UNUSUAL,
+ * so a credential pasted into the wrong toml key or env var is never echoed.
+ */
+const SHAPES = {
+  // us-east-1, eu-central-1, global, us-east5, europe-west4
+  region: /^[a-z]{2,12}(-[a-z0-9]{1,12}){0,3}$/,
+  // GCP project ids: lowercase letter first, 6 to 30 characters in practice.
+  project: /^[a-z][a-z0-9-]{4,60}$/,
+  // Foundry resource names.
+  resource: /^[a-z][a-z0-9-]{1,62}$/i,
+  // 2024-10-21, 2025-04-01-preview, preview, latest, v1
+  apiVersion: /^(\d{4}-\d{2}-\d{2}(-preview)?|preview|latest|v1)$/,
+} as const;
+
+const shown = (value: string, shape: keyof typeof SHAPES): string =>
+  SHAPES[shape].test(value) ? value : UNUSUAL;
 
 const hostOf = (url: string): string => {
   try {
@@ -41,26 +60,15 @@ const hostOf = (url: string): string => {
   }
 };
 
-/** `, host <host> (<VAR>)` when an SDK base-URL override is set in env. */
-const envHost = (env: NodeJS.ProcessEnv, name: string): string => {
-  const v = set(env[name]);
-  return v !== undefined ? `, host ${hostOf(v)} (${name})` : "";
-};
-
 /**
- * Each detail names where a value came from and which env vars hold credentials, never a
- * credential value: credentials are only ever reported by variable name. Validation reuses the
- * providers' own resolution, so doctor fails exactly where `createProvider` would.
+ * Each detail names where a value came from (the providers' own `sources`, never re-derived here)
+ * and which env vars hold credentials, never a credential value. Validation reuses the providers'
+ * own resolution, so doctor fails exactly where `createProvider` would.
  */
 function cloudDetail(name: Cloud, s: ProviderSettings, env: NodeJS.ProcessEnv): string {
   switch (name) {
     case "bedrock": {
       const t = resolveClaudeCloud("bedrock", s, env) as Target<"bedrock">;
-      const region = sourceOf([
-        ["[providers.bedrock] region", s.bedrock?.region],
-        ["AWS_REGION", env.AWS_REGION],
-        ["AWS_DEFAULT_REGION", env.AWS_DEFAULT_REGION],
-      ]);
       const auth =
         t.auth.kind === "bearer"
           ? "AWS_BEARER_TOKEN_BEDROCK"
@@ -69,45 +77,43 @@ function cloudDetail(name: Cloud, s: ProviderSettings, env: NodeJS.ProcessEnv): 
             : t.auth.kind === "profile"
               ? "AWS_PROFILE"
               : "the AWS default credential chain";
-      return `region ${t.region} (${region})${envHost(env, "ANTHROPIC_BEDROCK_MANTLE_BASE_URL")}, auth ${auth}`;
+      const host =
+        t.sources.baseUrl !== undefined ? `, host ${hostOf(t.baseUrl)} (${t.sources.baseUrl})` : "";
+      return `region ${shown(t.region, "region")} (${t.sources.region})${host}, auth ${auth}`;
     }
     case "vertex": {
       const t = resolveClaudeCloud("vertex", s, env) as Target<"vertex">;
-      const project = sourceOf([
-        ["[providers.vertex] project", s.vertex?.project],
-        ["ANTHROPIC_VERTEX_PROJECT_ID", env.ANTHROPIC_VERTEX_PROJECT_ID],
-        ["GOOGLE_CLOUD_PROJECT", env.GOOGLE_CLOUD_PROJECT],
-      ]);
-      const region = sourceOf([
-        ["[providers.vertex] region", s.vertex?.region],
-        ["CLOUD_ML_REGION", env.CLOUD_ML_REGION],
-      ]);
+      const host =
+        t.baseUrl !== undefined && t.sources.baseUrl !== undefined
+          ? `, host ${hostOf(t.baseUrl)} (${t.sources.baseUrl})`
+          : "";
       const adc =
-        set(env.GOOGLE_APPLICATION_CREDENTIALS) !== undefined
+        (env.GOOGLE_APPLICATION_CREDENTIALS ?? "").trim() !== ""
           ? " (GOOGLE_APPLICATION_CREDENTIALS)"
           : "";
-      return `project ${t.project} (${project}), region ${t.region} (${region})${envHost(env, "ANTHROPIC_VERTEX_BASE_URL")}, auth Google application default credentials${adc}`;
+      return `project ${shown(t.project, "project")} (${t.sources.project}), region ${shown(t.region, "region")} (${t.sources.region})${host}, auth Google application default credentials${adc}`;
     }
     case "foundry": {
       const t = resolveClaudeCloud("foundry", s, env) as Target<"foundry">;
       const target =
         t.baseUrl !== undefined
-          ? `host ${hostOf(t.baseUrl)} (${set(s.foundry?.baseUrl) !== undefined ? "[providers.foundry] base_url" : "ANTHROPIC_FOUNDRY_BASE_URL"})`
-          : `resource ${t.resource} (${set(s.foundry?.resource) !== undefined ? "[providers.foundry] resource" : "ANTHROPIC_FOUNDRY_RESOURCE"})`;
+          ? `host ${hostOf(t.baseUrl)} (${t.sources.baseUrl})`
+          : `resource ${shown(t.resource ?? "", "resource")} (${t.sources.resource})`;
       return `${target}, key ANTHROPIC_FOUNDRY_API_KEY`;
     }
     case "azure": {
       // Every missing piece at once (the provider stops at the first); the SDK has no default
       // API version, so a missing one is a failure here too.
-      const endpoint = set(s.azure?.endpoint) ?? set(env.AZURE_OPENAI_ENDPOINT);
-      const version = set(s.azure?.apiVersion) ?? set(env.OPENAI_API_VERSION);
+      const a = azureSettings(s, env);
       const missing: [string, string][] = [];
-      if (set(env.AZURE_OPENAI_API_KEY) === undefined) {
-        missing.push(["AZURE_OPENAI_API_KEY is not set", AZURE_KEY_HINT]);
+      if (a.apiKey === undefined) missing.push(["AZURE_OPENAI_API_KEY is not set", AZURE_KEY_HINT]);
+      if (a.endpoint === undefined) {
+        missing.push(["no Azure OpenAI endpoint", AZURE_ENDPOINT_HINT]);
       }
-      if (endpoint === undefined) missing.push(["no Azure OpenAI endpoint", AZURE_ENDPOINT_HINT]);
-      if (version === undefined) missing.push(["no Azure OpenAI API version", AZURE_VERSION_HINT]);
-      if (missing.length > 0) {
+      if (a.apiVersion === undefined) {
+        missing.push(["no Azure OpenAI API version", AZURE_VERSION_HINT]);
+      }
+      if (missing.length > 0 || a.endpoint === undefined || a.apiVersion === undefined) {
         throw new RewireError(
           "provider_auth_missing",
           missing.map(([m]) => m).join("; "),
@@ -115,20 +121,11 @@ function cloudDetail(name: Cloud, s: ProviderSettings, env: NodeJS.ProcessEnv): 
         );
       }
       createAzureProvider(s, env);
-      const endpointFrom = sourceOf([
-        ["[providers.azure] endpoint", s.azure?.endpoint],
-        ["AZURE_OPENAI_ENDPOINT", env.AZURE_OPENAI_ENDPOINT],
-      ]);
-      const versionFrom = sourceOf([
-        ["[providers.azure] api_version", s.azure?.apiVersion],
-        ["OPENAI_API_VERSION", env.OPENAI_API_VERSION],
-      ]);
-      return `host ${hostOf(endpoint as string)} (${endpointFrom}), api version ${version} (${versionFrom}), key AZURE_OPENAI_API_KEY`;
+      return `host ${hostOf(a.endpoint.value)} (${a.endpoint.source}), api version ${shown(a.apiVersion.value, "apiVersion")} (${a.apiVersion.source}), key ${a.apiKey?.source}`;
     }
     case "gemini": {
       createGeminiProvider(env);
-      const key = set(env.GEMINI_API_KEY) !== undefined ? "GEMINI_API_KEY" : "GOOGLE_API_KEY";
-      return `host ${hostOf(GEMINI_BASE_URL)}, key ${key}`;
+      return `host ${hostOf(GEMINI_BASE_URL)}, key ${geminiKey(env)?.source}`;
     }
   }
 }
@@ -159,12 +156,13 @@ function endpointDetail(name: string, refs: ModelRef[], env: NodeJS.ProcessEnv):
   return `host ${hostOf(c.baseUrl)}, ${key}${family}`;
 }
 
-function line(name: string, detail: () => string): ProviderLine {
+function line(name: string, used: boolean, detail: () => string): ProviderLine {
   try {
-    return { name, ok: true, detail: detail() };
+    return { name, used, ok: true, detail: detail() };
   } catch (e) {
     return {
       name,
+      used,
       ok: false,
       why: e instanceof Error ? e.message : String(e),
       hint: e instanceof RewireError ? e.hint : undefined,
@@ -184,16 +182,17 @@ export function providerLines(
     ...models.available,
     ...Object.values(models.overrides).filter((r): r is ModelRef => r !== undefined),
   ];
+  const usedBy = (provider: string) => refs.some((r) => r.provider === provider);
   const settings = models.providers ?? {};
   const out: ProviderLine[] = [];
   for (const cloud of CLOUDS) {
-    const used =
-      refs.some((r) => r.provider === cloud) ||
-      (cloud !== "gemini" && settings[cloud] !== undefined);
-    if (used) out.push(line(cloud, () => cloudDetail(cloud, settings, env)));
+    const used = usedBy(cloud);
+    if (used || (cloud !== "gemini" && settings[cloud] !== undefined)) {
+      out.push(line(cloud, used, () => cloudDetail(cloud, settings, env)));
+    }
   }
   for (const name of Object.keys(models.endpoints ?? {})) {
-    out.push(line(`endpoint ${name}`, () => endpointDetail(name, refs, env)));
+    out.push(line(`endpoint ${name}`, usedBy(name), () => endpointDetail(name, refs, env)));
   }
   return out;
 }
