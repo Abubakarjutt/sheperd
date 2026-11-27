@@ -17,18 +17,26 @@ import { chatSessions, routedRunController } from "../src/tui.js";
 const qwen: ModelRef = { provider: "ollama", model: "qwen2.5-coder:7b" };
 const qwen3: ModelRef = { provider: "ollama", model: "qwen3:8b" };
 const llama: ModelRef = { provider: "ollama", model: "llama3.1:8b" };
+const gemma: ModelRef = { provider: "ollama", model: "gemma3:4b" };
 const tick = () => new Promise((r) => setTimeout(r, 0));
 const show = (r: ModelRef) => `${r.provider}:${r.model}`;
 
 const control = (available: ModelRef[] = [qwen, llama, qwen3]) =>
   new RoutingControl({ available, fileOverrides: {}, providers: () => new FauxProvider([]) });
 
-type Built = { n: number; id: string | undefined; model: string; disposed: boolean };
+type Built = {
+  n: number;
+  id: string | undefined;
+  model: string;
+  verifier: string;
+  disposed: boolean;
+};
 
 /** startInteractive with fake sessions that record the chat model they were built on. */
 function harness(rc: RoutingControl, over: Partial<StartDeps> = {}) {
   const built: Built[] = [];
   let failNext: Error | undefined;
+  let gate: Promise<void> | undefined;
   const deps: StartDeps = {
     repo: "/repo",
     trustFile: "/cfg/trusted-skills.json",
@@ -37,7 +45,8 @@ function harness(rc: RoutingControl, over: Partial<StartDeps> = {}) {
     promptTrust: async () => true,
     createSkillSet: () => ({ skills: [], root: "/cache/set" }) as unknown as SkillSet,
     disposeSkillSet: async () => {},
-    newSession: async ({ sessionId }) => {
+    newSession: async ({ sessionId, routing }) => {
+      if (gate) await gate;
       if (failNext) {
         const e = failNext;
         failNext = undefined;
@@ -46,7 +55,8 @@ function harness(rc: RoutingControl, over: Partial<StartDeps> = {}) {
       const b: Built = {
         n: built.length + 1,
         id: sessionId ?? "s-1",
-        model: show(rc.current().spec),
+        model: show((routing ?? rc.current()).spec),
+        verifier: show((routing ?? rc.current()).verifier),
         disposed: false,
       };
       built.push(b);
@@ -75,6 +85,17 @@ function harness(rc: RoutingControl, over: Partial<StartDeps> = {}) {
     failNextBuild: (e: Error) => {
       failNext = e;
     },
+    /** Holds the next builds until the returned function is called. */
+    hold: (): (() => void) => {
+      let open: () => void = () => {};
+      gate = new Promise<void>((r) => {
+        open = () => {
+          gate = undefined;
+          r();
+        };
+      });
+      return () => open();
+    },
   };
 }
 
@@ -99,6 +120,59 @@ describe("startInteractive: the TUI's routingControl", () => {
     expect(show(rc.current().spec)).toBe(show(qwen3));
   });
 
+  test("while the new chat session builds, the old routing is in effect and runs are refused", async () => {
+    const rc = control();
+    const before = rc.current();
+    const fired: string[] = [];
+    rc.onChange((r) => fired.push(show(r.spec)));
+    let during: { routing: RoleRouting; runError: unknown; fired: number } | undefined;
+    let pick: RoutingPick | undefined;
+    const h = harness(rc, {
+      render: async (d) => {
+        const release = h.hold();
+        const p = d.routingControl?.set("spec", qwen3);
+        await tick();
+        let runError: unknown;
+        try {
+          d.runController.start("task", { checkpoints: new Set() });
+        } catch (e) {
+          runError = e;
+        }
+        during = { routing: rc.current(), runError, fired: fired.length };
+        release();
+        pick = await p;
+        return 0;
+      },
+    });
+    await startInteractive(h.deps);
+    expect(during?.routing).toBe(before);
+    expect(during?.fired).toBe(0);
+    expect(during?.runError).toBeInstanceOf(RewireError);
+    expect(pick?.ok).toBe(true);
+    // Built with the candidate routing, committed once after.
+    expect(h.built[1]?.model).toBe(show(qwen3));
+    expect(fired).toEqual([show(qwen3)]);
+  });
+
+  test("a verifier pick resumes the same session too, so compaction verifies with the new verifier", async () => {
+    const rc = control([qwen, llama, qwen3, gemma]);
+    let pick: RoutingPick | undefined;
+    const h = harness(rc, {
+      render: async (d) => {
+        // Automatic: reviewer llama, verifier gemma (a third family).
+        pick = await d.routingControl?.set("verifier", llama);
+        return 0;
+      },
+    });
+    await startInteractive(h.deps);
+    expect(pick?.ok).toBe(true);
+    expect(pick?.ok && pick.session?.id()).toBe("s-1");
+    expect(h.built.map((b) => [b.id, b.verifier])).toEqual([
+      ["s-1", show(gemma)],
+      ["s-1", show(llama)],
+    ]);
+  });
+
   test("a pick of another role builds no session", async () => {
     const rc = control();
     let pick: RoutingPick | undefined;
@@ -114,9 +188,12 @@ describe("startInteractive: the TUI's routingControl", () => {
     expect(h.built).toHaveLength(1);
   });
 
-  test("a failed swap restores the previous override and refuses; the old session stays", async () => {
+  test("a failed swap changes nothing and fires no onChange; the old session stays", async () => {
     const rc = control();
     expect(rc.set("spec", llama).ok).toBe(true);
+    const before = rc.current();
+    const fired: RoleRouting[] = [];
+    rc.onChange((r) => fired.push(r));
     let pick: RoutingPick | undefined;
     const h = harness(rc, {
       render: async (d) => {
@@ -129,8 +206,9 @@ describe("startInteractive: the TUI's routingControl", () => {
     expect(pick?.ok).toBe(false);
     if (pick?.ok !== false) return;
     expect(pick.reason).toContain("store unreadable");
-    expect(show(rc.current().spec)).toBe(show(llama));
+    expect(rc.current()).toBe(before);
     expect(rc.source("spec")).toBe("session");
+    expect(fired).toEqual([]);
     expect(h.built).toHaveLength(1);
   });
 
@@ -237,12 +315,17 @@ describe("chatSessions reads the control at each build", () => {
       const a = await newSession({ skills, emit: () => {} });
       expect(rc.set("spec", qwen3).ok).toBe(true);
       const b = await newSession({ skills, emit: () => {} });
+      // An explicit routing (a pick's candidate, not yet committed) wins over the getter.
+      const candidate = { ...rc.current(), spec: llama };
+      const c = await newSession({ skills, emit: () => {}, routing: candidate });
+      expect(routings[2]).toBe(candidate);
       expect(show(routings[0]?.spec as ModelRef)).toBe(show(qwen));
       expect(show(routings[1]?.spec as ModelRef)).toBe(show(qwen3));
       // The chat provider of each session is its build's `spec`.
-      expect(asked).toEqual([show(qwen), show(qwen3)]);
+      expect(asked).toEqual([show(qwen), show(qwen3), show(llama)]);
       await a.dispose();
       await b.dispose();
+      await c.dispose();
     } finally {
       await rm(repo, { recursive: true, force: true });
     }

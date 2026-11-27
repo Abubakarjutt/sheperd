@@ -91,8 +91,9 @@ export function chatSessions(o: ChatSessionsOptions): StartDeps["newSession"] {
   const prefillMeter = new PrefillMeter();
   const build = o.buildCompaction ?? compactionDeps;
   const routingNow = (): RoleRouting => (typeof o.routing === "function" ? o.routing() : o.routing);
-  return async ({ skills, emit, sessionId }) => {
-    const routing = routingNow();
+  return async ({ skills, emit, sessionId, routing: candidate }) => {
+    // A pick's candidate routing (committed only once this session is built), else the current.
+    const routing = candidate ?? routingNow();
     const chatModel = routing.spec;
     const compaction = await build({
       routing,

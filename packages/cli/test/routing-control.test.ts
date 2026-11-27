@@ -144,12 +144,61 @@ describe("RoutingControl", () => {
     expect(show(c.current().implementer)).toBe(show(qwen3));
   });
 
-  test("restore puts a snapshot of the session overrides back", () => {
+  test("plan validates without changing anything; commit applies it and fires onChange once", () => {
     const c = control([qwen, llama, qwen3]);
-    const snap = c.snapshot();
-    c.set("spec", qwen3);
-    c.restore(snap);
+    const before = c.current();
+    const fired: string[] = [];
+    c.onChange((r) => fired.push(show(r.spec)));
+    const plan = c.plan("spec", qwen3);
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(show(plan.routing.spec)).toBe(show(qwen3));
+    expect(c.current()).toBe(before);
     expect(c.source("spec")).toBe("auto");
+    expect(fired).toEqual([]);
+    const pick = plan.commit();
+    expect(pick.ok).toBe(true);
+    expect(show(c.current().spec)).toBe(show(qwen3));
+    expect(c.source("spec")).toBe("session");
+    expect(fired).toEqual([show(qwen3)]);
+  });
+
+  test("a refused plan is the same refusal set returns", () => {
+    const c = control([qwen, llama, qwen3]);
+    expect(c.plan("reviewer", qwen3).ok).toBe(false);
+  });
+
+  test("a plan whose base changed meanwhile is not committed", () => {
+    const c = control([qwen, llama, qwen3]);
+    const plan = c.plan("spec", qwen3);
+    expect(c.set("test-writer", llama).ok).toBe(true);
+    if (!plan.ok) throw new Error("plan refused");
+    const late = plan.commit();
+    expect(late.ok).toBe(false);
     expect(show(c.current().spec)).toBe(show(qwen));
+  });
+
+  test("a default pick back to the models file's routing is allowed even when it is same-family", () => {
+    // The file pairs the reviewer with the implementer's family on purpose.
+    const c = control([qwen, llama, qwen3], { reviewer: qwen3 });
+    expect(c.set("reviewer", llama).ok).toBe(true);
+    const back = c.set("reviewer", undefined);
+    expect(back.ok).toBe(true);
+    expect(show(c.current().reviewer)).toBe(show(qwen3));
+    expect(c.source("reviewer")).toBe("file");
+    // A new same-family pairing is still refused.
+    expect(c.set("verifier", qwen).ok).toBe(false);
+  });
+
+  test("a throwing onChange listener does not turn an applied pick into a throw", () => {
+    const c = control([qwen, llama, qwen3]);
+    const fired: string[] = [];
+    c.onChange(() => {
+      throw new Error("listener bug");
+    });
+    c.onChange((r) => fired.push(show(r.spec)));
+    const pick = c.set("spec", qwen3);
+    expect(pick.ok).toBe(true);
+    expect(fired).toEqual([show(qwen3)]);
   });
 });

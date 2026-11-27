@@ -1,6 +1,6 @@
 import { basename } from "node:path";
 import { RewireError } from "@rewire/core";
-import type { Role } from "@rewire/pipeline";
+import type { Role, RoleRouting } from "@rewire/pipeline";
 import { type ModelRef, modelFamily } from "@rewire/providers";
 import type {
   ChatEvent,
@@ -46,11 +46,15 @@ export type StartDeps = {
   }) => Promise<boolean | undefined>;
   createSkillSet: (active: Skill[]) => SkillSet;
   disposeSkillSet: (set: SkillSet) => Promise<void>;
-  /** A new (or, with `sessionId`, resumed) ChatSession, on the one SessionStore. */
+  /**
+   * A new (or, with `sessionId`, resumed) ChatSession, on the one SessionStore. `routing`, when
+   * given, is a pick's candidate routing (not yet committed): build on it instead of the current.
+   */
   newSession: (o: {
     skills: SkillSet;
     emit: (e: ChatEvent) => void;
     sessionId?: string;
+    routing?: RoleRouting;
   }) => Promise<ChatSession>;
   /** The same SessionStore's `list(repo)`. */
   listSessions: () => Promise<SessionSummary[]>;
@@ -68,12 +72,11 @@ export type StartDeps = {
   /**
    * The session routing `/model` picks change. `newSession` and `newRunController` must read
    * it (`current()`) when they build; the TUI gets a wrapper that refuses picks during a run or
-   * a turn and, when the chat model (`spec`) changed, resumes the current session on it.
+   * a turn and, when the pick changes `spec` or `verifier` (the chat model, the compaction
+   * verifier), first resumes the current session on the candidate routing, committing the pick
+   * only once that succeeded.
    */
-  routingControl?: Pick<
-    RoutingControl,
-    "current" | "available" | "source" | "set" | "snapshot" | "restore"
-  >;
+  routingControl?: Pick<RoutingControl, "current" | "available" | "source" | "plan">;
   /** The chat and run models, for the TUI's header and status line. */
   models?: ModelsInfo;
   /** The home directory, shown as `~` in the header. */
@@ -215,8 +218,17 @@ export async function startInteractive(d: StartDeps): Promise<number> {
     /** The session the TUI shows: the first, then each one `/clear`, `/resume` or a pick built. */
     let current = session;
     let runs = d.newRunController(set);
+    /** A pick's session build is in flight: its routing is not committed yet. */
+    let picking = false;
     const runController: Pick<RunController, "start"> = {
       start: (task, opts) => {
+        if (picking) {
+          throw new RewireError(
+            "run_in_progress",
+            "a model change is in progress",
+            "start the run once the /model pick is done",
+          );
+        }
         const h = runs.start(task, opts);
         activeRun = h;
         void h.done.finally(() => {
@@ -227,7 +239,7 @@ export async function startInteractive(d: StartDeps): Promise<number> {
     };
 
     /** A session on freshly discovered and resolved skills (a trust given mid-session applies). */
-    const build = async (sessionId?: string): Promise<ChatSession> => {
+    const build = async (sessionId?: string, routing?: RoleRouting): Promise<ChatSession> => {
       if (activeRun) throw new RewireError("run_in_progress", "a run is active");
       const next = await resolveNow();
       if (exiting !== undefined) throw closing();
@@ -238,6 +250,7 @@ export async function startInteractive(d: StartDeps): Promise<number> {
           skills: nextSet,
           emit,
           ...(sessionId !== undefined ? { sessionId } : {}),
+          ...(routing !== undefined ? { routing } : {}),
         });
       } catch (e) {
         await d.disposeSkillSet(nextSet).catch(() => {});
@@ -262,8 +275,8 @@ export async function startInteractive(d: StartDeps): Promise<number> {
     };
 
     /** `/clear` and `/resume` in flight; cleanup waits for them (bounded) so nothing leaks. */
-    const fresh = (sessionId?: string): Promise<ChatSession> => {
-      const p = build(sessionId);
+    const fresh = (sessionId?: string, routing?: RoleRouting): Promise<ChatSession> => {
+      const p = build(sessionId, routing);
       building.add(p);
       void p.then(
         () => building.delete(p),
@@ -288,22 +301,31 @@ export async function startInteractive(d: StartDeps): Promise<number> {
         if (building.size > 0) {
           return { ok: false, reason: "refused: a session change is in progress" };
         }
-        const before = rc.current().spec;
-        const snap = rc.snapshot();
-        const pick = rc.set(role as Role, ref as ModelRef | undefined);
-        if (!pick.ok || sameRef(before, pick.routing.spec)) return pick;
-        // The chat model changed: the same conversation continues on it (a session with no
-        // completed turn has no id and nothing to carry: a fresh one).
+        const plan = rc.plan(role as Role, ref as ModelRef | undefined);
+        if (!plan.ok) return plan;
+        const now = rc.current();
+        // The chat model and the compaction verifier live in the session: rebuild it for those.
+        const rebuild =
+          !sameRef(now.spec, plan.routing.spec) || !sameRef(now.verifier, plan.routing.verifier);
+        if (!rebuild) return plan.commit();
+        // The same conversation continues on the candidate routing (a session with no completed
+        // turn has no id and nothing to carry: a fresh one). Committed only once it is built.
+        picking = true;
+        let next: ChatSession;
         try {
-          const next = await fresh(current.id());
-          return { ...pick, session: next };
+          next = await fresh(current.id(), plan.routing);
         } catch (e) {
-          rc.restore(snap);
           return {
             ok: false,
-            reason: `the chat model was not changed: ${e instanceof Error ? e.message : String(e)}`,
+            reason: `the routing was not changed: ${e instanceof Error ? e.message : String(e)}`,
           };
+        } finally {
+          picking = false;
         }
+        const pick = plan.commit();
+        // Not reachable while picks are serialized (`building` refuses); never leave it unused.
+        if (!pick.ok) return pick;
+        return { ...pick, session: next };
       },
     };
 
