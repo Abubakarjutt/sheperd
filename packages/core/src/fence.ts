@@ -3,6 +3,12 @@ import { randomUUID } from "node:crypto";
 /** A fence id: a lowercase UUID. */
 export const FENCE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+/**
+ * The fence of web content (`web_search` results, `web_fetch` pages): text from the internet,
+ * data and never instructions, like every `untrusted_*` fence.
+ */
+export const UNTRUSTED_WEB = "untrusted_web";
+
 /** Any closing tag of an `untrusted_*` fence, however spaced or cased. */
 const UNTRUSTED_CLOSER = /<\s*\/\s*(untrusted_[A-Za-z0-9_]*)/gi;
 

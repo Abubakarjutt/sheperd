@@ -16,6 +16,7 @@ import {
 import type { Policy } from "@rewire/policy";
 import type { ModelRef, OllamaTimeout, Provider } from "@rewire/providers";
 import type { SkillSet } from "@rewire/skills";
+import type { WebAccess } from "@rewire/tools";
 
 export type PendingPrompt =
   | { kind: "checkpoint"; checkpoint: Checkpoint }
@@ -51,6 +52,8 @@ export type RunControllerOptions = {
   policy: Policy;
   /** For the author stages. The caller owns the set; the controller never disposes it. */
   skills?: SkillSet;
+  /** Web access for the spec and implementer stages (policy still decides). */
+  web?: WebAccess;
   faux?: boolean;
   seams?: PipelineSeams;
   /** Test seam; defaults to `runPipeline`. */
@@ -175,6 +178,7 @@ export class RunController {
         wait<CheckpointDecision>({ kind: "checkpoint", checkpoint }, { action: "stop" }),
       checkpointKinds: kinds,
       ...(this.opts.skills ? { skills: this.opts.skills } : {}),
+      ...(this.opts.web ? { web: this.opts.web } : {}),
       ...(this.opts.faux ? { faux: true } : {}),
       ...(this.opts.ollamaTimeout ? { ollamaTimeout: this.opts.ollamaTimeout } : {}),
       ...(this.opts.seams ? { seams: this.opts.seams } : {}),

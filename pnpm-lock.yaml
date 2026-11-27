@@ -301,6 +301,9 @@ importers:
       '@rewire/sandbox':
         specifier: workspace:*
         version: link:../sandbox
+      '@rewire/web':
+        specifier: workspace:*
+        version: link:../web
       shell-quote:
         specifier: ^1.8.3
         version: 1.12.0

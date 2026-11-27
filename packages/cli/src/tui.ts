@@ -1,6 +1,6 @@
 import { join, resolve } from "node:path";
 import { Writable } from "node:stream";
-import type { CompactionConfig, RoleRouting } from "@rewire/pipeline";
+import type { CompactionConfig, RoleRouting, WebAccess } from "@rewire/pipeline";
 import { loadPolicy, type Policy } from "@rewire/policy";
 import {
   type ContextWindowOptions,
@@ -38,6 +38,8 @@ import {
   ollamaTimeoutOption,
   providerFactory,
   resolveModels,
+  webAccess,
+  webOption,
 } from "./run.js";
 import { type StartDeps, startInteractive } from "./start-tui.js";
 import { xdgDirs } from "./xdg.js";
@@ -83,6 +85,8 @@ export type ChatSessionsOptions = {
   cacheDir?: string;
   /** Test seam: builds each session's compaction deps (default `compactionDeps`). */
   buildCompaction?: typeof compactionDeps;
+  /** Web access for the chat agent (`webAccess`); policy still decides. */
+  web?: WebAccess;
 };
 
 /**
@@ -122,6 +126,7 @@ export function chatSessions(o: ChatSessionsOptions): StartDeps["newSession"] {
       emit,
       prefillMeter,
       compaction,
+      ...(o.web ? { web: o.web } : {}),
     };
     return sessionId === undefined
       ? new ChatSession(opts)
@@ -173,6 +178,7 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
   if (faux) io.stderr.write(`${FAUX_WARNING}\n`);
 
   const providers = providerFactory(io.env, faux, models.providers);
+  const web = webOption(webAccess(models, io.env, faux !== undefined));
   // A misconfigured provider for any role, even one only a later run reaches: fail now.
   createRoutedProviders(routing, providers);
   const { home, xdgConfig, cacheDir } = xdgDirs(io.env);
@@ -209,6 +215,7 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
       compaction: models.compaction,
       windowOptions: { env: io.env },
       cacheDir,
+      ...web,
     }),
     listSessions: () => store.list(repo),
     newRunController: (skills) =>
@@ -224,6 +231,7 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
         ),
         policy,
         skills,
+        ...web,
         ...(faux ? { faux: true } : {}),
       }),
     render: (deps) => renderTui({ ...deps, renderOptions }),

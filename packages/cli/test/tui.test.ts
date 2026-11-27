@@ -3,14 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RewireError } from "@rewire/core";
 import { defaultCompactionConfig, type RoleRouting } from "@rewire/pipeline";
-import { DEFAULT_POLICY } from "@rewire/policy";
-import { FauxProvider, type ModelRef } from "@rewire/providers";
+import { DEFAULT_POLICY, mergeTightenOnly } from "@rewire/policy";
+import { FauxProvider, type ModelRef, text } from "@rewire/providers";
 import type { ChatSession, RunHandle, RunPipelineInput } from "@rewire/session";
 import { SessionStore } from "@rewire/session";
 import type { SkillSet } from "@rewire/skills";
 import type { InterruptTarget, RoutingPick, TuiDeps } from "@rewire/tui";
 import { describe, expect, test } from "vitest";
 import { RoutingControl } from "../src/routing-control.js";
+import { webAccess } from "../src/run.js";
 import { type StartDeps, startInteractive } from "../src/start-tui.js";
 import { chatSessions, routedRunController } from "../src/tui.js";
 
@@ -364,5 +365,65 @@ describe("routedRunController", () => {
     expect(show(seen[0]?.implementer as ModelRef)).toBe(show(qwen3));
     finish();
     await second.done.catch(() => {});
+  });
+});
+
+describe("web access threading", () => {
+  const models = (web = { maxResults: 3 }) => ({
+    available: [qwen],
+    overrides: {},
+    compaction: defaultCompactionConfig(),
+    web,
+  });
+
+  test("webAccess: models.toml [web] and the env; none in faux mode (no network in a self-test)", () => {
+    const env = { OLLAMA_API_KEY: "k" };
+    expect(webAccess(models(), env, false)).toEqual({ config: { maxResults: 3 }, env });
+    expect(webAccess(models(), env, true)).toBeUndefined();
+  });
+
+  test("chatSessions gives each session the web access; policy still decides", async () => {
+    const repo = await realpath(await mkdtemp(join(tmpdir(), "rewire-cli-web-")));
+    const providers: FauxProvider[] = [];
+    try {
+      const build = (policy: typeof DEFAULT_POLICY) =>
+        chatSessions({
+          repo,
+          routing: () => control().current(),
+          providers: () => {
+            const p = new FauxProvider([text("hi")]);
+            providers.push(p);
+            return p;
+          },
+          policy,
+          store: new SessionStore(),
+          compaction: defaultCompactionConfig(),
+          windowOptions: { env: { REWIRE_FAUX_WINDOW: "9000" } },
+          web: { config: { maxResults: 5 }, env: {} },
+          buildCompaction: async (a) => ({
+            window: { window: 9000, source: "model", provisional: true },
+            config: a.config,
+            estimator: a.estimator,
+            verifier: async (ops) => ops.map(() => ({ accept: true })),
+            independence: a.routing.independence,
+          }),
+        });
+      const skills = { skills: [], root: undefined, load: async () => ({}) } as unknown as SkillSet;
+      const on = await build(DEFAULT_POLICY)({ skills, emit: () => {} });
+      await on.send("hello");
+      const off = await build(mergeTightenOnly(DEFAULT_POLICY, { web: { enabled: false } }))({
+        skills,
+        emit: () => {},
+      });
+      await off.send("hello");
+      const names = (p: FauxProvider | undefined) =>
+        (p?.requests[0]?.tools ?? []).map((t) => t.name);
+      expect(names(providers[0])).toEqual(expect.arrayContaining(["web_search", "web_fetch"]));
+      expect(names(providers[1])).not.toContain("web_search");
+      await on.dispose();
+      await off.dispose();
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
   });
 });

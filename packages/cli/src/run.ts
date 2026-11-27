@@ -15,6 +15,7 @@ import {
   type RunOutcome,
   resolveRouting,
   runPipeline,
+  type WebAccess,
 } from "@rewire/pipeline";
 import { loadPolicy } from "@rewire/policy";
 import {
@@ -148,6 +149,19 @@ export async function resolveModels(
     compaction: defaultCompactionConfig(),
     web: defaultWebConfig(),
   };
+}
+
+/**
+ * The web access the chat and a run's spec and implementer get: models.toml's `[web]` and the
+ * env (search keys). Policy still decides (`[web] enabled`). None in faux mode: a faux run is a
+ * harness self-test that never touches the network.
+ */
+export function webAccess(
+  models: Pick<ModelsFile, "web">,
+  env: NodeJS.ProcessEnv,
+  faux: boolean,
+): WebAccess | undefined {
+  return faux ? undefined : { config: models.web, env };
 }
 
 /** `settings`: models.toml's `[providers.*]` tables, for the cloud providers. */
@@ -296,6 +310,7 @@ export async function runCommand(
     emit,
     signal,
     ...(faux ? { faux: true } : {}),
+    ...webOption(webAccess(models, io.env, faux !== undefined)),
   });
 
   // runPipeline has no provenance flag: the CLI appends the faux note to the report it wrote.
@@ -319,6 +334,8 @@ export async function runCommand(
   }
   return exitCodeFor(outcome);
 }
+
+export const webOption = (web: WebAccess | undefined): { web?: WebAccess } => (web ? { web } : {});
 
 export const FAUX_NOTE =
   "\n## Provider note\n\nThis run used the faux provider (REWIRE_FAUX_SCRIPT), not real models. It is a harness self-test, not evidence of model-checked code.\n";
