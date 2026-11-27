@@ -659,6 +659,11 @@ resource = "my-foundry-resource"         # or base_url = "https://..."
 | `vertex`  | Google application default credentials (`gcloud auth application-default login` or `GOOGLE_APPLICATION_CREDENTIALS`)                                                         | project: `[providers.vertex] project`, `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`. Region: `[providers.vertex] region`, `CLOUD_ML_REGION`, else `global` |
 | `foundry` | `ANTHROPIC_FOUNDRY_API_KEY` (required)                                                                                                                                       | `[providers.foundry] resource` or `base_url`, else `ANTHROPIC_FOUNDRY_RESOURCE` or `ANTHROPIC_FOUNDRY_BASE_URL`                                                     |
 
+`ANTHROPIC_CUSTOM_HEADERS` applies only to the plain `anthropic` provider. For Bedrock, Vertex and
+Foundry every header it names is removed, and each sends only its own credential (SigV4 or a Bedrock
+API key, a Google OAuth token, the Foundry key), so a gateway header meant for Anthropic never
+reaches AWS, Google or Azure.
+
 A missing region, project or key is `provider_auth_missing`, raised when the provider is created
 (before a run starts), and its hint names the env var or toml key to set. A region or Foundry
 resource must be a single DNS label, because it becomes part of a host name.

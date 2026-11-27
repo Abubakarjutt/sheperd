@@ -2,10 +2,19 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, test, vi } from "vitest";
-import { toAnthropicParams } from "../src/anthropic.js";
-import { ClaudeCloudProvider, createClaudeCloudClient } from "../src/claude-cloud.js";
+import { AnthropicProvider, toAnthropicParams } from "../src/anthropic.js";
+import {
+  type ClaudeCloudName,
+  ClaudeCloudProvider,
+  createClaudeCloudClient,
+} from "../src/claude-cloud.js";
 import { createProvider } from "../src/registry.js";
-import { type ChatRequest, type ModelRef, parseModelRef } from "../src/types.js";
+import {
+  type ChatRequest,
+  type ModelRef,
+  type ProviderSettings,
+  parseModelRef,
+} from "../src/types.js";
 import { isLoopbackHost, isLoopbackUrl } from "../src/url.js";
 import { contextWindow } from "../src/window.js";
 import { anthropicEvents, anthropicSSE } from "./sse.js";
@@ -578,5 +587,104 @@ describe("Bedrock: the AWS shared-config chain and AWS_PROFILE (fake files in a 
       { fetch: f.fetch },
     ).chat(req("anthropic.claude-opus-5-5"));
     expect(credentialOf(f.seen[0])).toBe("AKIAFAKEWORKPROFILE1");
+  });
+});
+
+describe("ANTHROPIC_CUSTOM_HEADERS never reaches Bedrock, Vertex or Foundry", () => {
+  /** A gateway credential meant for Anthropic: it must never reach AWS, Google or Azure. */
+  const GATEWAY = "GATEWAY-SECRET-123";
+  const GATEWAY_KEY = "gatewayapikey0123456789";
+  const PASSED = "passedenvtoken00000";
+  const passed = { ANTHROPIC_CUSTOM_HEADERS: `X-Bar: 2\nAuthorization: Bearer ${PASSED}` };
+  const BEARER = "fake-bedrock-api-key-123456";
+
+  function expectNoCustomHeaders(h: Headers) {
+    expect(h.has("x-foo")).toBe(false);
+    expect(h.has("x-bar")).toBe(false);
+    const all = [...h.values()].join(" ");
+    for (const secret of [GATEWAY, GATEWAY_KEY, PASSED]) expect(all).not.toContain(secret);
+    // SigV4 never signs a removed header.
+    expect(all).not.toMatch(/SignedHeaders=[^,]*x-(foo|bar)/);
+  }
+
+  test("from process.env or the env passed in: each platform sends exactly its own credential, plain and streamed", async () => {
+    vi.stubEnv(
+      "ANTHROPIC_CUSTOM_HEADERS",
+      `Authorization: Bearer ${GATEWAY}\nx-api-key: ${GATEWAY_KEY}\nx-foo: 1`,
+    );
+    const cases: [ClaudeCloudName, ProviderSettings, NodeJS.ProcessEnv, (h: Headers) => void][] = [
+      [
+        "bedrock",
+        {},
+        { ...passed, ...AWS_ENV },
+        (h) => {
+          expect(h.get("authorization")).toMatch(/^AWS4-HMAC-SHA256 Credential=AKIAFAKE/);
+          expect(h.has("x-api-key")).toBe(false);
+        },
+      ],
+      [
+        "bedrock",
+        {},
+        { ...passed, AWS_REGION: "us-east-1", AWS_BEARER_TOKEN_BEDROCK: BEARER },
+        (h) => {
+          expect(h.get("authorization")).toBe(`Bearer ${BEARER}`);
+          expect(h.has("x-api-key")).toBe(false);
+        },
+      ],
+      [
+        "vertex",
+        { vertex: { project: "my-proj" } },
+        passed,
+        (h) => {
+          expect(h.get("authorization")).toBe("Bearer ya29.fake-token");
+          expect(h.has("x-api-key")).toBe(false);
+        },
+      ],
+      [
+        "foundry",
+        { foundry: { resource: "my-res" } },
+        { ...passed, ANTHROPIC_FOUNDRY_API_KEY: FOUNDRY_KEY },
+        (h) => {
+          expect(h.get("x-api-key")).toBe(FOUNDRY_KEY);
+          expect(h.has("authorization")).toBe(false);
+        },
+      ],
+    ];
+    for (const [name, settings, env, ownAuth] of cases) {
+      const f = recordingFetch();
+      const p = new ClaudeCloudProvider(name, settings, env, {
+        fetch: f.fetch,
+        vertexAuthClient: fakeAuthClient,
+      });
+      await both(p, req(name === "bedrock" ? "anthropic.claude-opus-5-5" : "claude-opus-5-5"));
+      expect(f.seen).toHaveLength(2);
+      for (const s of f.seen) {
+        ownAuth(s.headers);
+        expectNoCustomHeaders(s.headers);
+      }
+    }
+  });
+
+  test("createClaudeCloudClient nulls them too", async () => {
+    vi.stubEnv("ANTHROPIC_CUSTOM_HEADERS", `x-api-key: ${GATEWAY_KEY}\nx-foo: 1`);
+    const f = recordingFetch();
+    const client = await createClaudeCloudClient(
+      "foundry",
+      { foundry: { resource: "my-res" } },
+      { ANTHROPIC_FOUNDRY_API_KEY: FOUNDRY_KEY },
+      f.fetch,
+    );
+    await new AnthropicProvider("", client).chat(req("claude-opus-5-5"));
+    expect(f.seen[0]?.headers.get("x-api-key")).toBe(FOUNDRY_KEY);
+    expectNoCustomHeaders(f.seen[0]?.headers ?? new Headers());
+  });
+
+  test("the plain anthropic provider still applies ANTHROPIC_CUSTOM_HEADERS (unchanged)", async () => {
+    vi.stubEnv("ANTHROPIC_CUSTOM_HEADERS", "x-foo: 1");
+    const { default: Anthropic } = await import("@anthropic-ai/sdk");
+    const f = recordingFetch();
+    const client = new Anthropic({ apiKey: "sk-ant-test-000", fetch: f.fetch, maxRetries: 0 });
+    await new AnthropicProvider("sk-ant-test-000", client).chat(req("claude-opus-5-5"));
+    expect(f.seen[0]?.headers.get("x-foo")).toBe("1");
   });
 });

@@ -1,6 +1,7 @@
 import { RewireError, redact } from "@rewire/core";
 import { type AnthropicMessagesClient, AnthropicProvider } from "./anthropic.js";
 import { providerError } from "./errors.js";
+import { customHeaderNames } from "./openai-compatible.js";
 import { firstSet, type ValueSources } from "./sources.js";
 import type { ChatRequest, ChatResponse, Provider, ProviderSettings } from "./types.js";
 import { baseUrlProblem } from "./url.js";
@@ -232,14 +233,35 @@ function secretsOf(t: ClaudeCloudTarget): string[] {
 }
 
 /**
+ * `defaultHeaders` for a cloud client. `ANTHROPIC_CUSTOM_HEADERS` is meant for Anthropic (often a
+ * gateway credential), and the SDK merges it into `defaultHeaders`, which it applies after its
+ * auth headers: it could replace the platform credential and would be sent to AWS, Google or
+ * Azure. Every name it holds (in the env rewire was given or in process.env) is passed as `null`,
+ * which removes the header before Bedrock signs the request and before Vertex adds its OAuth
+ * token; then the platform's own header credential (a Bedrock API key, the Foundry key) is set
+ * over it. SigV4 and Google OAuth are applied by the SDK after these headers.
+ */
+function cloudHeaders(t: ClaudeCloudTarget, env: NodeJS.ProcessEnv): Record<string, string | null> {
+  const headers: Record<string, string | null> = {};
+  for (const name of customHeaderNames(env, "ANTHROPIC_CUSTOM_HEADERS")) headers[name] = null;
+  if (t.provider === "foundry") headers["x-api-key"] = t.apiKey;
+  if (t.provider === "bedrock" && t.auth.kind === "bearer") {
+    headers.authorization = `Bearer ${t.auth.token}`;
+  }
+  return headers;
+}
+
+/**
  * Builds the platform's dedicated client. The SDK is imported here, on first use, so `rewire`
  * startup never loads the AWS or Google auth libraries.
  */
 async function clientFor(
   t: ClaudeCloudTarget,
+  env: NodeJS.ProcessEnv,
   opts: ClaudeCloudOptions,
 ): Promise<AnthropicMessagesClient> {
   const fetchOpt = opts.fetch ? { fetch: opts.fetch } : {};
+  const defaultHeaders = cloudHeaders(t, env);
   switch (t.provider) {
     case "bedrock": {
       const { AnthropicBedrockMantle } = await import("@anthropic-ai/bedrock-sdk");
@@ -260,6 +282,7 @@ async function clientFor(
         awsRegion: t.region,
         baseURL: t.baseUrl,
         ...auth,
+        defaultHeaders,
         ...fetchOpt,
       });
     }
@@ -273,6 +296,7 @@ async function clientFor(
         ...(opts.vertexAuthClient !== undefined
           ? { authClient: opts.vertexAuthClient as never }
           : {}),
+        defaultHeaders,
         ...fetchOpt,
       });
       await googleCredentials(client);
@@ -285,6 +309,7 @@ async function clientFor(
         ...(t.baseUrl !== undefined
           ? { baseURL: t.baseUrl, resource: null }
           : { resource: t.resource ?? null, baseURL: null }),
+        defaultHeaders,
         ...fetchOpt,
       });
     }
@@ -326,7 +351,7 @@ export async function createClaudeCloudClient(
 ): Promise<AnthropicMessagesClient> {
   const target = resolveClaudeCloud(provider, settings, env);
   try {
-    return await clientFor(target, { ...opts, ...(fetchFn ? { fetch: fetchFn } : {}) });
+    return await clientFor(target, env, { ...opts, ...(fetchFn ? { fetch: fetchFn } : {}) });
   } catch (err) {
     throw providerError(provider, err, { secrets: secretsOf(target) });
   }
@@ -340,6 +365,8 @@ export async function createClaudeCloudClient(
 export class ClaudeCloudProvider implements Provider {
   /** Holds credentials: never expose or log it. */
   private readonly target: ClaudeCloudTarget;
+  /** Holds credentials: never expose or log it. */
+  private readonly env: NodeJS.ProcessEnv;
   private inner: Promise<AnthropicProvider> | undefined;
 
   constructor(
@@ -349,13 +376,14 @@ export class ClaudeCloudProvider implements Provider {
     private readonly opts: ClaudeCloudOptions = {},
   ) {
     this.target = resolveClaudeCloud(provider, settings, env);
+    this.env = env;
   }
 
   private async load(): Promise<AnthropicProvider> {
     const secrets = secretsOf(this.target);
     let client: AnthropicMessagesClient;
     try {
-      client = await clientFor(this.target, this.opts);
+      client = await clientFor(this.target, this.env, this.opts);
     } catch (err) {
       throw providerError(this.provider, err, { secrets });
     }

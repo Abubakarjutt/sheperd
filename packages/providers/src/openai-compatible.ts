@@ -20,15 +20,19 @@ const set = (v: string | undefined): string | undefined =>
 const HEADER_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
 /**
- * The header names in `OPENAI_CUSTOM_HEADERS`, parsed as the installed SDK parses it
- * (`client.js`: the value trimmed, split on newlines, each line cut at its first colon, the name
- * trimmed), from both the env rewire was given and process.env (which the SDK reads itself).
- * Lowercased, as the SDK's header merge treats names. Names the SDK would refuse are skipped: it
+ * The header names in `variable` (`OPENAI_CUSTOM_HEADERS`, or `ANTHROPIC_CUSTOM_HEADERS` for the
+ * Claude cloud clients), parsed as the installed SDKs parse it (`client.js` in both `openai` and
+ * `@anthropic-ai/sdk`: the value trimmed, split on newlines, each line cut at its first colon, the
+ * name trimmed), from both the env rewire was given and process.env (which the SDK reads itself).
+ * Lowercased, as the SDKs' header merge treats names. Names the SDK would refuse are skipped: it
  * throws on them before any request.
  */
-export function customHeaderNames(env: NodeJS.ProcessEnv): string[] {
+export function customHeaderNames(
+  env: NodeJS.ProcessEnv,
+  variable: "OPENAI_CUSTOM_HEADERS" | "ANTHROPIC_CUSTOM_HEADERS" = "OPENAI_CUSTOM_HEADERS",
+): string[] {
   const names = new Set<string>();
-  for (const raw of [env.OPENAI_CUSTOM_HEADERS, process.env.OPENAI_CUSTOM_HEADERS]) {
+  for (const raw of [env[variable], process.env[variable]]) {
     const value = raw?.trim();
     if (!value) continue;
     for (const line of value.split("\n")) {
