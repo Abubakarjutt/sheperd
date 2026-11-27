@@ -152,6 +152,29 @@ base_url = "http://127.0.0.1:8080/v1"
     expect(out).toMatch(/^✓ endpoint local host 127\.0\.0\.1:8080, no key \(loopback\)$/m);
   });
 
+  test("an Azure family override is shown with the family rewire would derive", async () => {
+    const f = toml(
+      `available = ["azure:DeepSeek-R1", "azure:prod"]
+[providers.azure]
+endpoint = "https://myres.openai.azure.com"
+api_version = "2024-10-21"
+family = "gpt"
+`,
+    );
+    const [, out] = await doctor(f, { AZURE_OPENAI_API_KEY: FAKE });
+    expect(out).not.toContain(FAKE);
+    expect(out).toMatch(
+      /^✓ azure host myres\.openai\.azure\.com \(\[providers\.azure\] endpoint\), api version 2024-10-21 \(\[providers\.azure\] api_version\), key AZURE_OPENAI_API_KEY, family "gpt" from models\.toml \(rewire would derive "deepseek" for azure:DeepSeek-R1\)$/m,
+    );
+    const [, same] = await doctor(
+      toml(
+        `available = ["azure:prod"]\n[providers.azure]\nendpoint = "https://myres.openai.azure.com"\napi_version = "v1"\nfamily = "gpt"\n`,
+      ),
+      { AZURE_OPENAI_API_KEY: FAKE },
+    );
+    expect(same).toMatch(/key AZURE_OPENAI_API_KEY, family "gpt" from models\.toml$/m);
+  });
+
   test("env sources, bearer and profile auth, a family override that matches", async () => {
     const f = toml(
       `available = ["bedrock:anthropic.claude-opus-5-5", "vertex:claude-opus-5-5", "foundry:claude-x", "rt:openrouter/auto", "same:claude-opus-5-5"]

@@ -65,7 +65,12 @@ const hostOf = (url: string): string => {
  * and which env vars hold credentials, never a credential value. Validation reuses the providers'
  * own resolution, so doctor fails exactly where `createProvider` would.
  */
-function cloudDetail(name: Cloud, s: ProviderSettings, env: NodeJS.ProcessEnv): string {
+function cloudDetail(
+  name: Cloud,
+  s: ProviderSettings,
+  env: NodeJS.ProcessEnv,
+  refs: ModelRef[],
+): string {
   switch (name) {
     case "bedrock": {
       const t = resolveClaudeCloud("bedrock", s, env) as Target<"bedrock">;
@@ -121,7 +126,14 @@ function cloudDetail(name: Cloud, s: ProviderSettings, env: NodeJS.ProcessEnv): 
         );
       }
       createAzureProvider(s, env);
-      return `host ${hostOf(a.endpoint.value)} (${a.endpoint.source}), api version ${shown(a.apiVersion.value, "apiVersion")} (${a.apiVersion.source}), key ${a.apiKey?.source}`;
+      const family =
+        s.azure?.family !== undefined
+          ? familyNote(
+              s.azure.family,
+              refs.filter((r) => r.provider === "azure"),
+            )
+          : "";
+      return `host ${hostOf(a.endpoint.value)} (${a.endpoint.source}), api version ${shown(a.apiVersion.value, "apiVersion")} (${a.apiVersion.source}), key ${a.apiKey?.source}${family}`;
     }
     case "gemini": {
       createGeminiProvider(env);
@@ -130,29 +142,40 @@ function cloudDetail(name: Cloud, s: ProviderSettings, env: NodeJS.ProcessEnv): 
   }
 }
 
+/**
+ * `, family "<f>" from models.toml`, plus the family rewire would derive for each of `refs` where
+ * that differs (or that it cannot derive one).
+ */
+function familyNote(family: string, refs: ModelRef[]): string {
+  const notes: string[] = [];
+  for (const r of refs) {
+    let derived: string | undefined;
+    try {
+      derived = derivedFamily(r);
+    } catch {
+      notes.push(`rewire cannot derive one for ${r.provider}:${r.model}`);
+      continue;
+    }
+    if (derived !== family) {
+      notes.push(`rewire would derive "${derived}" for ${r.provider}:${r.model}`);
+    }
+  }
+  return `, family "${family}" from models.toml${notes.length > 0 ? ` (${notes.join("; ")})` : ""}`;
+}
+
 /** An endpoint's host and key variable, and its `family` override next to what rewire derives. */
 function endpointDetail(name: string, refs: ModelRef[], env: NodeJS.ProcessEnv): string {
   createEndpointProvider(name, env);
   const c = endpointConfig(name);
   if (c === undefined) throw new Error(`endpoint ${name} is not registered`);
   const key = c.apiKeyEnv !== undefined ? `key ${c.apiKeyEnv}` : "no key (loopback)";
-  let family = "";
-  if (c.family !== undefined) {
-    const notes: string[] = [];
-    for (const r of refs.filter((r) => r.provider === name)) {
-      let derived: string | undefined;
-      try {
-        derived = derivedFamily(r);
-      } catch {
-        notes.push(`rewire cannot derive one for ${name}:${r.model}`);
-        continue;
-      }
-      if (derived !== c.family) {
-        notes.push(`rewire would derive "${derived}" for ${name}:${r.model}`);
-      }
-    }
-    family = `, family "${c.family}" from models.toml${notes.length > 0 ? ` (${notes.join("; ")})` : ""}`;
-  }
+  const family =
+    c.family !== undefined
+      ? familyNote(
+          c.family,
+          refs.filter((r) => r.provider === name),
+        )
+      : "";
   return `host ${hostOf(c.baseUrl)}, ${key}${family}`;
 }
 
@@ -188,7 +211,7 @@ export function providerLines(
   for (const cloud of CLOUDS) {
     const used = usedBy(cloud);
     if (used || (cloud !== "gemini" && settings[cloud] !== undefined)) {
-      out.push(line(cloud, used, () => cloudDetail(cloud, settings, env)));
+      out.push(line(cloud, used, () => cloudDetail(cloud, settings, env, refs)));
     }
   }
   for (const name of Object.keys(models.endpoints ?? {})) {
