@@ -78,10 +78,11 @@ function checkedUrl(value: string, what: string, hint: string): string {
   return value;
 }
 
-const AZURE_KEY_HINT = "set AZURE_OPENAI_API_KEY";
-const AZURE_ENDPOINT_HINT =
+/** What to set for each missing piece of Azure configuration (`rewire doctor` lists them all). */
+export const AZURE_KEY_HINT = "set AZURE_OPENAI_API_KEY";
+export const AZURE_ENDPOINT_HINT =
   "set [providers.azure] endpoint in models.toml, or AZURE_OPENAI_ENDPOINT (https://<resource>.openai.azure.com)";
-const AZURE_VERSION_HINT =
+export const AZURE_VERSION_HINT =
   'set [providers.azure] api_version in models.toml, or OPENAI_API_VERSION (for example "2024-10-21")';
 
 /**

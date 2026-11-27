@@ -122,10 +122,26 @@ const RefString = z.string().transform((s, ctx) => {
     modelFamily(ref);
     return ref;
   } catch (e) {
-    ctx.addIssue({ code: "custom", message: e instanceof Error ? e.message : String(e) });
+    // The RewireError's hint (e.g. "declare [endpoints.<name>]") rides along to the file error.
+    const hint = e instanceof RewireError ? e.hint : undefined;
+    ctx.addIssue({
+      code: "custom",
+      message: e instanceof Error ? e.message : String(e),
+      ...(hint !== undefined ? { params: { hint } } : {}),
+    });
     return z.NEVER;
   }
 });
+
+/** The first hint a ref issue carried (see `RefString`), if any. */
+function issueHint(issues: z.core.$ZodIssue[]): string | undefined {
+  for (const i of issues) {
+    const hint =
+      i.code === "custom" ? (i.params as { hint?: unknown } | undefined)?.hint : undefined;
+    if (typeof hint === "string") return hint;
+  }
+  return undefined;
+}
 
 const CompactionToml = z.strictObject({
   latency_budget_s: z.number().min(5).max(3600).optional(),
@@ -248,6 +264,7 @@ export async function loadModelsFile(path: string): Promise<ModelsFile> {
       `invalid models file ${path}: ${issues
         .map((i) => `${i.path.map(String).join(".") || "(root)"}: ${i.message}`)
         .join("; ")}`,
+      issueHint(issues),
     );
   // Endpoints first: refs like "groq:llama-3.3-70b" parse only once "groq" is registered.
   const rawEndpoints = (raw as { endpoints?: unknown } | null)?.endpoints;
@@ -340,6 +357,7 @@ function compactionConfig(
       throw new RewireError(
         "models_file_invalid",
         `invalid models file ${path}: compaction.models.${JSON.stringify(key)}: ${e instanceof Error ? e.message : String(e)}`,
+        e instanceof RewireError ? e.hint : undefined,
       );
     }
     config.limits[show(ref)] = limit;

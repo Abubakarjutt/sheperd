@@ -6,6 +6,7 @@ import { INSTALL_HINTS } from "@rewire/gates";
 import { loadModelsFile } from "@rewire/pipeline";
 import { ollamaChatTimeoutMs, probeOllama } from "@rewire/providers";
 import { type FindBinaryOptions, locateSandboxBinary, type SandboxBinary } from "@rewire/sandbox";
+import { providerLines } from "./doctor-providers.js";
 import { discoverModels, ollamaBase } from "./models.js";
 import { defaultModelsFile } from "./run.js";
 import { oneLine } from "./sanitize.js";
@@ -97,7 +98,10 @@ export async function runDoctor(
   try {
     const file =
       modelsPath !== undefined ? resolve(io.cwd, modelsPath) : await defaultModelsFile(io.env);
-    const available = file ? (await loadModelsFile(file)).available : await discoverModels(io.env);
+    const models = file
+      ? await loadModelsFile(file)
+      : { available: await discoverModels(io.env), overrides: {} };
+    const available = models.available;
     ok("models", oneLine(available.map((m) => `${m.provider}:${m.model}`).join(", "), 300));
     if (available.some((m) => m.provider === "ollama")) {
       const base = ollamaBase(io.env);
@@ -112,6 +116,12 @@ export async function runDoctor(
           e instanceof RewireError ? e.hint : undefined,
         );
       }
+    }
+    // Cloud providers and endpoints: what each resolved, credentials by env var name only.
+    for (const l of providerLines(models, io.env)) {
+      if (l.ok) ok(l.name, oneLine(l.detail, 300));
+      else
+        bad(l.name, oneLine(l.why, 300), l.hint !== undefined ? oneLine(l.hint, 300) : undefined);
     }
   } catch (e) {
     bad(

@@ -1,6 +1,6 @@
 import type { Writable } from "node:stream";
 import { RewireError, redact } from "@rewire/core";
-import { compactionLimitOverride } from "@rewire/pipeline";
+import { compactionLimitOverride, type ModelsFile } from "@rewire/pipeline";
 import {
   builtinProvider,
   type ContextWindow,
@@ -177,11 +177,28 @@ export async function calibrateCommand(
   signal: AbortSignal,
 ): Promise<number> {
   if (o.model === undefined || o.model.trim() === "") throw usage("no model given");
-  const ref = parseModelRef(o.model.trim());
+  const raw = o.model.trim();
+  // An endpoint ref ("groq:llama-3.3-70b") parses only once models.toml has registered it, so a
+  // ref that fails now is parsed again after the load; that second error keeps its hint.
+  let early: unknown;
+  try {
+    parseModelRef(raw);
+  } catch (e) {
+    // A built-in provider's ref cannot be fixed by models.toml: fail now, as before.
+    if (builtinProvider(raw.slice(0, Math.max(0, raw.indexOf(":")))) !== undefined) throw e;
+    early = e;
+  }
   const max = parseMax(o.max);
   const fauxPath = io.env.REWIRE_FAUX_SCRIPT;
   const faux = fauxPath ? loadFauxScript(fauxPath) : undefined;
-  const models = await resolveModels(o.models, io.cwd, io.env, faux);
+  let models: ModelsFile;
+  try {
+    models = await resolveModels(o.models, io.cwd, io.env, faux);
+  } catch (e) {
+    // Nothing loaded: the bad ref is the more useful error.
+    throw early ?? e;
+  }
+  const ref = parseModelRef(raw);
   const name = `${ref.provider}:${ref.model}`;
   if (!models.available.some((m) => m.provider === ref.provider && m.model === ref.model)) {
     throw new RewireError(

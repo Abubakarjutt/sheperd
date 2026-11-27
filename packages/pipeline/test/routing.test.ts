@@ -96,6 +96,24 @@ test("loadModelsFile rejects unknown role, empty available, bad ref", async () =
   );
 });
 
+test("a bad ref keeps parseModelRef's hint: declare [endpoints.<name>]", async () => {
+  const err = await loadModelsFile(file(`available = ["groq:llama-3.3-70b"]\n`)).catch(
+    (e: unknown) => e,
+  );
+  expect(err).toMatchObject({ code: "models_file_invalid" });
+  expect((err as Error).message).toMatch(/available\.0.*unknown provider/);
+  expect((err as RewireError).hint).toMatch(/\[endpoints\.groq\] in models\.toml/);
+  const role = await loadModelsFile(
+    file(`available = ["anthropic:a"]\n[roles]\nreviewer = "nope:x"\n`),
+  ).catch((e: unknown) => e);
+  expect((role as RewireError).hint).toMatch(/\[endpoints\.nope\]/);
+  const compaction = await loadModelsFile(
+    file(`available = ["anthropic:a"]\n[compaction.models."nope:x"]\nlimit = 50000\n`),
+  ).catch((e: unknown) => e);
+  expect(compaction).toMatchObject({ code: "models_file_invalid" });
+  expect((compaction as RewireError).hint).toMatch(/\[endpoints\.nope\]/);
+});
+
 test("loadModelsFile rejects a top-level typo like [role]", async () => {
   await expect(
     loadModelsFile(file(`available = ["anthropic:a"]\n[role]\nverifier = "anthropic:a"\n`)),

@@ -76,6 +76,8 @@ function cleanEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   delete env.REWIRE_OPENAI_MODEL;
   delete env.ANTHROPIC_API_KEY;
   delete env.OPENAI_API_KEY;
+  delete env.GEMINI_API_KEY;
+  delete env.REWIRE_GEMINI_MODEL;
   const home = tmp();
   return { ...env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), ...extra };
 }

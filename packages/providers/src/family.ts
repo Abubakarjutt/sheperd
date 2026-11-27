@@ -124,3 +124,13 @@ export function modelFamily(ref: ModelRef): string {
       return ollamaFamily(ref.model);
   }
 }
+
+/**
+ * The family rewire derives from the ref alone, ignoring an endpoint's `family` override (which
+ * `modelFamily` honours). `rewire doctor` shows it next to an override that differs.
+ */
+export function derivedFamily(ref: ModelRef): string {
+  return builtinProvider(ref.provider) === undefined && endpointConfig(ref.provider) !== undefined
+    ? endpointFamily(ref)
+    : modelFamily(ref);
+}

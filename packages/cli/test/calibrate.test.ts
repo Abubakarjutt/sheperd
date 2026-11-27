@@ -596,6 +596,74 @@ describe("rewire calibrate: the paid gate", () => {
     expect(err.text()).toContain("billed by bedrock");
   });
 
+  test("an endpoint ref: models.toml is loaded before the ref is parsed, and a https endpoint is paid", async () => {
+    const s = setup();
+    const models = join(s.home, "models.toml");
+    writeFileSync(
+      models,
+      'available = ["groq:llama-3.3-70b"]\n[endpoints.groq]\nbase_url = "https://api.groq.com/openai/v1"\napi_key_env = "GROQ_API_KEY"\n',
+    );
+    let made = 0;
+    const err = sink();
+    const p = calibrateCommand(
+      { model: "groq:llama-3.3-70b", models, yes: false, fresh: false },
+      {
+        stdout: sink().stream,
+        stderr: err.stream,
+        env: { ...s.env, REWIRE_FAUX_SCRIPT: "" },
+        cwd: s.home,
+        providers: () => {
+          made++;
+          throw new Error("the paid gate let a provider be made");
+        },
+        window: async () => ({ window: 20_000, source: "model", provisional: false }),
+      },
+      new AbortController().signal,
+    );
+    await expect(p).rejects.toMatchObject({
+      code: "calibration_failed",
+      hint: "re-run with --yes to spend",
+    });
+    expect(made).toBe(0);
+    expect(err.text()).toContain("billed by groq");
+  });
+
+  test("a loopback endpoint ref measures without --yes", async () => {
+    const s = setup();
+    const models = join(s.home, "models.toml");
+    writeFileSync(
+      models,
+      'available = ["lm:qwen2.5-coder"]\n[endpoints.lm]\nbase_url = "http://127.0.0.1:1234/v1"\n',
+    );
+    s.setWindow({ window: 20_000, source: "model", provisional: false });
+    const model = oracle(1e9);
+    const r = await s.run({ model: "lm:qwen2.5-coder", models, yes: false }, model, undefined, {
+      REWIRE_FAUX_SCRIPT: "",
+    });
+    expect(r.code).toBe(0);
+    expect(model.lengths.length).toBeGreaterThan(0);
+  });
+
+  test("an undeclared endpoint ref keeps parseModelRef's hint", async () => {
+    const s = setup();
+    const models = join(s.home, "models.toml");
+    writeFileSync(models, 'available = ["ollama:m"]\n');
+    const p = calibrateCommand(
+      { model: "groq:llama-3.3-70b", models, yes: true, fresh: false },
+      {
+        stdout: sink().stream,
+        stderr: sink().stream,
+        env: { ...s.env, REWIRE_FAUX_SCRIPT: "" },
+        cwd: s.home,
+      },
+      new AbortController().signal,
+    );
+    await expect(p).rejects.toMatchObject({
+      code: "model_ref_invalid",
+      hint: expect.stringContaining("[endpoints.groq] in models.toml"),
+    });
+  });
+
   test("paid is every provider but ollama, faux and a loopback endpoint", () => {
     for (const name of ["anthropic", "openai", "bedrock", "vertex", "foundry", "azure", "gemini"]) {
       expect(isPaidProvider(name)).toBe(true);

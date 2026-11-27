@@ -1,6 +1,7 @@
 import { RewireError } from "@rewire/core";
 import { describe, expect, test } from "vitest";
 import {
+  derivedFamily,
   endpointConfig,
   isEndpointName,
   modelFamily,
@@ -164,6 +165,26 @@ describe("cloud providers and endpoints", () => {
     const undo = registerEndpoints({ claude: { baseUrl: "https://x.example/v1" } });
     try {
       expect(modelFamily(parseModelRef("claude:llama-3.3-70b"))).toBe("llama");
+    } finally {
+      undo();
+    }
+  });
+
+  test("derivedFamily ignores an endpoint's family override (doctor shows the difference)", () => {
+    const undo = registerEndpoints({
+      corp: { baseUrl: "https://llm.corp.example/v1", family: "x" },
+    });
+    try {
+      const ref = parseModelRef("corp:claude-opus-5-5");
+      expect(modelFamily(ref)).toBe("x");
+      expect(derivedFamily(ref)).toBe("claude");
+      expect(() => derivedFamily(parseModelRef("corp:openrouter/auto"))).toThrowError(
+        expect.objectContaining({ code: "model_ref_invalid" }),
+      );
+      expect(derivedFamily({ provider: "bedrock", model: "anthropic.claude-opus-5-5" })).toBe(
+        "claude",
+      );
+      expect(derivedFamily({ provider: "ollama", model: "llama3.1" })).toBe("llama");
     } finally {
       undo();
     }
