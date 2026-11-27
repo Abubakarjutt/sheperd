@@ -36,7 +36,8 @@ export type ProviderSettings = {
   bedrock?: { region?: string };
   vertex?: { project?: string; region?: string };
   foundry?: { resource?: string; baseUrl?: string };
-  azure?: { endpoint?: string; apiVersion?: string };
+  /** `family` overrides the family derived from the deployment name (see `registerAzureFamily`). */
+  azure?: { endpoint?: string; apiVersion?: string; family?: string };
 };
 
 /** Endpoint names: lowercase, start with a letter, at most 32 characters. */
@@ -87,6 +88,26 @@ export function registerEndpoints(entries: Record<string, EndpointConfig>): () =
       else endpoints.delete(name);
     }
   };
+}
+
+let azureFamily: string | undefined;
+
+/**
+ * Sets the family every `azure:` ref has (`[providers.azure] family` in models.toml), or clears it
+ * with undefined: Azure deployment names are user-chosen, so the derived family can be wrong.
+ * Module-level state, like `registerEndpoints`. Returns a function that restores the previous one.
+ */
+export function registerAzureFamily(family: string | undefined): () => void {
+  const prev = azureFamily;
+  azureFamily = family;
+  return () => {
+    azureFamily = prev;
+  };
+}
+
+/** The registered `[providers.azure] family`, if any. */
+export function azureFamilyOverride(): string | undefined {
+  return azureFamily;
 }
 
 /** The registered endpoint called `name`, if any. */

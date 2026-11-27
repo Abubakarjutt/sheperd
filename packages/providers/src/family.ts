@@ -1,5 +1,5 @@
 import { RewireError } from "@rewire/core";
-import { builtinProvider, endpointConfig, type ModelRef } from "./types.js";
+import { azureFamilyOverride, builtinProvider, endpointConfig, type ModelRef } from "./types.js";
 
 /**
  * Ollama names whose leading word is not their lineage (row 96): code, vision and reasoning
@@ -76,6 +76,41 @@ function endpointFamily(ref: ModelRef): string {
   return ollamaFamily(ref.model);
 }
 
+/**
+ * Words that name another vendor's model in an Azure deployment name, and their family (the
+ * Ollama family of the same weights). Matched at the start of a word, so "dolphin" is not "phi".
+ */
+const AZURE_OTHER: readonly (readonly [string, string])[] = [
+  ["claude", "claude"],
+  ["gemini", "gemini"],
+  ["codegemma", "gemma"],
+  ["gemma", "gemma"],
+  ["codellama", "llama"],
+  ["llava", "llama"],
+  ["llama", "llama"],
+  ["mixtral", "mixtral"],
+  ["mistral", "mistral"],
+  ["deepseek", "deepseek"],
+  ["qwq", "qwen"],
+  ["codeqwen", "qwen"],
+  ["qwen", "qwen"],
+  ["grok", "grok"],
+  ["phi", "phi"],
+];
+
+/**
+ * An Azure deployment is named by the user and Azure serves other vendors' models too: a name
+ * that names one ("DeepSeek-R1", "Meta-Llama-3.1-70B") gets its family, anything else is `gpt`.
+ * `[providers.azure] family` overrides this.
+ */
+function azureFamily(ref: ModelRef): string {
+  const lower = ref.model.toLowerCase();
+  for (const [word, family] of AZURE_OTHER) {
+    if (new RegExp(`(^|[^a-z])${word}`).test(lower)) return family;
+  }
+  return "gpt";
+}
+
 /** Bedrock, Vertex and Foundry are supported for Claude only. */
 function cloudClaude(ref: ModelRef): string {
   if (!ref.model.toLowerCase().includes("claude")) {
@@ -110,10 +145,12 @@ export function modelFamily(ref: ModelRef): string {
     case "anthropic":
       return "claude";
     case "openai":
-    case "azure":
       return "gpt";
+    case "azure":
+      return azureFamilyOverride() ?? azureFamily(ref);
     case "gemini":
-      return "gemini";
+      // The Gemini API serves Gemma too: the same weights as ollama:gemma*, never independent.
+      return ref.model.toLowerCase().includes("gemma") ? "gemma" : "gemini";
     case "bedrock":
     case "vertex":
     case "foundry":
@@ -126,10 +163,12 @@ export function modelFamily(ref: ModelRef): string {
 }
 
 /**
- * The family rewire derives from the ref alone, ignoring an endpoint's `family` override (which
- * `modelFamily` honours). `rewire doctor` shows it next to an override that differs.
+ * The family rewire derives from the ref alone, ignoring an endpoint's `family` override and
+ * `[providers.azure] family` (which `modelFamily` honours). `rewire doctor` shows it next to an
+ * override that differs.
  */
 export function derivedFamily(ref: ModelRef): string {
+  if (ref.provider === "azure" && ref.model.trim() !== "") return azureFamily(ref);
   return builtinProvider(ref.provider) === undefined && endpointConfig(ref.provider) !== undefined
     ? endpointFamily(ref)
     : modelFamily(ref);

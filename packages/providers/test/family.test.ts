@@ -6,6 +6,7 @@ import {
   isEndpointName,
   modelFamily,
   parseModelRef,
+  registerAzureFamily,
   registerEndpoints,
 } from "../src/index.js";
 
@@ -76,6 +77,53 @@ describe("cloud providers and endpoints", () => {
   test("azure is gpt and gemini is gemini", () => {
     expect(modelFamily(parseModelRef("azure:my-gpt-deployment"))).toBe("gpt");
     expect(modelFamily(parseModelRef("gemini:gemini-2.5-pro"))).toBe("gemini");
+  });
+  test("a gemini: Gemma id is gemma, as on endpoints and Ollama", () => {
+    expect(modelFamily(parseModelRef("gemini:gemma-3-27b-it"))).toBe("gemma");
+    expect(modelFamily(parseModelRef("gemini:models/Gemma-3n-e4b-it"))).toBe("gemma");
+    expect(modelFamily(parseModelRef("ollama:gemma3:27b"))).toBe("gemma");
+    expect(modelFamily(parseModelRef("gemini:gemini-2.5-flash"))).toBe("gemini");
+  });
+  test.each([
+    ["DeepSeek-R1", "deepseek"],
+    ["my-deepseek-v3", "deepseek"],
+    ["Meta-Llama-3.1-70B-Instruct", "llama"],
+    ["codellama-34b", "llama"],
+    ["Mistral-Large-2411", "mistral"],
+    ["mixtral-8x7b", "mixtral"],
+    ["claude-opus-5-5", "claude"],
+    ["Phi-4", "phi"],
+    ["qwen2.5-72b", "qwen"],
+    ["grok-3", "grok"],
+    ["gemma-3-27b", "gemma"],
+    ["gemini-2.5-pro", "gemini"],
+    ["my-gpt-deployment", "gpt"],
+    ["gpt-4o", "gpt"],
+    ["prod", "gpt"],
+    ["dolphin-chat", "gpt"],
+    ["auto", "gpt"],
+  ])(
+    "azure:%s is %s: a deployment naming another vendor's model gets that family",
+    (model, family) => {
+      expect(modelFamily(parseModelRef(`azure:${model}`))).toBe(family);
+      expect(derivedFamily(parseModelRef(`azure:${model}`))).toBe(family);
+    },
+  );
+  test("[providers.azure] family overrides the derived one; undo restores it", () => {
+    const ref = parseModelRef("azure:DeepSeek-R1");
+    const undo = registerAzureFamily("llama");
+    try {
+      expect(modelFamily(ref)).toBe("llama");
+      expect(modelFamily(parseModelRef("azure:prod"))).toBe("llama");
+      expect(derivedFamily(ref)).toBe("deepseek");
+      const inner = registerAzureFamily(undefined);
+      expect(modelFamily(ref)).toBe("deepseek");
+      inner();
+      expect(modelFamily(ref)).toBe("llama");
+    } finally {
+      undo();
+    }
+    expect(modelFamily(ref)).toBe("deepseek");
   });
 
   test("an endpoint ref fails before registration, parses after, and fails after undo", () => {

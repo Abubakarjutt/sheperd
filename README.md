@@ -676,6 +676,7 @@ available = ["azure:my-gpt-deployment"]  # the deployment name
 [providers.azure]
 endpoint = "https://myres.openai.azure.com"
 api_version = "2024-10-21"
+# family = "deepseek"                    # optional, see "Model families"
 ```
 
 Needs `AZURE_OPENAI_API_KEY`. The endpoint comes from `[providers.azure] endpoint` or
@@ -732,7 +733,14 @@ not read for these providers either.
 
 Cross-family review depends on knowing each model's family, so it is derived with fixed rules:
 
-- `bedrock`, `vertex`, `foundry`: `claude`. `azure`: `gpt`. `gemini`: `gemini`.
+- `bedrock`, `vertex`, `foundry`: `claude`. `gemini`: `gemini`, or `gemma` for a Gemma id (the
+  same weights as `ollama:gemma3`).
+- `azure`: `[providers.azure] family` when set (same rule as an endpoint `family`), else from the
+  deployment name, which you choose: a word naming another vendor's model (`claude`, `gemini`,
+  `gemma`, `llama`, `mistral`, `mixtral`, `deepseek`, `qwen`, `grok`, `phi`, at the start of a word)
+  gives that family, so `azure:DeepSeek-R1` is `deepseek`; anything else is `gpt`. A deployment
+  name that hides its model gets the wrong family: set `family`. `rewire doctor` shows the override,
+  and the family rewire would have derived when that differs.
 - An **endpoint** uses its `family` key when set. Otherwise the family comes from the model id
   alone, **never from the endpoint name** (you choose that name, and it says nothing about the
   model):

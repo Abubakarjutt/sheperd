@@ -8,6 +8,7 @@ import {
   modelFamily,
   type ProviderSettings,
   parseModelRef,
+  registerAzureFamily,
   registerEndpoints,
 } from "@rewire/providers";
 import { parse } from "smol-toml";
@@ -189,6 +190,9 @@ const isLoopbackUrl = (s: string): boolean => {
 
 const Setting = z.string().min(1);
 
+/** A model family name, for `[endpoints.<name>] family` and `[providers.azure] family`. */
+const Family = z.string().regex(/^[a-z][a-z0-9._-]{0,31}$/, "must be a lowercase family name");
+
 const ProvidersToml = z.strictObject({
   bedrock: z.strictObject({ region: Setting.optional() }).optional(),
   vertex: z.strictObject({ project: Setting.optional(), region: Setting.optional() }).optional(),
@@ -196,7 +200,11 @@ const ProvidersToml = z.strictObject({
     .strictObject({ resource: Setting.optional(), base_url: UrlString(false).optional() })
     .optional(),
   azure: z
-    .strictObject({ endpoint: UrlString(false).optional(), api_version: Setting.optional() })
+    .strictObject({
+      endpoint: UrlString(false).optional(),
+      api_version: Setting.optional(),
+      family: Family.optional(),
+    })
     .optional(),
 });
 
@@ -207,10 +215,7 @@ const EndpointToml = z
       .string()
       .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "must be the name of an env var, not a key")
       .optional(),
-    family: z
-      .string()
-      .regex(/^[a-z][a-z0-9._-]{0,31}$/, "must be a lowercase family name")
-      .optional(),
+    family: Family.optional(),
     context_window: z.number().int().min(MIN_ENDPOINT_CONTEXT_WINDOW).optional(),
     max_tokens_field: z.enum(["max_completion_tokens", "max_tokens"]).optional(),
   })
@@ -276,11 +281,21 @@ export async function loadModelsFile(path: string): Promise<ModelsFile> {
     }
     endpoints = endpointConfigs(e.data);
   }
-  // One file's endpoints at a time: this load replaces the previous file's set, and a failed load
-  // puts the previous set back.
+  // `[providers.azure] family` too: it decides the family of every azure: ref.
+  const rawProviders = (raw as { providers?: unknown } | null)?.providers;
+  let azureFamily: string | undefined;
+  if (rawProviders !== undefined) {
+    const p = ProvidersToml.safeParse(rawProviders);
+    if (!p.success) {
+      throw invalid(p.error.issues.map((i) => ({ ...i, path: ["providers", ...i.path] })));
+    }
+    azureFamily = p.data.azure?.family;
+  }
+  // One file's endpoints and Azure family at a time: this load replaces the previous file's, and
+  // a failed load puts the previous ones back.
   const previous = loaded;
   previous?.undo();
-  const undo = registerEndpoints(endpoints ?? {});
+  const undo = register(endpoints ?? {}, azureFamily);
   try {
     const r = ModelsToml.safeParse(raw);
     if (!r.success) throw invalid(r.error.issues);
@@ -296,20 +311,44 @@ export async function loadModelsFile(path: string): Promise<ModelsFile> {
     };
     if (r.data.providers !== undefined) out.providers = providerSettings(r.data.providers);
     if (endpoints !== undefined) out.endpoints = endpoints;
-    loaded = { endpoints: endpoints ?? {}, undo };
+    loaded = { endpoints: endpoints ?? {}, azureFamily, undo };
     return out;
   } catch (e) {
     undo();
     loaded =
       previous !== undefined
-        ? { endpoints: previous.endpoints, undo: registerEndpoints(previous.endpoints) }
+        ? {
+            ...previous,
+            undo: register(previous.endpoints, previous.azureFamily),
+          }
         : undefined;
     throw e;
   }
 }
 
-/** The endpoints the last successful `loadModelsFile` registered, and how to unregister them. */
-let loaded: { endpoints: Record<string, EndpointConfig>; undo: () => void } | undefined;
+function register(
+  endpoints: Record<string, EndpointConfig>,
+  azureFamily: string | undefined,
+): () => void {
+  const undoEndpoints = registerEndpoints(endpoints);
+  const undoAzure = registerAzureFamily(azureFamily);
+  return () => {
+    undoAzure();
+    undoEndpoints();
+  };
+}
+
+/**
+ * What the last successful `loadModelsFile` registered (its endpoints and `[providers.azure]
+ * family`), and how to unregister it.
+ */
+let loaded:
+  | {
+      endpoints: Record<string, EndpointConfig>;
+      azureFamily: string | undefined;
+      undo: () => void;
+    }
+  | undefined;
 
 function endpointConfigs(raw: z.infer<typeof EndpointsToml>): Record<string, EndpointConfig> {
   const out: Record<string, EndpointConfig> = {};
@@ -336,7 +375,11 @@ function providerSettings(raw: z.infer<typeof ProvidersToml>): ProviderSettings 
     out.foundry = defined({ resource: raw.foundry.resource, baseUrl: raw.foundry.base_url });
   }
   if (raw.azure) {
-    out.azure = defined({ endpoint: raw.azure.endpoint, apiVersion: raw.azure.api_version });
+    out.azure = defined({
+      endpoint: raw.azure.endpoint,
+      apiVersion: raw.azure.api_version,
+      family: raw.azure.family,
+    });
   }
   return out;
 }

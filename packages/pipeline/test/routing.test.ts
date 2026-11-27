@@ -430,3 +430,36 @@ describe("loadModelsFile: refs checked at load, one file's endpoints at a time",
     expect(MIN_ENDPOINT_CONTEXT_WINDOW).toBe(4096);
   });
 });
+
+describe("Gemma and Azure deployments of other vendors are not independent", () => {
+  test("gemini:gemma and ollama:gemma are one family", () => {
+    const r = resolveRouting(refs("gemini:gemma-3-27b-it", "ollama:gemma3:27b"));
+    expect(r.independence).toBe("same-family");
+  });
+  test("azure:DeepSeek-R1 and ollama:deepseek-r1 are one family", () => {
+    const r = resolveRouting(refs("azure:DeepSeek-R1", "ollama:deepseek-r1:70b"));
+    expect(r.independence).toBe("same-family");
+  });
+  test("[providers.azure] family loads, is registered, and a later file without it clears it", async () => {
+    const m = await loadModelsFile(
+      file(
+        `available = ["azure:prod", "ollama:llama3.1"]\n[providers.azure]\nendpoint = "https://my.openai.azure.com"\nfamily = "llama"\n`,
+      ),
+    );
+    expect(m.providers?.azure).toEqual({
+      endpoint: "https://my.openai.azure.com",
+      family: "llama",
+    });
+    expect(fam(parseModelRef("azure:prod"))).toBe("llama");
+    expect(resolveRouting(m.available).independence).toBe("same-family");
+    // A failed load keeps the previous file's override.
+    await expect(
+      loadModelsFile(
+        file(`available = ["azure:prod"]\n[providers.azure]\nfamily = "Bad Family"\n`),
+      ),
+    ).rejects.toMatchObject({ code: "models_file_invalid" });
+    expect(fam(parseModelRef("azure:prod"))).toBe("llama");
+    await loadModelsFile(file(`available = ["azure:prod"]\n`));
+    expect(fam(parseModelRef("azure:prod"))).toBe("gpt");
+  });
+});
