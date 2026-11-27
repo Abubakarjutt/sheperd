@@ -9,11 +9,11 @@ import {
   isLoopbackUrl,
   type ModelRef,
   OLLAMA_TRUNCATION_HINT,
-  ollamaChatTimeoutMs,
   type Provider,
   type ProviderName,
   parseModelRef,
   refreshContextWindow,
+  resolveOllamaTimeout,
   TokenEstimator,
   TRUNCATION_RATIO,
 } from "@rewire/providers";
@@ -51,7 +51,7 @@ The chat session's compaction then triggers at the calibrated size. Never runs a
   --fresh          ignore cached results for this model and measure again
 `;
 
-/** Wall-clock cap of one probe call for providers without their own (Ollama has REWIRE_OLLAMA_TIMEOUT_S). */
+/** Wall-clock cap of one probe call for providers without their own (Ollama has its reply timeout). */
 export const PROBE_TIMEOUT_MS = 600_000;
 
 /**
@@ -140,7 +140,8 @@ const errorText = (e: unknown): string => {
 
 /** What to check when probes keep failing. */
 const ERROR_HINT: Record<ProviderName, string> = {
-  ollama: "is Ollama running? check OLLAMA_HOST and `ollama ps`, or raise REWIRE_OLLAMA_TIMEOUT_S",
+  ollama:
+    "is Ollama running? check OLLAMA_HOST and `ollama ps`, or raise REWIRE_OLLAMA_TIMEOUT_S or [providers.ollama] timeout_s",
   anthropic: "check ANTHROPIC_API_KEY, the network and the rate limits",
   openai: "check OPENAI_API_KEY, the network and the rate limits",
   faux: "check the faux script (REWIRE_FAUX_SCRIPT)",
@@ -258,7 +259,10 @@ export async function calibrateCommand(
       ? (r: ModelRef) => refreshContextWindow(r, { env: io.env })
       : undefined);
   const now = io.now ?? Date.now;
-  const timeoutMs = ref.provider === "ollama" ? ollamaChatTimeoutMs(io.env) : PROBE_TIMEOUT_MS;
+  const timeoutMs =
+    ref.provider === "ollama"
+      ? resolveOllamaTimeout(io.env, models.providers).ms
+      : PROBE_TIMEOUT_MS;
   io.stdout.write(
     `calibrating ${name} (window ${window.window.toLocaleString("en-US")}${window.provisional ? ", provisional" : ""}): ${plan.map(lengthLabel).join(", ")}\n`,
   );
@@ -293,7 +297,12 @@ export async function calibrateCommand(
         system: probe.system,
         messages: [{ role: "user", content: probe.user }],
         maxTokens: PROBE_MAX_TOKENS,
-        signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
+        // Ollama enforces `timeoutMs` itself, and its timer alone must fire: a second one here
+        // would turn its ollama_timeout (which names the value and its source) into an abort.
+        signal:
+          ref.provider === "ollama"
+            ? signal
+            : AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
         timeoutMs,
       });
       if (!refreshed && refreshWindow !== undefined) {

@@ -206,6 +206,7 @@ const ProvidersToml = z.strictObject({
       family: Family.optional(),
     })
     .optional(),
+  ollama: z.strictObject({ timeout_s: z.number().int().min(1).max(86_400).optional() }).optional(),
 });
 
 const EndpointToml = z
@@ -381,6 +382,7 @@ function providerSettings(raw: z.infer<typeof ProvidersToml>): ProviderSettings 
       family: raw.azure.family,
     });
   }
+  if (raw.ollama) out.ollama = defined({ timeoutS: raw.ollama.timeout_s });
   return out;
 }
 

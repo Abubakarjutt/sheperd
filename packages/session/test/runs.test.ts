@@ -226,6 +226,26 @@ describe("RunController (fake pipeline)", () => {
     expect(evs.map((e) => e.type)).toEqual(["run_start", "checkpoint", "run_end"]);
   });
 
+  test("the resolved Ollama timeout reaches the pipeline input", async () => {
+    const seen: RunPipelineInput[] = [];
+    const c = new RunController({
+      repo: "/repo",
+      routing: ROUTING,
+      providers: () => {
+        throw new Error("unused");
+      },
+      policy: DEFAULT_POLICY,
+      ollamaTimeout: { ms: 1_800_000, source: "models.toml" },
+      pipeline: fakePipeline({ seen }),
+    });
+    const h = c.start("t", { checkpoints: NONE });
+    await h.done;
+    expect(seen[0]?.ollamaTimeout).toEqual({ ms: 1_800_000, source: "models.toml" });
+    const plain = controller(fakePipeline({ seen }));
+    await plain.start("t", { checkpoints: NONE }).done;
+    expect(seen[1]).not.toHaveProperty("ollamaTimeout");
+  });
+
   test("checkpoints not in the set auto-approve without a pending prompt", async () => {
     const seen: RunPipelineInput[] = [];
     const c = controller(fakePipeline({ seen }));

@@ -38,6 +38,8 @@ export type ProviderSettings = {
   foundry?: { resource?: string; baseUrl?: string };
   /** `family` overrides the family derived from the deployment name (see `registerAzureFamily`). */
   azure?: { endpoint?: string; apiVersion?: string; family?: string };
+  /** `timeoutS`: the reply timeout in seconds; REWIRE_OLLAMA_TIMEOUT_S overrides it. */
+  ollama?: { timeoutS?: number };
 };
 
 /** Endpoint names: lowercase, start with a letter, at most 32 characters. */
@@ -167,14 +169,18 @@ export type ChatRequest = {
   tools?: ToolSpec[];
   maxTokens: number;
   signal?: AbortSignal;
-  /** Optional wall-clock cap for the call; honored by providers that support it (ollama). */
+  /**
+   * Optional wall-clock cap for the call; honored by providers that support it (ollama: on a
+   * streamed call it replaces the reply timeout, the wait for the first chunk).
+   */
   timeoutMs?: number;
   /**
    * Optional token streaming. When set, providers request a streamed reply and call this with
    * each text delta, in order; the resolved ChatResponse is the same as without it. When unset,
    * the request is exactly the non-streamed one.
    * OpenAI and Anthropic streams have no wall-clock bound once headers arrive: callers that
-   * stream must pass a `signal` (Ollama's REWIRE_OLLAMA_TIMEOUT_S still covers the whole call).
+   * stream must pass a `signal`. Ollama's reply timeout bounds the wait for the first chunk,
+   * then an idle timeout (OLLAMA_IDLE_TIMEOUT_MS without a chunk) applies.
    */
   onDelta?: (text: string) => void;
   /**

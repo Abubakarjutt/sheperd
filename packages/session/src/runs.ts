@@ -14,7 +14,7 @@ import {
   runPipeline,
 } from "@rewire/pipeline";
 import type { Policy } from "@rewire/policy";
-import type { ModelRef, Provider } from "@rewire/providers";
+import type { ModelRef, OllamaTimeout, Provider } from "@rewire/providers";
 import type { SkillSet } from "@rewire/skills";
 
 export type PendingPrompt =
@@ -46,6 +46,8 @@ export type RunControllerOptions = {
   repo: string;
   routing: RoleRouting;
   providers: (ref: ModelRef) => Provider;
+  /** Passed to the pipeline as `ollamaTimeout` (its preflight smoke test). */
+  ollamaTimeout?: OllamaTimeout;
   policy: Policy;
   /** For the author stages. The caller owns the set; the controller never disposes it. */
   skills?: SkillSet;
@@ -174,6 +176,7 @@ export class RunController {
       checkpointKinds: kinds,
       ...(this.opts.skills ? { skills: this.opts.skills } : {}),
       ...(this.opts.faux ? { faux: true } : {}),
+      ...(this.opts.ollamaTimeout ? { ollamaTimeout: this.opts.ollamaTimeout } : {}),
       ...(this.opts.seams ? { seams: this.opts.seams } : {}),
     };
     const pipeline = this.opts.pipeline ?? runPipeline;

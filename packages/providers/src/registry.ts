@@ -2,7 +2,7 @@ import { RewireError } from "@rewire/core";
 import { AnthropicProvider } from "./anthropic.js";
 import { ClaudeCloudProvider } from "./claude-cloud.js";
 import { FauxProvider } from "./faux.js";
-import { normalizeOllamaHost, OllamaProvider, ollamaChatTimeoutMs } from "./ollama.js";
+import { normalizeOllamaHost, OllamaProvider, resolveOllamaTimeout } from "./ollama.js";
 import { OpenAIProvider } from "./openai.js";
 import {
   createAzureProvider,
@@ -71,5 +71,6 @@ export function ollamaBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
 
 registerProvider(
   "ollama",
-  (_ref, env) => new OllamaProvider(ollamaBaseUrl(env), ollamaChatTimeoutMs(env)),
+  (_ref, env, settings) =>
+    new OllamaProvider(ollamaBaseUrl(env), resolveOllamaTimeout(env, settings)),
 );

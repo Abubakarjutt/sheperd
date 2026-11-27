@@ -624,9 +624,27 @@ review is weaker than a cross-family one. Rewire still runs, and marks the evide
 `independence: same-family` so you can discount it. Ollama models must support tool calling;
 rewire checks this.
 
-Each Ollama reply may take up to 300 seconds. A larger local model on modest hardware can need
-more: set `REWIRE_OLLAMA_TIMEOUT_S` (whole seconds, 1 to 86400), e.g.
-`REWIRE_OLLAMA_TIMEOUT_S=900 rewire run ...`. `rewire doctor` shows the value in use.
+Each Ollama reply may take up to 900 seconds, the reply timeout. A larger local model on modest
+hardware can need more. Set it in either of two places (whole seconds, 1 to 86400):
+
+- `REWIRE_OLLAMA_TIMEOUT_S`, e.g. `REWIRE_OLLAMA_TIMEOUT_S=1800 rewire run ...`. It wins over the
+  file. A variable added to `~/.zshrc` reaches only terminals opened after the edit, so a
+  terminal opened before it runs rewire on the default.
+- `timeout_s` in `models.toml`, which does not depend on the shell:
+
+  ```toml
+  [providers.ollama]
+  timeout_s = 1800
+  ```
+
+`rewire doctor` shows the value in use and where it came from, as
+`reply timeout 1800s (env|models.toml|default)`. The `ollama_timeout` error names both too.
+
+A streamed reply (the TUI chat) works differently. The reply timeout covers only the wait for
+its first chunk, which is mostly the time the model spends reading the prompt. Once chunks
+flow there is no total limit. The request fails only when no chunk (text, thinking or a tool
+call) arrives for 120 seconds. Esc still interrupts it. The pipeline's stages never stream, so
+each of their replies has the reply timeout as its whole limit.
 
 ### Picking models in the TUI
 
@@ -819,7 +837,7 @@ as independent; set `family` when you know it does.
 | `REWIRE_ANTHROPIC_MODEL`, `REWIRE_OPENAI_MODEL`, `REWIRE_GEMINI_MODEL` | Override the auto-detected models.                                                                                 |
 | Cloud and endpoint credentials                                         | Named under "Providers" (AWS, Google, `ANTHROPIC_FOUNDRY_*`, `AZURE_OPENAI_*`, and each endpoint's `api_key_env`). |
 | `OLLAMA_HOST`                                                          | Where Ollama is found (default `http://127.0.0.1:11434`).                                                          |
-| `REWIRE_OLLAMA_TIMEOUT_S`                                              | Seconds to wait for each Ollama reply: whole seconds, 1 to 86400, default 300.                                     |
+| `REWIRE_OLLAMA_TIMEOUT_S`                                              | Ollama reply timeout, whole seconds 1 to 86400 (default 900). Wins over `[providers.ollama] timeout_s`.            |
 | `REWIRE_SANDBOX_BIN`                                                   | Use this sandbox binary (a missing file is an error, never a fall-through).                                        |
 | `XDG_CONFIG_HOME`                                                      | Where the default `rewire/models.toml` is looked up (default `~/.config`).                                         |
 

@@ -12,10 +12,13 @@ import {
   getModelInfo,
   MIN_OLLAMA_VERSION,
   normalizeOllamaHost,
+  OLLAMA_IDLE_TIMEOUT_MS,
   OLLAMA_TIMEOUT_ENV,
   OllamaProvider,
+  type OllamaTimeout,
   ollamaChatTimeoutMs,
   probeOllama,
+  resolveOllamaTimeout,
 } from "../src/index.js";
 import { openaiChunks, openaiSSE } from "./sse.js";
 
@@ -105,6 +108,24 @@ beforeEach(async () => {
         if (typeof out === "object" && out !== null && "__delayMs" in out) {
           const { __delayMs } = out as { __delayMs: number };
           setTimeout(() => json(200, structuredOk()), __delayMs);
+          return;
+        }
+        if (typeof out === "object" && out !== null && "__drip" in out) {
+          // One SSE event every `everyMs`, then end (or hang, to go silent).
+          const { __drip, everyMs, after } = out as {
+            __drip: string[];
+            everyMs: number;
+            after?: "end" | "hang";
+          };
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          let i = 0;
+          const tick = setInterval(() => {
+            if (res.destroyed) return clearInterval(tick);
+            const ev = __drip[i++];
+            if (ev !== undefined) return void res.write(ev);
+            clearInterval(tick);
+            if (after !== "hang") res.end();
+          }, everyMs);
           return;
         }
         if (typeof out === "object" && out !== null && "__sse" in out) {
@@ -231,10 +252,10 @@ describe("normalizeOllamaHost", () => {
 });
 
 describe("ollamaChatTimeoutMs", () => {
-  test("unset or blank is the 300s default", () => {
+  test("unset or blank is the 900s default", () => {
     expect(OLLAMA_TIMEOUT_ENV).toBe("REWIRE_OLLAMA_TIMEOUT_S");
-    expect(ollamaChatTimeoutMs({})).toBe(300_000);
-    expect(ollamaChatTimeoutMs({ REWIRE_OLLAMA_TIMEOUT_S: "  " })).toBe(300_000);
+    expect(ollamaChatTimeoutMs({})).toBe(900_000);
+    expect(ollamaChatTimeoutMs({ REWIRE_OLLAMA_TIMEOUT_S: "  " })).toBe(900_000);
   });
   test("whole seconds from 1 to 86400", () => {
     expect(ollamaChatTimeoutMs({ REWIRE_OLLAMA_TIMEOUT_S: "900" })).toBe(900_000);
@@ -246,6 +267,43 @@ describe("ollamaChatTimeoutMs", () => {
       expect.objectContaining({ code: "ollama_timeout_invalid" }),
     );
   });
+});
+
+describe("resolveOllamaTimeout", () => {
+  const toml = { ollama: { timeoutS: 1200 } };
+  test("env beats models.toml beats the default, and says which", () => {
+    expect(resolveOllamaTimeout({ REWIRE_OLLAMA_TIMEOUT_S: "60" }, toml)).toEqual({
+      ms: 60_000,
+      source: "env",
+    });
+    expect(resolveOllamaTimeout({}, toml)).toEqual({ ms: 1_200_000, source: "models.toml" });
+    expect(resolveOllamaTimeout({ REWIRE_OLLAMA_TIMEOUT_S: " " }, toml)).toEqual({
+      ms: 1_200_000,
+      source: "models.toml",
+    });
+    expect(resolveOllamaTimeout({})).toEqual({ ms: 900_000, source: "default" });
+    expect(resolveOllamaTimeout({}, {})).toEqual({ ms: 900_000, source: "default" });
+  });
+  test("an invalid env value is refused even when models.toml sets one", () => {
+    expect(() => resolveOllamaTimeout({ REWIRE_OLLAMA_TIMEOUT_S: "15m" }, toml)).toThrow(
+      expect.objectContaining({ code: "ollama_timeout_invalid" }),
+    );
+  });
+  test("createProvider takes models.toml's [providers.ollama] timeout_s", async () => {
+    mock.chat = () => "hang";
+    const p = createProvider(ref, { OLLAMA_HOST: base }, { ollama: { timeoutS: 1 } });
+    const err = await p
+      .chat({ model: "tiny:1b", system: "s", messages: [], maxTokens: 5 })
+      .catch((e) => e);
+    expect(err).toMatchObject({ code: "ollama_timeout" });
+    expect(err.message).toMatch(/timed out after 1s/);
+    expect(err.message).toMatch(/models\.toml/);
+  });
+});
+
+const tmo = (ms: number, source: OllamaTimeout["source"] = "env"): OllamaTimeout => ({
+  ms,
+  source,
 });
 
 describe("OllamaProvider", () => {
@@ -294,13 +352,38 @@ describe("OllamaProvider", () => {
   });
   test("the reply timeout comes from the constructor and the error names the variable", async () => {
     mock.chat = () => "hang";
-    const p = new OllamaProvider(base, 100);
+    const p = new OllamaProvider(base, tmo(100));
     const err = await p
       .chat({ model: "m", system: "s", messages: [], maxTokens: 5 })
       .catch((e) => e);
     expect(err).toMatchObject({ code: "ollama_timeout" });
-    expect(err.message).toMatch(/timed out after 0s/);
+    expect(err.message).toMatch(/timed out after 100ms/);
+    expect(err.message).toMatch(/REWIRE_OLLAMA_TIMEOUT_S/);
     expect(err.hint).toMatch(/REWIRE_OLLAMA_TIMEOUT_S/);
+  });
+  test("a non-streamed reply keeps one total timeout, even while the server is working", async () => {
+    mock.chat = () => ({ __delayMs: 600 });
+    const p = new OllamaProvider(base, tmo(200));
+    const t0 = Date.now();
+    const err = await p
+      .chat({ model: "m", system: "s", messages: [], maxTokens: 5 })
+      .catch((e) => e);
+    expect(err).toMatchObject({ code: "ollama_timeout" });
+    expect(err.message).toMatch(/timed out after 200ms/);
+    expect(Date.now() - t0).toBeLessThan(550);
+  });
+  test("on the default, the hint says the variable is not set in this process", async () => {
+    mock.chat = () => "hang";
+    const p = new OllamaProvider(base, tmo(100, "default"));
+    const err = await p
+      .chat({ model: "m", system: "s", messages: [], maxTokens: 5 })
+      .catch((e) => e);
+    expect(err).toMatchObject({ code: "ollama_timeout" });
+    expect(err.message).toMatch(/default/);
+    expect(err.hint).toMatch(/retry, or open a new terminal/);
+    expect(err.hint).toMatch(/REWIRE_OLLAMA_TIMEOUT_S is not set in this process's environment/);
+    expect(err.hint).toMatch(/or set REWIRE_OLLAMA_TIMEOUT_S or \[providers\.ollama\] timeout_s/);
+    expect(err.hint).toMatch(/\[providers\.ollama\] timeout_s/);
   });
   test("a slow reply within the rewire timeout is not cut by Node fetch's headers timeout", async () => {
     // Node's global fetch gives up after 300 s without response headers, below a
@@ -310,7 +393,7 @@ describe("OllamaProvider", () => {
     setGlobalDispatcher(new Agent({ headersTimeout: 1000, bodyTimeout: 1000 }));
     try {
       mock.chat = () => ({ __delayMs: 2500 });
-      const p = new OllamaProvider(base, 10_000);
+      const p = new OllamaProvider(base, tmo(10_000));
       const r = await p.chat({ model: "m", system: "s", messages: [], maxTokens: 5 });
       expect(r.message.text).toContain("ok");
     } finally {
@@ -326,6 +409,7 @@ describe("OllamaProvider", () => {
       .catch((e) => e);
     expect(err).toMatchObject({ code: "ollama_timeout" });
     expect(err.message).toMatch(/timed out after 1s/);
+    expect(err.message).toMatch(/REWIRE_OLLAMA_TIMEOUT_S/);
     expect(Date.now() - t0).toBeLessThan(10_000);
   });
   test("a dropped request while Ollama still answers is not reported as unreachable", async () => {
@@ -405,14 +489,95 @@ describe("OllamaProvider streaming (onDelta)", () => {
   });
   const partial = () =>
     openaiSSE(openaiChunks({ text: ["par", "tial"], finish: "stop" }).slice(0, 3), false);
-  test("a timeout mid-stream is ollama_timeout", async () => {
-    mock.chat = () => ({ __sse: partial(), after: "hang" });
-    const p = new OllamaProvider(base, 300);
+  const events = (text: string[]) =>
+    openaiChunks({ text, finish: "stop", usage }).map((c) => `data: ${JSON.stringify(c)}\n\n`);
+  test("the idle timeout is 120s", () => {
+    expect(OLLAMA_IDLE_TIMEOUT_MS).toBe(120_000);
+  });
+  test("a stream that keeps sending outlives the reply timeout", async () => {
+    const text = Array.from({ length: 12 }, (_, i) => `w${i} `);
+    mock.chat = () => ({ __drip: [...events(text), "data: [DONE]\n\n"], everyMs: 50 });
+    const p = new OllamaProvider(base, tmo(250), { idleTimeoutMs: 200 });
+    const t0 = Date.now();
+    const deltas: string[] = [];
+    const r = await p.chat({ ...req, onDelta: (d) => deltas.push(d) });
+    expect(Date.now() - t0).toBeGreaterThan(500);
+    expect(r.message.text).toBe(text.join(""));
+    expect(deltas).toEqual(text);
+  });
+  test("a stream that goes silent after the first chunk fails on the idle timeout", async () => {
+    mock.chat = () => ({ __drip: events(["par", "tial"]).slice(0, 3), everyMs: 20, after: "hang" });
+    const p = new OllamaProvider(base, tmo(5_000), { idleTimeoutMs: 200 });
+    const t0 = Date.now();
     const deltas: string[] = [];
     const err = await p.chat({ ...req, onDelta: (d) => deltas.push(d) }).catch((e) => e);
     expect(err).toMatchObject({ code: "ollama_timeout" });
-    expect(err.hint).toMatch(/REWIRE_OLLAMA_TIMEOUT_S/);
+    expect(err.message).toMatch(/no output for 200ms/);
+    expect(Date.now() - t0).toBeLessThan(2_000);
     expect(deltas).toEqual(["par", "tial"]);
+  });
+  test("silence before the first chunk, past the idle limit but within the reply timeout, is fine", async () => {
+    // The whole reply arrives in one write after 400 ms: longer than the 100 ms idle limit, within
+    // the 2 s reply timeout. Idle applies only once the reply has started.
+    mock.chat = () => ({ __drip: [`${events(["ok"]).join("")}data: [DONE]\n\n`], everyMs: 400 });
+    const p = new OllamaProvider(base, tmo(2_000), { idleTimeoutMs: 100 });
+    const r = await p.chat({ ...req, onDelta: () => {} });
+    expect(r.message.text).toBe("ok");
+  });
+  test("thinking-only and tool-call-only chunks reset the idle timer", async () => {
+    const chunk = (delta: unknown, finish_reason: string | null = null) =>
+      `data: ${JSON.stringify({
+        id: "c",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "m",
+        choices: [{ index: 0, delta, finish_reason }],
+      })}\n\n`;
+    const thinking = Array.from({ length: 6 }, () => chunk({ reasoning: "hmm" }));
+    const tool = [
+      chunk({
+        tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "echo" } }],
+      }),
+      ...Array.from({ length: 5 }, () =>
+        chunk({ tool_calls: [{ index: 0, function: { arguments: " " } }] }),
+      ),
+      chunk({ tool_calls: [{ index: 0, function: { arguments: "{}" } }] }),
+    ];
+    // 13 chunks 50 ms apart (650 ms, over three idle limits), none with text until the last.
+    mock.chat = () => ({
+      __drip: [...thinking, ...tool, chunk({ content: "done" }, "tool_calls"), "data: [DONE]\n\n"],
+      everyMs: 50,
+    });
+    const p = new OllamaProvider(base, tmo(5_000), { idleTimeoutMs: 200 });
+    const r = await p.chat({ ...req, onDelta: () => {} });
+    expect(r.message.text).toBe("done");
+    expect(r.message.toolCalls.map((c) => c.name)).toEqual(["echo"]);
+  });
+  test("no first chunk within the reply timeout is ollama_timeout with the first-chunk message", async () => {
+    mock.chat = () => ({ __sse: "", after: "hang" });
+    const p = new OllamaProvider(base, tmo(200), { idleTimeoutMs: 5_000 });
+    const err = await p.chat({ ...req, onDelta: () => {} }).catch((e) => e);
+    expect(err).toMatchObject({ code: "ollama_timeout" });
+    expect(err.message).toMatch(/no output within 200ms/);
+    expect(err.message).not.toMatch(/no output for/);
+    expect(err.hint).toMatch(/REWIRE_OLLAMA_TIMEOUT_S/);
+  });
+  test("caller abort mid-stream still aborts while chunks flow", async () => {
+    const text = Array.from({ length: 40 }, (_, i) => `w${i}`);
+    mock.chat = () => ({ __drip: events(text), everyMs: 30 });
+    const ac = new AbortController();
+    const p = new OllamaProvider(base, tmo(5_000), { idleTimeoutMs: 5_000 });
+    let n = 0;
+    const err = await p
+      .chat({
+        ...req,
+        signal: ac.signal,
+        onDelta: () => {
+          if (++n === 3) ac.abort();
+        },
+      })
+      .catch((e) => e);
+    expect(err).toMatchObject({ code: "provider_aborted" });
   });
   test("caller abort mid-stream is provider_aborted", async () => {
     mock.chat = () => ({ __sse: partial(), after: "hang" });
@@ -617,6 +782,16 @@ describe("assertRoleFit", () => {
     await fit("reviewer");
     expect(chats()).toBe(2);
     expect((await readCache())["sha256:abc:reviewer"].ok).toBe(true);
+  });
+  test("the smoke test's provider takes the resolved ollama timeout", async () => {
+    mock.chat = () => "hang";
+    const err = await assertRoleFit(ref, "reviewer", cache, {
+      baseUrl: base,
+      ollamaTimeout: { ms: 150, source: "models.toml" },
+    }).catch((e) => e);
+    expect(err).toMatchObject({ code: "ollama_timeout" });
+    expect(err.message).toMatch(/timed out after 150ms/);
+    expect(err.message).toMatch(/models\.toml/);
   });
   test("chat timeout is not cached and has a distinct message", async () => {
     mock.chat = () => "hang";

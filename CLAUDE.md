@@ -65,7 +65,7 @@ Package dependency direction, from bottom to top: `core`, then `policy` and `pro
   - `registry.ts` resolves `models.toml` or env auto-detection.
   - `family.ts` decides model families. Reviewer and verifier are chosen cross-family from the implementer when possible.
   - `fitness.ts` probes models.
-  - Ollama serves one request at a time per model, and the reply timeout is `REWIRE_OLLAMA_TIMEOUT_S`.
+  - Ollama serves one request at a time per model. The reply timeout is `REWIRE_OLLAMA_TIMEOUT_S`, else `[providers.ollama] timeout_s` in models.toml, else 900 s (`resolveOllamaTimeout` says which). A streamed reply gets it only until its first chunk, then a 120 s idle timeout (design decision #37).
   - Streaming is opt-in via `onDelta`. Without it a provider sends the same non-streamed request as before; only the TUI chat passes it (design decision #33).
 - **`sandbox`** (TS) wraps **`crates/rewire-sandbox`** (Rust). All agent writes and command execution go through it: bubblewrap on Linux, `sandbox-exec` profiles on macOS.
   - The CLI's binary lookup order (`REWIRE_SANDBOX_BIN`, then the checkout's `target/`, then the sha256-pinned `sheperd-<os>-<arch>` package, then `PATH`) is security-relevant and documented in the README. Keep the two in sync.
