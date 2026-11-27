@@ -16,6 +16,7 @@ export {
   type SessionFactory,
   type SkillsInfo,
   STALE_PROMPT,
+  sessionNotices,
   TRUSTED_LATER,
 } from "./app.js";
 export { CommandMenu, menuItems, menuQuery, menuWindow, POPUP_ROWS } from "./command-menu.js";
@@ -32,6 +33,18 @@ export {
   literalText,
   parseCommand,
 } from "./commands.js";
+export {
+  COMPACT_CANCELLED,
+  ContextBody,
+  type ContextInfo,
+  ContextPanel,
+  compactionEntries,
+  contextLines,
+  INDEPENDENCE_NOTICE,
+  type LastCompaction,
+  lastCompactionOf,
+  recordCounts,
+} from "./compaction-view.js";
 export {
   type AtToken,
   atToken,
@@ -65,8 +78,29 @@ export {
 export { cleanForMarkdown, Markdown } from "./markdown.js";
 export { Safe } from "./safe.js";
 export { sanitize } from "./sanitize.js";
-export { formatTokens, SPINNER_GLYPHS, SPINNER_VERBS, Spinner } from "./spinner.js";
-export { SHORTCUTS_HINT, StatusLine, type StatusParts, statusText } from "./status-line.js";
+export {
+  COMPACTING_VERB,
+  ESC_CANCEL,
+  ESC_INTERRUPT,
+  formatTokens,
+  SPINNER_GLYPHS,
+  SPINNER_VERBS,
+  Spinner,
+} from "./spinner.js";
+export {
+  CTX_ALERT,
+  CTX_WARN,
+  type CtxStatus,
+  ctxLevel,
+  kTokens,
+  REASON_INITIAL,
+  SHORTCUTS_HINT,
+  type StatusLayout,
+  StatusLine,
+  type StatusParts,
+  statusLayout,
+  statusText,
+} from "./status-line.js";
 export { theme } from "./theme.js";
 export {
   EntryLine,

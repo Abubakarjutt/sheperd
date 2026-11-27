@@ -513,3 +513,86 @@ describe("xdgDirs", () => {
     });
   });
 });
+
+describe("chatSessions: every TUI session gets compactionDeps (Task 7)", () => {
+  test("the first session, /clear and /resume are built with the routing, config, a shared estimator and the window", async () => {
+    const { mkdtemp, realpath, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { resolveRouting, defaultCompactionConfig } = await import("@rewire/pipeline");
+    const { DEFAULT_POLICY } = await import("@rewire/policy");
+    const { FauxProvider } = await import("@rewire/providers");
+    const { SessionStore } = await import("@rewire/session");
+    const { chatSessions } = await import("../src/tui.js");
+    type Deps = Awaited<ReturnType<typeof import("@rewire/session").compactionDeps>>;
+    type Args = Parameters<typeof import("@rewire/session").compactionDeps>[0];
+
+    const repo = await realpath(await mkdtemp(join(tmpdir(), "rewire-cli-compaction-")));
+    try {
+      const store = new SessionStore();
+      const stored = await store.create(repo);
+      const routing = resolveRouting([{ provider: "faux", model: "chat" }]);
+      const providers = () => new FauxProvider([]);
+      const config = { ...defaultCompactionConfig(), latencyBudgetS: 42 };
+      const calls: Args[] = [];
+      const buildCompaction = async (a: Args): Promise<Deps> => {
+        calls.push(a);
+        return {
+          window: { window: 9000, source: "model", provisional: true },
+          config: a.config,
+          estimator: a.estimator,
+          verifier: async (ops) => ops.map(() => ({ accept: true })),
+          independence: a.routing.independence,
+        };
+      };
+      const env = { REWIRE_FAUX_WINDOW: "9000" };
+      const newSession = chatSessions({
+        repo,
+        routing,
+        providers,
+        policy: DEFAULT_POLICY,
+        store,
+        compaction: config,
+        windowOptions: { env },
+        buildCompaction,
+      });
+      const built: ChatSession[] = [];
+      const views: (string | undefined)[] = [];
+      const f = fakeDeps({
+        newSession: async (o) => {
+          const s = await newSession(o);
+          built.push(s);
+          return s;
+        },
+        listSessions: async () => [{ id: stored, title: "x", updatedAt: new Date() }],
+        render: async (d) => {
+          await d.sessions?.create();
+          await d.sessions?.resume(stored);
+          // Each session has compaction on, with routing's independence (single model:
+          // same-family). Checked while they are alive (exit disposes them).
+          for (const s of built) views.push(s.compactionView()?.independence);
+          return 0;
+        },
+      });
+      await startInteractive(f.deps);
+      expect(built).toHaveLength(3);
+      expect(calls).toHaveLength(3);
+      for (const c of calls) {
+        expect(c.routing).toBe(routing);
+        expect(c.config).toBe(config);
+        expect(c.windowOptions).toEqual({ env });
+        // The Ollama probes must not hold the UI: a 2-3 s cap, then the provisional default.
+        expect(c.windowTimeoutMs).toBeGreaterThanOrEqual(2000);
+        expect(c.windowTimeoutMs).toBeLessThanOrEqual(3000);
+        expect(typeof c.providers).toBe("function");
+      }
+      // One estimator for the chat model, shared by its sessions.
+      expect(calls[1]?.estimator).toBe(calls[0]?.estimator);
+      expect(calls[2]?.estimator).toBe(calls[0]?.estimator);
+      expect(views).toEqual(["same-family", "same-family", "same-family"]);
+      expect(built[2]?.id()).toBe(stored);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+});

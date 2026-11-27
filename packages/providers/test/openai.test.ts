@@ -307,3 +307,91 @@ describe("openai streaming (onDelta)", () => {
     expect(err.message).toMatch(/render blew up/);
   });
 });
+
+describe("openai onFirstChunk", () => {
+  const req: ChatRequest = {
+    model: "m",
+    system: "s",
+    messages: [{ role: "user", content: "hi" }],
+    maxTokens: 9,
+  };
+  const usage = { prompt_tokens: 11, completion_tokens: 7 };
+  const mk = (reply: (body: Record<string, unknown>) => FetchReply) => {
+    const f = scriptedFetch(reply);
+    const client = new OpenAI({ apiKey: "sk-test", fetch: f.fetch, maxRetries: 0 });
+    return { provider: new OpenAIProvider("sk-test", client), bodies: f.bodies };
+  };
+  // A thinking model streams reasoning before any text.
+  const reasoningFirst = {
+    id: "c",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "m",
+    choices: [{ index: 0, delta: { reasoning: "thinking..." }, finish_reason: null }],
+  };
+
+  test("fires once, on a reasoning-only first chunk, before any text", async () => {
+    const { provider } = mk(() => ({
+      sse: openaiSSE([
+        reasoningFirst,
+        ...openaiChunks({ text: ["Hi", "!"], finish: "stop", usage }),
+      ]),
+    }));
+    const order: string[] = [];
+    const r = await provider.chat({
+      ...req,
+      onFirstChunk: () => order.push("first"),
+      onDelta: (d) => order.push(d),
+    });
+    expect(order).toEqual(["first", "Hi", "!"]);
+    expect(r.message.text).toBe("Hi!");
+  });
+
+  test("fires on a tool-call-only stream", async () => {
+    const { provider } = mk(() => ({
+      sse: openaiSSE(
+        openaiChunks({
+          toolCalls: [{ id: "a", name: "t", argPieces: ["{}"] }],
+          finish: "tool_calls",
+          usage,
+        }).slice(1),
+      ),
+    }));
+    let n = 0;
+    await provider.chat({ ...req, onFirstChunk: () => n++, onDelta: () => {} });
+    expect(n).toBe(1);
+  });
+
+  test("never fires without onDelta, and leaves both request bodies unchanged", async () => {
+    const { provider, bodies } = mk((b) =>
+      b.stream
+        ? { sse: openaiSSE(openaiChunks({ text: ["x"], finish: "stop", usage })) }
+        : { json: { choices: [{ finish_reason: "stop", message: { content: "x" } }], usage } },
+    );
+    let n = 0;
+    await provider.chat({ ...req, onFirstChunk: () => n++ });
+    expect(n).toBe(0);
+    expect(bodies[0]).toEqual(JSON.parse(JSON.stringify(toOpenAIParams(req))));
+    await provider.chat({ ...req, onDelta: () => {} });
+    await provider.chat({ ...req, onDelta: () => {}, onFirstChunk: () => n++ });
+    expect(bodies[2]).toEqual(bodies[1]);
+    expect(n).toBe(1);
+  });
+
+  test("a throw from onFirstChunk propagates as provider_stream_callback_failed", async () => {
+    const { provider } = mk(() => ({
+      sse: openaiSSE(openaiChunks({ text: ["x"], finish: "stop", usage })),
+    }));
+    const err = await provider
+      .chat({
+        ...req,
+        onDelta: () => {},
+        onFirstChunk: () => {
+          throw new Error("boom");
+        },
+      })
+      .catch((e) => e);
+    expect(err).toMatchObject({ code: "provider_stream_callback_failed" });
+    expect(String(err.message)).toMatch(/onFirstChunk.*boom/);
+  });
+});

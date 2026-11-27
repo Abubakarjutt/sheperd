@@ -1,7 +1,7 @@
 import type { ChatEvent } from "@rewire/session";
 import { Box, useInput } from "ink";
 import { cleanForMarkdown, lex, Markdown } from "./markdown.js";
-import { Spinner } from "./spinner.js";
+import { COMPACTING_VERB, Spinner } from "./spinner.js";
 import { EntryLine, ToolLine, type TranscriptEntry } from "./transcript.js";
 import { useColumns } from "./use-columns.js";
 
@@ -41,6 +41,10 @@ export type LiveState = {
   shownText: boolean;
   verb: string;
   startedAt: number;
+  /** Set while a compaction runs (its start time): the spinner says `Compacting context…`. */
+  compacting?: number;
+  /** The spinner's Esc hint (default `esc to interrupt`). */
+  hint?: string;
 };
 
 /** Minimum interval between re-renders of the live area (global performance rule). */
@@ -100,6 +104,10 @@ export function applyEvent(s: LiveState, e: ChatEvent): LiveState {
     }
     case "skill_loaded":
       return { ...s, items: [...s.items, { kind: "skill", name: e.name }] };
+    case "compaction":
+      if (e.phase === "start") return { ...s, compacting: Date.now() };
+      if (s.compacting === undefined) return s;
+      return withoutCompacting(s);
     case "usage": {
       // One usage event per model call: its text is complete, so a later call's text (even with
       // no tool in between) starts a new paragraph, and the estimate gives way to the count.
@@ -115,6 +123,11 @@ export function applyEvent(s: LiveState, e: ChatEvent): LiveState {
       // assistant_text: the streamed deltas (or the turn's final text) already carry it.
       return s;
   }
+}
+
+function withoutCompacting(s: LiveState): LiveState {
+  const { compacting: _c, ...rest } = s;
+  return rest;
 }
 
 /** Output tokens to show: the reported count plus ~chars/4 for the call still streaming. */
@@ -292,7 +305,21 @@ export function LiveTurn({ state, onInterrupt, interruptible, maxRows }: LiveTur
           ))}
         </Box>
       ) : null}
-      <Spinner verb={state.verb} startedAt={state.startedAt} {...liveTokens(state)} />
+      {state.compacting !== undefined ? (
+        <Spinner
+          verb={COMPACTING_VERB}
+          startedAt={state.compacting}
+          tokens={0}
+          {...(state.hint !== undefined ? { hint: state.hint } : {})}
+        />
+      ) : (
+        <Spinner
+          verb={state.verb}
+          startedAt={state.startedAt}
+          {...liveTokens(state)}
+          {...(state.hint !== undefined ? { hint: state.hint } : {})}
+        />
+      )}
     </Box>
   );
 }

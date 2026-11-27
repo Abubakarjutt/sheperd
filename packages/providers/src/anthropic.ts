@@ -125,10 +125,28 @@ export class AnthropicProvider implements Provider {
           req.signal ? { signal: req.signal } : undefined,
         );
         const onDelta = req.onDelta;
+        const onFirstChunk = req.onFirstChunk;
         let callbackError: RewireError | undefined;
         let stopped = false;
+        let first = true;
         stream.on("streamEvent", (event) => {
           if (event.type === "message_stop") stopped = true;
+          // The first content event of any kind (thinking and tool_use included); message_start
+          // is only the envelope and arrives before the prompt is read.
+          if (
+            first &&
+            (event.type === "content_block_start" || event.type === "content_block_delta")
+          ) {
+            first = false;
+            if (onFirstChunk && !callbackError) {
+              try {
+                onFirstChunk();
+              } catch (err) {
+                callbackError = streamCallbackFailed(err, "onFirstChunk");
+                stream.abort();
+              }
+            }
+          }
         });
         stream.on("text", (delta) => {
           if (callbackError) return;

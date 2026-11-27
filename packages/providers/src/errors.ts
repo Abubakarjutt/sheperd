@@ -48,10 +48,13 @@ function scrub(s: string, apiKey?: string): string {
     .slice(0, 500);
 }
 
-/** A throw from the caller's `onDelta` stream callback: surfaced as-is, never as a transport error. */
-export function streamCallbackFailed(err: unknown): RewireError {
+/**
+ * A throw from one of the caller's stream callbacks (`onDelta`, `onFirstChunk`): surfaced as-is,
+ * never as a transport error.
+ */
+export function streamCallbackFailed(err: unknown, callback = "onDelta"): RewireError {
   return new RewireError(
     "provider_stream_callback_failed",
-    `the onDelta stream callback threw: ${err instanceof Error ? err.message : String(err)}`,
+    `the ${callback} stream callback threw: ${err instanceof Error ? err.message : String(err)}`,
   );
 }

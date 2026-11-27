@@ -3,6 +3,8 @@ import { type CheckpointKind, RewireError, redact } from "@rewire/core";
 import {
   type ChatEvent,
   type ChatSession,
+  type CompactionView,
+  type ContextStatus,
   outcomeMessage,
   type PendingPrompt,
   PROPOSAL_NOTE,
@@ -12,7 +14,7 @@ import {
   TURN_LIMIT_NOTE,
 } from "@rewire/session";
 import type { Skill } from "@rewire/skills";
-import { Box } from "ink";
+import { Box, type DOMElement, measureElement } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type RunDone, RunView } from "./board-view.js";
 import { STALE_PROMPT } from "./checkpoint.js";
@@ -26,6 +28,15 @@ import {
   literalText,
   parseCommand,
 } from "./commands.js";
+import {
+  COMPACT_CANCELLED,
+  type ContextInfo,
+  ContextPanel,
+  compactionEntries,
+  INDEPENDENCE_NOTICE,
+  type LastCompaction,
+  lastCompactionOf,
+} from "./compaction-view.js";
 import { listRepoFiles } from "./files.js";
 import type { HeaderInfo, ModelsInfo } from "./header.js";
 import { InputBox } from "./input.js";
@@ -41,8 +52,8 @@ import {
 } from "./live-turn.js";
 import { ClarifyPanel, ProposalCard } from "./proposal.js";
 import { sanitize } from "./sanitize.js";
-import { pickVerb } from "./spinner.js";
-import { StatusLine } from "./status-line.js";
+import { COMPACTING_VERB, ESC_CANCEL, pickVerb } from "./spinner.js";
+import { type CtxStatus, StatusLine } from "./status-line.js";
 import { Transcript, type TranscriptEntry } from "./transcript.js";
 import { TrustPrompt } from "./trust-prompt.js";
 import { useRows } from "./use-columns.js";
@@ -165,6 +176,26 @@ function skillsText(s: SkillsInfo | undefined, trustedLater: boolean): string {
   return lines.join("\n");
 }
 
+/** `contextStatus()`, or undefined (compaction off, or a session without it). Never throws. */
+async function statusOf(s: ChatSession): Promise<ContextStatus | undefined> {
+  if (typeof s.contextStatus !== "function") return undefined;
+  try {
+    return await s.contextStatus();
+  } catch {
+    return undefined; // disposed meanwhile: the next session refreshes it
+  }
+}
+
+const viewOf = (s: ChatSession): CompactionView | undefined =>
+  typeof s.compactionView === "function" ? s.compactionView() : undefined;
+
+/** Startup lines of a session: the independence notice when its verifier shares chat's family. */
+export function sessionNotices(s: ChatSession): TranscriptEntry[] {
+  return viewOf(s)?.independence === "same-family"
+    ? [{ kind: "line", tone: "dim", text: INDEPENDENCE_NOTICE }]
+    : [];
+}
+
 type Clarify = { prompt: Extract<PendingPrompt, { kind: "clarify" }>; answers: string[] };
 
 /** `contract,tests` (in the canonical order), or `off`. */
@@ -226,6 +257,7 @@ export function App(props: AppProps) {
   const [entries, setEntries] = useState<TranscriptEntry[]>(() => [
     headerEntry(),
     ...(props.warnings ?? []).map((text): TranscriptEntry => ({ kind: "note", text })),
+    ...sessionNotices(props.session),
     ...historyEntries(props.session),
   ]);
   /** Bumped on every session swap: a fresh `<Static>` region for the new transcript (I3). */
@@ -254,6 +286,39 @@ export function App(props: AppProps) {
   const [trustOpen, setTrustOpen] = useState(false);
   /** Context size: the last chat model call's input plus output tokens; none before the first. */
   const [context, setContext] = useState<number | undefined>(undefined);
+  /** With compaction: the estimate against the limit (`contextStatus()`), for the status line. */
+  const [ctx, setCtx] = useState<CtxStatus | undefined>(undefined);
+  /** The `/context` card while open. */
+  const [contextInfo, setContextInfo] = useState<ContextInfo | undefined>(undefined);
+  /** This session's last compaction result, for `/context`. */
+  const lastCompaction = useRef<LastCompaction | undefined>(undefined);
+  /** The Ollama truncation hint was shown (once). */
+  const truncationShown = useRef(false);
+  /** Bumped on every session swap: a status read for the old session is dropped. */
+  const sessionGen = useRef(0);
+  /** Bumped by every status read: only the newest one may set the status line. */
+  const statusRead = useRef(0);
+  const refreshStatus = useCallback(() => {
+    const gen = sessionGen.current;
+    const read = ++statusRead.current;
+    void statusOf(sessionRef.current).then((st) => {
+      if (gen !== sessionGen.current || read !== statusRead.current) return;
+      setCtx(
+        st === undefined
+          ? undefined
+          : {
+              estimate: st.estimate,
+              limit: st.limit.limit,
+              reason: st.limit.reason,
+              ...(st.hold ? { hold: st.hold } : {}),
+            },
+      );
+    });
+  }, []);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: once, for the first session
+  useEffect(() => {
+    refreshStatus();
+  }, []);
   /** The active run's stage, from its board (status line). */
   const [stage, setStage] = useState<string | undefined>(undefined);
   const [trustedLater, setTrustedLater] = useState(false);
@@ -299,6 +364,20 @@ export function App(props: AppProps) {
   }, []);
   useEffect(() => () => clearTimeout(liveTimer.current), []);
   const rows = useRows();
+  /**
+   * The rows of the dynamic frame around the `/context` card (the run board and clarify panel
+   * above it, the input and status line below), measured after each render so the card is
+   * sized to what is left of the terminal.
+   */
+  const aboveRef = useRef<DOMElement>(null);
+  const belowRef = useRef<DOMElement>(null);
+  const [around, setAround] = useState(0);
+  useEffect(() => {
+    const h = (r: { current: DOMElement | null }): number =>
+      r.current ? measureElement(r.current).height : 0;
+    const next = h(aboveRef) + h(belowRef);
+    if (next !== around) setAround(next);
+  });
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: bound once; the target reads refs
   useEffect(() => {
@@ -342,6 +421,25 @@ export function App(props: AppProps) {
   useEffect(() => {
     if (!subscribe) return;
     return subscribe((e) => {
+      // Compaction results and the truncation hint are lines of their own: shown whenever they
+      // arrive (a `/compact` runs outside a chat turn).
+      if (e.type === "truncation_suspected") {
+        if (truncationShown.current) return;
+        truncationShown.current = true;
+        setEntries((cur) => [...cur, { kind: "line", tone: "warn", text: `⎿ ${e.hint}` }]);
+        return;
+      }
+      if (e.type === "compaction" && e.phase !== "start") {
+        const last = lastCompactionOf(e);
+        if (last) lastCompaction.current = last;
+        if (liveRef.current) liveRef.current = applyEvent(liveRef.current, e);
+        const lines = compactionEntries(e);
+        // What the live area finished goes first, then the result, in arrival order.
+        flushLive();
+        if (lines.length > 0) setEntries((cur) => [...cur, ...lines]);
+        refreshStatus();
+        return;
+      }
       // Chat events belong to the turn live when they arrive. With none live (a late event of a
       // turn that already ended or was interrupted) they are dropped (M4): printed now, they
       // would land after the turn's last line, without their context.
@@ -358,7 +456,7 @@ export function App(props: AppProps) {
       if (e.type === "assistant_delta" || e.type === "tool_call") scheduleLive();
       else flushLive();
     });
-  }, [subscribe, scheduleLive, flushLive]);
+  }, [subscribe, scheduleLive, flushLive, refreshStatus]);
 
   /** Runs `work` with the input busy; one at a time (chat turns, session swaps). */
   const exclusive = useCallback((work: () => Promise<void>) => {
@@ -395,10 +493,56 @@ export function App(props: AppProps) {
           add(...rest, ac.signal.aborted ? { kind: "note", text: INTERRUPTED } : errorEntry(err));
         } finally {
           if (turnAbort.current === ac) turnAbort.current = undefined;
+          refreshStatus();
         }
       }),
-    [exclusive, add, note, endLive],
+    [exclusive, add, note, endLive, refreshStatus],
   );
+
+  /** `/compact [focus]`: the live area shows the spinner; Esc (or Ctrl-C) cancels it. */
+  const compactNow = useCallback(
+    (focus: string | undefined) => {
+      if (typeof sessionRef.current.compact !== "function") {
+        return note("compaction is not available here", true);
+      }
+      exclusive(async () => {
+        const ac = new AbortController();
+        turnAbort.current = ac;
+        liveRef.current = { ...newLive(COMPACTING_VERB, Date.now()), hint: ESC_CANCEL };
+        setLive(liveRef.current);
+        try {
+          const out = await sessionRef.current.compact(focus, ac.signal);
+          const { rest } = endLive();
+          // A result that arrived before a late Esc stands: only an aborted outcome is a cancel.
+          const cancelled = !out.ok && out.reason === "aborted";
+          add(...rest, ...(cancelled ? [{ kind: "note", text: COMPACT_CANCELLED } as const] : []));
+        } catch (err) {
+          const { rest } = endLive();
+          add(
+            ...rest,
+            ac.signal.aborted ? { kind: "note", text: COMPACT_CANCELLED } : errorEntry(err),
+          );
+        } finally {
+          if (turnAbort.current === ac) turnAbort.current = undefined;
+          refreshStatus();
+        }
+      });
+    },
+    [exclusive, add, note, endLive, refreshStatus],
+  );
+
+  /** `/context`: the card, from the session's status now (display-only, also during a run). */
+  const showContext = useCallback(() => {
+    const s = sessionRef.current;
+    const gen = sessionGen.current;
+    const view = viewOf(s);
+    if (view === undefined) return note("compaction is not configured for this session");
+    void statusOf(s).then((status) => {
+      if (gen !== sessionGen.current) return;
+      if (status === undefined) return note("the context status is not available now", true);
+      setContextInfo({ status, view, last: lastCompaction.current });
+    });
+  }, [note]);
 
   const startRun = useCallback(
     (task: string) => {
@@ -430,10 +574,16 @@ export function App(props: AppProps) {
           setEntries([
             { kind: "note", text: `${SEPARATOR} ${label} ${SEPARATOR}` },
             headerEntry(),
+            ...sessionNotices(next),
             ...entriesOf(next),
           ]);
           setRegion((r) => r + 1);
           setContext(undefined);
+          sessionGen.current++;
+          lastCompaction.current = undefined;
+          setContextInfo(undefined);
+          setCtx(undefined);
+          refreshStatus();
           resetFiles(); // `/clear` and `/resume` list the repo afresh
           // The new session re-resolved the skills: a trust given earlier is now in effect.
           setTrustedLater(false);
@@ -442,7 +592,7 @@ export function App(props: AppProps) {
           add(errorEntry(err));
         }
       }),
-    [exclusive, add, headerEntry, resetFiles],
+    [exclusive, add, headerEntry, resetFiles, refreshStatus],
   );
 
   const resume = useCallback(
@@ -507,6 +657,10 @@ export function App(props: AppProps) {
             () => [],
             "new session",
           );
+        case "compact":
+          return compactNow(c.focus);
+        case "context":
+          return showContext();
         case "doctor":
           if (!doctor) return note("doctor is not available here", true);
           doctor().then(
@@ -539,6 +693,8 @@ export function App(props: AppProps) {
       onExit,
       note,
       add,
+      compactNow,
+      showContext,
     ],
   );
 
@@ -611,26 +767,32 @@ export function App(props: AppProps) {
     turnAbort.current?.abort();
   }, []);
   const trustSkills = trustOpen ? skillsNow() : undefined;
-  const inputOff =
-    proposal !== undefined || trustOpen || (run !== undefined && pending?.kind === "checkpoint");
+  const checkpointOpen = run !== undefined && pending?.kind === "checkpoint";
+  // A checkpoint owns the keys: the /context card gives way to it.
+  const contextOpen = contextInfo !== undefined && !checkpointOpen;
+  const inputOff = proposal !== undefined || trustOpen || checkpointOpen || contextOpen;
   const mode =
     run !== undefined && pending?.kind === "checkpoint"
       ? `checkpoint: ${pending.checkpoint.kind}`
       : run !== undefined
         ? `run: ${stage ?? "starting"}`
         : live !== undefined
-          ? "thinking"
+          ? live.compacting !== undefined
+            ? "compacting"
+            : "thinking"
           : "chat";
 
   return (
     <Box flexDirection="column">
       <Transcript entries={entries} region={region} />
-      {run ? (
-        <RunView run={run} onDone={onRunDone} onPending={onPending} onStage={setStage} />
-      ) : null}
-      {clarify ? (
-        <ClarifyPanel questions={clarify.prompt.questions} index={clarify.answers.length} />
-      ) : null}
+      <Box ref={aboveRef} flexDirection="column">
+        {run ? (
+          <RunView run={run} onDone={onRunDone} onPending={onPending} onStage={setStage} />
+        ) : null}
+        {clarify ? (
+          <ClarifyPanel questions={clarify.prompt.questions} index={clarify.answers.length} />
+        ) : null}
+      </Box>
       {proposal !== undefined ? <ProposalCard task={proposal} onAnswer={onProposal} /> : null}
       {trustOpen && trustSkills ? (
         <TrustPrompt
@@ -641,33 +803,46 @@ export function App(props: AppProps) {
           onDone={onTrust}
         />
       ) : null}
+      {contextOpen && contextInfo ? (
+        <ContextPanel
+          info={contextInfo}
+          onClose={() => setContextInfo(undefined)}
+          isActive={contextOpen}
+          reserved={around}
+        />
+      ) : null}
       {live ? (
         <LiveTurn
           state={live}
           onInterrupt={abortTurn}
-          interruptible={run === undefined && proposal === undefined && !trustOpen && !popup}
+          interruptible={
+            run === undefined && proposal === undefined && !trustOpen && !popup && !contextOpen
+          }
           maxRows={rows - LIVE_RESERVED_ROWS}
         />
       ) : null}
-      <InputBox
-        busy={busy}
-        disabled={inputOff || live !== undefined}
-        // A clarification answer is free text: `?` types there.
-        helpKey={clarify === undefined}
-        // ...and so do `/` and `@`: no command menu or file picker there.
-        popups={clarify === undefined}
-        onSubmit={submit}
-        inRun={run !== undefined}
-        files={files}
-        onWantFiles={wantFiles}
-        onPopup={setPopup}
-      />
-      <StatusLine
-        model={models?.chat}
-        context={context}
-        checkpoints={checkpointsShort(checkpoints)}
-        mode={mode}
-      />
+      <Box ref={belowRef} flexDirection="column">
+        <InputBox
+          busy={busy}
+          disabled={inputOff || live !== undefined}
+          // A clarification answer is free text: `?` types there.
+          helpKey={clarify === undefined}
+          // ...and so do `/` and `@`: no command menu or file picker there.
+          popups={clarify === undefined}
+          onSubmit={submit}
+          inRun={run !== undefined}
+          files={files}
+          onWantFiles={wantFiles}
+          onPopup={setPopup}
+        />
+        <StatusLine
+          model={models?.chat}
+          context={context}
+          ctx={ctx}
+          checkpoints={checkpointsShort(checkpoints)}
+          mode={mode}
+        />
+      </Box>
     </Box>
   );
 }

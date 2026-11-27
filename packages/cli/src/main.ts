@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
+import { CALIBRATE_USAGE, calibrateCommand } from "./calibrate.js";
 import { runDoctor } from "./doctor.js";
 import { isInteractive, tuiRequiresTty } from "./interactive.js";
 import { effectivePlatform, isSupported, PLATFORM_MESSAGE } from "./platform.js";
@@ -13,6 +14,7 @@ const USAGE = `usage:
   rewire run <task> [--repo <path>] [--models <file>] [--headless]
   rewire run --task-file <path> [--repo <path>] [--models <file>] [--headless]
   rewire doctor [--models <file>]
+  rewire calibrate <provider:model> [--max <tokens>] [--yes] [--models <file>] [--fresh]
 `;
 
 async function drain(): Promise<void> {
@@ -33,6 +35,7 @@ async function main(argv: string[]): Promise<number> {
     return command === undefined ? 1 : 0;
   }
   if (command === "chat") return await chat(rest);
+  if (command === "calibrate") return await calibrate(rest);
   if (command !== "run" && command !== "doctor") {
     process.stderr.write(`unknown command: ${JSON.stringify(command.slice(0, 40))}\n${USAGE}`);
     return 1;
@@ -88,6 +91,59 @@ async function main(argv: string[]): Promise<number> {
   } catch (e) {
     if (e instanceof Error && (e as NodeJS.ErrnoException).code?.startsWith("ERR_PARSE_ARGS")) {
       process.stderr.write(`${oneLine(e.message, 300)}\n${USAGE}`);
+      return 1;
+    }
+    process.stderr.write(`${formatError(e)}\n`);
+    return 1;
+  }
+}
+
+/** `rewire calibrate`: first Ctrl-C stops after the lengths already recorded (exit 130), the second force-quits. */
+async function calibrate(args: string[]): Promise<number> {
+  try {
+    const { values, positionals } = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        max: { type: "string" },
+        models: { type: "string" },
+        yes: { type: "boolean", default: false },
+        fresh: { type: "boolean", default: false },
+        help: { type: "boolean", short: "h", default: false },
+      },
+    });
+    if (values.help === true) {
+      process.stdout.write(CALIBRATE_USAGE);
+      return 0;
+    }
+    if (positionals.length !== 1) {
+      process.stderr.write(`usage: rewire calibrate takes exactly one model\n${CALIBRATE_USAGE}`);
+      return 1;
+    }
+    const ac = new AbortController();
+    installSigint({
+      on: (h) => process.on("SIGINT", h),
+      abort: () => ac.abort(),
+      exit: (c) => process.exit(c),
+      notify: () =>
+        process.stderr.write(
+          "interrupted: stopping calibration, completed lengths are kept (Ctrl-C again to force quit)\n",
+        ),
+    });
+    return await calibrateCommand(
+      {
+        model: positionals[0],
+        max: values.max,
+        models: values.models,
+        yes: values.yes === true,
+        fresh: values.fresh === true,
+      },
+      { stdout: process.stdout, stderr: process.stderr, env: process.env, cwd: process.cwd() },
+      ac.signal,
+    );
+  } catch (e) {
+    if (e instanceof Error && (e as NodeJS.ErrnoException).code?.startsWith("ERR_PARSE_ARGS")) {
+      process.stderr.write(`${oneLine(e.message, 300)}\n${CALIBRATE_USAGE}`);
       return 1;
     }
     process.stderr.write(`${formatError(e)}\n`);

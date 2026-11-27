@@ -215,8 +215,15 @@ describe("proposal card", () => {
     const { rc, start } = controller(fakeRun(() => undefined).run);
     const v = mount({ session, runController: rc });
     await enter(v.stdin, "go");
-    v.stdin.write("n");
-    await tick(80);
+    // Wait for the card, then press n until it is gone (a key sent before the card's input
+    // handler attaches is lost on a slow CI runner).
+    for (let i = 0; i < 100 && !(v.lastFrame() ?? "").includes("Run this as a gated task?"); i++)
+      await tick(20);
+    expect(v.lastFrame()).toContain("Run this as a gated task?");
+    for (let i = 0; i < 20 && (v.lastFrame() ?? "").includes("Run this as a gated task?"); i++) {
+      v.stdin.write("n");
+      await tick(80);
+    }
     expect(start).not.toHaveBeenCalled();
     expect(v.lastFrame()).not.toContain("Run this as a gated task?");
   });

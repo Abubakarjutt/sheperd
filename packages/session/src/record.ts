@@ -1,0 +1,507 @@
+import { redact, sanitizeTerminal } from "@rewire/core";
+import type { ChatMessage } from "@rewire/providers";
+import { z } from "zod";
+
+/**
+ * The structured session record: what a compacted chat keeps instead of a lossy summary.
+ *
+ * Items are written by the compactor (Task 4), which cleans every string (sanitize, then redact)
+ * when it applies an operation; `renderRecord` does not sanitize or redact item text again, but
+ * it does collapse every whitespace run (newlines included) to one space, so no value can start
+ * a line and forge a section header or a `[user mN]` line. `observed` is computed by code
+ * (`observe`), never by the model, and cleans and flattens its own entries. The rendered text is
+ * untrusted: the caller fences it (`untrusted_session_record`).
+ */
+
+export const TEXT_MAX = 500;
+export const QUOTE_MAX = 300;
+export const EVIDENCE_MAX = 5;
+export const ACTIVE_ITEMS_MAX = 200;
+export const FILES_MAX = 200;
+export const COMMANDS_MAX = 100;
+export const ERRORS_MAX = 50;
+export const CMD_MAX = 200;
+export const PATH_MAX = 500;
+export const ERROR_MESSAGE_MAX = 300;
+export const RUNS_MAX = 50;
+export const RUN_FIELD_MAX = 200;
+
+/** A stored message's stable id (`m<n>`, assigned by `SessionStore`). */
+export const MessageId = z.string().regex(/^m(?:0|[1-9]\d*)$/);
+
+export const ITEM_KINDS = [
+  "goal",
+  "constraint",
+  "preserve",
+  "decision",
+  "open_question",
+  "preference",
+  "next_step",
+  "note",
+] as const;
+
+export const Evidence = z
+  .object({ messageId: MessageId, quote: z.string().min(1).max(QUOTE_MAX) })
+  .strict();
+
+export const RecordItem = z
+  .object({
+    id: z.string().min(1).max(64),
+    kind: z.enum(ITEM_KINDS),
+    text: z.string().min(1).max(TEXT_MAX),
+    reason: z.string().max(TEXT_MAX).optional(),
+    source: z.enum(["user", "inferred"]),
+    evidence: z.array(Evidence).max(EVIDENCE_MAX).optional(),
+    /**
+     * Set by code on an `inferred` item when no user message supports it (its evidence cites
+     * only tool results or assistant replies, or nothing): rendered `[inferred, not from the
+     * user …]` so it can never pass for the user's own rule.
+     */
+    notFromUser: z.literal(true).optional(),
+    status: z.enum(["active", "resolved", "superseded"]),
+    supersededBy: z.string().min(1).max(64).optional(),
+    createdAt: MessageId,
+    updatedAt: MessageId,
+  })
+  .strict();
+export type RecordItem = z.infer<typeof RecordItem>;
+
+export const Observed = z
+  .object({
+    files: z
+      .array(
+        z
+          .object({
+            path: z.string().max(PATH_MAX),
+            reads: z.number().int().nonnegative(),
+            writes: z.number().int().nonnegative().optional(),
+          })
+          .strict(),
+      )
+      .max(FILES_MAX),
+    commands: z
+      .array(
+        z
+          .object({
+            cmd: z.string().max(CMD_MAX),
+            /** null when the result's exit line was cut off (truncated output). */
+            exit: z.number().int().nullable(),
+            count: z.number().int().positive(),
+          })
+          .strict(),
+      )
+      .max(COMMANDS_MAX),
+    runs: z
+      .array(
+        z
+          .object({
+            runId: z.string().max(RUN_FIELD_MAX),
+            status: z.string().max(RUN_FIELD_MAX),
+            reportPath: z.string().max(RUN_FIELD_MAX),
+          })
+          .strict(),
+      )
+      .max(RUNS_MAX),
+    errors: z
+      .array(
+        z.object({ tool: z.string().max(64), message: z.string().max(ERROR_MESSAGE_MAX) }).strict(),
+      )
+      .max(ERRORS_MAX),
+  })
+  .strict();
+export type Observed = z.infer<typeof Observed>;
+export type ObservedRun = Observed["runs"][number];
+
+/** At most this many pending citations. */
+export const PENDING_MAX = 50;
+/** How many further compactions a pending citation stays citable. */
+export const PENDING_COMPACTIONS = 3;
+
+/**
+ * A user message an op cited that was rejected for a reason other than a failed authority check
+ * (a verifier reject, `duplicate_target`, `verification_budget`, …). It stays citable for user
+ * authority for `compactionsLeft` more compactions, so a correction is not lost when the window
+ * moves on. Computed by code, never by the model.
+ */
+export const PendingCitation = z
+  .object({
+    messageId: MessageId,
+    compactionsLeft: z.number().int().min(1).max(PENDING_COMPACTIONS),
+  })
+  .strict();
+export type PendingCitation = z.infer<typeof PendingCitation>;
+
+export const SessionRecord = z
+  .object({
+    version: z.literal(1),
+    items: z.array(RecordItem),
+    observed: Observed,
+    /** Resolved and superseded items. Unbounded; never rendered (reachable through recall). */
+    archive: z.array(RecordItem),
+    /** How many compactions produced this record. */
+    compactions: z.number().int().nonnegative(),
+    /** User messages still citable after a rejected op (absent in older records). */
+    pending: z.array(PendingCitation).max(PENDING_MAX).default([]),
+  })
+  .strict()
+  .superRefine((r, ctx) => {
+    const active = r.items.filter((i) => i.status === "active").length;
+    if (active > ACTIVE_ITEMS_MAX) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["items"],
+        message: `at most ${ACTIVE_ITEMS_MAX} active items (got ${active})`,
+      });
+    }
+    const seen = new Set<string>();
+    for (const i of [...r.items, ...r.archive]) {
+      if (seen.has(i.id)) {
+        ctx.addIssue({ code: "custom", path: ["items"], message: `duplicate item id ${i.id}` });
+      }
+      seen.add(i.id);
+    }
+  });
+export type SessionRecord = z.infer<typeof SessionRecord>;
+
+export function emptyRecord(): SessionRecord {
+  return {
+    version: 1,
+    items: [],
+    observed: { files: [], commands: [], runs: [], errors: [] },
+    archive: [],
+    compactions: 0,
+    pending: [],
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// observe
+// ---------------------------------------------------------------------------------------------
+
+/** Collapse every whitespace run (newlines, tabs, CR included) to one space, and trim. */
+export const flatten = (s: string): string => s.replace(/\s+/g, " ").trim();
+
+/** Sanitize, redact (whole text, so multi-line secrets still match), then flatten. */
+const clean = (s: string): string => flatten(redact(sanitizeTerminal(s)));
+
+/** The bash tool's last line (`packages/tools/src/bash.ts`); capOutput keeps the tail. */
+const EXIT_LINE = /(?:^|\n)exit code (-?\d+)$/;
+
+/**
+ * Stored tool results carry no `isError` (the loop keeps only the content), so failures are
+ * recognised by the exact shapes the loop, tools, skills and propose_run produce. Matched on the
+ * first line of the result.
+ */
+const ERROR_FIRST_LINE: RegExp[] = [
+  /^Tool call "[^"]*" was not executed: /, // loop: aborted or truncated arguments
+  /^Unknown tool "/, // loop
+  /^Invalid arguments for tool "/, // loop
+  /^Tool \S+ failed: /, // loop: a tool threw
+  /^rg failed \(exit code /, // grep, find
+  /^\S+ is unavailable: ripgrep/, // grep, find
+  /^(?:path|pattern|glob|command|old_string|content) is required$/, // tools
+  /^command not allowed: /, // bash policy pre-check
+  /^background processes are not allowed: /, // bash
+  / is protected \(rule [^)]*\) in stage /, // tools: path_protected
+  /^unknown skill\. /, // skill
+  /^propose_run needs a non-empty task$/,
+  /^the task is too long \(max /,
+  /^the task contains control characters /,
+  /^a run was already proposed in this turn$/,
+];
+
+/**
+ * `errorResult` shapes (`<snake_case code>: msg` and `error: msg`). Only a one-line result counts:
+ * a multi-line read of a file that starts with `some_key: 1` is file content, not an error. A
+ * one-line file of that exact shape is a known false positive (it only adds an error entry).
+ */
+const ERROR_ONE_LINE = /^(?:error|[a-z][a-z0-9]*(?:_[a-z0-9]+)+): /;
+
+/** The recorded flag when the store has one; the shape heuristic for older files. */
+function isErrorResult(content: string, isError: unknown): boolean {
+  if (typeof isError === "boolean") return isError;
+  const first = content.split("\n", 1)[0] ?? "";
+  if (ERROR_FIRST_LINE.some((re) => re.test(first))) return true;
+  return !content.includes("\n") && ERROR_ONE_LINE.test(content);
+}
+
+const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
+
+/** The path-like argument of a reading tool: read `path`, grep `path` (when given), find `glob`. */
+function pathArg(tool: string, args: Record<string, unknown>): string | undefined {
+  if (tool === "read" || tool === "grep") return str(args.path);
+  if (tool === "find") return str(args.glob);
+  return undefined;
+}
+
+/** Keep the `max` entries touched most recently, in first-seen order. */
+function keepRecent<T>(entries: { value: T; last: number }[], max: number): T[] {
+  if (entries.length <= max) return entries.map((e) => e.value);
+  const cut = [...entries].sort((a, b) => b.last - a.last)[max - 1]?.last ?? 0;
+  return entries.filter((e) => e.last >= cut).map((e) => e.value);
+}
+
+/**
+ * Facts computed by code from stored messages: files read (read/grep/find arguments), bash
+ * commands with their latest exit code and count, tool errors, and the given run outcomes
+ * (`propose_run` itself records nothing: a run is a fact only once it has an outcome). Pure and
+ * deterministic. Every stored string is sanitized, then redacted. A call with no stored result
+ * (the turn ended first) records nothing.
+ */
+/**
+ * Pair each tool call with its stored result: `[assistant index, call position, call, result
+ * index]` per call that has one. A call id pairs by id only when it is non-empty and unique
+ * across all calls and all results; otherwise (OpenAI-compatible servers may send "" or reuse
+ * ids such as call_0) by position: the loop stores a turn's results right after its assistant
+ * message, in call order.
+ */
+function pairToolCalls(
+  messages: readonly ChatMessage[],
+): { idx: number; k: number; call: ToolCallOf; result: number }[] {
+  const callIds = new Map<string, number>();
+  const resultIds = new Map<string, number>();
+  for (const m of messages) {
+    for (const c of m.role === "assistant" ? (m.toolCalls ?? []) : []) {
+      callIds.set(c.id, (callIds.get(c.id) ?? 0) + 1);
+    }
+    if (m.role === "tool" && m.toolCallId !== undefined) {
+      resultIds.set(m.toolCallId, (resultIds.get(m.toolCallId) ?? 0) + 1);
+    }
+  }
+  const byId = new Map<string, number>();
+  for (const [j, m] of messages.entries()) {
+    if (m.role === "tool" && m.toolCallId && resultIds.get(m.toolCallId) === 1) {
+      byId.set(m.toolCallId, j);
+    }
+  }
+  const resultFor = (call: { id: string }, idx: number, k: number): number | undefined => {
+    if (call.id !== "" && callIds.get(call.id) === 1 && resultIds.get(call.id) === 1) {
+      return byId.get(call.id);
+    }
+    const j = idx + 1 + k;
+    if (messages[j]?.role !== "tool") return undefined;
+    // Every message between the assistant message and this one must be a tool result too.
+    for (let i = idx + 1; i < j; i++) if (messages[i]?.role !== "tool") return undefined;
+    return j;
+  };
+  const out: { idx: number; k: number; call: ToolCallOf; result: number }[] = [];
+  for (const [idx, m] of messages.entries()) {
+    if (m.role !== "assistant") continue;
+    for (const [k, call] of (m.toolCalls ?? []).entries()) {
+      const result = resultFor(call, idx, k);
+      if (result !== undefined) out.push({ idx, k, call, result });
+    }
+  }
+  return out;
+}
+
+type ToolCallOf = NonNullable<ChatMessage["toolCalls"]>[number];
+
+/** The tool name of each stored tool result, by message index (results with no call are absent). */
+export function toolResultNames(messages: readonly ChatMessage[]): Map<number, string> {
+  return new Map(pairToolCalls(messages).map((p) => [p.result, p.call.name]));
+}
+
+export function observe(
+  messages: readonly ChatMessage[],
+  opts: { runs?: readonly ObservedRun[] } = {},
+): Observed {
+  type Result = { content: string; isError: unknown };
+  const toResult = (m: ChatMessage): Result => ({
+    content: m.content,
+    isError: (m as { isError?: unknown }).isError,
+  });
+
+  let tick = 0;
+  const files = new Map<string, { value: Observed["files"][number]; last: number }>();
+  const commands = new Map<string, { value: Observed["commands"][number]; last: number }>();
+  const errors: Observed["errors"] = [];
+
+  for (const { call, result: j } of pairToolCalls(messages)) {
+    const result = toResult(messages[j] as ChatMessage);
+    tick++;
+    const tool = call.name;
+    const args = call.arguments ?? {};
+    const exit = tool === "bash" ? EXIT_LINE.exec(result.content) : null;
+    const failed = exit === null && isErrorResult(result.content, result.isError);
+
+    if (tool === "bash" && !failed) {
+      const cmd = clean(str(args.command) ?? "").slice(0, CMD_MAX);
+      const code = exit ? Number(exit[1]) : null;
+      const prev = commands.get(cmd);
+      if (prev) {
+        prev.value.exit = code;
+        prev.value.count++;
+        prev.last = tick;
+      } else {
+        commands.set(cmd, { value: { cmd, exit: code, count: 1 }, last: tick });
+      }
+      continue;
+    }
+    if (failed) {
+      const message = clean(result.content.split("\n", 1)[0] ?? "").slice(0, ERROR_MESSAGE_MAX);
+      errors.push({ tool: clean(tool).slice(0, 64), message });
+      continue;
+    }
+    const raw = pathArg(tool, args);
+    if (raw === undefined) continue;
+    const path = clean(raw).slice(0, PATH_MAX);
+    if (path === "") continue;
+    const prev = files.get(path);
+    if (prev) {
+      prev.value.reads++;
+      prev.last = tick;
+    } else {
+      files.set(path, { value: { path, reads: 1 }, last: tick });
+    }
+  }
+
+  return {
+    files: keepRecent([...files.values()], FILES_MAX),
+    commands: keepRecent([...commands.values()], COMMANDS_MAX),
+    runs: (opts.runs ?? []).slice(-RUNS_MAX).map((r) => ({
+      runId: clean(r.runId).slice(0, RUN_FIELD_MAX),
+      status: clean(r.status).slice(0, RUN_FIELD_MAX),
+      reportPath: clean(r.reportPath).slice(0, RUN_FIELD_MAX),
+    })),
+    errors: errors.slice(-ERRORS_MAX),
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// renderRecord
+// ---------------------------------------------------------------------------------------------
+
+const SECTIONS: { title: string; kinds: RecordItem["kind"][] }[] = [
+  { title: "Goal", kinds: ["goal"] },
+  { title: "Constraints & must-keep-working", kinds: ["constraint", "preserve"] },
+  { title: "Decisions", kinds: ["decision"] },
+  { title: "Open questions", kinds: ["open_question"] },
+  { title: "Preferences", kinds: ["preference"] },
+  { title: "Next step", kinds: ["next_step"] },
+  { title: "Notes", kinds: ["note"] },
+];
+
+export type RenderResult = {
+  /** Compact Markdown; untrusted, so the caller fences it. Empty for an empty record. */
+  text: string;
+  /** True when the user items alone exceed the budget (they are all rendered anyway). */
+  overBudget: boolean;
+  /** Entries left out to fit the budget. */
+  dropped: { observed: number; notes: number; inferred: number };
+};
+
+/**
+ * An inline code span no value can break out of: the fence is one backtick longer than the
+ * longest backtick run in the (flattened) value, padded when the value starts or ends with one.
+ */
+export function codeSpan(value: string): string {
+  const v = flatten(value);
+  const longest = Math.max(0, ...(v.match(/`+/g) ?? []).map((r) => r.length));
+  const fence = "`".repeat(longest + 1);
+  const pad = v.startsWith("`") || v.endsWith("`") ? " " : "";
+  return `${fence}${pad}${v}${pad}${fence}`;
+}
+
+/** The tag of an inferred item that no user message supports. */
+export const NOT_FROM_USER_TAG = "inferred, not from the user";
+
+function itemLine(i: RecordItem): string {
+  const ids = (i.evidence ?? []).map((e) => flatten(e.messageId));
+  const source = i.source === "inferred" && i.notFromUser ? NOT_FROM_USER_TAG : i.source;
+  const tag = [source, ...ids].join(" ");
+  const reason = i.reason ? flatten(i.reason) : "";
+  return `- [${tag}] ${flatten(i.text)}${reason ? ` — ${reason}` : ""}`;
+}
+
+type ObservedLine = { line: string; rank: number; order: number };
+
+function observedLines(o: Observed): ObservedLine[] {
+  const out: ObservedLine[] = [];
+  const add = (lines: string[], order: number): void => {
+    lines.forEach((line, i) => {
+      out.push({ line, rank: i / lines.length, order });
+    });
+  };
+  add(
+    o.files.map(
+      (f) =>
+        `- file ${codeSpan(f.path)} (read ${f.reads}${f.writes !== undefined ? `, written ${f.writes}` : ""})`,
+    ),
+    0,
+  );
+  add(
+    o.commands.map(
+      (c) => `- command ${codeSpan(c.cmd)} (exit ${c.exit ?? "unknown"}, ×${c.count})`,
+    ),
+    1,
+  );
+  add(
+    o.runs.map((r) => `- run ${flatten(r.runId)} ${flatten(r.status)} (${codeSpan(r.reportPath)})`),
+    2,
+  );
+  add(
+    o.errors.map((e) => `- error ${flatten(e.tool)}: ${flatten(e.message)}`),
+    3,
+  );
+  return out;
+}
+
+const tokens = (s: string): number => Math.ceil(s.length / 4);
+
+/**
+ * Render the active items as compact Markdown sections (Goal, Constraints & must-keep-working,
+ * Decisions, Open questions, Preferences, Next step, Notes), then `## Observed`. Each item is
+ * `- [<source> <evidence ids>] text — reason`; an inferred item no user message supports is
+ * tagged `[inferred, not from the user <ids>]`. The archive is never rendered.
+ *
+ * To fit `budgetTokens` (chars / 4) entries are dropped in this order: observed entries oldest
+ * first (interleaved across files, commands, runs and errors by their relative age), then
+ * inferred notes oldest first, then the other inferred items oldest first. `user` items are
+ * never dropped: when they alone exceed the budget they are all rendered and `overBudget` is set.
+ */
+export function renderRecord(record: SessionRecord, budgetTokens: number): RenderResult {
+  const active = record.items.filter((i) => i.status === "active");
+  const drop = new Set<RecordItem>();
+  const obs = observedLines(record.observed);
+  // Drop order for observed: oldest relative position first, ties by category.
+  const obsOrder = obs
+    .map((o, idx) => ({ ...o, idx }))
+    .sort((a, b) => a.rank - b.rank || a.order - b.order)
+    .map((o) => o.idx);
+  const dropObs = new Set<number>();
+
+  const build = (): string => {
+    const parts: string[] = [];
+    for (const s of SECTIONS) {
+      const lines = active.filter((i) => s.kinds.includes(i.kind) && !drop.has(i)).map(itemLine);
+      if (lines.length > 0) parts.push(`## ${s.title}\n${lines.join("\n")}`);
+    }
+    const o = obs.filter((_, i) => !dropObs.has(i)).map((x) => x.line);
+    if (o.length > 0) parts.push(`## Observed\n${o.join("\n")}`);
+    return parts.join("\n\n");
+  };
+
+  const notes = active.filter((i) => i.source === "inferred" && i.kind === "note");
+  const others = active.filter((i) => i.source === "inferred" && i.kind !== "note");
+  const dropped = { observed: 0, notes: 0, inferred: 0 };
+  let text = build();
+  for (const idx of obsOrder) {
+    if (tokens(text) <= budgetTokens) break;
+    dropObs.add(idx);
+    dropped.observed++;
+    text = build();
+  }
+  for (const [list, key] of [
+    [notes, "notes"],
+    [others, "inferred"],
+  ] as const) {
+    for (const i of list) {
+      if (tokens(text) <= budgetTokens) break;
+      drop.add(i);
+      dropped[key]++;
+      text = build();
+    }
+  }
+  return { text, overBudget: tokens(text) > budgetTokens, dropped };
+}

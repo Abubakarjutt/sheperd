@@ -149,10 +149,22 @@ export async function probeOllama(baseUrl: string): Promise<{ version: string }>
 const ShowSchema = z.object({
   capabilities: z.array(z.string()).optional(),
   model_info: z.record(z.string(), z.unknown()).optional(),
+  /** Modelfile parameters as a text block, one "name value" per line (e.g. "num_ctx 8192"). */
+  parameters: z.string().optional(),
 });
 const TagsSchema = z.object({
   models: z.array(
     z.object({ name: z.string(), model: z.string().optional(), digest: z.string().min(1) }),
+  ),
+});
+const PsSchema = z.object({
+  models: z.array(
+    z.object({
+      name: z.string(),
+      model: z.string().optional(),
+      digest: z.string().optional(),
+      context_length: z.number().optional(),
+    }),
   ),
 });
 
@@ -162,16 +174,48 @@ export type OllamaModelInfo = {
   digest: string;
 };
 
-export async function getModelInfo(baseUrl: string, model: string): Promise<OllamaModelInfo> {
+/** What `/api/show` says about a model's context. */
+export type OllamaShowInfo = {
+  capabilities: string[];
+  /** The trained maximum: model_info `*.context_length`. */
+  contextLength: number | null;
+  /** The `num_ctx` Modelfile parameter, when the model sets one. */
+  numCtx: number | null;
+};
+
+/** A model currently loaded in Ollama memory (`/api/ps`). */
+export type OllamaLoadedModel = { name: string; digest?: string; contextLength: number | null };
+
+/** "tiny" also names "tiny:latest"; a tagged name names only itself. */
+function nameCandidates(model: string): string[] {
+  return model.includes(":") ? [model] : [model, `${model}:latest`];
+}
+
+function matchesName(m: { name: string; model?: string }, candidates: string[]): boolean {
+  return candidates.includes(m.name) || (m.model !== undefined && candidates.includes(m.model));
+}
+
+/** `num_ctx` from `/api/show` `parameters`; null when absent or not a positive integer. */
+export function parseNumCtx(parameters: string | undefined): number | null {
+  if (parameters === undefined) return null;
+  const m = /^\s*num_ctx\s+(\S+)\s*$/m.exec(parameters);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/** The `/api/tags` entry for `model`. Throws `model_not_pulled` when it is not there. */
+export async function findOllamaTag(
+  baseUrl: string,
+  model: string,
+): Promise<{ name: string; digest: string }> {
   const tagsRaw = await ollamaRequest(baseUrl, "/api/tags");
   const tags = TagsSchema.safeParse(tagsRaw);
   if (!tags.success) {
     throw new RewireError("provider_bad_response", "ollama /api/tags has an unexpected shape");
   }
-  const candidates = model.includes(":") ? [model] : [model, `${model}:latest`];
-  const entry = tags.data.models.find(
-    (m) => candidates.includes(m.name) || (m.model !== undefined && candidates.includes(m.model)),
-  );
+  const candidates = nameCandidates(model);
+  const entry = tags.data.models.find((m) => matchesName(m, candidates));
   if (!entry) {
     throw new RewireError(
       "model_not_pulled",
@@ -179,6 +223,10 @@ export async function getModelInfo(baseUrl: string, model: string): Promise<Olla
       `Run: ollama pull ${model}`,
     );
   }
+  return { name: entry.name, digest: entry.digest };
+}
+
+export async function showOllamaModel(baseUrl: string, model: string): Promise<OllamaShowInfo> {
   const showRaw = await ollamaRequest(baseUrl, "/api/show", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -192,7 +240,38 @@ export async function getModelInfo(baseUrl: string, model: string): Promise<Olla
   for (const [k, v] of Object.entries(show.data.model_info ?? {})) {
     if (k.endsWith(".context_length") && typeof v === "number") contextLength = v;
   }
-  return { capabilities: show.data.capabilities ?? [], contextLength, digest: entry.digest };
+  return {
+    capabilities: show.data.capabilities ?? [],
+    contextLength,
+    numCtx: parseNumCtx(show.data.parameters),
+  };
+}
+
+/** The loaded instance of `model` from `/api/ps`, or null when it is not loaded. */
+export async function getLoadedOllamaModel(
+  baseUrl: string,
+  model: string,
+): Promise<OllamaLoadedModel | null> {
+  const psRaw = await ollamaRequest(baseUrl, "/api/ps");
+  const ps = PsSchema.safeParse(psRaw);
+  if (!ps.success) {
+    throw new RewireError("provider_bad_response", "ollama /api/ps has an unexpected shape");
+  }
+  const candidates = nameCandidates(model);
+  const entry = ps.data.models.find((m) => matchesName(m, candidates));
+  if (!entry) return null;
+  const n = entry.context_length;
+  return {
+    name: entry.name,
+    ...(entry.digest !== undefined && entry.digest !== "" ? { digest: entry.digest } : {}),
+    contextLength: n !== undefined && Number.isInteger(n) && n > 0 ? n : null,
+  };
+}
+
+export async function getModelInfo(baseUrl: string, model: string): Promise<OllamaModelInfo> {
+  const entry = await findOllamaTag(baseUrl, model);
+  const { capabilities, contextLength } = await showOllamaModel(baseUrl, model);
+  return { capabilities, contextLength, digest: entry.digest };
 }
 
 const TRANSPORT_CODES = new Set([
@@ -251,7 +330,7 @@ export class OllamaProvider implements Provider {
           { signal },
         );
         streaming = true;
-        resp = await collectOpenAIStream(stream, req.onDelta, signal);
+        resp = await collectOpenAIStream(stream, req.onDelta, signal, req.onFirstChunk);
       } else
         resp = await this.client.chat.completions.create(
           // Ollama's OpenAI-compat layer lists `max_tokens` (not `max_completion_tokens`) as supported:

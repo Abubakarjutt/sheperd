@@ -104,6 +104,14 @@ if (help.status !== 0 || !help.stdout.includes("usage:")) {
 }
 pass("rewire --help");
 
+const calibrateHelp = run(["calibrate", "--help"]);
+if (calibrateHelp.status !== 0 || !calibrateHelp.stdout.includes("usage: rewire calibrate")) {
+  fail(
+    `rewire calibrate --help exited ${calibrateHelp.status}: ${calibrateHelp.stdout}${calibrateHelp.stderr}`,
+  );
+}
+pass("rewire calibrate --help");
+
 // No TTY anywhere: stdin is /dev/null, stdout and stderr are pipes.
 function noTty(args, extra = {}) {
   const devNull = openSync("/dev/null", "r");

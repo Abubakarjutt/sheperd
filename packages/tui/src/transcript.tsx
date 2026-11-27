@@ -24,6 +24,8 @@ export type TranscriptEntry =
   | { kind: "skill"; name: string }
   | { kind: "error"; code: string; message: string }
   | { kind: "note"; text: string; error?: boolean }
+  /** A status line (compaction results, notices): `dim`, `warn` (yellow) or `dimWarn`. */
+  | { kind: "line"; text: string; tone: "dim" | "warn" | "dimWarn" }
   /** The welcome box, first in every transcript region (startup, `/clear`, `/resume`). */
   | { kind: "header"; info: HeaderInfo };
 
@@ -151,6 +153,15 @@ export function EntryLine({ entry }: { entry: TranscriptEntry }) {
       );
     case "note":
       return <Safe color={entry.error ? theme.error : theme.dim}>{entry.text}</Safe>;
+    case "line":
+      return (
+        <Safe
+          color={entry.tone === "dim" ? theme.dim : theme.busy}
+          dimColor={entry.tone === "dimWarn"}
+        >
+          {entry.text}
+        </Safe>
+      );
     case "header":
       return <Header info={entry.info} />;
   }

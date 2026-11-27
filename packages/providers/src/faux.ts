@@ -25,8 +25,8 @@ export class FauxProvider implements Provider {
   }
 
   async chat(req: ChatRequest): Promise<ChatResponse> {
-    // Neither the signal nor the stream callback is part of the recorded request.
-    const { signal: _signal, onDelta, ...rest } = req;
+    // Neither the signal nor the stream callbacks are part of the recorded request.
+    const { signal: _signal, onDelta, onFirstChunk, ...rest } = req;
     this.requests.push(structuredClone(rest) as ChatRequest);
     const entry = this.script[this.index++];
     if (entry === undefined) {
@@ -40,7 +40,10 @@ export class FauxProvider implements Provider {
       ...c,
       id: c.id !== "" ? c.id : `call_${this.nextCallId++}`,
     }));
-    if (onDelta && turn.text) onDelta(turn.text);
+    if (onDelta) {
+      onFirstChunk?.();
+      if (turn.text) onDelta(turn.text);
+    }
     return {
       message: { text: turn.text ?? "", toolCalls },
       stopReason: turn.stopReason ?? (toolCalls.length > 0 ? "tool_use" : "end"),

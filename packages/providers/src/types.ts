@@ -55,6 +55,12 @@ export type ChatRequest = {
    * stream must pass a `signal` (Ollama's REWIRE_OLLAMA_TIMEOUT_S still covers the whole call).
    */
   onDelta?: (text: string) => void;
+  /**
+   * Called exactly once, when the first stream chunk of any kind arrives (reasoning/thinking and
+   * tool-call deltas included), so callers can time prompt reading apart from generation. Only
+   * fires on a streamed call (`onDelta` set); never changes the request sent.
+   */
+  onFirstChunk?: () => void;
 };
 export type ChatResponse = { message: AssistantMessage; stopReason: StopReason; usage: Usage };
 

@@ -41,7 +41,12 @@ registerProvider(
 );
 registerProvider("openai", (_ref, env) => new OpenAIProvider(requireKey(env, "OPENAI_API_KEY")));
 registerProvider("faux", () => new FauxProvider([]));
+/** The Ollama base URL the provider and window discovery use: OLLAMA_HOST, normalized. */
+export function ollamaBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
+  return normalizeOllamaHost(env.OLLAMA_HOST);
+}
+
 registerProvider(
   "ollama",
-  (_ref, env) => new OllamaProvider(normalizeOllamaHost(env.OLLAMA_HOST), ollamaChatTimeoutMs(env)),
+  (_ref, env) => new OllamaProvider(ollamaBaseUrl(env), ollamaChatTimeoutMs(env)),
 );

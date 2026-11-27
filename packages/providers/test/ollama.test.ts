@@ -422,6 +422,38 @@ describe("OllamaProvider streaming (onDelta)", () => {
     expect(err.message).toMatch(/ollama/);
     expect(hits["/api/version"] ?? 0).toBe(0);
   });
+  test("onFirstChunk fires once on a reasoning-only first chunk (qwen3 thinking), before text", async () => {
+    const reasoning = {
+      id: "c",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "m",
+      choices: [
+        {
+          index: 0,
+          delta: { role: "assistant", content: "", reasoning: "hmm" },
+          finish_reason: null,
+        },
+      ],
+    };
+    mock.chat = (b) =>
+      b.stream
+        ? {
+            __sse: openaiSSE([
+              reasoning,
+              ...openaiChunks({ text: ["o", "k"], finish: "stop", usage }),
+            ]),
+          }
+        : {};
+    const p = new OllamaProvider(base);
+    const order: string[] = [];
+    await p.chat({
+      ...req,
+      onFirstChunk: () => order.push("first"),
+      onDelta: (d) => order.push(d),
+    });
+    expect(order).toEqual(["first", "o", "k"]);
+  });
   test("an onDelta throw propagates as provider_stream_callback_failed, not dropped", async () => {
     mock.chat = (b) =>
       b.stream ? { __sse: openaiSSE(openaiChunks({ text: ["x"], finish: "stop" })) } : {};

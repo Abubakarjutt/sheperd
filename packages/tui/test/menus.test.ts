@@ -34,12 +34,16 @@ describe("command menu", () => {
 
   it("lists only the commands allowed in a run while one is active", () => {
     const inRun = names("", true);
-    expect(inRun.sort()).toEqual(["checkpoints", "help", "model", "skills", "skip"]);
+    expect(inRun.sort()).toEqual(["checkpoints", "context", "help", "model", "skills", "skip"]);
     for (const n of inRun) {
       const cmd = parseCommand(`/${n}`);
       expect(cmd && allowedInRun(cmd)).toBe(true);
     }
     expect(names("ru", true)).toEqual([]);
+    // /compact is idle-only: not listed in a run, and refused there.
+    expect(names("comp", true)).toEqual([]);
+    expect(names("comp")).toEqual(["compact"]);
+    expect(allowedInRun({ kind: "compact" })).toBe(false);
   });
 
   it("windows 8 rows around the selection", () => {

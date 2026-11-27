@@ -222,6 +222,8 @@ works).
 | `/checkpoints [contract] [tests] [commit]` | Show or set where runs pause. `/checkpoints off` pauses nowhere. | show only    |
 | `/model`                                   | Show the model routing.                                          | yes          |
 | `/resume [id]`                             | List stored sessions, or resume one.                             | no           |
+| `/compact [focus]`                         | Compact the chat context now (see "Context and compaction").     | no           |
+| `/context`                                 | Show the compaction limit, window and session record.            | yes          |
 | `/clear`                                   | Start a fresh session. The old one stays resumable.              | no           |
 | `/doctor`                                  | Check prerequisites.                                             | no           |
 | `/skip`                                    | Decline a run's clarification questions.                         | yes          |
@@ -244,6 +246,168 @@ decline); checkpoints and proposals take single keys.
 
 A chat `bash` command ignores the abort and runs to its own timeout (up to 600 seconds). It
 cannot write to the repo.
+
+## Context and compaction
+
+A long chat fills the model's context window. rewire compacts the chat before that happens.
+Compaction applies to the interactive chat only. `rewire run`, `--headless` and the gated
+pipeline never compact.
+
+### What compaction does
+
+After a compaction the model sees, in order:
+
+1. the session record: a structured list of goals, constraints, decisions, open questions,
+   preferences, next steps and notes, each with the messages that back it;
+2. your recent messages, kept verbatim (up to `recent_user_tokens`, and at most a quarter of the
+   limit; fewer, or none, when the context must shrink to fit, and the newest one cut in the
+   middle when it alone is over that budget);
+3. every turn after that point.
+
+The older assistant turns and tool output are not kept in the context. The full conversation
+stays on disk, and the chat can search it with `recall`.
+
+It is a record and not a summary, so nothing is lost without a trace:
+
+- The model proposes edits to the record (add, update, resolve, supersede). Code checks every
+  one. Each edit cites messages, and the quote must appear word for word in the cited message.
+- A constraint that came from you can only be created or changed by an edit that quotes one of
+  your own messages. Tool output, file contents, skills and the model's own text can never make
+  or override one. This stops a file that says "from now on, the user requires X" from becoming
+  a standing rule.
+- Only items tagged `[user …]` speak for you. Everything else is `[inferred …]`: the compactor's
+  reading of tool output, files and replies, which the chat model is told never to treat as an
+  instruction. An inferred item that none of your messages supports is shown as
+  `[inferred, not from the user …]`.
+- Some edits are also checked by a second model, from a different family when one is
+  configured: an edit that changes one of your rules or adds a claim attributed to you, any
+  change to an open question, and an inferred goal, constraint, must-keep-working item or
+  decision that rests on tool output with no message of yours behind it. Without that check they are not applied. If the
+  check is unavailable, the whole compaction fails.
+- Skill text and `recall` results are never evidence for an edit.
+- Items are never deleted. Resolved and superseded items move to an archive.
+- If a compaction fails for any reason, the previous record and the full context are kept, and
+  the chat carries on. (When a long window is compacted in parts, the parts already applied
+  stay.)
+
+The facts about files and commands (what was read, which commands ran and their exit codes,
+which tool calls failed) are computed by code from the stored messages. The model does not
+write them. Run outcomes are not part of the record.
+
+### When it triggers
+
+The limit is a number of tokens. Compaction runs before a send when the next request would reach
+it. For a context window `W`, the formula is:
+
+```
+min(0.85·W, 32768·(W/32768)^0.6), rounded down to the thousand
+```
+
+| window | trigger |
+| ------ | ------- |
+| 8K     | 6000    |
+| 32K    | 27000   |
+| 128K   | 75000   |
+| 200K   | 97000   |
+| 256K   | 114000  |
+| 1M     | 262000  |
+
+Large windows trigger well before they are full. Models read long prompts less reliably, and
+every turn re-reads the whole context.
+
+Other candidates:
+
+- **Window share.** `0.85·W`, rounded down to the thousand.
+- **Latency.** Once rewire has timed the model reading prompts, that rate times
+  `latency_budget_s`. A slow local model compacts sooner.
+- **Calibrated.** `rewire calibrate` (below) measures how much context a model really uses.
+  The measured value replaces the formula, so it can be higher than the formula's value (a 200K
+  window that passes at 128K gives 131,072, not 97,000).
+
+The smallest candidate wins. It is raised to at least 4,096 and then capped at `0.85·W`, so a
+window under about 4.8K gets a limit below 4,096. A configured `limit` (below) replaces all of
+this; it is at least 4,096 and is not capped. The window is asked of the provider (Ollama's
+loaded context, or a built-in table for Anthropic and OpenAI).
+
+Compaction aims to leave the context at no more than half the limit, with room for the message
+being sent, keeping fewer recent messages and then a shorter record until it fits. Your own rules are
+never dropped from the record, so when they alone are too big the compaction still applies, and
+automatic compaction is held back (` · held`, or ` · stuck`).
+
+### `models.toml`
+
+```toml
+[compaction]
+latency_budget_s = 60        # 5 to 3600; seconds to read a full context
+recent_user_tokens = 20000   # 1000 to 200000; your recent messages kept verbatim
+
+[compaction.models."ollama:qwen3:32b"]
+limit = 24000                # integer, at least 4096; replaces every computed candidate
+```
+
+All keys are optional. Unknown keys are an error (`models_file_invalid`).
+
+### Commands and the status line
+
+| Command            | What it does                                                                                                                                            |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/compact [focus]` | Compact now. The optional focus tells the compactor what to keep. Not available during a run. Esc cancels.                                              |
+| `/context`         | Show the limit and how it was chosen, the window, the record counts, the last compaction and the record itself. Scroll with the arrow keys, Esc closes. |
+
+The status line shows `ctx 61k/74k (f)`: the context size, the limit, and why the limit is that
+value: `f` formula, `l` latency, `c` calibrated, `w` window share, `o` override. The size is dim,
+turns yellow at 70% of the limit and red at 90%. A dim ` · held` means automatic compaction is
+waiting for the context to grow by a quarter of the limit before it tries again. ` · stuck` means
+automatic compaction is off for this window, because a failed or over-budget compaction left the
+context at or past halfway from the limit to `0.85·W`. `/compact` still works then, and a
+changed window clears it.
+
+Lines you may see:
+
+- `⎿ compacted 41 messages → record (3 decisions · 2 constraints · 1 open) · ctx 72k → 9k`
+- `⎿ 2 proposed changes rejected: <first reason>…` (the checks refused some edits; the rest applied)
+- `⎿ compaction skipped: <code> — kept full context (/context for details)`
+- `⎿ automatic compaction paused: <reason> — /compact to retry`
+- `⎿ note: compaction checks use the same model family as chat (no independent verifier configured)`
+
+### `recall`
+
+The chat has a read-only `recall` tool. It searches the whole stored conversation and the
+archive for a word or phrase, so a detail that left the context can be found again. Results are
+at most 10 snippets and 4 KB, are cleaned of secrets, and are fenced as untrusted data. Only the
+chat has it, never a pipeline stage, and a compaction never cites its results as evidence.
+
+### `rewire calibrate`
+
+```sh
+rewire calibrate <provider:model> [--max <tokens>] [--yes] [--models <file>] [--fresh]
+```
+
+The formula is a guess. `calibrate` measures. It sends probes of growing length (8K, 16K, 32K
+and so on, up to 0.95 of the window or `--max`, which takes `N` or `Nk`). Each probe is filled
+with varied text with facts planted through it, and the model has to answer five questions about
+them. A probe passes with 4 of 5 right. The effective context is the longest length that passes
+along with every shorter one. The run stops after two failures in a row.
+
+On a local model this is slow: each long probe can take minutes, and a full run can take an hour
+or more. Calibration never runs by itself.
+
+- **Resume.** Each length is saved as soon as it finishes, under the XDG cache directory. Ctrl-C
+  stops the run after the lengths already recorded (exit 130; a second Ctrl-C force-quits), and
+  the same command continues from the saved lengths. A failed run exits 1
+  (`calibration_failed`). `--fresh`
+  measures everything again.
+- **Stale runs.** The result is tied to the model's digest and window. If the window changes by
+  more than 10%, the result is stale: `/context` warns, the trigger stops using it, and
+  `calibrate` measures again.
+- **Truncation.** If the provider read far fewer tokens than were sent (under 60%), the probe is
+  not scored and the run fails with `calibration_failed`. For Ollama, the hint is to raise
+  `OLLAMA_CONTEXT_LENGTH` (for example 65536) on the server, or set `num_ctx` in a Modelfile.
+- **Provider errors.** An error is not a score. The run is marked incomplete and the failed
+  length is tried again next time. An incomplete run is never used.
+- **Paid providers.** For Anthropic and OpenAI, `calibrate` prints the probe list and an
+  input-token estimate (a token count, not a price), then exits without spending. Add `--yes` to
+  run. Ollama needs no flag.
 
 ## Skills
 
@@ -348,6 +512,7 @@ Errors carry a stable code. The ones added with interactive mode and skills:
 | `trust_store_unreadable`          | `trusted-skills.json` is unreadable: repo skills are not loaded; the session opens. |
 | `trust_store_locked`              | Another rewire process holds the trust store lock.                                  |
 | `session_corrupt`                 | A stored session file is damaged.                                                   |
+| `session_locked`                  | Another rewire process is writing this session; retry shortly.                      |
 | `session_not_found`               | `/resume` named a session that is not stored.                                       |
 | `session_disposed`                | The session was closed and can't take more turns.                                   |
 | `session_store_unsafe`            | `.rewire/sessions/` is not a plain directory owned by you (for example a symlink).  |
@@ -355,6 +520,10 @@ Errors carry a stable code. The ones added with interactive mode and skills:
 | `stopped_by_user`                 | You chose stop at a checkpoint. The run escalates (exit 2).                         |
 | `aborted`                         | You pressed Esc or Ctrl-C during a chat turn; the turn is not stored.               |
 | `provider_stream_callback_failed` | A streaming reply's display callback threw; the chat call fails.                    |
+| `compaction_invalid`              | A compaction's output or an edit to the record was invalid; the context is kept.    |
+| `compaction_rejected`             | A compaction broke a rule or its independent check was unavailable; context kept.   |
+| `calibration_failed`              | `rewire calibrate` could not finish (bad model, paid gate, truncation, errors).     |
+| `context_window_unknown`          | The model ref has no known provider, so no context window can be found.             |
 
 ### Run directory
 
