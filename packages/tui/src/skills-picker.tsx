@@ -66,7 +66,9 @@ export type SkillsPickerProps = {
   /** Esc in the list. */
   onClose: () => void;
   /** The live file walk (default {@link listSkillFiles}). */
-  listFiles?: (dir: string) => Promise<{ entries: SkillFile[]; truncated: boolean }>;
+  listFiles?: (
+    dir: string,
+  ) => Promise<{ entries: SkillFile[]; truncated: boolean; linkedTo?: string }>;
   /** Keys are taken only while true (default true). */
   isActive?: boolean;
 };
@@ -123,7 +125,10 @@ export function SkillsPicker({
   );
 }
 
-type Files = { entries: SkillFile[]; truncated: boolean } | { error: string } | undefined;
+type Files =
+  | { entries: SkillFile[]; truncated: boolean; linkedTo?: string }
+  | { error: string }
+  | undefined;
 
 function SkillDetail({
   row,
@@ -174,6 +179,7 @@ function SkillDetail({
     const more = files.entries.length - shown.length;
     fileLines = (
       <>
+        {files.linkedTo !== undefined ? line(`  (linked → ${files.linkedTo})`, theme.dim) : null}
         {files.entries.length === 0 ? line("  (none)", theme.dim) : null}
         {shown.map((f) =>
           line(

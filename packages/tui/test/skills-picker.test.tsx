@@ -356,6 +356,30 @@ describe("/skills details", () => {
     v.unmount();
   });
 
+  it("a linked skill dir says where it links to, sanitized, and lists the target's files", async () => {
+    const a = await skill("linked", "user");
+    const listFiles = async () => ({
+      entries: [{ path: "SKILL.md", bytes: 3 }],
+      truncated: false,
+      linkedTo: "/real/pl\x1b[2Jace",
+    });
+    const v = render(
+      <SkillsPicker
+        skills={{ found: [a], active: [a], pendingRepo: [] }}
+        trustedLater={false}
+        canReview={false}
+        onReview={() => {}}
+        onClose={() => {}}
+        listFiles={listFiles}
+      />,
+    );
+    await waitText(v, "user · active");
+    await pressFor(v, KEY.enter, "(linked → /real/place)");
+    expect(v.lastFrame() ?? "").not.toContain("\x1b[2J");
+    expect(plain(v.lastFrame())).toContain("SKILL.md  3 B");
+    v.unmount();
+  });
+
   it("Esc in the list does not interrupt anything and never reaches the input", async () => {
     const { session, sent } = fakeSession();
     const onExit = vi.fn();

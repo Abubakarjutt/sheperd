@@ -1,4 +1,4 @@
-import { lstat, readdir } from "node:fs/promises";
+import { lstat, readdir, realpath } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { RewireError, redact } from "@rewire/core";
 import { REPO_SKILL_CAPS, repoSkillsHash, type Skill, trustRepo } from "@rewire/skills";
@@ -19,8 +19,8 @@ export type SkillFile = { path: string; bytes: number; symlink?: boolean };
 /**
  * The files under a skill dir as they are on disk now, read on the host with `lstat`: a symlink is
  * listed as one (its own size) and never followed, and directories are walked without following
- * links. That includes `dir` itself: a symlinked skill dir is one entry (`.`, a symlink), not
- * walked, so a link swapped after discovery never lists another dir. Bounded: files and directories both count toward `cap`, and the walk stops at `maxDepth`;
+ * links. Only `dir` itself is followed, once, as discovery does (a user skill dir is often a
+ * link): its real path is walked and returned as `linkedTo`; links inside are never followed. Bounded: files and directories both count toward `cap`, and the walk stops at `maxDepth`;
  * `truncated` is true only when something was actually left out. Paths are relative to `dir` and
  * sorted. Names are NOT sanitized here.
  */
@@ -28,7 +28,7 @@ export async function listSkillFiles(
   dir: string,
   cap: number = VIEW_FILES_CAP,
   maxDepth: number = VIEW_MAX_DEPTH,
-): Promise<{ entries: SkillFile[]; truncated: boolean }> {
+): Promise<{ entries: SkillFile[]; truncated: boolean; linkedTo?: string }> {
   const entries: SkillFile[] = [];
   let seen = 0;
   let truncated = false;
@@ -51,19 +51,17 @@ export async function listSkillFiles(
         await walk(p, depth + 1);
       } else {
         entries.push({
-          path: relative(dir, p),
+          path: relative(base, p),
           bytes: st.size,
           ...(st.isSymbolicLink() ? { symlink: true } : {}),
         });
       }
     }
   };
-  const rootStat = await lstat(dir);
-  if (rootStat.isSymbolicLink()) {
-    return { entries: [{ path: ".", bytes: rootStat.size, symlink: true }], truncated: false };
-  }
-  await walk(dir, 1);
-  return { entries, truncated };
+  const linked = (await lstat(dir)).isSymbolicLink();
+  const base = linked ? await realpath(dir) : dir;
+  await walk(base, 1);
+  return { entries, truncated, ...(linked ? { linkedTo: base } : {}) };
 }
 
 /** Shown next to a repo skill that a user skill of the same name hides. */
@@ -107,6 +105,7 @@ async function viewLines(skills: Skill[]): Promise<string[]> {
       const pinned = new Set(s.files.map(key));
       const differs =
         live.truncated ||
+        live.linkedTo !== undefined ||
         live.entries.length !== s.files.length ||
         live.entries.some((e) => e.symlink || !pinned.has(key(e)));
       if (differs) {
@@ -120,6 +119,8 @@ async function viewLines(skills: Skill[]): Promise<string[]> {
             );
           }
         }
+        if (live.linkedTo !== undefined)
+          out.push(`    the skill dir is a link to ${live.linkedTo}`);
         if (live.truncated) out.push("    … truncated");
       }
     } catch (e) {

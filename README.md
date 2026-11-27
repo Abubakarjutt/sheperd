@@ -427,8 +427,9 @@ Interactive mode can use Claude-style skills (`<name>/SKILL.md`).
   verifier.
 - `/skills` lists every skill found, with its source (`user` or `repo`) and state (`active`,
   `pending trust`, `trusted; takes effect in a new session (/clear)` or `shadowed`), active ones
-  first. Enter shows a skill's description, path and the files in its directory now (a symlinked
-  skill directory is shown as the link, not walked); Esc goes back, then closes. When repo skills
+  first. Enter shows a skill's description, path and the files in its directory now. A
+  symlinked skill directory is followed once and shown as `linked → <real path>`; links inside
+  it are listed, never followed. Esc goes back, then closes. When repo skills
   are pending, a first row, "Review pending repo skills", opens the trust prompt. During a run
   the list is read-only, that row is absent, and a checkpoint or clarification closes the list.
 - A skill that is rejected (malformed, over a limit, or a repo skill with a symlink) is skipped
