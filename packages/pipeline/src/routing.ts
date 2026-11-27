@@ -197,11 +197,11 @@ const ProvidersToml = z.strictObject({
   bedrock: z.strictObject({ region: Setting.optional() }).optional(),
   vertex: z.strictObject({ project: Setting.optional(), region: Setting.optional() }).optional(),
   foundry: z
-    .strictObject({ resource: Setting.optional(), base_url: UrlString(false).optional() })
+    .strictObject({ resource: Setting.optional(), base_url: UrlString(true).optional() })
     .optional(),
   azure: z
     .strictObject({
-      endpoint: UrlString(false).optional(),
+      endpoint: UrlString(true).optional(),
       api_version: Setting.optional(),
       family: Family.optional(),
     })

@@ -337,6 +337,16 @@ describe("loadModelsFile [providers] and [endpoints]", () => {
     expect((err as Error).message).toMatch(why);
   });
 
+  test("[providers.foundry] base_url and [providers.azure] endpoint take loopback http, as their env forms do", async () => {
+    const m = await loadModelsFile(
+      file(
+        `available = ["anthropic:a"]\n[providers.foundry]\nbase_url = "http://localhost:8080/anthropic"\n[providers.azure]\nendpoint = "http://127.0.0.1:9000"\n`,
+      ),
+    );
+    expect(m.providers?.foundry?.baseUrl).toBe("http://localhost:8080/anthropic");
+    expect(m.providers?.azure?.endpoint).toBe("http://127.0.0.1:9000");
+  });
+
   test("loopback http needs no api_key_env", async () => {
     for (const [name, url] of [
       ["lo1", "http://localhost:11434/v1"],
