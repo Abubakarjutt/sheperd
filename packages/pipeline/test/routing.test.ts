@@ -8,6 +8,7 @@ import {
   compactionLimitOverride,
   defaultCompactionConfig,
   loadModelsFile,
+  MIN_ENDPOINT_CONTEXT_WINDOW,
   resolveRouting,
 } from "../src/routing.js";
 
@@ -289,6 +290,26 @@ describe("loadModelsFile [providers] and [endpoints]", () => {
       `[providers.azure]\nendpoint = "http://my.openai.azure.com"\n`,
       /endpoint/,
     ],
+    [
+      "base_url with userinfo",
+      `[endpoints.e8]\nbase_url = "https://sk-secret@x.example/v1"\napi_key_env = "K"\n`,
+      /base_url/,
+    ],
+    [
+      "base_url with user and password",
+      `[endpoints.e9]\nbase_url = "https://u:p@x.example/v1"\napi_key_env = "K"\n`,
+      /base_url/,
+    ],
+    [
+      "base_url with a query",
+      `[endpoints.e10]\nbase_url = "https://x.example/v1?api_key=sk-secret"\napi_key_env = "K"\n`,
+      /base_url/,
+    ],
+    [
+      "azure endpoint with userinfo",
+      `[providers.azure]\nendpoint = "https://k@my.openai.azure.com"\n`,
+      /endpoint/,
+    ],
   ])("rejects %s with models_file_invalid", async (_name, body, why) => {
     const err = await loadModelsFile(file(`available = ["anthropic:a"]\n${body}`)).catch(
       (e: unknown) => e,
@@ -327,5 +348,67 @@ describe("loadModelsFile [providers] and [endpoints]", () => {
     await expect(loadModelsFile(file(`available = ["groq:llama-3.3-70b"]\n`))).rejects.toThrow(
       /groq/,
     );
+  });
+});
+
+describe("loadModelsFile: refs checked at load, one file's endpoints at a time", () => {
+  test.each([
+    [
+      "a non-Claude bedrock ref",
+      `available = ["anthropic:a", "bedrock:meta.llama3"]\n`,
+      /available\.1/,
+    ],
+    [
+      "a non-Claude vertex role",
+      `available = ["anthropic:a"]\n[roles]\nreviewer = "vertex:gemini-2.5-pro"\n`,
+      /roles\.reviewer/,
+    ],
+    [
+      "an endpoint router id without family",
+      `available = ["anthropic:a", "rt:openrouter/auto"]\n[endpoints.rt]\nbase_url = "https://openrouter.ai/api/v1"\napi_key_env = "K"\n`,
+      /available\.1.*family/,
+    ],
+  ])("rejects %s with models_file_invalid and its path", async (_name, body, why) => {
+    const err = await loadModelsFile(file(body)).catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "models_file_invalid" });
+    expect((err as Error).message).toMatch(why);
+  });
+
+  test("a router id with an explicit family loads", async () => {
+    const m = await loadModelsFile(
+      file(
+        `available = ["rt2:openrouter/auto"]\n[endpoints.rt2]\nbase_url = "https://openrouter.ai/api/v1"\napi_key_env = "K"\nfamily = "mixed"\n`,
+      ),
+    );
+    expect(modelFamily(m.available[0] as ModelRef)).toBe("mixed");
+  });
+
+  test("a later load replaces the earlier file's endpoints; a failed load keeps them", async () => {
+    await loadModelsFile(
+      file(
+        `available = ["fa:m"]\n[endpoints.fa]\nbase_url = "https://a.example/v1"\napi_key_env = "K"\n`,
+      ),
+    );
+    expect(endpointConfig("fa")?.baseUrl).toBe("https://a.example/v1");
+    const bad = await loadModelsFile(
+      file(
+        `available = ["fb:m", "nope:x"]\n[endpoints.fb]\nbase_url = "https://b.example/v1"\napi_key_env = "K"\n`,
+      ),
+    ).catch((e: unknown) => e);
+    expect(bad).toMatchObject({ code: "models_file_invalid" });
+    expect(endpointConfig("fa")?.baseUrl).toBe("https://a.example/v1");
+    expect(endpointConfig("fb")).toBeUndefined();
+    await expect(loadModelsFile(file(`available = ["fa:m"]\n`))).rejects.toMatchObject({
+      code: "models_file_invalid",
+    });
+    await loadModelsFile(file(`available = ["anthropic:a"]\n`));
+    expect(endpointConfig("fa")).toBeUndefined();
+    expect(() => parseModelRef("fa:m")).toThrowError(
+      expect.objectContaining({ code: "model_ref_invalid" }),
+    );
+  });
+
+  test("the endpoint window minimum is its own constant", () => {
+    expect(MIN_ENDPOINT_CONTEXT_WINDOW).toBe(4096);
   });
 });

@@ -43,6 +43,8 @@ export const DEFAULT_LATENCY_BUDGET_S = 60;
 export const DEFAULT_RECENT_USER_TOKENS = 20_000;
 /** The smallest compaction limit, configured or computed. */
 export const MIN_COMPACTION_LIMIT = 4096;
+/** The smallest `context_window` an `[endpoints.<name>]` table may declare. */
+export const MIN_ENDPOINT_CONTEXT_WINDOW = 4096;
 
 /** A fresh copy of the defaults, safe to mutate. */
 export const defaultCompactionConfig = (): CompactionConfig => ({
@@ -112,9 +114,12 @@ export function resolveRouting(
   };
 }
 
+/** A model ref whose family is known: an unsupported cloud model or a router id fails at load. */
 const RefString = z.string().transform((s, ctx) => {
   try {
-    return parseModelRef(s);
+    const ref = parseModelRef(s);
+    modelFamily(ref);
+    return ref;
   } catch (e) {
     ctx.addIssue({ code: "custom", message: e instanceof Error ? e.message : String(e) });
     return z.NEVER;
@@ -140,6 +145,13 @@ const UrlString = (loopbackHttp: boolean) =>
       u = new URL(s);
     } catch {
       ctx.addIssue({ code: "custom", message: "must be an absolute https URL" });
+      return;
+    }
+    if (u.username !== "" || u.password !== "" || u.search !== "" || u.hash !== "") {
+      ctx.addIssue({
+        code: "custom",
+        message: "must not carry credentials, a query or a fragment (put the key in an env var)",
+      });
       return;
     }
     if (u.protocol === "https:") return;
@@ -185,7 +197,7 @@ const EndpointToml = z
       .string()
       .regex(/^[a-z][a-z0-9._-]{0,31}$/, "must be a lowercase family name")
       .optional(),
-    context_window: z.number().int().min(MIN_COMPACTION_LIMIT).optional(),
+    context_window: z.number().int().min(MIN_ENDPOINT_CONTEXT_WINDOW).optional(),
     max_tokens_field: z.enum(["max_completion_tokens", "max_tokens"]).optional(),
   })
   .superRefine((e, ctx) => {
@@ -219,7 +231,8 @@ const ModelsToml = z.strictObject({
 /**
  * Read `available = [...]` and the optional `[roles]`, `[compaction]`, `[providers.*]` and
  * `[endpoints.<name>]` tables from a TOML file. The endpoints are registered (`registerEndpoints`)
- * before the refs are parsed; nothing stays registered when the file is invalid.
+ * before the refs are parsed, replacing those of the previous load; an invalid file leaves the
+ * previous load's endpoints registered and its own not.
  */
 export async function loadModelsFile(path: string): Promise<ModelsFile> {
   let raw: unknown;
@@ -248,7 +261,11 @@ export async function loadModelsFile(path: string): Promise<ModelsFile> {
     }
     endpoints = endpointConfigs(e.data);
   }
-  const undo = endpoints !== undefined ? registerEndpoints(endpoints) : () => {};
+  // One file's endpoints at a time: this load replaces the previous file's set, and a failed load
+  // puts the previous set back.
+  const previous = loaded;
+  previous?.undo();
+  const undo = registerEndpoints(endpoints ?? {});
   try {
     const r = ModelsToml.safeParse(raw);
     if (!r.success) throw invalid(r.error.issues);
@@ -264,12 +281,20 @@ export async function loadModelsFile(path: string): Promise<ModelsFile> {
     };
     if (r.data.providers !== undefined) out.providers = providerSettings(r.data.providers);
     if (endpoints !== undefined) out.endpoints = endpoints;
+    loaded = { endpoints: endpoints ?? {}, undo };
     return out;
   } catch (e) {
     undo();
+    loaded =
+      previous !== undefined
+        ? { endpoints: previous.endpoints, undo: registerEndpoints(previous.endpoints) }
+        : undefined;
     throw e;
   }
 }
+
+/** The endpoints the last successful `loadModelsFile` registered, and how to unregister them. */
+let loaded: { endpoints: Record<string, EndpointConfig>; undo: () => void } | undefined;
 
 function endpointConfigs(raw: z.infer<typeof EndpointsToml>): Record<string, EndpointConfig> {
   const out: Record<string, EndpointConfig> = {};

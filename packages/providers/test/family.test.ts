@@ -135,6 +135,22 @@ describe("cloud providers and endpoints", () => {
     ["mistral-large-latest", "mistral"],
     ["Qwen/QwQ-32B", "qwen"],
     ["accounts/fireworks/models/codellama-34b", "llama"],
+    // Vendor path segment wins over the last segment.
+    ["openai/chatgpt-4o-latest", "gpt"],
+    ["openai/codex-mini", "gpt"],
+    ["OpenAI/Some-New-Model", "gpt"],
+    ["anthropic/opus-next", "claude"],
+    ["google/learnlm-2.0", "gemini"],
+    ["google/gemma-3-27b-it", "gemma"],
+    ["meta-llama/Meta-Muse-1", "llama"],
+    ["x-ai/grok-4", "grok"],
+    ["mistralai/codestral-2501", "mistral"],
+    ["deepseek/r2", "deepseek"],
+    ["qwen/qwq-32b", "qwen"],
+    ["anthropic/claude-opus-5-5/thinking", "claude"],
+    // Last-segment rules without a vendor path.
+    ["chatgpt-4o-latest", "gpt"],
+    ["codex-mini-latest", "gpt"],
   ])("endpoint model %s is %s", (model, family) => {
     const undo = registerEndpoints({ openrouter: { baseUrl: "https://openrouter.ai/api/v1" } });
     try {
@@ -159,6 +175,31 @@ describe("cloud providers and endpoints", () => {
     });
     try {
       expect(modelFamily(parseModelRef("corp:claude-opus-5-5"))).toBe("x");
+    } finally {
+      undo();
+    }
+  });
+
+  test.each([
+    "openrouter/auto",
+    "auto",
+    "router",
+    "default",
+    "anthropic/",
+    "openrouter/anthropic/claude-opus-5-5",
+  ])("router or meta id %s needs an explicit family", (model) => {
+    const undo = registerEndpoints({
+      openrouter: { baseUrl: "https://openrouter.ai/api/v1" },
+      pinned: { baseUrl: "https://openrouter.ai/api/v1", family: "mixed" },
+    });
+    try {
+      expect(() => modelFamily({ provider: "openrouter", model })).toThrowError(
+        expect.objectContaining({
+          code: "model_ref_invalid",
+          hint: expect.stringMatching(/\[endpoints\.openrouter\] family/),
+        }),
+      );
+      expect(modelFamily({ provider: "pinned", model })).toBe("mixed");
     } finally {
       undo();
     }

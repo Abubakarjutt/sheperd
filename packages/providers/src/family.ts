@@ -23,18 +23,52 @@ function ollamaFamily(model: string): string {
   return LINEAGE[word] ?? word;
 }
 
+/** Vendor path segments in hosted ids ("anthropic/claude-opus-5-5") and the family they name. */
+const VENDOR: Readonly<Record<string, string>> = {
+  anthropic: "claude",
+  openai: "gpt",
+  google: "gemini",
+  "meta-llama": "llama",
+  "x-ai": "grok",
+  mistralai: "mistral",
+  deepseek: "deepseek",
+  qwen: "qwen",
+};
+
+/** Last segments that name a router or a server-side default, not a model. */
+const META_IDS: ReadonlySet<string> = new Set(["auto", "router", "default", ""]);
+
+/** Path segments that name a router serving models of several families. */
+const ROUTER_VENDORS: ReadonlySet<string> = new Set(["openrouter"]);
+
 /**
  * The family of a model behind an OpenAI-compatible endpoint, from the model id alone (never the
  * endpoint name, which the user picks): hosted ids name other vendors' models, often behind a
- * vendor path ("anthropic/claude-opus-5-5" on OpenRouter is Claude).
+ * vendor path ("anthropic/claude-opus-5-5" on OpenRouter is Claude). Independence is never
+ * inferred from an id that names no model: a router or meta id needs an explicit `family`.
  */
-function endpointFamily(model: string): string {
-  const last = (model.split("/").pop() ?? model).toLowerCase();
+function endpointFamily(ref: ModelRef): string {
+  const segs = ref.model.toLowerCase().split("/");
+  const last = segs[segs.length - 1] ?? "";
+  const path = segs.slice(0, -1);
+  if (META_IDS.has(last) || path.some((s) => ROUTER_VENDORS.has(s))) {
+    throw new RewireError(
+      "model_ref_invalid",
+      `cannot tell the model family of "${ref.provider}:${ref.model}": it names a router or default, not a model`,
+      `set [endpoints.${ref.provider}] family = "<family>" in models.toml`,
+    );
+  }
+  // The vendor segment right before the model, else the first segment of a longer path.
+  for (const seg of [path[path.length - 1], path[0]]) {
+    const family = seg !== undefined ? VENDOR[seg] : undefined;
+    if (family === "gemini" && last.includes("gemma")) return "gemma";
+    if (family !== undefined) return family;
+  }
   if (last.includes("claude")) return "claude";
-  if (/^(gpt-|o1|o3|o4)/.test(last)) return "gpt";
+  if (/^(gpt-|o1|o3|o4|chatgpt|codex)/.test(last)) return "gpt";
   if (last.includes("gemini")) return "gemini";
   if (last.includes("gemma")) return "gemma";
-  return ollamaFamily(model);
+  return ollamaFamily(ref.model);
 }
 
 /** Bedrock, Vertex and Foundry are supported for Claude only. */
@@ -65,7 +99,7 @@ export function modelFamily(ref: ModelRef): string {
         `unknown provider "${String((ref as { provider: unknown }).provider)}"`,
       );
     }
-    return endpoint.family ?? endpointFamily(ref.model);
+    return endpoint.family ?? endpointFamily(ref);
   }
   switch (provider) {
     case "anthropic":
