@@ -664,8 +664,11 @@ Foundry every header it names is removed, and each sends only its own credential
 API key, a Google OAuth token, the Foundry key), so a gateway header meant for Anthropic never
 reaches AWS, Google or Azure.
 
-A missing region, project or key is `provider_auth_missing`, raised when the provider is created
-(before a run starts), and its hint names the env var or toml key to set. A region or Foundry
+A missing region, project or key is `provider_auth_missing`, and its hint names the env var or toml
+key to set. `rewire run` and `rewire chat` create the provider of every routed role (spec,
+test-writer, implementer, reviewer, verifier) before they start, so a misconfigured provider fails
+before any model is called, even one only the review stage would use. Creating a provider sends no
+request: the cloud SDK, and for Vertex the Google credentials, load on its first call. A region or Foundry
 resource must be a single DNS label, because it becomes part of a host name.
 
 ### Azure OpenAI

@@ -30,7 +30,7 @@ import { runDoctor } from "./doctor.js";
 import { loadFauxScript } from "./faux.js";
 import { isInteractive, tuiRequiresTty } from "./interactive.js";
 import { effectivePlatform } from "./platform.js";
-import { FAUX_WARNING, providerFactory, resolveModels } from "./run.js";
+import { createRoutedProviders, FAUX_WARNING, providerFactory, resolveModels } from "./run.js";
 import { type StartDeps, startInteractive } from "./start-tui.js";
 import { xdgDirs } from "./xdg.js";
 
@@ -142,6 +142,8 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
   if (faux) io.stderr.write(`${FAUX_WARNING}\n`);
 
   const providers = providerFactory(io.env, faux, models.providers);
+  // A misconfigured provider for any role, even one only a later run reaches: fail now.
+  createRoutedProviders(routing, providers);
   const { home, xdgConfig, cacheDir } = xdgDirs(io.env);
   const trustFile = join(xdgConfig, "rewire", "trusted-skills.json");
   const store = new SessionStore();

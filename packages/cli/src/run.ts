@@ -9,6 +9,8 @@ import {
   defaultCompactionConfig,
   loadModelsFile,
   type ModelsFile,
+  ROLES,
+  type RoleRouting,
   type RunOutcome,
   resolveRouting,
   runPipeline,
@@ -169,6 +171,28 @@ export function providerFactory(
   };
 }
 
+/**
+ * Creates the provider of every distinct model `routing` assigns (spec, test-writer, implementer,
+ * reviewer, verifier; the chat model is spec and its compaction verifier is verifier) and drops
+ * them, so a misconfigured one (an Azure reviewer without an API version, a Bedrock verifier
+ * without a region) throws `provider_auth_missing` before a run or chat spends anything. Creation
+ * only resolves settings and env: no request is sent, and the cloud SDKs (and Vertex's Google
+ * credentials) still load on the first chat.
+ */
+export function createRoutedProviders(
+  routing: RoleRouting,
+  providers: (ref: ModelRef) => Provider,
+): void {
+  const seen = new Set<string>();
+  for (const role of ROLES) {
+    const ref = routing[role];
+    const key = `${ref.provider}:${ref.model}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    providers(ref);
+  }
+}
+
 async function askInteractive(
   questions: string[],
   io: RunIo,
@@ -231,11 +255,14 @@ export async function runCommand(
     if (line !== undefined) io.stdout.write(`${line}\n`);
   };
 
+  const providers = providerFactory(io.env, faux, models.providers);
+  createRoutedProviders(routing, providers);
+
   const outcome: RunOutcome = await runPipeline({
     task,
     repo,
     routing,
-    providers: providerFactory(io.env, faux, models.providers),
+    providers,
     policy,
     ask: o.headless ? async () => null : (qs) => askInteractive(qs, io, signal, onInterrupt),
     emit,

@@ -1,10 +1,12 @@
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveRouting } from "@rewire/pipeline";
 import { afterAll, afterEach, describe, expect, test, vi } from "vitest";
 import { runDoctor } from "../src/doctor.js";
 import { DEFAULT_GEMINI_MODEL, discoverModels } from "../src/models.js";
-import { providerFactory, resolveModels } from "../src/run.js";
+import { createRoutedProviders, providerFactory, resolveModels, runCommand } from "../src/run.js";
+import { chatCommand } from "../src/tui.js";
 
 const dirs: string[] = [];
 afterAll(() => {
@@ -407,5 +409,101 @@ api_key_env = "GROQ_API_KEY"
     expect(calls).toHaveLength(1);
     expect(calls[0]?.url).toBe("https://api.groq.com/openai/v1/chat/completions");
     expect(calls[0]?.auth).toBe(`Bearer ${FAKE}`);
+  });
+});
+
+describe("a misconfigured provider for any routed role fails before anything is billed", () => {
+  /**
+   * anthropic writes and openai verifies (the chat and its compaction verifier work); only the
+   * Azure reviewer, which a chat uses once a run reaches review, has no API version.
+   */
+  const body = `available = ["anthropic:claude-opus-5-5", "azure:gpt-5-deploy", "openai:gpt-5"]
+[roles]
+reviewer = "azure:gpt-5-deploy"
+verifier = "openai:gpt-5"
+[providers.azure]
+endpoint = "https://myres.openai.azure.com"
+`;
+  const env = {
+    ANTHROPIC_API_KEY: `sk-ant-${FAKE}`,
+    OPENAI_API_KEY: `sk-${FAKE}`,
+    AZURE_OPENAI_API_KEY: FAKE,
+    PATH: process.env.PATH ?? "",
+  };
+  const sink = (to: string[]) =>
+    ({
+      write: (s: string) => {
+        to.push(String(s));
+        return true;
+      },
+    }) as unknown as NodeJS.WritableStream;
+  const recordFetch = () => {
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", async (input: string | URL | Request) => {
+      calls.push(String(input instanceof Request ? input.url : input));
+      return new Response("{}", { status: 500 });
+    });
+    return calls;
+  };
+
+  test("rewire run: provider_auth_missing before the pipeline starts or any provider call", async () => {
+    const calls = recordFetch();
+    const repo = tmp();
+    const out: string[] = [];
+    await expect(
+      runCommand(
+        { task: "do thing", repo, models: toml(body), headless: true },
+        {
+          stdout: sink(out),
+          stderr: sink(out),
+          stdin: process.stdin,
+          env,
+          cwd: repo,
+        } as Parameters<typeof runCommand>[1],
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({
+      code: "provider_auth_missing",
+      hint: expect.stringContaining("api_version"),
+    });
+    expect(calls).toEqual([]);
+    expect(existsSync(join(repo, ".rewire"))).toBe(false);
+    expect(out.join("")).not.toContain(FAKE);
+  });
+
+  test("rewire chat: provider_auth_missing before the UI starts or any provider call", async () => {
+    const calls = recordFetch();
+    const repo = tmp();
+    const tty = { isTTY: true, write: () => true };
+    await expect(
+      chatCommand({ repo, models: toml(body) }, {
+        stdin: tty,
+        stdout: tty,
+        stderr: tty,
+        env,
+        cwd: repo,
+        onSigint: () => () => {},
+        exit: () => {
+          throw new Error("exit");
+        },
+      } as unknown as Parameters<typeof chatCommand>[1]),
+    ).rejects.toMatchObject({ code: "provider_auth_missing" });
+    expect(calls).toEqual([]);
+  });
+
+  test("createRoutedProviders creates each distinct routed ref once, and nothing else", async () => {
+    const models = await resolveModels(
+      toml(`available = ["anthropic:a", "openai:b", "ollama:llama3.1"]\n`),
+      tmp(),
+      {},
+      undefined,
+    );
+    const routing = resolveRouting(models.available, models.overrides);
+    const made: string[] = [];
+    createRoutedProviders(routing, (ref) => {
+      made.push(`${ref.provider}:${ref.model}`);
+      return { chat: async () => Promise.reject(new Error("never called")) };
+    });
+    expect(made.sort()).toEqual(["anthropic:a", "ollama:llama3.1", "openai:b"]);
   });
 });
