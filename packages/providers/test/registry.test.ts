@@ -1,5 +1,12 @@
 import { describe, expect, test } from "vitest";
-import { createProvider, FauxProvider, OllamaProvider, registerProvider } from "../src/index.js";
+import {
+  createProvider,
+  FauxProvider,
+  OllamaProvider,
+  parseModelRef,
+  registerEndpoints,
+  registerProvider,
+} from "../src/index.js";
 
 describe("createProvider", () => {
   test("provider_auth_missing for absent and empty keys, without leaking values", () => {
@@ -34,5 +41,20 @@ describe("createProvider", () => {
       restore();
     }
     expect(createProvider({ provider: "ollama", model: "m" }, {})).toBeInstanceOf(OllamaProvider);
+  });
+});
+
+describe("createProvider: names a later task wires up", () => {
+  test("cloud providers and endpoints fail cleanly with provider_unknown", () => {
+    const undo = registerEndpoints({ groq: { baseUrl: "https://api.groq.com/openai/v1" } });
+    try {
+      for (const ref of ["bedrock:anthropic.claude-opus-5-5", "gemini:gemini-2.5-pro", "groq:m"]) {
+        expect(() => createProvider(parseModelRef(ref), {})).toThrowError(
+          expect.objectContaining({ code: "provider_unknown" }),
+        );
+      }
+    } finally {
+      undo();
+    }
   });
 });

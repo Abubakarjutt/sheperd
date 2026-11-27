@@ -1,6 +1,14 @@
 import { readFile } from "node:fs/promises";
 import { RewireError } from "@rewire/core";
-import { type ModelRef, modelFamily, parseModelRef } from "@rewire/providers";
+import {
+  type EndpointConfig,
+  endpointNameProblem,
+  type ModelRef,
+  modelFamily,
+  type ProviderSettings,
+  parseModelRef,
+  registerEndpoints,
+} from "@rewire/providers";
 import { parse } from "smol-toml";
 import { z } from "zod";
 
@@ -13,6 +21,10 @@ export type ModelsFile = {
   overrides: Partial<Record<Role, ModelRef>>;
   /** The chat session's compaction settings (`[compaction]`); defaults when the table is absent. */
   compaction: CompactionConfig;
+  /** Cloud provider settings (`[providers.*]`); absent when the file has none. */
+  providers?: ProviderSettings;
+  /** OpenAI-compatible endpoints (`[endpoints.<name>]`); registered by `loadModelsFile`. */
+  endpoints?: Record<string, EndpointConfig>;
 };
 
 /**
@@ -117,16 +129,98 @@ const CompactionToml = z.strictObject({
     .optional(),
 });
 
+const isLoopbackHost = (host: string): boolean =>
+  host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
+
+/** An absolute http(s) URL; https is required unless `loopbackHttp` and the host is loopback. */
+const UrlString = (loopbackHttp: boolean) =>
+  z.string().superRefine((s, ctx) => {
+    let u: URL;
+    try {
+      u = new URL(s);
+    } catch {
+      ctx.addIssue({ code: "custom", message: "must be an absolute https URL" });
+      return;
+    }
+    if (u.protocol === "https:") return;
+    if (loopbackHttp && u.protocol === "http:" && isLoopbackHost(u.hostname)) return;
+    ctx.addIssue({
+      code: "custom",
+      message: loopbackHttp
+        ? "must be https (http only for localhost, 127.0.0.1 or [::1])"
+        : "must be https",
+    });
+  });
+
+const isLoopbackUrl = (s: string): boolean => {
+  try {
+    const u = new URL(s);
+    return u.protocol === "http:" && isLoopbackHost(u.hostname);
+  } catch {
+    return false;
+  }
+};
+
+const Setting = z.string().min(1);
+
+const ProvidersToml = z.strictObject({
+  bedrock: z.strictObject({ region: Setting.optional() }).optional(),
+  vertex: z.strictObject({ project: Setting.optional(), region: Setting.optional() }).optional(),
+  foundry: z
+    .strictObject({ resource: Setting.optional(), base_url: UrlString(false).optional() })
+    .optional(),
+  azure: z
+    .strictObject({ endpoint: UrlString(false).optional(), api_version: Setting.optional() })
+    .optional(),
+});
+
+const EndpointToml = z
+  .strictObject({
+    base_url: UrlString(true),
+    api_key_env: z
+      .string()
+      .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "must be the name of an env var, not a key")
+      .optional(),
+    family: z
+      .string()
+      .regex(/^[a-z][a-z0-9._-]{0,31}$/, "must be a lowercase family name")
+      .optional(),
+    context_window: z.number().int().min(MIN_COMPACTION_LIMIT).optional(),
+    max_tokens_field: z.enum(["max_completion_tokens", "max_tokens"]).optional(),
+  })
+  .superRefine((e, ctx) => {
+    if (e.api_key_env === undefined && !isLoopbackUrl(e.base_url)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["api_key_env"],
+        message: "is required unless base_url is a loopback http URL",
+      });
+    }
+  });
+
+const EndpointsToml = z.record(z.string(), EndpointToml).superRefine((endpoints, ctx) => {
+  for (const name of Object.keys(endpoints)) {
+    const problem = endpointNameProblem(name);
+    if (problem !== undefined) ctx.addIssue({ code: "custom", path: [name], message: problem });
+  }
+});
+
 const ModelsToml = z.strictObject({
   available: z.array(RefString).min(1, "available must list at least one model"),
   compaction: CompactionToml.optional(),
+  endpoints: EndpointsToml.optional(),
+  providers: ProvidersToml.optional(),
   roles: z
     .object(Object.fromEntries(ROLES.map((r) => [r, RefString.optional()])))
     .strict()
     .optional(),
 });
 
-/** Read `available = [...]` and the optional `[roles]` and `[compaction]` tables from a TOML file. */
+/**
+ * Read `available = [...]` and the optional `[roles]`, `[compaction]`, `[providers.*]` and
+ * `[endpoints.<name>]` tables from a TOML file. The endpoints are registered (`registerEndpoints`)
+ * before the refs are parsed; nothing stays registered when the file is invalid.
+ */
 export async function loadModelsFile(path: string): Promise<ModelsFile> {
   let raw: unknown;
   try {
@@ -137,23 +231,74 @@ export async function loadModelsFile(path: string): Promise<ModelsFile> {
       `cannot read models file ${path}: ${e instanceof Error ? e.message : String(e)}`,
     );
   }
-  const r = ModelsToml.safeParse(raw);
-  if (!r.success) {
-    const why = r.error.issues
-      .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
-      .join("; ");
-    throw new RewireError("models_file_invalid", `invalid models file ${path}: ${why}`);
+  const invalid = (issues: z.core.$ZodIssue[]): RewireError =>
+    new RewireError(
+      "models_file_invalid",
+      `invalid models file ${path}: ${issues
+        .map((i) => `${i.path.map(String).join(".") || "(root)"}: ${i.message}`)
+        .join("; ")}`,
+    );
+  // Endpoints first: refs like "groq:llama-3.3-70b" parse only once "groq" is registered.
+  const rawEndpoints = (raw as { endpoints?: unknown } | null)?.endpoints;
+  let endpoints: Record<string, EndpointConfig> | undefined;
+  if (rawEndpoints !== undefined) {
+    const e = EndpointsToml.safeParse(rawEndpoints);
+    if (!e.success) {
+      throw invalid(e.error.issues.map((i) => ({ ...i, path: ["endpoints", ...i.path] })));
+    }
+    endpoints = endpointConfigs(e.data);
   }
-  const overrides: Partial<Record<Role, ModelRef>> = {};
-  for (const role of ROLES) {
-    const ref = (r.data.roles as Record<string, ModelRef | undefined> | undefined)?.[role];
-    if (ref) overrides[role] = ref;
+  const undo = endpoints !== undefined ? registerEndpoints(endpoints) : () => {};
+  try {
+    const r = ModelsToml.safeParse(raw);
+    if (!r.success) throw invalid(r.error.issues);
+    const overrides: Partial<Record<Role, ModelRef>> = {};
+    for (const role of ROLES) {
+      const ref = (r.data.roles as Record<string, ModelRef | undefined> | undefined)?.[role];
+      if (ref) overrides[role] = ref;
+    }
+    const out: ModelsFile = {
+      available: r.data.available,
+      overrides,
+      compaction: compactionConfig(r.data.compaction, path),
+    };
+    if (r.data.providers !== undefined) out.providers = providerSettings(r.data.providers);
+    if (endpoints !== undefined) out.endpoints = endpoints;
+    return out;
+  } catch (e) {
+    undo();
+    throw e;
   }
-  return {
-    available: r.data.available,
-    overrides,
-    compaction: compactionConfig(r.data.compaction, path),
-  };
+}
+
+function endpointConfigs(raw: z.infer<typeof EndpointsToml>): Record<string, EndpointConfig> {
+  const out: Record<string, EndpointConfig> = {};
+  for (const [name, e] of Object.entries(raw)) {
+    const c: EndpointConfig = { baseUrl: e.base_url };
+    if (e.api_key_env !== undefined) c.apiKeyEnv = e.api_key_env;
+    if (e.family !== undefined) c.family = e.family;
+    if (e.context_window !== undefined) c.contextWindow = e.context_window;
+    if (e.max_tokens_field !== undefined) c.maxTokensField = e.max_tokens_field;
+    out[name] = c;
+  }
+  return out;
+}
+
+/** Drops absent keys so the result has only what the file set. */
+const defined = <T extends Record<string, unknown>>(o: T): T =>
+  Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as T;
+
+function providerSettings(raw: z.infer<typeof ProvidersToml>): ProviderSettings {
+  const out: ProviderSettings = {};
+  if (raw.bedrock) out.bedrock = defined({ region: raw.bedrock.region });
+  if (raw.vertex) out.vertex = defined({ project: raw.vertex.project, region: raw.vertex.region });
+  if (raw.foundry) {
+    out.foundry = defined({ resource: raw.foundry.resource, baseUrl: raw.foundry.base_url });
+  }
+  if (raw.azure) {
+    out.azure = defined({ endpoint: raw.azure.endpoint, apiVersion: raw.azure.api_version });
+  }
+  return out;
 }
 
 function compactionConfig(

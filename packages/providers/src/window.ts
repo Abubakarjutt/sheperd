@@ -1,7 +1,14 @@
 import { RewireError } from "@rewire/core";
 import { findOllamaTag, getLoadedOllamaModel, showOllamaModel } from "./ollama.js";
 import { ollamaBaseUrl } from "./registry.js";
-import { type ChatMessage, type ModelRef, PROVIDER_NAMES, type ToolSpec } from "./types.js";
+import {
+  builtinProvider,
+  type ChatMessage,
+  isKnownProvider,
+  type ModelRef,
+  PROVIDER_NAMES,
+  type ToolSpec,
+} from "./types.js";
 
 /** Where a context window came from, most trusted first. */
 export type WindowSource = "loaded" | "model" | "table" | "default";
@@ -137,10 +144,20 @@ export async function contextWindow(
 ): Promise<ContextWindow> {
   assertRef(ref);
   const env = opts.env ?? process.env;
-  switch (ref.provider) {
+  const provider = builtinProvider(ref.provider);
+  // Registered OpenAI-compatible endpoints: no table yet.
+  if (provider === undefined) return DEFAULT;
+  switch (provider) {
     case "anthropic":
     case "openai":
-      return fromTable(WINDOW_TABLE[ref.provider], ref.model);
+      return fromTable(WINDOW_TABLE[provider], ref.model);
+    // Cloud providers: no table yet.
+    case "bedrock":
+    case "vertex":
+    case "foundry":
+    case "azure":
+    case "gemini":
+      return DEFAULT;
     case "faux": {
       const w = positiveInt(opts.fauxWindow) ?? positiveInt(Number(env[FAUX_WINDOW_ENV] ?? ""));
       return w !== null ? { window: w, source: "model", provisional: true } : DEFAULT;
@@ -189,14 +206,15 @@ function resolveBaseUrl(opts: ContextWindowOptions, env: NodeJS.ProcessEnv): str
 
 function assertRef(ref: ModelRef): void {
   if (
-    !(PROVIDER_NAMES as readonly string[]).includes(ref?.provider) ||
+    typeof ref?.provider !== "string" ||
+    !isKnownProvider(ref.provider) ||
     typeof ref.model !== "string" ||
     ref.model === ""
   ) {
     throw new RewireError(
       "context_window_unknown",
       `cannot find a context window for model ref ${JSON.stringify(ref)}`,
-      `use <provider>:<model> with provider one of: ${PROVIDER_NAMES.join(", ")}`,
+      `use <provider>:<model> with provider one of: ${PROVIDER_NAMES.join(", ")}, or a registered endpoint`,
     );
   }
 }

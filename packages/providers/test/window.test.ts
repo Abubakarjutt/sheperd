@@ -9,8 +9,10 @@ import {
   type ModelRef,
   OLLAMA_PROVISIONAL_WINDOW_CAP,
   OLLAMA_TRUNCATION_HINT,
+  parseModelRef,
   parseNumCtx,
   refreshContextWindow,
+  registerEndpoints,
   suspectTruncation,
   TokenEstimator,
   WINDOW_TABLE,
@@ -465,5 +467,34 @@ describe("suspectTruncation", () => {
   test("a starting ratio can be supplied and is clamped", () => {
     expect(new TokenEstimator({ ratio: 1.2 }).ratio).toBe(1.2);
     expect(new TokenEstimator({ ratio: 9 }).ratio).toBe(2);
+  });
+});
+
+describe("contextWindow: providers without a table yet", () => {
+  test("cloud providers and registered endpoints get the default, never throw", async () => {
+    const undo = registerEndpoints({ groq: { baseUrl: "https://api.groq.com/openai/v1" } });
+    try {
+      for (const ref of [
+        "bedrock:anthropic.claude-opus-5-5",
+        "vertex:claude-opus-5-5",
+        "foundry:claude-opus-5-5",
+        "azure:gpt-5",
+        "gemini:gemini-2.5-pro",
+        "groq:llama-3.3-70b",
+      ]) {
+        await expect(contextWindow(parseModelRef(ref))).resolves.toEqual({
+          window: DEFAULT_CONTEXT_WINDOW,
+          source: "default",
+          provisional: true,
+        });
+      }
+    } finally {
+      undo();
+    }
+  });
+  test("an unregistered endpoint throws context_window_unknown", async () => {
+    await expect(contextWindow({ provider: "groq", model: "m" })).rejects.toMatchObject({
+      code: "context_window_unknown",
+    });
   });
 });

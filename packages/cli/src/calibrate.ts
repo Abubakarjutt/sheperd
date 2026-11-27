@@ -2,12 +2,14 @@ import type { Writable } from "node:stream";
 import { RewireError, redact } from "@rewire/core";
 import { compactionLimitOverride } from "@rewire/pipeline";
 import {
+  builtinProvider,
   type ContextWindow,
   contextWindow,
   type ModelRef,
   OLLAMA_TRUNCATION_HINT,
   ollamaChatTimeoutMs,
   type Provider,
+  type ProviderName,
   parseModelRef,
   refreshContextWindow,
   TokenEstimator,
@@ -126,11 +128,24 @@ const errorText = (e: unknown): string => {
 };
 
 /** What to check when probes keep failing. */
-const ERROR_HINT: Record<ModelRef["provider"], string> = {
+const ERROR_HINT: Record<ProviderName, string> = {
   ollama: "is Ollama running? check OLLAMA_HOST and `ollama ps`, or raise REWIRE_OLLAMA_TIMEOUT_S",
   anthropic: "check ANTHROPIC_API_KEY, the network and the rate limits",
   openai: "check OPENAI_API_KEY, the network and the rate limits",
   faux: "check the faux script (REWIRE_FAUX_SCRIPT)",
+  bedrock: "check the AWS credentials and region, the network and the rate limits",
+  vertex: "check the Google Cloud credentials, project and region, the network and the rate limits",
+  foundry:
+    "check ANTHROPIC_FOUNDRY_API_KEY and the Foundry resource, the network and the rate limits",
+  azure: "check AZURE_OPENAI_API_KEY and the Azure endpoint, the network and the rate limits",
+  gemini: "check GEMINI_API_KEY, the network and the rate limits",
+};
+
+const errorHint = (provider: string): string => {
+  const builtin = builtinProvider(provider);
+  return builtin !== undefined
+    ? ERROR_HINT[builtin]
+    : `check the [endpoints.${provider}] base_url and api_key_env, the network and the rate limits`;
 };
 
 /** Two provider errors in a row end the run (the recorded lengths are kept). */
@@ -304,7 +319,7 @@ export async function calibrateCommand(
       throw new RewireError(
         "calibration_failed",
         `${MAX_CONSECUTIVE_ERRORS} probes in a row failed (last: ${"error" in result ? oneLine(result.error, 200) : "?"}); the lengths measured so far are kept`,
-        ERROR_HINT[ref.provider],
+        errorHint(ref.provider),
       );
     }
   }

@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RewireError } from "@rewire/core";
-import { modelFamily, parseModelRef } from "@rewire/providers";
+import { endpointConfig, type ModelRef, modelFamily, parseModelRef } from "@rewire/providers";
 import { describe, expect, test } from "vitest";
 import {
   compactionLimitOverride,
@@ -157,5 +157,175 @@ describe("loadModelsFile [compaction]", () => {
     expect(err).toBeInstanceOf(RewireError);
     expect(err).toMatchObject({ code: "models_file_invalid" });
     expect((err as Error).message).toMatch(why);
+  });
+});
+
+describe("loadModelsFile [providers] and [endpoints]", () => {
+  test("reads provider settings and endpoints, and registers the endpoints", async () => {
+    const m = await loadModelsFile(
+      file(
+        [
+          `available = ["bedrock:anthropic.claude-opus-5-5", "openrouter:anthropic/claude-opus-5-5", "local:qwen3:32b"]`,
+          `[roles]`,
+          `reviewer = "local:qwen3:32b"`,
+          `[providers.bedrock]`,
+          `region = "us-east-1"`,
+          `[providers.vertex]`,
+          `project = "my-proj"`,
+          `region = "global"`,
+          `[providers.foundry]`,
+          `resource = "my-res"`,
+          `base_url = "https://my-res.services.ai.azure.com/anthropic"`,
+          `[providers.azure]`,
+          `endpoint = "https://my.openai.azure.com"`,
+          `api_version = "2025-04-01-preview"`,
+          `[endpoints.openrouter]`,
+          `base_url = "https://openrouter.ai/api/v1"`,
+          `api_key_env = "OPENROUTER_API_KEY"`,
+          `max_tokens_field = "max_completion_tokens"`,
+          `[endpoints.local]`,
+          `base_url = "http://127.0.0.1:8080/v1"`,
+          `family = "qwen"`,
+          `context_window = 65536`,
+          `[compaction.models."local:qwen3:32b"]`,
+          `limit = 32000`,
+          ``,
+        ].join("\n"),
+      ),
+    );
+    expect(m.providers).toEqual({
+      bedrock: { region: "us-east-1" },
+      vertex: { project: "my-proj", region: "global" },
+      foundry: { resource: "my-res", baseUrl: "https://my-res.services.ai.azure.com/anthropic" },
+      azure: { endpoint: "https://my.openai.azure.com", apiVersion: "2025-04-01-preview" },
+    });
+    expect(m.endpoints).toEqual({
+      openrouter: {
+        baseUrl: "https://openrouter.ai/api/v1",
+        apiKeyEnv: "OPENROUTER_API_KEY",
+        maxTokensField: "max_completion_tokens",
+      },
+      local: { baseUrl: "http://127.0.0.1:8080/v1", family: "qwen", contextWindow: 65536 },
+    });
+    expect(m.available[1]).toEqual({ provider: "openrouter", model: "anthropic/claude-opus-5-5" });
+    expect(m.overrides.reviewer).toEqual({ provider: "local", model: "qwen3:32b" });
+    expect(m.compaction.limits).toEqual({ "local:qwen3:32b": 32000 });
+    expect(parseModelRef("openrouter:x")).toEqual({ provider: "openrouter", model: "x" });
+    expect(endpointConfig("local")?.family).toBe("qwen");
+  });
+
+  test("an OpenRouter Claude cannot review a Bedrock Claude implementer", async () => {
+    const m = await loadModelsFile(
+      file(
+        `available = ["bedrock:anthropic.claude-opus-5-5", "or2:anthropic/claude-opus-5-5", "openai:gpt-5"]\n[endpoints.or2]\nbase_url = "https://openrouter.ai/api/v1"\napi_key_env = "OPENROUTER_API_KEY"\n`,
+      ),
+    );
+    const r = resolveRouting(m.available);
+    expect(r.reviewer).toEqual({ provider: "openai", model: "gpt-5" });
+    expect(modelFamily(m.available[1] as ModelRef)).toBe("claude");
+  });
+
+  test("a file without the new tables has neither field", async () => {
+    const m = await loadModelsFile(file(`available = ["anthropic:a"]\n`));
+    expect(m.providers).toBeUndefined();
+    expect(m.endpoints).toBeUndefined();
+  });
+
+  test.each([
+    ["unknown provider table", `[providers.aws]\nregion = "x"\n`, /aws/],
+    ["unknown provider key", `[providers.bedrock]\nprofile = "x"\n`, /profile/],
+    [
+      "unknown endpoint key",
+      `[endpoints.e1]\nbase_url = "https://x.example"\napi_key_env = "K"\nkey = "sk"\n`,
+      /key/,
+    ],
+    [
+      "bad endpoint name",
+      `[endpoints.Bad_Name]\nbase_url = "https://x.example"\napi_key_env = "K"\n`,
+      /Bad_Name/,
+    ],
+    [
+      "name colliding with openai",
+      `[endpoints.openai]\nbase_url = "https://x.example"\napi_key_env = "K"\n`,
+      /openai/,
+    ],
+    [
+      "name colliding with gemini",
+      `[endpoints.gemini]\nbase_url = "https://x.example"\napi_key_env = "K"\n`,
+      /gemini/,
+    ],
+    [
+      "http non-loopback base_url",
+      `[endpoints.e2]\nbase_url = "http://api.example.com/v1"\napi_key_env = "K"\n`,
+      /base_url/,
+    ],
+    [
+      "base_url not a url",
+      `[endpoints.e3]\nbase_url = "api.example.com"\napi_key_env = "K"\n`,
+      /base_url/,
+    ],
+    [
+      "missing api_key_env off loopback",
+      `[endpoints.e4]\nbase_url = "https://x.example"\n`,
+      /api_key_env/,
+    ],
+    [
+      "api_key_env holding a key",
+      `[endpoints.e5]\nbase_url = "https://x.example"\napi_key_env = "sk-abc def"\n`,
+      /api_key_env/,
+    ],
+    [
+      "context_window below 4096",
+      `[endpoints.e6]\nbase_url = "https://x.example"\napi_key_env = "K"\ncontext_window = 4095\n`,
+      /context_window/,
+    ],
+    [
+      "bad max_tokens_field",
+      `[endpoints.e7]\nbase_url = "https://x.example"\napi_key_env = "K"\nmax_tokens_field = "max"\n`,
+      /max_tokens_field/,
+    ],
+    [
+      "http azure endpoint",
+      `[providers.azure]\nendpoint = "http://my.openai.azure.com"\n`,
+      /endpoint/,
+    ],
+  ])("rejects %s with models_file_invalid", async (_name, body, why) => {
+    const err = await loadModelsFile(file(`available = ["anthropic:a"]\n${body}`)).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(RewireError);
+    expect(err).toMatchObject({ code: "models_file_invalid" });
+    expect((err as Error).message).toMatch(why);
+  });
+
+  test("loopback http needs no api_key_env", async () => {
+    for (const [name, url] of [
+      ["lo1", "http://localhost:11434/v1"],
+      ["lo2", "http://127.0.0.1:8080/v1"],
+      ["lo3", "http://[::1]:8080/v1"],
+    ] as const) {
+      const m = await loadModelsFile(
+        file(`available = ["${name}:m"]\n[endpoints.${name}]\nbase_url = "${url}"\n`),
+      );
+      expect(m.endpoints?.[name]).toEqual({ baseUrl: url });
+    }
+  });
+
+  test("a file whose refs fail leaves no endpoint registered", async () => {
+    const err = await loadModelsFile(
+      file(
+        `available = ["leak:m", "nope:x"]\n[endpoints.leak]\nbase_url = "https://x.example"\napi_key_env = "K"\n`,
+      ),
+    ).catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "models_file_invalid" });
+    expect(() => parseModelRef("leak:m")).toThrowError(
+      expect.objectContaining({ code: "model_ref_invalid" }),
+    );
+  });
+
+  test("an endpoint ref without the endpoint table is refused", async () => {
+    await expect(loadModelsFile(file(`available = ["groq:llama-3.3-70b"]\n`))).rejects.toThrow(
+      /groq/,
+    );
   });
 });
