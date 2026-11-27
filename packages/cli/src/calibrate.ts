@@ -46,7 +46,7 @@ up to 95% of its window (or --max), and caches the result in $XDG_CACHE_HOME/rew
 The chat session's compaction then triggers at the calibrated size. Never runs automatically.
 
   --max <tokens>   largest probe length
-  --yes            required for paid providers (all but ollama and a loopback endpoint): the probes cost input tokens
+  --yes            required for paid providers (all but ollama, faux and a loopback endpoint): the probes cost input tokens
   --models <file>  the models file (default: models.toml discovery, as rewire run)
   --fresh          ignore cached results for this model and measure again
 `;

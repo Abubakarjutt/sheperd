@@ -31,6 +31,7 @@ import {
 import type { SkillSet } from "@rewire/skills";
 import { afterAll, describe, expect, test } from "vitest";
 import {
+  CALIBRATE_USAGE,
   type CalibrateOptions,
   calibrateCommand,
   formatDuration,
@@ -525,6 +526,9 @@ describe("rewire calibrate (faux)", () => {
 });
 
 describe("rewire calibrate: the paid gate", () => {
+  test("--help names every free provider: ollama, faux and a loopback endpoint", () => {
+    expect(CALIBRATE_USAGE).toMatch(/all but ollama, faux and a loopback endpoint/);
+  });
   function paid() {
     const s = setup();
     const models = join(s.home, "models.toml");
