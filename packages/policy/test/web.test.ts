@@ -8,6 +8,7 @@ import {
   mergeTightenOnly,
   type Policy,
   webHostRefusal,
+  webOffReason,
 } from "../src/index.js";
 
 async function repoWith(toml: string): Promise<string> {
@@ -152,5 +153,18 @@ describe("webHostRefusal", () => {
     expect(webHostRefusal(withWeb({ enabled: false, denyDomains: [] }).web, "a.com")).toMatch(
       /enabled = false/,
     );
+  });
+});
+
+describe("webOffReason", () => {
+  test("off, or an empty allow list, gives the reason; otherwise none", () => {
+    expect(webOffReason(DEFAULT_POLICY)).toBeUndefined();
+    expect(webOffReason(withWeb({ enabled: false, denyDomains: [] }))).toMatch(/enabled = false/);
+    expect(webOffReason(withWeb({ enabled: true, denyDomains: [], allowDomains: [] }).web)).toMatch(
+      /allow_domains is empty/,
+    );
+    expect(
+      webOffReason(withWeb({ enabled: true, denyDomains: [], allowDomains: ["a.example"] })),
+    ).toBeUndefined();
   });
 });

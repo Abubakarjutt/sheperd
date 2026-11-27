@@ -36,3 +36,16 @@ export function webHostRefusal(web: WebPolicy, host: string): string | undefined
     return `${h} is not in [web] allow_domains`;
   return undefined;
 }
+
+/**
+ * Why the web tools are not offered at all, or undefined when they are: web is off, or the
+ * allow list is empty (set to `[]`, or layers with no domain in common), which refuses every
+ * host. For the doctor and the stages alike.
+ */
+export function webOffReason(web: WebPolicy | { web: WebPolicy }): string | undefined {
+  const w = "web" in web ? web.web : web;
+  if (!w.enabled) return "web access is off ([web] enabled = false)";
+  if (w.allowDomains !== undefined && w.allowDomains.length === 0)
+    return "[web] allow_domains is empty (set to [] or no domain in common across policy layers), so every host is refused";
+  return undefined;
+}

@@ -350,6 +350,36 @@ describe("runAgent", () => {
     }
   });
 
+  test("a tool's own summary hook replaces the raw arguments in its tool_call event", async () => {
+    const events: RunEvent[] = [];
+    const hooked = {
+      ...mkTool("secretive").tool,
+      summary: (args: Record<string, unknown>) => `safe:${String(args.n)}`,
+    };
+    const throwing = {
+      ...mkTool("broken").tool,
+      summary: () => {
+        throw new Error("x");
+      },
+    };
+    const faux = new FauxProvider([
+      call("secretive", { n: 1, key: "xsk-hidden" }),
+      call("broken", { key: "xsk-hidden" }),
+      call("echo", { value: "plain" }),
+      text("ok"),
+    ]);
+    await runAgent(
+      base(faux, [hooked, throwing, mkTool("echo").tool], {
+        emit: (e: RunEvent) => events.push(e),
+      }),
+    );
+    const summaries = events.flatMap((e) => (e.type === "tool_call" ? [e.summary] : []));
+    expect(summaries[0]).toBe("secretive safe:1");
+    expect(summaries[1]).toBe("broken [summary unavailable]");
+    expect(summaries[2]).toBe('echo {"value":"plain"}');
+    expect(JSON.stringify(events)).not.toContain("xsk-hidden");
+  });
+
   test("never appends an empty assistant message", async () => {
     const faux = new FauxProvider([{ text: "", stopReason: "end" }]);
     const res = await runAgent(base(faux, []));

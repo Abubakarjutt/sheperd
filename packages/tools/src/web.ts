@@ -6,7 +6,7 @@ import {
   UNTRUSTED_WEB,
 } from "@rewire/core";
 import type { AgentTool, ToolResult } from "@rewire/loop";
-import { type Policy, webHostRefusal } from "@rewire/policy";
+import { type Policy, webHostRefusal, webOffReason } from "@rewire/policy";
 import {
   checkOutgoing,
   checkOutgoingUrl,
@@ -75,11 +75,18 @@ export type WebToolsOptions = WebAccess & {
   onRequest: (r: WebRequest) => void;
 };
 
-/** Whether an agent gets the web tools: access was given and policy has web on. */
+/**
+ * Whether an agent gets the web tools: access was given and policy has web on with a usable
+ * allow list (`webOffReason` says why not).
+ */
 export const webToolsOn = (policy: Policy, web: WebAccess | undefined): web is WebAccess =>
-  web !== undefined && policy.web.enabled;
+  web !== undefined && webOffReason(policy) === undefined;
 
-const clean = (s: string): string => redact(stripControls(s));
+/**
+ * NFKC first, so full-width and small-form lookalikes (`＜／untrusted_web＞`) fold to ASCII and
+ * the fence's closer defanging catches them; then controls, then secrets.
+ */
+const clean = (s: string): string => redact(stripControls(s.normalize("NFKC")));
 const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim();
 const bytes = (s: string): number => Buffer.byteLength(s, "utf8");
 const capChars = (s: string, n: number): string => {
@@ -89,10 +96,12 @@ const capChars = (s: string, n: number): string => {
 
 /** The longest prefix of `s` of at most `max` UTF-8 bytes, cut on a code point boundary. */
 function capBytes(s: string, max: number): { text: string; cut: boolean } {
-  if (bytes(s) <= max) return { text: s, cut: false };
-  let text = Buffer.from(s, "utf8").subarray(0, max).toString("utf8");
-  while (text.endsWith("�")) text = text.slice(0, -1);
-  return { text, cut: true };
+  const buf = Buffer.from(s, "utf8");
+  if (buf.length <= max) return { text: s, cut: false };
+  // Back off to the start of a code point: never split a multi-byte sequence.
+  let end = max;
+  while (end > 0 && ((buf[end] ?? 0) & 0xc0) === 0x80) end--;
+  return { text: buf.subarray(0, end).toString("utf8"), cut: true };
 }
 
 /** Host and path of `raw` for the event, or a placeholder; a URL carrying a secret is hidden. */
@@ -107,13 +116,23 @@ function target(raw: string): string {
   }
 }
 
-function hostOf(url: string): string | undefined {
+/** The host of an http(s) URL with a host, else undefined (data:, javascript:, ftp:, junk). */
+function httpHost(url: string): string | undefined {
   try {
-    return new URL(url).hostname;
+    const u = new URL(url);
+    return (u.protocol === "http:" || u.protocol === "https:") && u.hostname !== ""
+      ? u.hostname
+      : undefined;
   } catch {
     return undefined;
   }
 }
+
+/** The `tool_call` summary of web_search: the cleaned query, or a placeholder for a secret. */
+const querySummary = (query: string): string =>
+  checkOutgoing(query) !== undefined
+    ? "[refused: secret-shaped]"
+    : `"${capChars(clean(oneLine(query)), 200)}"`;
 
 const isAbort = (e: unknown, signal: AbortSignal | undefined): boolean =>
   !(e instanceof WebError) &&
@@ -134,7 +153,7 @@ function failure(tool: WebToolName, e: unknown, signal: AbortSignal | undefined)
  * With web off in policy, there are no tools.
  */
 export function createWebTools(o: WebToolsOptions): AgentTool[] {
-  if (!o.policy.web.enabled) return [];
+  if (webOffReason(o.policy) !== undefined) return [];
   const web = o.policy.web;
   const search = o.search ?? webSearch;
   const fetchPage = o.fetch ?? webFetch;
@@ -157,6 +176,7 @@ export function createWebTools(o: WebToolsOptions): AgentTool[] {
         required: ["query"],
       },
     },
+    summary: (args) => querySummary(strArg(args, "query") ?? ""),
     async execute(args, signal): Promise<ToolResult> {
       const query = strArg(args, "query") ?? "";
       const rec: WebRequest = {
@@ -178,8 +198,9 @@ export function createWebTools(o: WebToolsOptions): AgentTool[] {
         rec.backend = r.backend;
         let hidden = 0;
         const shown = r.results.filter((x) => {
-          const host = hostOf(x.url);
-          const keep = host !== undefined && webHostRefusal(web, host) === undefined;
+          const host = httpHost(x.url);
+          if (host === undefined) return false; // never shown, whatever the policy
+          const keep = webHostRefusal(web, host) === undefined;
           if (!keep) hidden++;
           return keep;
         });
@@ -218,6 +239,7 @@ export function createWebTools(o: WebToolsOptions): AgentTool[] {
         required: ["url"],
       },
     },
+    summary: (args) => target(strArg(args, "url") ?? ""),
     async execute(args, signal): Promise<ToolResult> {
       const url = strArg(args, "url") ?? "";
       const rec: WebRequest = { tool: "web_fetch", url: target(url), bytes: 0, ok: false };

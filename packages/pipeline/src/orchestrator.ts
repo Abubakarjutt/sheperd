@@ -136,6 +136,8 @@ export type RunPipelineInput = {
   /**
    * Web access (`web_search`, `web_fetch`) for the spec and implementer agents only, when policy
    * has web on. Never the test-writer, reviewers or verifier. Unset: no stage has web tools.
+   * `faux` does not turn it off: a caller running a faux self-test must leave this unset (the
+   * CLI does), or pass injected `search`/`fetch` so no real network is used.
    */
   web?: WebAccess;
   /**

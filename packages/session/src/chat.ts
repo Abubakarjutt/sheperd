@@ -100,7 +100,8 @@ export type ChatEvent =
     }
   | { type: "skill_loaded"; name: string }
   /**
-   * One `web_search` or `web_fetch` call of a live turn, success or failure (the audit record:
+   * One `web_search` or `web_fetch` call, success or failure, also from a turn that was aborted
+   * meanwhile (the audit record:
    * query or host+path sanitized and redacted, never a key).
    */
   | ({ type: "web_request" } & WebRequest)
@@ -1285,10 +1286,9 @@ export class ChatSession {
         return r;
       },
     };
-    // Web calls of an abandoned turn are not reported, like its skill loads.
-    const web = this.webTools((r) => {
-      if (live()) this.emit({ type: "web_request", ...r });
-    });
+    // Audit records, not UI state: a call of an aborted or abandoned turn is still reported,
+    // because its request went out.
+    const web = this.webTools((r) => this.emit({ type: "web_request", ...r }));
     const tools = [...this.baseTools(client, skill, web), propose];
     this.specCache ??= tools.map((t) => t.spec);
     const system = this.system();

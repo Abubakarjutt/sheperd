@@ -7,6 +7,12 @@ export type ToolResult = { content: string; isError: boolean };
 export type AgentTool = {
   spec: ToolSpec;
   execute(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult>;
+  /**
+   * What the `tool_call` event shows after the tool name, instead of the raw JSON arguments
+   * (for a tool whose arguments may carry what must never be logged). A throwing hook shows
+   * `[summary unavailable]`, never the arguments.
+   */
+  summary?(args: Record<string, unknown>): string;
 };
 
 export type LoopState = { messages: ChatMessage[]; turns: number; lastText: string };

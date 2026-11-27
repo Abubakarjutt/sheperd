@@ -181,7 +181,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
         }
         const content = truncate(result.content);
         messages.push({ role: "tool", content, toolCallId: call.id });
-        const argsJson = JSON.stringify(call.arguments) ?? "";
+        const owner = tools.find((t) => t.spec.name === call.name);
+        let shown: string;
+        if (owner?.summary) {
+          try {
+            shown = owner.summary(call.arguments);
+          } catch {
+            shown = "[summary unavailable]";
+          }
+        } else shown = JSON.stringify(call.arguments) ?? "";
         opts.emit({
           type: "tool_call",
           runId: opts.runId,
@@ -189,7 +197,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
           stage: opts.stage,
           tool: call.name,
           isError: result.isError,
-          summary: `${call.name} ${argsJson.slice(0, 200)}`,
+          summary: `${call.name} ${shown.slice(0, 200)}`,
         });
       }
       continue;
