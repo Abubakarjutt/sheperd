@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { checkOutgoing } from "../src/outgoing.js";
+import { checkOutgoing, checkOutgoingUrl } from "../src/outgoing.js";
 
 describe("checkOutgoing", () => {
   test.each([
@@ -52,5 +52,48 @@ describe("checkOutgoing decodes robustly (review I1)", () => {
     expect(
       checkOutgoing("https://example.com/search?q=caf%C3%A9%20au%20lait&x=%zz"),
     ).toBeUndefined();
+  });
+});
+
+describe("the outgoing check has no token-start guard (fix round 2)", () => {
+  test.each([
+    "https://e.example/?d=xsk-ant-api03-abcdefghijklmnopqrstu",
+    "https://e.example/?d=xAKIAIOSFODNN7EXAMPLE",
+    "https://e.example/?d=_ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+    "https://e.example/xsk-ant-api03-abcdefghijklmnopqrstu/page",
+    "query 1sk-proj-abcdefghijklmnopqrstuvwx",
+    "d=%u0073k-ant-api03-abcdefghijklmnopqrstu",
+    "d=ｓｋ-ant-api03-abcdefghijklmnopqrstu",
+    "d=sk-ant-api03-abcdefghij%00klmnopqrstu",
+  ])("%s is refused", (s) => {
+    expect(checkOutgoing(s)).toMatch(/secret/);
+  });
+
+  test("five and more rounds of encoding are decoded (fixpoint)", () => {
+    let s = "sk-ant-api03-abcdefghijk";
+    for (let i = 0; i < 8; i++) s = encodeURIComponent(s);
+    expect(checkOutgoing(s)).toMatch(/secret/);
+  });
+
+  test.each([
+    "ask-matt how to use task-file and disk-usage",
+    "https://example.com/docs/task-file/disk-usage?q=ask-matt",
+    "AKIA is a prefix",
+    "ghp_ short",
+  ])("%s passes", (s) => {
+    expect(checkOutgoing(s)).toBeUndefined();
+  });
+});
+
+describe("checkOutgoingUrl hosts (fix round 2)", () => {
+  test.each([
+    "https://xakiaiosfodnn7example.evil.example/",
+    "https://xsk-ant-api03-abcdefghijklmnopqrstu.evil.example/",
+    "https://aizasyabcdefghijklmnopqrstuvwxyz0123456.evil.example/",
+  ])("%s is refused", (u) => {
+    expect(checkOutgoingUrl(u)).toMatch(/secret/);
+  });
+  test("an ordinary host passes", () => {
+    expect(checkOutgoingUrl("https://ask-matt.disk-usage.example/task-file")).toBeUndefined();
   });
 });

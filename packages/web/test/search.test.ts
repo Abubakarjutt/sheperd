@@ -287,3 +287,18 @@ describe("webSearch refusals and failures", () => {
     expect(r.results[0]?.snippet.length).toBeLessThanOrEqual(2001);
   });
 });
+
+describe("search queries (fix round 2)", () => {
+  test("a prefixed key is refused; ordinary hyphenated words pass", async () => {
+    const env = { OLLAMA_API_KEY: OLLAMA };
+    const never: WebFetchFn = async () => {
+      throw new Error("must not fetch");
+    };
+    await expect(
+      webSearch("xsk-ant-api03-abcdefghijklmnopqrstu", { config: cfg(), env, fetchFn: never }),
+    ).rejects.toThrow(/secret/);
+    const { fetchFn, calls } = json({ results: [] });
+    await webSearch("ask-matt task-file disk-usage", { config: cfg(), env, fetchFn });
+    expect(calls).toHaveLength(1);
+  });
+});

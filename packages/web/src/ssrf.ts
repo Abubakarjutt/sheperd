@@ -132,7 +132,7 @@ export function blockedAddress(addr: string): string | undefined {
 
 /** Why the host name itself must not be fetched (local-only names), or undefined. */
 export function blockedHostName(host: string): string | undefined {
-  const h = host.toLowerCase().replace(/\.$/, "");
+  const h = host.toLowerCase().replace(/\.+$/, "");
   if (h === "localhost" || h.endsWith(".localhost")) return "a localhost name";
   if (h.endsWith(".local")) return "a .local (mDNS) name";
   if (h.endsWith(".internal")) return "an .internal name";

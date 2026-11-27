@@ -460,3 +460,36 @@ describe("fix round 1", () => {
     );
   });
 });
+
+describe("fix round 2", () => {
+  const never: WebFetchFn = async () => {
+    throw new Error("must not fetch");
+  };
+  const noDns: Resolver = async () => {
+    throw new Error("must not resolve");
+  };
+  test.each([
+    "https://e.example/?d=xsk-ant-api03-abcdefghijklmnopqrstu",
+    "https://e.example/xAKIAIOSFODNN7EXAMPLE",
+    "https://e.example/?d=_ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+    "https://xakiaiosfodnn7example.evil.example/",
+    "https://xsk-ant-api03-abcdefghijklmnopqrstu.evil.example/",
+  ])("%s is refused before DNS", async (url) => {
+    await expect(webFetch(url, { fetchFn: never, resolve: noDns })).rejects.toThrow(/secret/);
+  });
+
+  test("every trailing dot is stripped before isAllowed (N1)", async () => {
+    const seen: string[] = [];
+    await expect(
+      webFetch("https://evil.example../", {
+        fetchFn: never,
+        resolve: noDns,
+        isAllowed: (h) => {
+          seen.push(h);
+          return "deny";
+        },
+      }),
+    ).rejects.toThrow(/deny/);
+    expect(seen).toEqual(["evil.example"]);
+  });
+});

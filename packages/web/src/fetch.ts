@@ -121,7 +121,7 @@ export async function webFetchUsing(
   try {
     let current = checkUrl(url);
     for (let hop = 0; ; hop++) {
-      const refused = o.isAllowed?.(current.hostname.toLowerCase().replace(/\.$/, ""));
+      const refused = o.isAllowed?.(current.hostname.toLowerCase().replace(/\.+$/, ""));
       if (refused !== undefined) throw new WebError(`refused by policy: ${refused}`);
       let pin: Awaited<ReturnType<typeof vetHost>>;
       try {
