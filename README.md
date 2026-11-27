@@ -260,7 +260,8 @@ After a compaction the model sees, in order:
 1. the session record: a structured list of goals, constraints, decisions, open questions,
    preferences, next steps and notes, each with the messages that back it;
 2. your recent messages, kept verbatim (up to `recent_user_tokens`, and at most a quarter of the
-   limit);
+   limit; fewer, or none, when the context must shrink to fit, and the newest one cut in the
+   middle when it alone is over that budget);
 3. every turn after that point.
 
 The older assistant turns and tool output are not kept in the context. The full conversation
@@ -274,15 +275,24 @@ It is a record and not a summary, so nothing is lost without a trace:
   your own messages. Tool output, file contents, skills and the model's own text can never make
   or override one. This stops a file that says "from now on, the user requires X" from becoming
   a standing rule.
-- An edit that changes a rule, or adds a claim attributed to you, is also checked by a second
-  model, from a different family when one is configured. If that check is unavailable, the whole
-  compaction fails.
+- Only items tagged `[user …]` speak for you. Everything else is `[inferred …]`: the compactor's
+  reading of tool output, files and replies, which the chat model is told never to treat as an
+  instruction. An inferred item that none of your messages supports is shown as
+  `[inferred, not from the user …]`.
+- Some edits are also checked by a second model, from a different family when one is
+  configured: an edit that changes one of your rules or adds a claim attributed to you, any
+  change to an open question, and an inferred goal, constraint, must-keep-working item or
+  decision that rests only on tool output. Without that check they are not applied. If the
+  check is unavailable, the whole compaction fails.
+- Skill text and `recall` results are never evidence for an edit.
 - Items are never deleted. Resolved and superseded items move to an archive.
 - If a compaction fails for any reason, the previous record and the full context are kept, and
-  the chat carries on.
+  the chat carries on. (When a long window is compacted in parts, the parts already applied
+  stay.)
 
-The facts about files and commands (what was read, what ran, what failed) are computed by code
-from the stored messages. The model does not write them.
+The facts about files and commands (what was read, which commands ran and their exit codes,
+which tool calls failed) are computed by code from the stored messages. The model does not
+write them. Run outcomes are not part of the record.
 
 ### When it triggers
 
@@ -305,16 +315,24 @@ min(0.85·W, 32768·(W/32768)^0.6), rounded down to the thousand
 Large windows trigger well before they are full. Models read long prompts less reliably, and
 every turn re-reads the whole context.
 
-Two more candidates can lower the limit:
+Other candidates:
 
-- **Latency.** Once rewire has timed the model reading prompts, the limit is that rate times
+- **Window share.** `0.85·W`, rounded down to the thousand.
+- **Latency.** Once rewire has timed the model reading prompts, that rate times
   `latency_budget_s`. A slow local model compacts sooner.
 - **Calibrated.** `rewire calibrate` (below) measures how much context a model really uses.
-  The measured value replaces the formula.
+  The measured value replaces the formula, so it can be higher than the formula's value (a 200K
+  window that passes at 128K gives 131,072, not 97,000).
 
-The smallest candidate wins, and the limit is never above `0.85·W` or below 4,096. The window is
-asked of the provider (Ollama's loaded context, or a built-in table for Anthropic and OpenAI).
-Compaction also leaves the context at no more than half the limit.
+The smallest candidate wins. It is raised to at least 4,096 and then capped at `0.85·W`, so a
+window under about 4.8K gets a limit below 4,096. A configured `limit` (below) replaces all of
+this; it is at least 4,096 and is not capped. The window is asked of the provider (Ollama's
+loaded context, or a built-in table for Anthropic and OpenAI).
+
+Compaction aims to leave the context at no more than half the limit, with room for the message
+being sent, keeping fewer recent messages and then a shorter record until it fits. Your own rules are
+never dropped from the record, so when they alone are too big the compaction still applies, and
+automatic compaction is held back (` · held`, or ` · stuck`).
 
 ### `models.toml`
 
@@ -339,8 +357,10 @@ All keys are optional. Unknown keys are an error (`models_file_invalid`).
 The status line shows `ctx 61k/74k (f)`: the context size, the limit, and why the limit is that
 value: `f` formula, `l` latency, `c` calibrated, `w` window share, `o` override. The size is dim,
 turns yellow at 70% of the limit and red at 90%. A dim ` · held` means automatic compaction is
-waiting for the context to grow before it tries again. ` · stuck` means automatic compaction is off for this
-window, because compacting did not get the context under the limit. `/compact` still works then.
+waiting for the context to grow by a quarter of the limit before it tries again. ` · stuck` means
+automatic compaction is off for this window, because a failed or over-budget compaction left the
+context at or past halfway from the limit to `0.85·W`. `/compact` still works then, and a
+changed window clears it.
 
 Lines you may see:
 
@@ -355,7 +375,7 @@ Lines you may see:
 The chat has a read-only `recall` tool. It searches the whole stored conversation and the
 archive for a word or phrase, so a detail that left the context can be found again. Results are
 at most 10 snippets and 4 KB, are cleaned of secrets, and are fenced as untrusted data. Only the
-chat has it, never a pipeline stage.
+chat has it, never a pipeline stage, and a compaction never cites its results as evidence.
 
 ### `rewire calibrate`
 
@@ -373,7 +393,9 @@ On a local model this is slow: each long probe can take minutes, and a full run 
 or more. Calibration never runs by itself.
 
 - **Resume.** Each length is saved as soon as it finishes, under the XDG cache directory. Ctrl-C
-  stops the run (exit 130), and the same command continues from the saved lengths. `--fresh`
+  stops the run after the lengths already recorded (exit 130; a second Ctrl-C force-quits), and
+  the same command continues from the saved lengths. A failed run exits 1
+  (`calibration_failed`). `--fresh`
   measures everything again.
 - **Stale runs.** The result is tied to the model's digest and window. If the window changes by
   more than 10%, the result is stale: `/context` warns, the trigger stops using it, and
