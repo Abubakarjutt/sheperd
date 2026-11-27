@@ -399,7 +399,8 @@ or more. Calibration never runs by itself.
   measures everything again.
 - **Stale runs.** The result is tied to the model's digest and window. If the window changes by
   more than 10%, the result is stale: `/context` warns, the trigger stops using it, and
-  `calibrate` measures again.
+  `calibrate` measures again. An endpoint's result is kept by `<endpoint>:<model>`, not its
+  `base_url`: after pointing an endpoint at another server, run `calibrate --fresh`.
 - **Truncation.** If the provider read far fewer tokens than were sent (under 60%), the probe is
   not scored and the run fails with `calibration_failed`. For Ollama, the hint is to raise
   `OLLAMA_CONTEXT_LENGTH` (for example 65536) on the server, or set `num_ctx` in a Modelfile.
