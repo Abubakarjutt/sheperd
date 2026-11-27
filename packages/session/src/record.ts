@@ -52,6 +52,12 @@ export const RecordItem = z
     reason: z.string().max(TEXT_MAX).optional(),
     source: z.enum(["user", "inferred"]),
     evidence: z.array(Evidence).max(EVIDENCE_MAX).optional(),
+    /**
+     * Set by code on an `inferred` item when no user message supports it (its evidence cites
+     * only tool results or assistant replies, or nothing): rendered `[inferred, not from the
+     * user …]` so it can never pass for the user's own rule.
+     */
+    notFromUser: z.literal(true).optional(),
     status: z.enum(["active", "resolved", "superseded"]),
     supersededBy: z.string().min(1).max(64).optional(),
     createdAt: MessageId,
@@ -242,15 +248,16 @@ function keepRecent<T>(entries: { value: T; last: number }[], max: number): T[] 
  * deterministic. Every stored string is sanitized, then redacted. A call with no stored result
  * (the turn ended first) records nothing.
  */
-export function observe(
+/**
+ * Pair each tool call with its stored result: `[assistant index, call position, call, result
+ * index]` per call that has one. A call id pairs by id only when it is non-empty and unique
+ * across all calls and all results; otherwise (OpenAI-compatible servers may send "" or reuse
+ * ids such as call_0) by position: the loop stores a turn's results right after its assistant
+ * message, in call order.
+ */
+function pairToolCalls(
   messages: readonly ChatMessage[],
-  opts: { runs?: readonly ObservedRun[] } = {},
-): Observed {
-  // Pair each call with its result. A call id pairs by id only when it is non-empty and unique
-  // across all calls and all results; otherwise (OpenAI-compatible servers may send "" or reuse
-  // ids such as call_0) by position: the loop stores a turn's results right after its assistant
-  // message, in call order.
-  type Result = { content: string; isError: unknown };
+): { idx: number; k: number; call: ToolCallOf; result: number }[] {
   const callIds = new Map<string, number>();
   const resultIds = new Map<string, number>();
   for (const m of messages) {
@@ -261,72 +268,91 @@ export function observe(
       resultIds.set(m.toolCallId, (resultIds.get(m.toolCallId) ?? 0) + 1);
     }
   }
-  const byId = new Map<string, Result>();
+  const byId = new Map<string, number>();
+  for (const [j, m] of messages.entries()) {
+    if (m.role === "tool" && m.toolCallId && resultIds.get(m.toolCallId) === 1) {
+      byId.set(m.toolCallId, j);
+    }
+  }
+  const resultFor = (call: { id: string }, idx: number, k: number): number | undefined => {
+    if (call.id !== "" && callIds.get(call.id) === 1 && resultIds.get(call.id) === 1) {
+      return byId.get(call.id);
+    }
+    const j = idx + 1 + k;
+    if (messages[j]?.role !== "tool") return undefined;
+    // Every message between the assistant message and this one must be a tool result too.
+    for (let i = idx + 1; i < j; i++) if (messages[i]?.role !== "tool") return undefined;
+    return j;
+  };
+  const out: { idx: number; k: number; call: ToolCallOf; result: number }[] = [];
+  for (const [idx, m] of messages.entries()) {
+    if (m.role !== "assistant") continue;
+    for (const [k, call] of (m.toolCalls ?? []).entries()) {
+      const result = resultFor(call, idx, k);
+      if (result !== undefined) out.push({ idx, k, call, result });
+    }
+  }
+  return out;
+}
+
+type ToolCallOf = NonNullable<ChatMessage["toolCalls"]>[number];
+
+/** The tool name of each stored tool result, by message index (results with no call are absent). */
+export function toolResultNames(messages: readonly ChatMessage[]): Map<number, string> {
+  return new Map(pairToolCalls(messages).map((p) => [p.result, p.call.name]));
+}
+
+export function observe(
+  messages: readonly ChatMessage[],
+  opts: { runs?: readonly ObservedRun[] } = {},
+): Observed {
+  type Result = { content: string; isError: unknown };
   const toResult = (m: ChatMessage): Result => ({
     content: m.content,
     isError: (m as { isError?: unknown }).isError,
   });
-  for (const m of messages) {
-    if (m.role === "tool" && m.toolCallId && resultIds.get(m.toolCallId) === 1) {
-      byId.set(m.toolCallId, toResult(m));
-    }
-  }
-  const resultFor = (call: { id: string }, idx: number, k: number): Result | undefined => {
-    if (call.id !== "" && callIds.get(call.id) === 1 && resultIds.get(call.id) === 1) {
-      return byId.get(call.id);
-    }
-    const m = messages[idx + 1 + k];
-    if (m === undefined || m.role !== "tool") return undefined;
-    // Every message between the assistant message and this one must be a tool result too.
-    for (let j = idx + 1; j < idx + 1 + k; j++) if (messages[j]?.role !== "tool") return undefined;
-    return toResult(m);
-  };
 
   let tick = 0;
   const files = new Map<string, { value: Observed["files"][number]; last: number }>();
   const commands = new Map<string, { value: Observed["commands"][number]; last: number }>();
   const errors: Observed["errors"] = [];
 
-  for (const [idx, m] of messages.entries()) {
-    if (m.role !== "assistant") continue;
-    for (const [k, call] of (m.toolCalls ?? []).entries()) {
-      const result = resultFor(call, idx, k);
-      if (result === undefined) continue;
-      tick++;
-      const tool = call.name;
-      const args = call.arguments ?? {};
-      const exit = tool === "bash" ? EXIT_LINE.exec(result.content) : null;
-      const failed = exit === null && isErrorResult(result.content, result.isError);
+  for (const { call, result: j } of pairToolCalls(messages)) {
+    const result = toResult(messages[j] as ChatMessage);
+    tick++;
+    const tool = call.name;
+    const args = call.arguments ?? {};
+    const exit = tool === "bash" ? EXIT_LINE.exec(result.content) : null;
+    const failed = exit === null && isErrorResult(result.content, result.isError);
 
-      if (tool === "bash" && !failed) {
-        const cmd = clean(str(args.command) ?? "").slice(0, CMD_MAX);
-        const code = exit ? Number(exit[1]) : null;
-        const prev = commands.get(cmd);
-        if (prev) {
-          prev.value.exit = code;
-          prev.value.count++;
-          prev.last = tick;
-        } else {
-          commands.set(cmd, { value: { cmd, exit: code, count: 1 }, last: tick });
-        }
-        continue;
-      }
-      if (failed) {
-        const message = clean(result.content.split("\n", 1)[0] ?? "").slice(0, ERROR_MESSAGE_MAX);
-        errors.push({ tool: clean(tool).slice(0, 64), message });
-        continue;
-      }
-      const raw = pathArg(tool, args);
-      if (raw === undefined) continue;
-      const path = clean(raw).slice(0, PATH_MAX);
-      if (path === "") continue;
-      const prev = files.get(path);
+    if (tool === "bash" && !failed) {
+      const cmd = clean(str(args.command) ?? "").slice(0, CMD_MAX);
+      const code = exit ? Number(exit[1]) : null;
+      const prev = commands.get(cmd);
       if (prev) {
-        prev.value.reads++;
+        prev.value.exit = code;
+        prev.value.count++;
         prev.last = tick;
       } else {
-        files.set(path, { value: { path, reads: 1 }, last: tick });
+        commands.set(cmd, { value: { cmd, exit: code, count: 1 }, last: tick });
       }
+      continue;
+    }
+    if (failed) {
+      const message = clean(result.content.split("\n", 1)[0] ?? "").slice(0, ERROR_MESSAGE_MAX);
+      errors.push({ tool: clean(tool).slice(0, 64), message });
+      continue;
+    }
+    const raw = pathArg(tool, args);
+    if (raw === undefined) continue;
+    const path = clean(raw).slice(0, PATH_MAX);
+    if (path === "") continue;
+    const prev = files.get(path);
+    if (prev) {
+      prev.value.reads++;
+      prev.last = tick;
+    } else {
+      files.set(path, { value: { path, reads: 1 }, last: tick });
     }
   }
 
@@ -377,9 +403,13 @@ export function codeSpan(value: string): string {
   return `${fence}${pad}${v}${pad}${fence}`;
 }
 
+/** The tag of an inferred item that no user message supports. */
+export const NOT_FROM_USER_TAG = "inferred, not from the user";
+
 function itemLine(i: RecordItem): string {
   const ids = (i.evidence ?? []).map((e) => flatten(e.messageId));
-  const tag = [i.source, ...ids].join(" ");
+  const source = i.source === "inferred" && i.notFromUser ? NOT_FROM_USER_TAG : i.source;
+  const tag = [source, ...ids].join(" ");
   const reason = i.reason ? flatten(i.reason) : "";
   return `- [${tag}] ${flatten(i.text)}${reason ? ` — ${reason}` : ""}`;
 }
@@ -422,7 +452,8 @@ const tokens = (s: string): number => Math.ceil(s.length / 4);
 /**
  * Render the active items as compact Markdown sections (Goal, Constraints & must-keep-working,
  * Decisions, Open questions, Preferences, Next step, Notes), then `## Observed`. Each item is
- * `- [<source> <evidence ids>] text — reason`. The archive is never rendered.
+ * `- [<source> <evidence ids>] text — reason`; an inferred item no user message supports is
+ * tagged `[inferred, not from the user <ids>]`. The archive is never rendered.
  *
  * To fit `budgetTokens` (chars / 4) entries are dropped in this order: observed entries oldest
  * first (interleaved across files, commands, runs and errors by their relative age), then

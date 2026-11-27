@@ -444,6 +444,34 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
     );
   });
 
+  test("a cut retained message holding secrets is byte-identical after resume (final review M2)", async () => {
+    const p = model({ chat: [text("a1")], compact: [ops()] });
+    const { deps: d } = deps({ recentUserTokens: 300 });
+    const { session, repo } = await setup(p, d);
+    // Each key is 67 characters live and "[redacted]" (10) in the file: the cut must be measured
+    // on the stored text, or the same head and tail land elsewhere on resume.
+    const keys = `key sk-ant-${"A".repeat(60)} `.repeat(30);
+    await session.send(`${keys}${"p ".repeat(3000)}THE END`);
+    const out = await session.compact();
+    if (!out.ok) throw new Error(out.reason);
+    const ctx = session.context();
+    const recent = ctx[1]?.content ?? "";
+    expect(recent.startsWith(RECENT_TITLE)).toBe(true);
+    expect(recent).toContain("characters omitted by compaction");
+    expect(recent).toContain("THE END");
+    expect(recent).not.toContain("sk-ant-");
+
+    const fresh = new SessionStore();
+    await fresh.list(repo);
+    const { deps: d2 } = deps({ recentUserTokens: 300 });
+    const { session: resumed } = await setup(model({ chat: [] }), d2, {
+      repo,
+      store: fresh,
+      sessionId: session.id() as string,
+    });
+    expect(JSON.stringify(resumed.context())).toBe(JSON.stringify(ctx));
+  });
+
   test("a failed compaction keeps the session usable and the file loadable; automatic retries wait for 25% growth", async () => {
     const p = model({
       chat: Array.from({ length: 6 }, (_, k) => text(`r${k}`)),

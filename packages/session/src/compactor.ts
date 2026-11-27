@@ -24,6 +24,7 @@ import {
   type RecordItem,
   SessionRecord,
   TEXT_MAX,
+  toolResultNames,
 } from "./record.js";
 import type { StoredMessage } from "./store.js";
 
@@ -363,6 +364,11 @@ type ApplyContext = {
   userCitable: Set<string>;
   /** The newest message id in the window: the compaction point. */
   asOf: string;
+  /**
+   * Tool results that are never evidence: `skill` (skill text) and `recall` (a repeat of older
+   * history; cite the original message). So neither can reach the verifier.
+   */
+  withheld: Map<string, string>;
 };
 
 class Reject extends Error {}
@@ -386,6 +392,10 @@ function checkEvidence(raw: readonly Evidence[] | undefined, ctx: ApplyContext):
     const m = ctx.byId.get(id);
     if (m === undefined)
       return rejectAuthority(`evidence cites ${id}, which is not a stored message`);
+    const tool = ctx.withheld.get(id);
+    if (tool !== undefined) {
+      rejectAuthority(`evidence cites ${id}, a ${tool} result, which is never evidence`);
+    }
     const quote = cleanText(e.quote);
     if (quote === "") rejectAuthority(`evidence for ${id} has an empty quote`);
     if (quote.length > QUOTE_MAX)
@@ -404,6 +414,10 @@ const messageNumber = (id: string): number => Number(id.slice(1));
 
 const allFromUser = (ev: readonly Evidence[], ctx: ApplyContext): boolean =>
   ev.every((e) => ctx.byId.get(e.messageId)?.role === "user");
+
+/** True when no cited message is a user message (an empty list included). */
+const noUserEvidence = (ev: readonly Evidence[], ctx: ApplyContext): boolean =>
+  !ev.some((e) => ctx.byId.get(e.messageId)?.role === "user");
 
 function cleanField(raw: string, what: string, allowEmpty: boolean): string {
   const s = cleanText(raw);
@@ -449,21 +463,66 @@ function newItem(
     ...(reason ? { reason } : {}),
     source: p.source,
     ...(ev.length > 0 ? { evidence: ev } : {}),
+    ...(p.source === "inferred" && noUserEvidence(ev, ctx) ? { notFromUser: true as const } : {}),
     status: "active",
     createdAt: ctx.asOf,
     updatedAt: ctx.asOf,
   };
 }
 
+/** Kinds that steer the chat: an inferred one resting only on tool output needs the verifier. */
+const STEERING_KINDS: ReadonlySet<RecordItem["kind"]> = new Set([
+  "goal",
+  "constraint",
+  "preserve",
+  "decision",
+]);
+
+type RoleOf = (messageId: string) => ChatMessage["role"] | undefined;
+
+const toolOnly = (ev: readonly Evidence[] | undefined, roleOf: RoleOf): boolean =>
+  (ev ?? []).length > 0 && (ev ?? []).every((e) => roleOf(e.messageId) === "tool");
+
+/** The evidence an op's new or changed text rests on: its own, else the target's or the op's. */
+const backing = (own: readonly Evidence[] | undefined, other: readonly Evidence[] | undefined) =>
+  (own ?? []).length > 0 ? own : other;
+
 /**
  * Ops the verifier must confirm: any op on a `user` item, any add or supersede that creates a
- * `user` item, and any op on an open question (update, resolve or supersede).
+ * `user` item, any op on an open question (update, resolve or supersede), and an add, update or
+ * supersede that leaves an inferred goal, constraint, must-keep-working item or decision resting
+ * only on tool results (`roleOf` gives the cited messages' roles): text from a file or a command
+ * must not become a steering rule unchecked.
  */
-export const isRiskyOp = (op: CompactionOp, target?: RecordItem): boolean =>
+export const isRiskyOp = (op: CompactionOp, target?: RecordItem, roleOf?: RoleOf): boolean =>
   target?.source === "user" ||
   (op.op === "add" && op.source === "user") ||
   (op.op === "supersede" && op.by.source === "user") ||
-  (op.op !== "add" && target?.kind === "open_question");
+  (op.op !== "add" && target?.kind === "open_question") ||
+  (roleOf !== undefined && steersFromTools(op, target, roleOf));
+
+function steersFromTools(op: CompactionOp, target: RecordItem | undefined, roleOf: RoleOf) {
+  switch (op.op) {
+    case "add":
+      return (
+        op.source === "inferred" && STEERING_KINDS.has(op.kind) && toolOnly(op.evidence, roleOf)
+      );
+    case "update":
+      return (
+        target?.source === "inferred" &&
+        STEERING_KINDS.has(target.kind) &&
+        toolOnly(backing(op.evidence, target.evidence), roleOf)
+      );
+    case "supersede":
+      return (
+        op.by.source === "inferred" &&
+        STEERING_KINDS.has(op.by.kind) &&
+        toolOnly(backing(op.by.evidence, op.evidence), roleOf)
+      );
+    default:
+      return false;
+  }
+}
 
 /** A verifier decision, with the target state the verifier was shown. */
 type Verdict = VerifyDecision & { shown?: RecordItem };
@@ -607,6 +666,12 @@ function applyOps(
             if (opEvidence.length > 0) {
               t.evidence = [...(t.evidence ?? []), ...opEvidence].slice(-EVIDENCE_MAX);
             }
+            if (t.source === "inferred") {
+              // New evidence decides; without any, the item's own.
+              if (noUserEvidence(opEvidence.length > 0 ? opEvidence : (t.evidence ?? []), ctx)) {
+                t.notFromUser = true;
+              } else delete t.notFromUser;
+            }
             t.updatedAt = ctx.asOf;
           };
           break;
@@ -636,7 +701,7 @@ function applyOps(
       // The op passed every code check: it claims its item, whatever the verifier says.
       // (An op failing code checks claims nothing, so it can never block a later one.)
       if (op.op !== "add") targeted.add(op.itemId);
-      if (isRiskyOp(op, target)) {
+      if (isRiskyOp(op, target, (id) => ctx.byId.get(id)?.role)) {
         const d = decisions?.get(index);
         // Valid only in the second pass (e.g. a slot freed by a rejection): never sent.
         if (decisions !== undefined && d === undefined) {
@@ -760,7 +825,8 @@ function truncateToBudget(
 /**
  * The recent user messages kept verbatim: newest first while their tokens fit `budget`; the
  * newest alone over budget is cut (`truncated`). `retainedFrom` is the oldest one kept, null
- * when there is no user message.
+ * when there is no user message. Measured and cut on `redact(content)`, the text the store
+ * writes, so the same cut lands on the same characters live and after a resume.
  */
 export function retain(
   messages: readonly StoredMessage[],
@@ -772,7 +838,8 @@ export function retain(
   for (let k = messages.length - 1; k >= 0; k--) {
     const m = messages[k] as StoredMessage;
     if (m.role !== "user") continue;
-    const t = est.estimate("", [{ role: "user", content: m.content }]);
+    const content = redact(m.content);
+    const t = est.estimate("", [{ role: "user", content }]);
     if (used + t <= budget) {
       used += t;
       from = m.id;
@@ -781,7 +848,7 @@ export function retain(
     if (from === null) {
       return {
         retainedFrom: m.id,
-        truncated: { id: m.id, ...truncateToBudget(m.content, budget, est) },
+        truncated: { id: m.id, ...truncateToBudget(content, budget, est) },
       };
     }
     break;
@@ -932,7 +999,20 @@ async function compactInner(input: CompactInput): Promise<CompactResult> {
   for (const i of [...record.items, ...record.archive]) {
     for (const e of i.evidence ?? []) citable.add(e.messageId);
   }
-  const ctx: ApplyContext = { byId, citable, window: windowIds, userCitable, asOf: last.id };
+  const names = toolResultNames(messages);
+  const withheld = new Map<string, string>();
+  messages.forEach((m, k) => {
+    const name = names.get(k);
+    if (name === "skill" || name === "recall") withheld.set(m.id, name);
+  });
+  const ctx: ApplyContext = {
+    byId,
+    citable,
+    window: windowIds,
+    userCitable,
+    asOf: last.id,
+    withheld,
+  };
 
   let outcome = applyOps(record, ops, ctx);
   if (outcome.risky.length > 0 && input.verifyRisky === undefined) {
