@@ -8,7 +8,9 @@ const SECRET_SOURCES: readonly string[] = [
   // PEM private-key blocks, through the END line or, when truncated, the end of the text.
   "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\\s\\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)",
   // OpenAI / Anthropic (sk-, sk-ant-, sk-proj-), GitHub classic, AWS key ids (the v0.1 set).
-  "(?:sk-|ghp_|AKIA)[A-Za-z0-9_-]+",
+  // Only at the start of a token: a letter or digit right before the prefix makes it part of a
+  // word ("ask-matt", "--task-file", "disk-usage"), which is never a key.
+  "(?<![A-Za-z0-9])(?:sk-|ghp_|AKIA)[A-Za-z0-9_-]+",
   // GitHub OAuth, user-to-server, server-to-server and refresh tokens; fine-grained PATs.
   "gh[ousr]_[A-Za-z0-9_]{16,}",
   "github_pat_[A-Za-z0-9_]{20,}",

@@ -515,7 +515,8 @@ describe("fix round 1", () => {
   it("a secret straddling the 200k cap is redacted whole, not cut to a prefix", () => {
     const key = `sk-ant-api03-${"Q".repeat(40)}`;
     for (const before of [8, 13, 20, 30]) {
-      const text = `${"x".repeat(VIEW_MAX_TEXT - before)}${key} tail`;
+      // The padding ends in a space: a key glued to a word is part of that word, never a secret.
+      const text = `${"x".repeat(VIEW_MAX_TEXT - before - 1)} ${key} tail`;
       const out = cleanView(text);
       expect(out.length).toBeLessThanOrEqual(VIEW_MAX_TEXT);
       expect(out).not.toContain("sk-ant");
