@@ -48,7 +48,7 @@ The system tools the gates need at runtime are git, ripgrep, semgrep and gitleak
 
 ## Architecture
 
-Package dependency direction, from bottom to top: `core`, then `policy` and `providers`, then `sandbox`, `pack-typescript`, `loop` and `skills`, then `gates` and `tools`, then `reviewers`, then `pipeline`, then `session`, then `tui`, then `cli`.
+Package dependency direction, from bottom to top: `core`, then `web`, `policy` and `providers`, then `sandbox`, `pack-typescript`, `loop` and `skills`, then `gates` and `tools`, then `reviewers`, then `pipeline`, then `session`, then `tui`, then `cli`.
 
 - **`core`**: zod schemas (contract, criteria with `kind: change | preserve`, events), `RewireError(code, message, hint)`, run ids, secret redaction, and `fenceUntrusted()`.
   - Errors are identified by a stable snake_case `code` (e.g. `preserve_fails_now`, `ollama_request_dropped`). Tests and docs refer to codes, so treat them as API.
@@ -61,6 +61,10 @@ Package dependency direction, from bottom to top: `core`, then `policy` and `pro
   5. **gates**, then **reviewers**, then **fix loop** (`fix-loop.ts`, using `loop` for progress and oscillation detection and re-planning).
   6. **report** (`report.ts`), then commit.
   - Each run writes `.rewire/runs/<runId>/{events.jsonl, contract.json, manifest.json, report.md}` into the target repo.
+- **`web`** (depends on `core` only): every web call made from the rewire process, never from inside the sandbox.
+  - `webFetch` is an SSRF-guarded direct GET. Every hop is resolved and refused if any address is loopback, private, link-local, CGNAT, multicast or unspecified, and the socket is pinned to the vetted IP. It follows at most 5 redirects by hand and reads only text types, with HTML turned into text that keeps its links.
+  - `webSearch` uses a pluggable backend chosen by `resolveSearch`: Ollama (the default), Tavily, Brave or SearXNG, set by `[web]` in models.toml or picked by whichever key is present.
+  - `checkOutgoing` refuses a query or URL that carries a `SECRET`. Refusals throw `WebError`, which has no code.
 - **`providers`**: Anthropic, OpenAI, Ollama and faux behind one interface, plus Claude on Bedrock, Vertex and Foundry, Azure OpenAI, Gemini and `[endpoints.<name>]` OpenAI-compatible endpoints (design decision #35). Cloud SDKs are imported lazily. An endpoint's family comes from its `family` key or the model id, never the endpoint name (`family.ts`).
   - `registry.ts` resolves `models.toml` or env auto-detection.
   - `family.ts` decides model families. Reviewer and verifier are chosen cross-family from the implementer when possible.

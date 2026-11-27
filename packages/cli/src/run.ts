@@ -7,6 +7,7 @@ import type { Readable, Writable } from "node:stream";
 import { RewireError, type RunEvent } from "@rewire/core";
 import {
   defaultCompactionConfig,
+  defaultWebConfig,
   loadModelsFile,
   type ModelsFile,
   ROLES,
@@ -135,6 +136,7 @@ export async function resolveModels(
       available: names.map((model) => ({ provider: "faux", model }) as ModelRef),
       overrides: {},
       compaction: defaultCompactionConfig(),
+      web: defaultWebConfig(),
     };
   }
   if (modelsPath !== undefined) return loadModelsFile(resolve(cwd, modelsPath));
@@ -144,6 +146,7 @@ export async function resolveModels(
     available: await discoverModels(env),
     overrides: {},
     compaction: defaultCompactionConfig(),
+    web: defaultWebConfig(),
   };
 }
 
