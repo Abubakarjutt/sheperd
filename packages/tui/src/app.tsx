@@ -51,6 +51,7 @@ import {
   takeFinished,
 } from "./live-turn.js";
 import { ClarifyPanel, ProposalCard } from "./proposal.js";
+import { type RoutingControlDep, routingLines } from "./routing.js";
 import { sanitize } from "./sanitize.js";
 import { COMPACTING_VERB, ESC_CANCEL, pickVerb } from "./spinner.js";
 import { type CtxStatus, StatusLine } from "./status-line.js";
@@ -114,8 +115,14 @@ export type AppProps = {
   skills?: SkillsInfo | (() => SkillsInfo | undefined);
   /** The `rewire doctor` output, for `/doctor` (injected: the CLI depends on this package). */
   doctor?: () => Promise<string>;
-  /** The model routing, for `/model`. */
+  /** The model routing, for `/model` (without `routingControl`). */
   routing?: string | (() => string);
+  /**
+   * The session routing that `/model` picks change (the CLI's `RoutingControl` plus the chat
+   * session swap). When present, `/model` shows its current routing and the status line its chat
+   * model (`spec`). Absent in a non-interactive context: `/model` prints `routing`.
+   */
+  routingControl?: RoutingControlDep;
   /** Initial checkpoints (default contract and tests). */
   checkpoints?: ReadonlySet<CheckpointKind>;
   /** Startup warnings (skipped skills, an unreadable trust store), shown as dim lines first. */
@@ -207,6 +214,7 @@ function checkpointsShort(set: ReadonlySet<CheckpointKind>): string {
 
 export function App(props: AppProps) {
   const { subscribe, runController, sessions, doctor, routing, onExit, bindInterrupt } = props;
+  const routingControl = props.routingControl;
   const skillsProp = props.skills;
   const skillsNow = useCallback(
     (): SkillsInfo | undefined => (typeof skillsProp === "function" ? skillsProp() : skillsProp),
@@ -645,7 +653,11 @@ export function App(props: AppProps) {
           if (c.set) setCheckpoints(c.set);
           return note(describeCheckpoints(c.set ?? checkpoints));
         case "model": {
-          const text = typeof routing === "function" ? routing() : routing;
+          const text = routingControl
+            ? routingLines(routingControl.current())
+            : typeof routing === "function"
+              ? routing()
+              : routing;
           return note(text ?? "model routing is not available here");
         }
         case "resume":
@@ -686,6 +698,7 @@ export function App(props: AppProps) {
       trustedLater,
       checkpoints,
       routing,
+      routingControl,
       resume,
       sessions,
       swapSession,
@@ -836,7 +849,7 @@ export function App(props: AppProps) {
           onPopup={setPopup}
         />
         <StatusLine
-          model={models?.chat}
+          model={routingControl?.current().spec.model ?? models?.chat}
           context={context}
           ctx={ctx}
           checkpoints={checkpointsShort(checkpoints)}

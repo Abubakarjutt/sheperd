@@ -1,5 +1,7 @@
 import { basename } from "node:path";
 import { RewireError } from "@rewire/core";
+import type { Role } from "@rewire/pipeline";
+import { type ModelRef, modelFamily } from "@rewire/providers";
 import type {
   ChatEvent,
   ChatSession,
@@ -9,8 +11,16 @@ import type {
 } from "@rewire/session";
 import { resolveSkills, type Skill, type SkillProblem, type SkillSet } from "@rewire/skills";
 // Type-only: the TUI (Ink, React) is loaded by the caller, only on the interactive path.
-import type { InterruptTarget, ModelsInfo, SkillsInfo, TuiDeps } from "@rewire/tui";
+import type {
+  InterruptTarget,
+  ModelsInfo,
+  RoutingControlDep,
+  RoutingPick,
+  SkillsInfo,
+  TuiDeps,
+} from "@rewire/tui";
 import { type Activity, Interrupter } from "./interactive.js";
+import type { RoutingControl } from "./routing-control.js";
 
 /** Cleanup on exit (run done, session and skill-set disposal) never waits longer than this. */
 export const DISPOSE_TIMEOUT_MS = 2000;
@@ -53,7 +63,17 @@ export type StartDeps = {
   /** Ink unmounted; also make sure raw mode is off and the cursor is shown. */
   restoreTerminal: () => void;
   doctor?: () => Promise<string>;
-  routing?: string;
+  /** The routing text for `/model` (re-read on each use when a getter). */
+  routing?: string | (() => string);
+  /**
+   * The session routing `/model` picks change. `newSession` and `newRunController` must read
+   * it (`current()`) when they build; the TUI gets a wrapper that refuses picks during a run or
+   * a turn and, when the chat model (`spec`) changed, resumes the current session on it.
+   */
+  routingControl?: Pick<
+    RoutingControl,
+    "current" | "available" | "source" | "set" | "snapshot" | "restore"
+  >;
   /** The chat and run models, for the TUI's header and status line. */
   models?: ModelsInfo;
   /** The home directory, shown as `~` in the header. */
@@ -71,6 +91,9 @@ type Resolved = {
   /** The trust store could not be read: do not prompt (saving would fail the same way). */
   trustUnreadable: boolean;
 };
+
+const sameRef = (a: ModelRef, b: ModelRef): boolean =>
+  a.provider === b.provider && a.model === b.model;
 
 const problemLine = (p: SkillProblem): string =>
   `skill ${basename(p.dir)} skipped: ${p.code} ${p.message}`;
@@ -189,6 +212,8 @@ export async function startInteractive(d: StartDeps): Promise<number> {
       return s;
     };
     const session = track(await d.newSession({ skills: set, emit }));
+    /** The session the TUI shows: the first, then each one `/clear`, `/resume` or a pick built. */
+    let current = session;
     let runs = d.newRunController(set);
     const runController: Pick<RunController, "start"> = {
       start: (task, opts) => {
@@ -225,6 +250,7 @@ export async function startInteractive(d: StartDeps): Promise<number> {
         throw closing();
       }
       track(s);
+      current = s;
       const old = set;
       set = nextSet;
       sets.push(nextSet);
@@ -246,6 +272,41 @@ export async function startInteractive(d: StartDeps): Promise<number> {
       return p;
     };
 
+    const rc = d.routingControl;
+    const routingControl: RoutingControlDep | undefined = rc && {
+      current: () => rc.current(),
+      available: () => rc.available(),
+      source: (role) => rc.source(role),
+      family: (ref) => modelFamily(ref),
+      set: async (role, ref): Promise<RoutingPick> => {
+        if (activeRun || target?.activity() === "run") {
+          return { ok: false, reason: "refused: a gated run is active; pick after it ends" };
+        }
+        if (target?.activity() === "turn") {
+          return { ok: false, reason: "refused: a chat turn is in flight; pick after it ends" };
+        }
+        if (building.size > 0) {
+          return { ok: false, reason: "refused: a session change is in progress" };
+        }
+        const before = rc.current().spec;
+        const snap = rc.snapshot();
+        const pick = rc.set(role as Role, ref as ModelRef | undefined);
+        if (!pick.ok || sameRef(before, pick.routing.spec)) return pick;
+        // The chat model changed: the same conversation continues on it (a session with no
+        // completed turn has no id and nothing to carry: a fresh one).
+        try {
+          const next = await fresh(current.id());
+          return { ...pick, session: next };
+        } catch (e) {
+          rc.restore(snap);
+          return {
+            ok: false,
+            reason: `the chat model was not changed: ${e instanceof Error ? e.message : String(e)}`,
+          };
+        }
+      },
+    };
+
     if (exiting !== undefined) return exiting;
     return await d.render({
       session,
@@ -263,6 +324,7 @@ export async function startInteractive(d: StartDeps): Promise<number> {
       warnings: r.warnings,
       ...(d.doctor ? { doctor: d.doctor } : {}),
       ...(d.routing !== undefined ? { routing: d.routing } : {}),
+      ...(routingControl ? { routingControl } : {}),
       bindEmit: (l) => {
         forward = l;
       },

@@ -150,6 +150,34 @@ describe("slash commands", () => {
     expect(v.lastFrame()).toContain("/checkpoints");
   });
 
+  it("/model with a routingControl prints its current routing (re-read each time)", async () => {
+    const { session } = fakeSession();
+    const ref = (model: string) => ({ provider: "ollama", model });
+    let spec = ref("qwen3:8b");
+    const routingControl = {
+      current: () => ({
+        spec,
+        "test-writer": ref("qwen3:8b"),
+        implementer: ref("qwen3:8b"),
+        reviewer: ref("llama3.1:8b"),
+        verifier: ref("llama3.1:8b"),
+        independence: "cross-family" as const,
+      }),
+      available: () => [ref("qwen3:8b"), ref("llama3.1:8b")],
+      source: () => "auto" as const,
+      family: (r: { model: string }) => r.model.replace(/[^a-z].*$/, ""),
+      set: () => ({ ok: false as const, reason: "unused" }),
+    };
+    const v = mount({ session, routing: () => "stale text", routingControl });
+    await enter(v.stdin, "/model");
+    expect(v.lastFrame()).toContain("spec: ollama:qwen3:8b");
+    expect(v.lastFrame()).not.toContain("stale text");
+    spec = ref("llama3.1:8b\x1b[2J");
+    await enter(v.stdin, "/model");
+    expect(v.lastFrame()).toContain("spec: ollama:llama3.1:8b");
+    expect(v.lastFrame()).not.toContain("\x1b[2J");
+  });
+
   it("/doctor output is redacted", async () => {
     const { session } = fakeSession();
     const secret = `ghp_${"a".repeat(36)}`;

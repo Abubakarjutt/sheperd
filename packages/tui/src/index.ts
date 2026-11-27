@@ -76,6 +76,16 @@ export {
   takeFinished,
 } from "./live-turn.js";
 export { cleanForMarkdown, Markdown } from "./markdown.js";
+export {
+  ROUTING_ROLES,
+  type RoutingControlDep,
+  type RoutingModel,
+  type RoutingPick,
+  type RoutingRole,
+  type RoutingSource,
+  type RoutingView,
+  routingLines,
+} from "./routing.js";
 export { Safe } from "./safe.js";
 export { sanitize } from "./sanitize.js";
 export {
