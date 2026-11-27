@@ -3,6 +3,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Agent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import {
   assertRoleFit,
@@ -101,6 +102,11 @@ beforeEach(async () => {
         const out = mock.chat(body);
         if (out === "destroy") return void req.socket.destroy();
         if (out === "hang") return;
+        if (typeof out === "object" && out !== null && "__delayMs" in out) {
+          const { __delayMs } = out as { __delayMs: number };
+          setTimeout(() => json(200, structuredOk()), __delayMs);
+          return;
+        }
         if (typeof out === "object" && out !== null && "__sse" in out) {
           const { __sse, after } = out as { __sse: string; after?: "end" | "hang" | "destroy" };
           res.writeHead(200, { "content-type": "text/event-stream" });
@@ -296,6 +302,21 @@ describe("OllamaProvider", () => {
     expect(err.message).toMatch(/timed out after 0s/);
     expect(err.hint).toMatch(/REWIRE_OLLAMA_TIMEOUT_S/);
   });
+  test("a slow reply within the rewire timeout is not cut by Node fetch's headers timeout", async () => {
+    // Node's global fetch gives up after 300 s without response headers, below a
+    // REWIRE_OLLAMA_TIMEOUT_S of 900. Shrink that default to 1 s to stand in for it (undici
+    // checks timeouts on a coarse timer, so a shorter one is not enforced).
+    const prev = getGlobalDispatcher();
+    setGlobalDispatcher(new Agent({ headersTimeout: 1000, bodyTimeout: 1000 }));
+    try {
+      mock.chat = () => ({ __delayMs: 2500 });
+      const p = new OllamaProvider(base, 10_000);
+      const r = await p.chat({ model: "m", system: "s", messages: [], maxTokens: 5 });
+      expect(r.message.text).toContain("ok");
+    } finally {
+      setGlobalDispatcher(prev);
+    }
+  }, 15_000);
   test("createProvider takes the reply timeout from REWIRE_OLLAMA_TIMEOUT_S", async () => {
     mock.chat = () => "hang";
     const p = createProvider(ref, { OLLAMA_HOST: base, REWIRE_OLLAMA_TIMEOUT_S: "1" });

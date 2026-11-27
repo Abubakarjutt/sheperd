@@ -204,7 +204,10 @@ importers:
         version: link:../core
       openai:
         specifier: ^7.61.0
-        version: 7.61.0(@aws-sdk/credential-provider-node@3.972.99)(@smithy/signature-v4@5.7.5)(google-auth-library@10.9.1)(zod@4.6.7)
+        version: 7.61.0(@aws-sdk/credential-provider-node@3.972.99)(@smithy/signature-v4@5.7.5)(google-auth-library@10.9.1)(undici@7.30.2)(zod@4.6.7)
+      undici:
+        specifier: ^7.30.2
+        version: 7.30.2
       zod:
         specifier: ^4.6.7
         version: 4.6.7
@@ -1638,6 +1641,10 @@ packages:
   undici-types@8.9.0:
     resolution: {integrity: sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg==}
 
+  undici@7.30.2:
+    resolution: {integrity: sha512-mLyPQnHwUxaM/rideoK/+KL8DaAJLRl4aBCfmX444aCSLnIaomqPLtNRe2jdCYcsk5wZzXrDIQC8ZeYNRAYyIA==}
+    engines: {node: '>=20.18.1'}
+
   vite@8.3.8:
     resolution: {integrity: sha512-LzOn3h9rG/0vhLdXrV4yJ4QFA9eEoqCl+Yx+kGJd7aB9w6nfNgVHKSYwLPZUHrz4ZGa+t+kXjV9itvcHDLQouA==}
     engines: {node: ^20.19.0 || >=22.12.0}
@@ -2868,11 +2875,12 @@ snapshots:
     dependencies:
       mimic-fn: 2.1.0
 
-  openai@7.61.0(@aws-sdk/credential-provider-node@3.972.99)(@smithy/signature-v4@5.7.5)(google-auth-library@10.9.1)(zod@4.6.7):
+  openai@7.61.0(@aws-sdk/credential-provider-node@3.972.99)(@smithy/signature-v4@5.7.5)(google-auth-library@10.9.1)(undici@7.30.2)(zod@4.6.7):
     optionalDependencies:
       '@aws-sdk/credential-provider-node': 3.972.99
       '@smithy/signature-v4': 5.7.5
       google-auth-library: 10.9.1
+      undici: 7.30.2
       zod: 4.6.7
 
   patch-console@2.0.0: {}
@@ -3007,6 +3015,8 @@ snapshots:
       '@typescript/typescript-win32-x64': 7.0.2
 
   undici-types@8.9.0: {}
+
+  undici@7.30.2: {}
 
   vite@8.3.8(@types/node@26.6.6)(esbuild@0.28.2):
     dependencies:

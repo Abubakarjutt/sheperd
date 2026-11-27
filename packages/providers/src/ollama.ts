@@ -1,5 +1,6 @@
 import { RewireError } from "@rewire/core";
 import OpenAI from "openai";
+import { Agent, fetch as undiciFetch } from "undici";
 import { z } from "zod";
 import { providerError } from "./errors.js";
 import {
@@ -305,13 +306,30 @@ function isConnectionError(err: unknown): boolean {
   return name === "APIConnectionError" || name === "APIConnectionTimeoutError";
 }
 
+/** The SDK's own timeout sits just past ours, so ours fires first and names the variable. */
+const SDK_TIMEOUT_SLACK_MS = 5_000;
+
+/** No headers or body timeout: the per-request reply timeout is the only limit (see below). */
+const OLLAMA_DISPATCHER = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+
 export class OllamaProvider implements Provider {
   private readonly client: OpenAI;
   constructor(
     private readonly baseUrl: string = DEFAULT_OLLAMA_HOST,
     private readonly chatTimeoutMs: number = DEFAULT_CHAT_TIMEOUT_MS,
   ) {
-    this.client = new OpenAI({ baseURL: `${baseUrl}/v1`, apiKey: "ollama", maxRetries: 0 });
+    this.client = new OpenAI({
+      baseURL: `${baseUrl}/v1`,
+      apiKey: "ollama",
+      maxRetries: 0,
+      // A local model can read a long prompt for many minutes before it sends the response
+      // headers. Node's fetch gives up after 300 s without headers and the SDK after 600 s, both
+      // below a REWIRE_OLLAMA_TIMEOUT_S of 900: turn both off so the reply timeout (an
+      // AbortSignal per request, below) is the only limit. undici's fetch is used because a
+      // dispatcher only applies to the fetch from the same undici.
+      fetch: undiciFetch as unknown as typeof fetch,
+      fetchOptions: { dispatcher: OLLAMA_DISPATCHER } as Record<string, unknown>,
+    });
   }
   async chat(req: ChatRequest): Promise<ChatResponse> {
     const timeoutMs = req.timeoutMs ?? this.chatTimeoutMs;
@@ -327,7 +345,7 @@ export class OllamaProvider implements Provider {
           toOpenAIStreamParams(req, {
             maxTokensField: "max_tokens",
           }) as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
-          { signal },
+          { signal, timeout: timeoutMs + SDK_TIMEOUT_SLACK_MS },
         );
         streaming = true;
         resp = await collectOpenAIStream(stream, req.onDelta, signal, req.onFirstChunk);
@@ -338,7 +356,7 @@ export class OllamaProvider implements Provider {
           toOpenAIParams(req, {
             maxTokensField: "max_tokens",
           }) as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
-          { signal },
+          { signal, timeout: timeoutMs + SDK_TIMEOUT_SLACK_MS },
         );
     } catch (err) {
       if (req.signal?.aborted) throw providerError("ollama", err, { signal: req.signal });
