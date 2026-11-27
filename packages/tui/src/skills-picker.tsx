@@ -17,7 +17,7 @@ export const REVIEW_ROW = "Review pending repo skills";
 export const SKILL_STATE = {
   active: "active",
   pending: "pending trust",
-  trustedLater: "trusted; loads in a new session (/clear)",
+  trustedLater: "trusted; takes effect in a new session (/clear)",
   shadowed: "shadowed",
   notTrusted: "not trusted",
 } as const;

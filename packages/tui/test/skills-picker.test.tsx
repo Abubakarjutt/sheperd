@@ -165,7 +165,7 @@ describe("skillRows", () => {
       "gamma/repo/shadowed",
     ]);
     expect(skillRows(s, true).find((r) => r.skill.name === "beta")?.state).toBe(
-      "trusted; loads in a new session (/clear)",
+      "trusted; takes effect in a new session (/clear)",
     );
   });
 
