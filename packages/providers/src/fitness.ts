@@ -6,8 +6,9 @@ import {
   getModelInfo,
   normalizeOllamaHost,
   OllamaProvider,
-  ollamaChatTimeoutMs,
+  type OllamaTimeout,
   probeOllama,
+  resolveOllamaTimeout,
 } from "./ollama.js";
 import { structured } from "./structured.js";
 import type { ModelRef, Provider } from "./types.js";
@@ -113,7 +114,13 @@ export async function assertRoleFit(
   ref: ModelRef,
   role: Role,
   cacheDir: string,
-  opts: { baseUrl?: string; provider?: Provider; chatTimeoutMs?: number } = {},
+  opts: {
+    baseUrl?: string;
+    provider?: Provider;
+    chatTimeoutMs?: number;
+    /** The resolved reply timeout (default: `resolveOllamaTimeout(process.env)`, no models.toml). */
+    ollamaTimeout?: OllamaTimeout;
+  } = {},
 ): Promise<void> {
   if (ref.provider !== "ollama") return;
   const baseUrl = opts.baseUrl ?? normalizeOllamaHost(process.env.OLLAMA_HOST);
@@ -140,7 +147,8 @@ export async function assertRoleFit(
   let reason: string | undefined;
   try {
     reason = await smokeTest(
-      opts.provider ?? new OllamaProvider(baseUrl, ollamaChatTimeoutMs(process.env)),
+      opts.provider ??
+        new OllamaProvider(baseUrl, opts.ollamaTimeout ?? resolveOllamaTimeout(process.env)),
       ref,
       role,
       opts.chatTimeoutMs,

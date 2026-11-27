@@ -10,7 +10,7 @@ import {
   toOpenAIParams,
   toOpenAIStreamParams,
 } from "./openai.js";
-import type { ChatRequest, ChatResponse, Provider } from "./types.js";
+import type { ChatRequest, ChatResponse, Provider, ProviderSettings } from "./types.js";
 
 /**
  * Oldest Ollama we support. It is the later of the two features we depend on:
@@ -28,25 +28,76 @@ export const MIN_OLLAMA_VERSION = "0.6.4";
 
 export const DEFAULT_OLLAMA_HOST = "http://localhost:11434";
 const HTTP_TIMEOUT_MS = 5_000;
-const DEFAULT_CHAT_TIMEOUT_MS = 300_000;
+const DEFAULT_CHAT_TIMEOUT_MS = 900_000;
 const MAX_CHAT_TIMEOUT_S = 86_400;
 
-/** Seconds one Ollama reply may take. Local models on modest hardware can need well over 300s. */
+/**
+ * Seconds one Ollama reply may take (for a streamed reply: until its first chunk). Local models
+ * on modest hardware can need many minutes to read a long prompt.
+ */
 export const OLLAMA_TIMEOUT_ENV = "REWIRE_OLLAMA_TIMEOUT_S";
 
-/** The per-reply Ollama timeout from REWIRE_OLLAMA_TIMEOUT_S: whole seconds, 1 to 86400; default 300. */
-export function ollamaChatTimeoutMs(env: Record<string, string | undefined>): number {
+/**
+ * A streamed reply that has started fails only when no chunk (text, thinking or tool-call delta)
+ * arrives for this long. There is no total cap while chunks flow.
+ */
+export const OLLAMA_IDLE_TIMEOUT_MS = 120_000;
+
+/** The reply timeout in use and where it came from. */
+export type OllamaTimeout = { ms: number; source: "env" | "models.toml" | "default" };
+
+/**
+ * The reply timeout: REWIRE_OLLAMA_TIMEOUT_S, else models.toml's `[providers.ollama] timeout_s`,
+ * else 900 s. The variable is whole seconds, 1 to 86400; an invalid value is refused even when
+ * models.toml sets one (it wins, so it must not be silently ignored).
+ */
+export function resolveOllamaTimeout(
+  env: Record<string, string | undefined>,
+  settings: ProviderSettings = {},
+): OllamaTimeout {
   const raw = (env[OLLAMA_TIMEOUT_ENV] ?? "").trim();
-  if (raw === "") return DEFAULT_CHAT_TIMEOUT_MS;
-  const s = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
-  if (!Number.isSafeInteger(s) || s < 1 || s > MAX_CHAT_TIMEOUT_S) {
-    throw new RewireError(
-      "ollama_timeout_invalid",
-      `${OLLAMA_TIMEOUT_ENV}="${raw}" is not a whole number of seconds from 1 to ${MAX_CHAT_TIMEOUT_S}`,
-      `e.g. ${OLLAMA_TIMEOUT_ENV}=900 for 15 minutes per reply`,
-    );
+  if (raw !== "") {
+    const s = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+    if (!Number.isSafeInteger(s) || s < 1 || s > MAX_CHAT_TIMEOUT_S) {
+      throw new RewireError(
+        "ollama_timeout_invalid",
+        `${OLLAMA_TIMEOUT_ENV}="${raw}" is not a whole number of seconds from 1 to ${MAX_CHAT_TIMEOUT_S}`,
+        `e.g. ${OLLAMA_TIMEOUT_ENV}=900 for 15 minutes per reply`,
+      );
+    }
+    return { ms: s * 1000, source: "env" };
   }
-  return s * 1000;
+  const fromToml = settings.ollama?.timeoutS;
+  if (fromToml !== undefined) return { ms: fromToml * 1000, source: "models.toml" };
+  return { ms: DEFAULT_CHAT_TIMEOUT_MS, source: "default" };
+}
+
+/** The reply timeout's milliseconds from REWIRE_OLLAMA_TIMEOUT_S alone (default 900 s). */
+export function ollamaChatTimeoutMs(env: Record<string, string | undefined>): number {
+  return resolveOllamaTimeout(env).ms;
+}
+
+/** `900s`, or `250ms` for a value that is not whole seconds (only tests use those). */
+function duration(ms: number): string {
+  return ms % 1000 === 0 ? `${ms / 1000}s` : `${ms}ms`;
+}
+
+/** Where the reply timeout came from, for the `ollama_timeout` message. */
+function describeTimeout(t: OllamaTimeout): string {
+  if (t.source === "env") return `${OLLAMA_TIMEOUT_ENV}=${t.ms / 1000} from the environment`;
+  if (t.source === "models.toml") return `[providers.ollama] timeout_s in models.toml`;
+  return `the ${duration(t.ms)} default`;
+}
+
+/** How to raise the reply timeout, given where the current one came from. */
+function raiseHint(t: OllamaTimeout): string {
+  if (t.source === "default") {
+    return `${OLLAMA_TIMEOUT_ENV} is not set in this process's environment, so the default applies (a terminal opened before you edited ~/.zshrc does not have it: open a new one), or set [providers.ollama] timeout_s in models.toml (seconds, e.g. 1800)`;
+  }
+  if (t.source === "env") {
+    return `raise ${OLLAMA_TIMEOUT_ENV} (seconds, e.g. 1800); it overrides [providers.ollama] timeout_s`;
+  }
+  return `raise [providers.ollama] timeout_s in models.toml (seconds, e.g. 1800), unless ${OLLAMA_TIMEOUT_ENV} is set: it wins`;
 }
 
 /** `host:port`, `0.0.0.0` and `http://host/` style OLLAMA_HOST values -> `http://host[:port]`. */
@@ -306,67 +357,113 @@ function isConnectionError(err: unknown): boolean {
   return name === "APIConnectionError" || name === "APIConnectionTimeoutError";
 }
 
-/** The SDK's own timeout sits just past ours, so ours fires first and names the variable. */
+/**
+ * The SDK's own timeout sits just past ours, so ours fires first. The SDK clears it once the
+ * response headers arrive, so on a stream it bounds only the wait for headers, which is never
+ * longer than the wait for the first chunk: it cannot cap a stream that has started.
+ */
 const SDK_TIMEOUT_SLACK_MS = 5_000;
 
-/** No headers or body timeout: the per-request reply timeout is the only limit (see below). */
+/**
+ * No headers or body timeout: our own timers are the only limit (see below). A body timeout
+ * would also be an idle limit on a stream, but one that fails with a transport error instead of
+ * `ollama_timeout`.
+ */
 const OLLAMA_DISPATCHER = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+
+/** Yields what `it` yields, calling `touch` before each item. */
+async function* touching<T>(it: AsyncIterable<T>, touch: () => void): AsyncGenerator<T> {
+  for await (const x of it) {
+    touch();
+    yield x;
+  }
+}
+
+export type OllamaProviderOptions = {
+  /** Test seam: the streamed-reply idle timeout (default `OLLAMA_IDLE_TIMEOUT_MS`). */
+  idleTimeoutMs?: number;
+};
 
 export class OllamaProvider implements Provider {
   private readonly client: OpenAI;
+  private readonly idleTimeoutMs: number;
   constructor(
     private readonly baseUrl: string = DEFAULT_OLLAMA_HOST,
-    private readonly chatTimeoutMs: number = DEFAULT_CHAT_TIMEOUT_MS,
+    private readonly timeout: OllamaTimeout = { ms: DEFAULT_CHAT_TIMEOUT_MS, source: "default" },
+    opts: OllamaProviderOptions = {},
   ) {
+    this.idleTimeoutMs = opts.idleTimeoutMs ?? OLLAMA_IDLE_TIMEOUT_MS;
     this.client = new OpenAI({
       baseURL: `${baseUrl}/v1`,
       apiKey: "ollama",
       maxRetries: 0,
       // A local model can read a long prompt for many minutes before it sends the response
       // headers. Node's fetch gives up after 300 s without headers and the SDK after 600 s, both
-      // below a REWIRE_OLLAMA_TIMEOUT_S of 900: turn both off so the reply timeout (an
-      // AbortSignal per request, below) is the only limit. undici's fetch is used because a
-      // dispatcher only applies to the fetch from the same undici.
+      // below a reply timeout of 900: turn both off so our own timers (per request, below) are
+      // the only limit. undici's fetch is used because a dispatcher only applies to the fetch
+      // from the same undici.
       fetch: undiciFetch as unknown as typeof fetch,
       fetchOptions: { dispatcher: OLLAMA_DISPATCHER } as Record<string, unknown>,
     });
   }
+  /**
+   * Non-streamed: one total timeout, the reply timeout. Streamed (`onDelta`): the reply timeout
+   * bounds only the wait for the first chunk (prompt reading); after that the request fails only
+   * when no chunk arrives for the idle timeout, so a model that keeps writing is never cut off.
+   * The caller's `signal` aborts either way.
+   */
   async chat(req: ChatRequest): Promise<ChatResponse> {
-    const timeoutMs = req.timeoutMs ?? this.chatTimeoutMs;
-    const timeout = AbortSignal.timeout(timeoutMs);
-    const signal = req.signal ? AbortSignal.any([req.signal, timeout]) : timeout;
+    const limit: OllamaTimeout =
+      req.timeoutMs === undefined || req.timeoutMs === this.timeout.ms
+        ? this.timeout
+        : { ...this.timeout, ms: req.timeoutMs };
+    const perCall = limit !== this.timeout;
+    const timer = new AbortController();
+    let fired: "total" | "first" | "idle" | undefined;
+    let handle: ReturnType<typeof setTimeout> | undefined;
+    const arm = (ms: number, kind: "total" | "first" | "idle") => {
+      clearTimeout(handle);
+      handle = setTimeout(() => {
+        fired = kind;
+        timer.abort();
+      }, ms);
+    };
+    const signal = req.signal ? AbortSignal.any([req.signal, timer.signal]) : timer.signal;
     const started = Date.now();
     let resp: unknown;
     // Set once a streamed reply has started: a transport failure after that is a dropped request.
     let streaming = false;
     try {
       if (req.onDelta) {
+        arm(limit.ms, "first");
         const stream = await this.client.chat.completions.create(
           toOpenAIStreamParams(req, {
             maxTokensField: "max_tokens",
           }) as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
-          { signal, timeout: timeoutMs + SDK_TIMEOUT_SLACK_MS },
+          { signal, timeout: limit.ms + SDK_TIMEOUT_SLACK_MS },
         );
         streaming = true;
-        resp = await collectOpenAIStream(stream, req.onDelta, signal, req.onFirstChunk);
-      } else
+        const idle = () => arm(this.idleTimeoutMs, "idle");
+        resp = await collectOpenAIStream(
+          touching(stream, idle),
+          req.onDelta,
+          signal,
+          req.onFirstChunk,
+        );
+      } else {
+        arm(limit.ms, "total");
         resp = await this.client.chat.completions.create(
           // Ollama's OpenAI-compat layer lists `max_tokens` (not `max_completion_tokens`) as supported:
           // https://github.com/ollama/ollama/blob/main/docs/api/openai-compatibility.mdx
           toOpenAIParams(req, {
             maxTokensField: "max_tokens",
           }) as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
-          { signal, timeout: timeoutMs + SDK_TIMEOUT_SLACK_MS },
-        );
-    } catch (err) {
-      if (req.signal?.aborted) throw providerError("ollama", err, { signal: req.signal });
-      if (timeout.aborted) {
-        throw new RewireError(
-          "ollama_timeout",
-          `Ollama chat request to ${this.baseUrl} timed out after ${Math.round(timeoutMs / 1000)}s`,
-          `The model may still be loading, or replies slowly on this machine: retry, or set ${OLLAMA_TIMEOUT_ENV} (seconds, e.g. 900)`,
+          { signal, timeout: limit.ms + SDK_TIMEOUT_SLACK_MS },
         );
       }
+    } catch (err) {
+      if (req.signal?.aborted) throw providerError("ollama", err, { signal: req.signal });
+      if (fired !== undefined) throw this.timedOut(fired, limit, perCall);
       const midStreamDrop = streaming && isStreamTransportError(err);
       if (isConnectionError(err) || midStreamDrop) {
         // A broken connection to a server that still answers is a dropped request, not an outage.
@@ -378,7 +475,36 @@ export class OllamaProvider implements Provider {
         );
       }
       throw providerError("ollama", err);
+    } finally {
+      clearTimeout(handle);
     }
     return fromOpenAIResponse(resp as Parameters<typeof fromOpenAIResponse>[0], "ollama");
+  }
+
+  private timedOut(
+    kind: "total" | "first" | "idle",
+    limit: OllamaTimeout,
+    perCall: boolean,
+  ): RewireError {
+    const at = `Ollama chat request to ${this.baseUrl}`;
+    if (kind === "idle") {
+      return new RewireError(
+        "ollama_timeout",
+        `${at} stopped streaming: no output for ${duration(this.idleTimeoutMs)} after the reply started`,
+        "The model stalled mid-reply (or the machine is overloaded): retry. This idle limit is fixed; the reply timeout only bounds the wait for the first output",
+      );
+    }
+    const what = perCall
+      ? `a per-call limit of ${duration(limit.ms)}`
+      : `reply timeout ${duration(limit.ms)}: ${describeTimeout(limit)}`;
+    const message =
+      kind === "first"
+        ? `${at} timed out: no output within ${duration(limit.ms)} (${what})`
+        : `${at} timed out after ${duration(limit.ms)} (${what})`;
+    return new RewireError(
+      "ollama_timeout",
+      message,
+      `The model may still be loading, or reads the prompt slowly on this machine: retry, or ${raiseHint(this.timeout)}`,
+    );
   }
 }
