@@ -43,6 +43,7 @@ import type { Policy } from "@rewire/policy";
 import {
   assertRoleFit,
   type ModelRef,
+  type OllamaTimeout,
   type Provider,
   structured,
   type Usage,
@@ -116,6 +117,11 @@ export type RunPipelineInput = {
   repo: string;
   routing: RoleRouting;
   providers: (ref: ModelRef) => Provider;
+  /**
+   * The Ollama reply timeout for the preflight smoke test (`resolveOllamaTimeout` with the
+   * models.toml settings). Unset: REWIRE_OLLAMA_TIMEOUT_S from process.env, else the default.
+   */
+  ollamaTimeout?: OllamaTimeout;
   policy: Policy;
   ask: (questions: string[]) => Promise<string[] | null>;
   emit: (e: RunEvent) => void;
@@ -769,7 +775,12 @@ async function execute(ctx: Ctx): Promise<void> {
   await mkdir(ctx.runDir, { recursive: true });
   log.start();
   for (const role of ROLES) {
-    await assertRoleFit(routing[role], role, join(repo, ".rewire", "cache"));
+    await assertRoleFit(
+      routing[role],
+      role,
+      join(repo, ".rewire", "cache"),
+      input.ollamaTimeout ? { ollamaTimeout: input.ollamaTimeout } : {},
+    );
   }
   await detectTsPack(repo);
   checkAbort(ctx);

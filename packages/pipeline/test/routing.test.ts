@@ -198,6 +198,8 @@ describe("loadModelsFile [providers] and [endpoints]", () => {
           `[providers.azure]`,
           `endpoint = "https://my.openai.azure.com"`,
           `api_version = "2025-04-01-preview"`,
+          `[providers.ollama]`,
+          `timeout_s = 1800`,
           `[endpoints.openrouter]`,
           `base_url = "https://openrouter.ai/api/v1"`,
           `api_key_env = "OPENROUTER_API_KEY"`,
@@ -217,6 +219,7 @@ describe("loadModelsFile [providers] and [endpoints]", () => {
       vertex: { project: "my-proj", region: "global" },
       foundry: { resource: "my-res", baseUrl: "https://my-res.services.ai.azure.com/anthropic" },
       azure: { endpoint: "https://my.openai.azure.com", apiVersion: "2025-04-01-preview" },
+      ollama: { timeoutS: 1800 },
     });
     expect(m.endpoints).toEqual({
       openrouter: {
@@ -253,6 +256,11 @@ describe("loadModelsFile [providers] and [endpoints]", () => {
   test.each([
     ["unknown provider table", `[providers.aws]\nregion = "x"\n`, /aws/],
     ["unknown provider key", `[providers.bedrock]\nprofile = "x"\n`, /profile/],
+    ["unknown ollama key", `[providers.ollama]\nhost = "x"\n`, /host/],
+    ["ollama timeout_s of 0", `[providers.ollama]\ntimeout_s = 0\n`, /timeout_s/],
+    ["ollama timeout_s over a day", `[providers.ollama]\ntimeout_s = 86401\n`, /timeout_s/],
+    ["fractional ollama timeout_s", `[providers.ollama]\ntimeout_s = 1.5\n`, /timeout_s/],
+    ["ollama timeout_s as a string", `[providers.ollama]\ntimeout_s = "900"\n`, /timeout_s/],
     [
       "unknown endpoint key",
       `[endpoints.e1]\nbase_url = "https://x.example"\napi_key_env = "K"\nkey = "sk"\n`,
