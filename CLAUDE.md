@@ -61,7 +61,7 @@ Package dependency direction, from bottom to top: `core`, then `policy` and `pro
   5. **gates**, then **reviewers**, then **fix loop** (`fix-loop.ts`, using `loop` for progress and oscillation detection and re-planning).
   6. **report** (`report.ts`), then commit.
   - Each run writes `.rewire/runs/<runId>/{events.jsonl, contract.json, manifest.json, report.md}` into the target repo.
-- **`providers`**: Anthropic, OpenAI, Ollama and faux behind one interface.
+- **`providers`**: Anthropic, OpenAI, Ollama and faux behind one interface, plus Claude on Bedrock, Vertex and Foundry, Azure OpenAI, Gemini and `[endpoints.<name>]` OpenAI-compatible endpoints (design decision #35). Cloud SDKs are imported lazily. An endpoint's family comes from its `family` key or the model id, never the endpoint name (`family.ts`).
   - `registry.ts` resolves `models.toml` or env auto-detection.
   - `family.ts` decides model families. Reviewer and verifier are chosen cross-family from the implementer when possible.
   - `fitness.ts` probes models.

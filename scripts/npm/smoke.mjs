@@ -159,6 +159,23 @@ const leaked = externalUi.exec(bundle);
 if (leaked) fail(`the bundle loads ${leaked[0]} at runtime; it must be bundled (or stubbed)`);
 pass("React, Ink and yoga-layout are bundled; react-devtools-core is never imported");
 
+// The cloud SDKs (Bedrock, Vertex, Foundry, and the AWS and Google auth they load) are imported
+// lazily but must be inside the bundle: the install has no node_modules for them.
+const CLOUD_PKGS =
+  "@anthropic-ai/bedrock-sdk|@anthropic-ai/vertex-sdk|@anthropic-ai/foundry-sdk|google-auth-library|@aws-sdk/client-[a-z0-9-]+|@aws-sdk/credential-providers";
+const cloudSpec = `["'](?:${CLOUD_PKGS})(?:/[^"']*)?["']`;
+const externalCloud = new RegExp(
+  `require\\(\\s*${cloudSpec}\\s*\\)|\\bfrom\\s*${cloudSpec}|\\bimport\\(\\s*${cloudSpec}\\s*\\)`,
+);
+// Doc comments and error strings quote `require('...')`; look at code lines only.
+const codeOnly = bundle.replace(/^\s*(?:\*|\/\/).*$/gm, "");
+const cloudLeak = externalCloud.exec(codeOnly);
+if (cloudLeak) fail(`the bundle loads ${cloudLeak[0]} at runtime; it must be bundled`);
+if (!bundle.includes("AnthropicBedrockMantle") || !bundle.includes("AnthropicVertex")) {
+  fail("the bundle does not contain the Bedrock and Vertex SDK clients");
+}
+pass("the Bedrock, Vertex and Foundry SDKs are bundled, not imported at runtime");
+
 const sandboxLine = (path) => `✓ rewire-sandbox ${path} (platform package ${platformPkg})`;
 /** Runs doctor and requires its sandbox line to be one of `paths`; returns the path found. */
 function doctorFinds(exe, paths, label) {

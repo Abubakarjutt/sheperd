@@ -405,9 +405,11 @@ or more. Calibration never runs by itself.
   `OLLAMA_CONTEXT_LENGTH` (for example 65536) on the server, or set `num_ctx` in a Modelfile.
 - **Provider errors.** An error is not a score. The run is marked incomplete and the failed
   length is tried again next time. An incomplete run is never used.
-- **Paid providers.** For Anthropic and OpenAI, `calibrate` prints the probe list and an
-  input-token estimate (a token count, not a price), then exits without spending. Add `--yes` to
-  run. Ollama needs no flag.
+- **Paid providers.** For every provider except Ollama, the faux provider and an endpoint on a
+  loopback `base_url` (Anthropic, OpenAI, Bedrock, Vertex, Foundry, Azure, Gemini, any other
+  endpoint), `calibrate` prints the probe list and an input-token estimate (a token count, not a
+  price), then exits without spending. Add `--yes` to run. Ollama and loopback endpoints need no
+  flag.
 
 ## Skills
 
@@ -553,6 +555,15 @@ present or `1` otherwise. It checks: the sandbox binary, `git`, `rg`, `semgrep`,
 `bwrap` (Linux) or `sandbox-exec` (macOS), the model list, and, when any model is an Ollama model,
 that Ollama is reachable and at least version 0.6.4. Run it before your first `rewire run`.
 
+For each cloud provider a model or a `[providers.*]` table uses, and each `[endpoints.<name>]`, it
+prints one line with what rewire resolved (region, project, resource or host, API version) and
+where each value came from (a toml key, or an env var **name**). Credentials appear only as env var
+names, never as values. A region, project, resource or API version that does not look like a
+normal one is shown as `(set, unusual format)` instead of its value. An endpoint `family` override
+is shown, with the family rewire would derive when it differs. A provider that a model uses but
+that is incomplete is `✗` and makes doctor exit 1; a table that no model uses is a `!` note and
+does not. Doctor makes no network calls and reads no credential files.
+
 ## Choosing models
 
 With no configuration, rewire uses whatever it finds: `ANTHROPIC_API_KEY` selects
@@ -562,8 +573,9 @@ Ollama selects its first pulled model. Override the first two with `REWIRE_ANTHR
 
 For control, write a `models.toml` and pass `--models <file>`, or save it as
 `~/.config/rewire/models.toml` (`$XDG_CONFIG_HOME/rewire/models.toml`), which is used
-automatically. Models are written `<provider>:<model>` where provider is `anthropic`, `openai` or
-`ollama`.
+automatically. Models are written `<provider>:<model>` where provider is `anthropic`, `openai`,
+`ollama`, a cloud provider (`bedrock`, `vertex`, `foundry`, `azure`, `gemini`) or an endpoint you
+declare (see "Providers" below).
 
 - `available` (required): the models rewire may use. The first one is the author: it writes the
   spec and tests and implements.
@@ -606,16 +618,157 @@ Each Ollama reply may take up to 300 seconds. A larger local model on modest har
 more: set `REWIRE_OLLAMA_TIMEOUT_S` (whole seconds, 1 to 86400), e.g.
 `REWIRE_OLLAMA_TIMEOUT_S=900 rewire run ...`. `rewire doctor` shows the value in use.
 
+## Providers
+
+Besides Anthropic, OpenAI and Ollama, rewire talks to Claude on Amazon Bedrock, Google Vertex AI
+and Microsoft Foundry, to Azure OpenAI, to Gemini, and to any OpenAI-compatible endpoint (Groq,
+OpenRouter, vLLM, LM Studio and so on). Only Gemini (`GEMINI_API_KEY`) is auto-detected. The clouds,
+Azure and endpoints need a `models.toml`, because their credentials are ambiguous.
+
+Credentials come only from the environment or the platform's own credential chain. rewire never
+reads credential files itself, never stores a key, and redacts keys from every error. `models.toml`
+holds the **name** of an env var (`api_key_env`), never a key.
+
+### Claude on Bedrock, Vertex and Foundry
+
+rewire uses each platform's own client (`AnthropicBedrockMantle`, `AnthropicVertex`,
+`AnthropicFoundry`), not the Anthropic client with a changed URL. Only Claude models are supported
+there: a model id without `claude` is `model_ref_invalid`.
+
+```toml
+available = [
+  "bedrock:anthropic.claude-opus-5-5",   # Bedrock ids carry the anthropic. prefix
+  "vertex:claude-opus-5-5",              # bare ids; dated snapshots use @
+  "foundry:my-claude-deployment",        # the Foundry deployment name
+]
+
+[providers.bedrock]
+region = "us-west-2"
+
+[providers.vertex]
+project = "my-gcp-project"
+region = "us-east5"                      # optional, default "global"
+
+[providers.foundry]
+resource = "my-foundry-resource"         # or base_url = "https://..."
+```
+
+| Provider  | Credentials                                                                                                                                                                  | Region, project, resource (first set wins)                                                                                                                          |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bedrock` | `AWS_BEARER_TOKEN_BEDROCK`, else `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`), else `AWS_PROFILE`, else the AWS default chain (SSO, instance roles) | `[providers.bedrock] region`, `AWS_REGION`, `AWS_DEFAULT_REGION`                                                                                                    |
+| `vertex`  | Google application default credentials (`gcloud auth application-default login` or `GOOGLE_APPLICATION_CREDENTIALS`)                                                         | project: `[providers.vertex] project`, `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`. Region: `[providers.vertex] region`, `CLOUD_ML_REGION`, else `global` |
+| `foundry` | `ANTHROPIC_FOUNDRY_API_KEY` (required)                                                                                                                                       | `[providers.foundry] resource` or `base_url`, else `ANTHROPIC_FOUNDRY_RESOURCE` or `ANTHROPIC_FOUNDRY_BASE_URL`                                                     |
+
+A missing region, project or key is `provider_auth_missing`, raised when the provider is created
+(before a run starts), and its hint names the env var or toml key to set. A region or Foundry
+resource must be a single DNS label, because it becomes part of a host name.
+
+### Azure OpenAI
+
+```toml
+available = ["azure:my-gpt-deployment"]  # the deployment name
+
+[providers.azure]
+endpoint = "https://myres.openai.azure.com"
+api_version = "2024-10-21"
+```
+
+Needs `AZURE_OPENAI_API_KEY`. The endpoint comes from `[providers.azure] endpoint` or
+`AZURE_OPENAI_ENDPOINT`, and **must be the resource root** with no path (rewire adds
+`/openai/deployments/<deployment>/...`). **The API version is required**, from
+`[providers.azure] api_version` or `OPENAI_API_VERSION`: the OpenAI SDK has no default for Azure, so a
+missing version is `provider_auth_missing`.
+
+### Gemini
+
+```toml
+available = ["gemini:gemini-2.5-pro"]
+```
+
+Needs `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). rewire uses Gemini's OpenAI-compatible API at
+`https://generativelanguage.googleapis.com/v1beta/openai/`. With `GEMINI_API_KEY` set and no
+`models.toml`, rewire auto-detects `gemini:gemini-2.5-pro` (override with `REWIRE_GEMINI_MODEL`).
+`GOOGLE_API_KEY` alone is not auto-detected.
+
+### OpenAI-compatible endpoints
+
+```toml
+available = ["groq:llama-3.3-70b-versatile", "local:qwen2.5-coder"]
+
+[endpoints.groq]
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"             # the NAME of the env var
+# family = "llama"                       # optional override, see "Model families"
+# context_window = 131072                # optional, integer >= 4096
+# max_tokens_field = "max_tokens"        # or "max_completion_tokens"; default max_tokens
+
+[endpoints.local]
+base_url = "http://127.0.0.1:1234/v1"    # loopback http needs no key
+```
+
+Endpoint names match `^[a-z][a-z0-9-]{0,31}$` and may not be a built-in provider name. Unknown keys
+in any of these tables are `models_file_invalid`. Requests go to `<base_url>/chat/completions`.
+
+Rules for every base URL (endpoints, `[providers.foundry] base_url`, the Azure endpoint, and the
+three SDK env overrides `ANTHROPIC_BEDROCK_MANTLE_BASE_URL`, `ANTHROPIC_VERTEX_BASE_URL` and
+`ANTHROPIC_FOUNDRY_BASE_URL`):
+
+- It must be `https`. Plain `http` is allowed only for `localhost`, `127.x.x.x` and `[::1]`.
+- It may not carry userinfo, a query or a fragment. Put the key in an env var.
+- A loopback endpoint without `api_key_env` sends **no** auth header at all. Any other endpoint
+  needs `api_key_env`, and an unset var is `provider_auth_missing`.
+
+`OPENAI_CUSTOM_HEADERS` applies only to the plain `openai` provider. For Azure, Gemini and endpoints
+it is ignored, so a header meant for OpenAI can never replace another vendor's credential. The
+OpenAI SDK's own `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_ORG_ID` and `OPENAI_PROJECT_ID` are
+not read for these providers either.
+
+### Model families
+
+Cross-family review depends on knowing each model's family, so it is derived with fixed rules:
+
+- `bedrock`, `vertex`, `foundry`: `claude`. `azure`: `gpt`. `gemini`: `gemini`.
+- An **endpoint** uses its `family` key when set. Otherwise the family comes from the model id
+  alone, **never from the endpoint name** (you choose that name, and it says nothing about the
+  model):
+  1. A vendor path segment: `anthropic/` is `claude`, `openai/` is `gpt`, `google/` is `gemini`
+     (`gemma` for gemma ids), `meta-llama/` is `llama`, `x-ai/` is `grok`, `mistralai/` is
+     `mistral`, `deepseek/` is `deepseek`, `qwen/` is `qwen`. So `openrouter:anthropic/claude-opus-5-5`
+     is `claude` and cannot be the independent reviewer of a Claude implementer.
+  2. Otherwise, in the last path segment: contains `claude` is `claude`; starts `gpt-`, `o1`, `o3`,
+     `o4`, `chatgpt`, `codex` or `gpt-oss` is `gpt`; contains `gemini` or `gemma` is that family.
+  3. Otherwise the Ollama rules (leading word, with code and vision variants mapped to their base).
+- A router or default id (`auto`, `router`, `default`, an empty last segment, or anything under
+  `openrouter/`) names no model, so its family cannot be known: set `family` or it is
+  `model_ref_invalid`.
+- An endpoint `family` override is honoured, and `rewire doctor` prints it, and the family rewire
+  would have derived when that differs.
+
+An unrecognised leading word counts as its own family (so `llama-3.3` and `qwen2.5` work with no
+configuration). An exotic id that really shares training with another family can therefore pass
+as independent; set `family` when you know it does.
+
+### Not supported
+
+- **Claude subscription login (Free, Pro, Max).** Anthropic's terms say it "does not permit
+  third-party developers to offer Claude.ai login into their own applications, or to route requests
+  through Free, Pro, Max, or Ultra plan credentials on behalf of their users"
+  ([Legal and compliance](https://code.claude.com/docs/en/legal-and-compliance)). rewire is such an
+  application, so it takes an API key (`ANTHROPIC_API_KEY`) or a supported cloud provider instead.
+- Non-Claude models on Bedrock, Vertex and Foundry (use `azure`, `gemini` or an endpoint).
+- Keys in `models.toml`, and credentials in URLs.
+
 ## Configuration
 
-| Variable                                        | What it does                                                                              |
-| ----------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`           | Enable the Anthropic and OpenAI providers (auto-detected when no `models.toml` is given). |
-| `REWIRE_ANTHROPIC_MODEL`, `REWIRE_OPENAI_MODEL` | Override the auto-detected Anthropic and OpenAI models.                                   |
-| `OLLAMA_HOST`                                   | Where Ollama is found (default `http://127.0.0.1:11434`).                                 |
-| `REWIRE_OLLAMA_TIMEOUT_S`                       | Seconds to wait for each Ollama reply: whole seconds, 1 to 86400, default 300.            |
-| `REWIRE_SANDBOX_BIN`                            | Use this sandbox binary (a missing file is an error, never a fall-through).               |
-| `XDG_CONFIG_HOME`                               | Where the default `rewire/models.toml` is looked up (default `~/.config`).                |
+| Variable                                                               | What it does                                                                                                       |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`                | Enable the Anthropic, OpenAI and Gemini providers (auto-detected when no `models.toml` is given).                  |
+| `REWIRE_ANTHROPIC_MODEL`, `REWIRE_OPENAI_MODEL`, `REWIRE_GEMINI_MODEL` | Override the auto-detected models.                                                                                 |
+| Cloud and endpoint credentials                                         | Named under "Providers" (AWS, Google, `ANTHROPIC_FOUNDRY_*`, `AZURE_OPENAI_*`, and each endpoint's `api_key_env`). |
+| `OLLAMA_HOST`                                                          | Where Ollama is found (default `http://127.0.0.1:11434`).                                                          |
+| `REWIRE_OLLAMA_TIMEOUT_S`                                              | Seconds to wait for each Ollama reply: whole seconds, 1 to 86400, default 300.                                     |
+| `REWIRE_SANDBOX_BIN`                                                   | Use this sandbox binary (a missing file is an error, never a fall-through).                                        |
+| `XDG_CONFIG_HOME`                                                      | Where the default `rewire/models.toml` is looked up (default `~/.config`).                                         |
 
 The repository's own policy lives in `.rewire/policy.toml` and belongs in version control. Policy
 layers only ever tighten: built-in, then organisation, then repository, then run.
