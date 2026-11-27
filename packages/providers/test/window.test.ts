@@ -467,3 +467,11 @@ describe("suspectTruncation", () => {
     expect(new TokenEstimator({ ratio: 9 }).ratio).toBe(2);
   });
 });
+
+describe("contextWindow: endpoints", () => {
+  test("an unregistered endpoint throws context_window_unknown", async () => {
+    await expect(contextWindow({ provider: "groq", model: "m" })).rejects.toMatchObject({
+      code: "context_window_unknown",
+    });
+  });
+});

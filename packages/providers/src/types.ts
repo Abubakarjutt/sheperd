@@ -1,19 +1,141 @@
 import { RewireError } from "@rewire/core";
 
-export const PROVIDER_NAMES = ["anthropic", "openai", "ollama", "faux"] as const;
+export const PROVIDER_NAMES = [
+  "anthropic",
+  "openai",
+  "ollama",
+  "faux",
+  "bedrock",
+  "vertex",
+  "foundry",
+  "azure",
+  "gemini",
+] as const;
 export type ProviderName = (typeof PROVIDER_NAMES)[number];
 
-export type ModelRef = { provider: ProviderName; model: string };
+/**
+ * `provider` is a built-in `ProviderName` or the name of an OpenAI-compatible endpoint registered
+ * with `registerEndpoints` (from `[endpoints.<name>]` in models.toml). Code that switches on the
+ * provider narrows with `builtinProvider` first, so a switch over built-ins stays exhaustive.
+ */
+export type ModelRef = { provider: ProviderName | (string & {}); model: string };
+
+/** `[endpoints.<name>]` in models.toml: an OpenAI-compatible API reached at `baseUrl`. */
+export type EndpointConfig = {
+  baseUrl: string;
+  /** The name of the env var holding the API key (never the key itself); optional on loopback. */
+  apiKeyEnv?: string;
+  /** Overrides the family derived from the model id. */
+  family?: string;
+  contextWindow?: number;
+  maxTokensField?: "max_completion_tokens" | "max_tokens";
+};
+
+/** `[providers.*]` in models.toml: per-platform settings for the cloud providers. */
+export type ProviderSettings = {
+  bedrock?: { region?: string };
+  vertex?: { project?: string; region?: string };
+  foundry?: { resource?: string; baseUrl?: string };
+  /** `family` overrides the family derived from the deployment name (see `registerAzureFamily`). */
+  azure?: { endpoint?: string; apiVersion?: string; family?: string };
+};
+
+/** Endpoint names: lowercase, start with a letter, at most 32 characters. */
+export const ENDPOINT_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
+
+const endpoints = new Map<string, EndpointConfig>();
+
+/** `name` as a built-in provider name, or undefined when it is not one (an endpoint, or unknown). */
+export function builtinProvider(name: string): ProviderName | undefined {
+  return (PROVIDER_NAMES as readonly string[]).includes(name) ? (name as ProviderName) : undefined;
+}
+
+/** Why `name` cannot be an endpoint name, or undefined when it can. */
+export function endpointNameProblem(name: string): string | undefined {
+  if (builtinProvider(name) !== undefined) {
+    return `endpoint name "${name}" is a built-in provider`;
+  }
+  if (!ENDPOINT_NAME_RE.test(name)) {
+    return `endpoint name "${name}" must match ${ENDPOINT_NAME_RE.source}`;
+  }
+  return undefined;
+}
+
+/**
+ * Registers OpenAI-compatible endpoints so `<name>:<model>` parses and resolves. Module-level
+ * state, like `registerProvider`. Returns a function that restores the previous entries for
+ * these names. Throws `model_ref_invalid` (registering nothing) for a malformed or built-in name.
+ */
+export function registerEndpoints(entries: Record<string, EndpointConfig>): () => void {
+  for (const name of Object.keys(entries)) {
+    const problem = endpointNameProblem(name);
+    if (problem !== undefined) {
+      throw new RewireError(
+        "model_ref_invalid",
+        problem,
+        "use a lowercase name that is not a built-in provider",
+      );
+    }
+  }
+  const prev = new Map<string, EndpointConfig | undefined>();
+  for (const [name, config] of Object.entries(entries)) {
+    if (!prev.has(name)) prev.set(name, endpoints.get(name));
+    endpoints.set(name, { ...config });
+  }
+  return () => {
+    for (const [name, config] of prev) {
+      if (config) endpoints.set(name, config);
+      else endpoints.delete(name);
+    }
+  };
+}
+
+let azureFamily: string | undefined;
+
+/**
+ * Sets the family every `azure:` ref has (`[providers.azure] family` in models.toml), or clears it
+ * with undefined: Azure deployment names are user-chosen, so the derived family can be wrong.
+ * Module-level state, like `registerEndpoints`. Returns a function that restores the previous one.
+ */
+export function registerAzureFamily(family: string | undefined): () => void {
+  const prev = azureFamily;
+  azureFamily = family;
+  return () => {
+    azureFamily = prev;
+  };
+}
+
+/** The registered `[providers.azure] family`, if any. */
+export function azureFamilyOverride(): string | undefined {
+  return azureFamily;
+}
+
+/** The registered endpoint called `name`, if any. */
+export function endpointConfig(name: string): EndpointConfig | undefined {
+  const c = endpoints.get(name);
+  return c ? { ...c } : undefined;
+}
+
+/** Whether `name` is a registered endpoint (built-in provider names never are). */
+export function isEndpointName(name: string): boolean {
+  return endpoints.has(name);
+}
+
+/** Whether `name` is a built-in provider or a registered endpoint. */
+export function isKnownProvider(name: string): boolean {
+  return builtinProvider(name) !== undefined || endpoints.has(name);
+}
 
 export function parseModelRef(s: string): ModelRef {
   const i = s.indexOf(":");
   const provider = i < 0 ? s : s.slice(0, i);
   const model = i < 0 ? "" : s.slice(i + 1);
-  if (!(PROVIDER_NAMES as readonly string[]).includes(provider)) {
+  if (!isKnownProvider(provider)) {
+    const names = [...PROVIDER_NAMES, ...endpoints.keys()];
     throw new RewireError(
       "model_ref_invalid",
       `unknown provider in model ref "${s}"`,
-      `use one of: ${PROVIDER_NAMES.join(", ")} as <provider>:<model>`,
+      `use one of: ${names.join(", ")} as <provider>:<model>, or declare [endpoints.${ENDPOINT_NAME_RE.test(provider) ? provider : "<name>"}] in models.toml`,
     );
   }
   if (model === "") {
@@ -23,7 +145,7 @@ export function parseModelRef(s: string): ModelRef {
       "use <provider>:<model>",
     );
   }
-  return { provider: provider as ProviderName, model };
+  return { provider, model };
 }
 
 export type ToolCall = { id: string; name: string; arguments: Record<string, unknown> };

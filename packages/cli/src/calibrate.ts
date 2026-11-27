@@ -1,13 +1,17 @@
 import type { Writable } from "node:stream";
 import { RewireError, redact } from "@rewire/core";
-import { compactionLimitOverride } from "@rewire/pipeline";
+import { compactionLimitOverride, type ModelsFile } from "@rewire/pipeline";
 import {
+  builtinProvider,
   type ContextWindow,
   contextWindow,
+  endpointConfig,
+  isLoopbackUrl,
   type ModelRef,
   OLLAMA_TRUNCATION_HINT,
   ollamaChatTimeoutMs,
   type Provider,
+  type ProviderName,
   parseModelRef,
   refreshContextWindow,
   TokenEstimator,
@@ -42,7 +46,7 @@ up to 95% of its window (or --max), and caches the result in $XDG_CACHE_HOME/rew
 The chat session's compaction then triggers at the calibrated size. Never runs automatically.
 
   --max <tokens>   largest probe length
-  --yes            required for paid providers (anthropic, openai): the probes cost input tokens
+  --yes            required for paid providers (all but ollama, faux and a loopback endpoint): the probes cost input tokens
   --models <file>  the models file (default: models.toml discovery, as rewire run)
   --fresh          ignore cached results for this model and measure again
 `;
@@ -50,7 +54,16 @@ The chat session's compaction then triggers at the calibrated size. Never runs a
 /** Wall-clock cap of one probe call for providers without their own (Ollama has REWIRE_OLLAMA_TIMEOUT_S). */
 export const PROBE_TIMEOUT_MS = 600_000;
 
-const PAID = new Set<ModelRef["provider"]>(["anthropic", "openai"]);
+/**
+ * Paid providers need `--yes`: every provider except Ollama, faux and an endpoint whose
+ * `base_url` is loopback. An unknown name fails closed (paid).
+ */
+export function isPaidProvider(provider: string): boolean {
+  const builtin = builtinProvider(provider);
+  if (builtin !== undefined) return builtin !== "ollama" && builtin !== "faux";
+  const endpoint = endpointConfig(provider);
+  return endpoint === undefined || !isLoopbackUrl(endpoint.baseUrl);
+}
 
 export type CalibrateOptions = {
   model?: string | undefined;
@@ -126,11 +139,24 @@ const errorText = (e: unknown): string => {
 };
 
 /** What to check when probes keep failing. */
-const ERROR_HINT: Record<ModelRef["provider"], string> = {
+const ERROR_HINT: Record<ProviderName, string> = {
   ollama: "is Ollama running? check OLLAMA_HOST and `ollama ps`, or raise REWIRE_OLLAMA_TIMEOUT_S",
   anthropic: "check ANTHROPIC_API_KEY, the network and the rate limits",
   openai: "check OPENAI_API_KEY, the network and the rate limits",
   faux: "check the faux script (REWIRE_FAUX_SCRIPT)",
+  bedrock: "check the AWS credentials and region, the network and the rate limits",
+  vertex: "check the Google Cloud credentials, project and region, the network and the rate limits",
+  foundry:
+    "check ANTHROPIC_FOUNDRY_API_KEY and the Foundry resource, the network and the rate limits",
+  azure: "check AZURE_OPENAI_API_KEY and the Azure endpoint, the network and the rate limits",
+  gemini: "check GEMINI_API_KEY, the network and the rate limits",
+};
+
+const errorHint = (provider: string): string => {
+  const builtin = builtinProvider(provider);
+  return builtin !== undefined
+    ? ERROR_HINT[builtin]
+    : `check the [endpoints.${provider}] base_url and api_key_env, the network and the rate limits`;
 };
 
 /** Two provider errors in a row end the run (the recorded lengths are kept). */
@@ -151,11 +177,28 @@ export async function calibrateCommand(
   signal: AbortSignal,
 ): Promise<number> {
   if (o.model === undefined || o.model.trim() === "") throw usage("no model given");
-  const ref = parseModelRef(o.model.trim());
+  const raw = o.model.trim();
+  // An endpoint ref ("groq:llama-3.3-70b") parses only once models.toml has registered it, so a
+  // ref that fails now is parsed again after the load; that second error keeps its hint.
+  let early: unknown;
+  try {
+    parseModelRef(raw);
+  } catch (e) {
+    // A built-in provider's ref cannot be fixed by models.toml: fail now, as before.
+    if (builtinProvider(raw.slice(0, Math.max(0, raw.indexOf(":")))) !== undefined) throw e;
+    early = e;
+  }
   const max = parseMax(o.max);
   const fauxPath = io.env.REWIRE_FAUX_SCRIPT;
   const faux = fauxPath ? loadFauxScript(fauxPath) : undefined;
-  const models = await resolveModels(o.models, io.cwd, io.env, faux);
+  let models: ModelsFile;
+  try {
+    models = await resolveModels(o.models, io.cwd, io.env, faux);
+  } catch (e) {
+    // Nothing loaded: the bad ref is the more useful error.
+    throw early ?? e;
+  }
+  const ref = parseModelRef(raw);
   const name = `${ref.provider}:${ref.model}`;
   if (!models.available.some((m) => m.provider === ref.provider && m.model === ref.model)) {
     throw new RewireError(
@@ -196,7 +239,7 @@ export async function calibrateCommand(
   const todo = decide(inPlan()).stop ? [] : plan.filter(needs);
 
   // Paid gate: before any provider exists, so nothing can be spent.
-  if (PAID.has(ref.provider) && !o.yes && todo.length > 0) {
+  if (isPaidProvider(ref.provider) && !o.yes && todo.length > 0) {
     const tokens = todo.reduce((n, l) => n + l, 0);
     io.stderr.write(
       `calibrating ${name} sends up to ${todo.length} probes (${todo.map(lengthLabel).join(", ")}): at most about ${tokens.toLocaleString("en-US")} input tokens billed by ${ref.provider} (a token count, not a price: rewire has no price table)\n`,
@@ -208,7 +251,7 @@ export async function calibrateCommand(
     );
   }
 
-  const providers = io.providers ?? providerFactory(io.env, faux);
+  const providers = io.providers ?? providerFactory(io.env, faux, models.providers);
   const refreshWindow =
     io.refreshWindow ??
     (ref.provider === "ollama"
@@ -304,7 +347,7 @@ export async function calibrateCommand(
       throw new RewireError(
         "calibration_failed",
         `${MAX_CONSECUTIVE_ERRORS} probes in a row failed (last: ${"error" in result ? oneLine(result.error, 200) : "?"}); the lengths measured so far are kept`,
-        ERROR_HINT[ref.provider],
+        errorHint(ref.provider),
       );
     }
   }

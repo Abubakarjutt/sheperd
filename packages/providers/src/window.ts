@@ -1,7 +1,16 @@
 import { RewireError } from "@rewire/core";
+import { modelFamily } from "./family.js";
 import { findOllamaTag, getLoadedOllamaModel, showOllamaModel } from "./ollama.js";
 import { ollamaBaseUrl } from "./registry.js";
-import { type ChatMessage, type ModelRef, PROVIDER_NAMES, type ToolSpec } from "./types.js";
+import {
+  builtinProvider,
+  type ChatMessage,
+  endpointConfig,
+  isKnownProvider,
+  type ModelRef,
+  PROVIDER_NAMES,
+  type ToolSpec,
+} from "./types.js";
 
 /** Where a context window came from, most trusted first. */
 export type WindowSource = "loaded" | "model" | "table" | "default";
@@ -46,7 +55,7 @@ export const FAUX_WINDOW_ENV = "REWIRE_FAUX_WINDOW";
  * Owner: whoever adds a model family; a missing id only makes compaction start early (32K).
  */
 export const WINDOW_TABLE: Readonly<
-  Record<"anthropic" | "openai", ReadonlyArray<[string, number]>>
+  Record<"anthropic" | "openai" | "gemini", ReadonlyArray<[string, number]>>
 > = {
   anthropic: [
     ["claude-3", 200_000],
@@ -70,6 +79,19 @@ export const WINDOW_TABLE: Readonly<
     ["o3", 200_000],
     ["o4-mini", 200_000],
   ],
+  // Gemini API ids (gemini-2.5-pro, gemini-2.5-flash, ...): 1M input tokens from 2.5 on, and
+  // assumed for any other gemini- id.
+  gemini: [
+    ["gemini-", 1_048_576],
+    ["gemini-2.5", 1_048_576],
+  ],
+};
+
+/** The table for a model family, when there is one. */
+const FAMILY_TABLE: Readonly<Record<string, ReadonlyArray<[string, number]>>> = {
+  claude: WINDOW_TABLE.anthropic,
+  gpt: WINDOW_TABLE.openai,
+  gemini: WINDOW_TABLE.gemini,
 };
 
 const DEFAULT: ContextWindow = {
@@ -137,10 +159,28 @@ export async function contextWindow(
 ): Promise<ContextWindow> {
   assertRef(ref);
   const env = opts.env ?? process.env;
-  switch (ref.provider) {
+  const provider = builtinProvider(ref.provider);
+  if (provider === undefined) return endpointWindow(ref);
+  switch (provider) {
     case "anthropic":
     case "openai":
-      return fromTable(WINDOW_TABLE[ref.provider], ref.model);
+      return fromTable(WINDOW_TABLE[provider], ref.model);
+    // Azure model refs are deployment names: a deployment named like its model gets the table.
+    case "azure":
+      return fromTable(WINDOW_TABLE.openai, ref.model);
+    case "gemini":
+      return fromTable(
+        WINDOW_TABLE.gemini,
+        ref.model
+          .trim()
+          .toLowerCase()
+          .replace(/^models\//, ""),
+      );
+    // Claude on the clouds: the anthropic table, by the bare Claude id.
+    case "bedrock":
+    case "vertex":
+    case "foundry":
+      return fromTable(WINDOW_TABLE.anthropic, cloudClaudeId(ref.model));
     case "faux": {
       const w = positiveInt(opts.fauxWindow) ?? positiveInt(Number(env[FAUX_WINDOW_ENV] ?? ""));
       return w !== null ? { window: w, source: "model", provisional: true } : DEFAULT;
@@ -150,6 +190,26 @@ export async function contextWindow(
       return baseUrl === undefined ? DEFAULT : ollamaWindow(baseUrl, ref.model);
     }
   }
+}
+
+/**
+ * A registered endpoint: its `context_window`, else the table for the model's family looked up by
+ * the id's last path segment ("anthropic/claude-opus-5-5" -> "claude-opus-5-5"), else the default.
+ * A model whose family cannot be derived (a router id) gets the default, never a throw.
+ */
+function endpointWindow(ref: ModelRef): ContextWindow {
+  const declared = endpointConfig(ref.provider)?.contextWindow;
+  if (declared !== undefined) return { window: declared, source: "model", provisional: true };
+  let family: string;
+  try {
+    family = modelFamily(ref);
+  } catch {
+    return DEFAULT;
+  }
+  const rows = FAMILY_TABLE[family];
+  if (rows === undefined) return DEFAULT;
+  const last = (ref.model.split("/").pop() ?? ref.model).trim().toLowerCase();
+  return fromTable(rows, last);
 }
 
 /**
@@ -179,6 +239,19 @@ export async function refreshContextWindow(
   return contextWindow(ref, opts);
 }
 
+/**
+ * The first-party id inside a cloud model id: Bedrock's `anthropic.` prefix (after an optional
+ * cross-region inference prefix such as `us.` or `global.`) and Vertex's `@<snapshot>` suffix
+ * are dropped.
+ */
+export function cloudClaudeId(model: string): string {
+  let id = model.trim().toLowerCase();
+  const at = id.indexOf("@");
+  if (at >= 0) id = id.slice(0, at);
+  const m = /^(?:[a-z]{2,6}\.)?anthropic\.(.+)$/.exec(id);
+  return m?.[1] ?? id;
+}
+
 function resolveBaseUrl(opts: ContextWindowOptions, env: NodeJS.ProcessEnv): string | undefined {
   try {
     return opts.baseUrl ?? ollamaBaseUrl(env);
@@ -189,14 +262,15 @@ function resolveBaseUrl(opts: ContextWindowOptions, env: NodeJS.ProcessEnv): str
 
 function assertRef(ref: ModelRef): void {
   if (
-    !(PROVIDER_NAMES as readonly string[]).includes(ref?.provider) ||
+    typeof ref?.provider !== "string" ||
+    !isKnownProvider(ref.provider) ||
     typeof ref.model !== "string" ||
     ref.model === ""
   ) {
     throw new RewireError(
       "context_window_unknown",
       `cannot find a context window for model ref ${JSON.stringify(ref)}`,
-      `use <provider>:<model> with provider one of: ${PROVIDER_NAMES.join(", ")}`,
+      `use <provider>:<model> with provider one of: ${PROVIDER_NAMES.join(", ")}, or a registered endpoint`,
     );
   }
 }

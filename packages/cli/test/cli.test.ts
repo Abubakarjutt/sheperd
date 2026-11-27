@@ -76,6 +76,8 @@ function cleanEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   delete env.REWIRE_OPENAI_MODEL;
   delete env.ANTHROPIC_API_KEY;
   delete env.OPENAI_API_KEY;
+  delete env.GEMINI_API_KEY;
+  delete env.REWIRE_GEMINI_MODEL;
   const home = tmp();
   return { ...env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), ...extra };
 }
@@ -203,6 +205,13 @@ describe("faux mode is exclusive", () => {
     const f = providerFactory({ ANTHROPIC_API_KEY: "x" }, { scripts: { m: [] } });
     expect(() => f({ provider: "anthropic", model: "m" })).toThrow(/faux/);
     expect(f({ provider: "faux", model: "m" })).toBeDefined();
+  });
+  test("models.toml [providers.*] settings reach the cloud provider factories", () => {
+    const vertex = { provider: "vertex", model: "claude-opus-5-5" } as const;
+    expect(() => providerFactory({}, undefined)(vertex)).toThrowError(
+      expect.objectContaining({ code: "provider_auth_missing" }),
+    );
+    expect(providerFactory({}, undefined, { vertex: { project: "p" } })(vertex)).toBeDefined();
   });
   test("markFauxReport surfaces append failures", async () => {
     await expect(

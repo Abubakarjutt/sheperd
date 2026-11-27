@@ -1,6 +1,14 @@
 import { RewireError } from "@rewire/core";
 import { describe, expect, test } from "vitest";
-import { modelFamily, parseModelRef } from "../src/index.js";
+import {
+  derivedFamily,
+  endpointConfig,
+  isEndpointName,
+  modelFamily,
+  parseModelRef,
+  registerAzureFamily,
+  registerEndpoints,
+} from "../src/index.js";
 
 describe("modelFamily", () => {
   test("families", () => {
@@ -52,5 +60,244 @@ describe("parseModelRef", () => {
     expect(() => parseModelRef("nope:x")).toThrow(RewireError);
     expect(() => parseModelRef("openai")).toThrow(RewireError);
     expect(() => parseModelRef("openai:")).toThrow(RewireError);
+  });
+});
+
+describe("cloud providers and endpoints", () => {
+  test("bedrock, vertex and foundry are claude; a non-Claude model there is refused", () => {
+    expect(modelFamily(parseModelRef("bedrock:anthropic.claude-opus-5-5"))).toBe("claude");
+    expect(modelFamily(parseModelRef("vertex:claude-opus-5-5@20261101"))).toBe("claude");
+    expect(modelFamily(parseModelRef("foundry:claude-opus-5-5"))).toBe("claude");
+    for (const ref of ["bedrock:anthropic.llama3", "vertex:gemini-2.5-pro", "foundry:my-deploy"]) {
+      expect(() => modelFamily(parseModelRef(ref))).toThrowError(
+        expect.objectContaining({ code: "model_ref_invalid" }),
+      );
+    }
+  });
+  test("azure is gpt and gemini is gemini", () => {
+    expect(modelFamily(parseModelRef("azure:my-gpt-deployment"))).toBe("gpt");
+    expect(modelFamily(parseModelRef("gemini:gemini-2.5-pro"))).toBe("gemini");
+  });
+  test("a gemini: Gemma id is gemma, as on endpoints and Ollama", () => {
+    expect(modelFamily(parseModelRef("gemini:gemma-3-27b-it"))).toBe("gemma");
+    expect(modelFamily(parseModelRef("gemini:models/Gemma-3n-e4b-it"))).toBe("gemma");
+    expect(modelFamily(parseModelRef("ollama:gemma3:27b"))).toBe("gemma");
+    expect(modelFamily(parseModelRef("gemini:gemini-2.5-flash"))).toBe("gemini");
+  });
+  test.each([
+    ["DeepSeek-R1", "deepseek"],
+    ["my-deepseek-v3", "deepseek"],
+    ["Meta-Llama-3.1-70B-Instruct", "llama"],
+    ["codellama-34b", "llama"],
+    ["Mistral-Large-2411", "mistral"],
+    ["mixtral-8x7b", "mixtral"],
+    ["claude-opus-5-5", "claude"],
+    ["Phi-4", "phi"],
+    ["qwen2.5-72b", "qwen"],
+    ["grok-3", "grok"],
+    ["gemma-3-27b", "gemma"],
+    ["gemini-2.5-pro", "gemini"],
+    ["my-gpt-deployment", "gpt"],
+    ["gpt-4o", "gpt"],
+    ["prod", "gpt"],
+    ["dolphin-chat", "gpt"],
+    ["auto", "gpt"],
+  ])(
+    "azure:%s is %s: a deployment naming another vendor's model gets that family",
+    (model, family) => {
+      expect(modelFamily(parseModelRef(`azure:${model}`))).toBe(family);
+      expect(derivedFamily(parseModelRef(`azure:${model}`))).toBe(family);
+    },
+  );
+  test("[providers.azure] family overrides the derived one; undo restores it", () => {
+    const ref = parseModelRef("azure:DeepSeek-R1");
+    const undo = registerAzureFamily("llama");
+    try {
+      expect(modelFamily(ref)).toBe("llama");
+      expect(modelFamily(parseModelRef("azure:prod"))).toBe("llama");
+      expect(derivedFamily(ref)).toBe("deepseek");
+      const inner = registerAzureFamily(undefined);
+      expect(modelFamily(ref)).toBe("deepseek");
+      inner();
+      expect(modelFamily(ref)).toBe("llama");
+    } finally {
+      undo();
+    }
+    expect(modelFamily(ref)).toBe("deepseek");
+  });
+
+  test("an endpoint ref fails before registration, parses after, and fails after undo", () => {
+    expect(() => parseModelRef("groq:llama-3.3-70b")).toThrowError(
+      expect.objectContaining({ code: "model_ref_invalid" }),
+    );
+    const undo = registerEndpoints({ groq: { baseUrl: "https://api.groq.com/openai/v1" } });
+    try {
+      expect(parseModelRef("groq:llama-3.3-70b")).toEqual({
+        provider: "groq",
+        model: "llama-3.3-70b",
+      });
+      expect(endpointConfig("groq")).toEqual({ baseUrl: "https://api.groq.com/openai/v1" });
+    } finally {
+      undo();
+    }
+    expect(() => parseModelRef("groq:llama-3.3-70b")).toThrowError(
+      expect.objectContaining({ code: "model_ref_invalid" }),
+    );
+    expect(endpointConfig("groq")).toBeUndefined();
+  });
+
+  test("undo restores an endpoint registered before", () => {
+    const first = registerEndpoints({ ep: { baseUrl: "https://a.example/v1" } });
+    try {
+      const second = registerEndpoints({ ep: { baseUrl: "https://b.example/v1" } });
+      expect(endpointConfig("ep")?.baseUrl).toBe("https://b.example/v1");
+      second();
+      expect(endpointConfig("ep")?.baseUrl).toBe("https://a.example/v1");
+    } finally {
+      first();
+    }
+  });
+
+  test("an endpoint name that is a built-in provider or malformed is refused", () => {
+    for (const name of ["openai", "bedrock", "Groq", "1x", "a_b", "x".repeat(33)]) {
+      expect(() => registerEndpoints({ [name]: { baseUrl: "https://x.example" } })).toThrowError(
+        expect.objectContaining({ code: "model_ref_invalid" }),
+      );
+    }
+    expect(isEndpointName("openai")).toBe(false);
+  });
+
+  test.each([
+    ["anthropic/claude-opus-5-5", "claude"],
+    ["claude-sonnet-5", "claude"],
+    ["openai/gpt-5", "gpt"],
+    ["gpt-4o-mini", "gpt"],
+    ["o1-mini", "gpt"],
+    ["o3", "gpt"],
+    ["o4-mini", "gpt"],
+    ["openai/gpt-oss-120b", "gpt"],
+    ["google/gemini-2.5-pro", "gemini"],
+    ["google/gemma-3-27b-it", "gemma"],
+    ["llama-3.3-70b-versatile", "llama"],
+    ["meta-llama/Llama-3.3-70B-Instruct", "llama"],
+    ["deepseek-chat", "deepseek"],
+    ["mistral-large-latest", "mistral"],
+    ["Qwen/QwQ-32B", "qwen"],
+    ["accounts/fireworks/models/codellama-34b", "llama"],
+    // Vendor path segment wins over the last segment.
+    ["openai/chatgpt-4o-latest", "gpt"],
+    ["openai/codex-mini", "gpt"],
+    ["OpenAI/Some-New-Model", "gpt"],
+    ["anthropic/opus-next", "claude"],
+    ["google/learnlm-2.0", "gemini"],
+    ["google/gemma-3-27b-it", "gemma"],
+    ["meta-llama/Meta-Muse-1", "llama"],
+    ["x-ai/grok-4", "grok"],
+    ["mistralai/codestral-2501", "mistral"],
+    ["deepseek/r2", "deepseek"],
+    ["qwen/qwq-32b", "qwen"],
+    ["anthropic/claude-opus-5-5/thinking", "claude"],
+    // Last-segment rules without a vendor path.
+    ["chatgpt-4o-latest", "gpt"],
+    ["codex-mini-latest", "gpt"],
+  ])("endpoint model %s is %s", (model, family) => {
+    const undo = registerEndpoints({ openrouter: { baseUrl: "https://openrouter.ai/api/v1" } });
+    try {
+      expect(modelFamily({ provider: "openrouter", model })).toBe(family);
+    } finally {
+      undo();
+    }
+  });
+
+  test("a family is never derived from the endpoint name", () => {
+    const undo = registerEndpoints({ claude: { baseUrl: "https://x.example/v1" } });
+    try {
+      expect(modelFamily(parseModelRef("claude:llama-3.3-70b"))).toBe("llama");
+    } finally {
+      undo();
+    }
+  });
+
+  test("derivedFamily ignores an endpoint's family override (doctor shows the difference)", () => {
+    const undo = registerEndpoints({
+      corp: { baseUrl: "https://llm.corp.example/v1", family: "x" },
+    });
+    try {
+      const ref = parseModelRef("corp:claude-opus-5-5");
+      expect(modelFamily(ref)).toBe("x");
+      expect(derivedFamily(ref)).toBe("claude");
+      expect(() => derivedFamily(parseModelRef("corp:openrouter/auto"))).toThrowError(
+        expect.objectContaining({ code: "model_ref_invalid" }),
+      );
+      expect(derivedFamily({ provider: "bedrock", model: "anthropic.claude-opus-5-5" })).toBe(
+        "claude",
+      );
+      expect(derivedFamily({ provider: "ollama", model: "llama3.1" })).toBe("llama");
+    } finally {
+      undo();
+    }
+  });
+
+  test("an endpoint family override wins over the model id", () => {
+    const undo = registerEndpoints({
+      corp: { baseUrl: "https://llm.corp.example/v1", family: "x" },
+    });
+    try {
+      expect(modelFamily(parseModelRef("corp:claude-opus-5-5"))).toBe("x");
+    } finally {
+      undo();
+    }
+  });
+
+  test.each([
+    "openrouter/auto",
+    "auto",
+    "router",
+    "default",
+    "anthropic/",
+    "openrouter/anthropic/claude-opus-5-5",
+  ])("router or meta id %s needs an explicit family", (model) => {
+    const undo = registerEndpoints({
+      openrouter: { baseUrl: "https://openrouter.ai/api/v1" },
+      pinned: { baseUrl: "https://openrouter.ai/api/v1", family: "mixed" },
+    });
+    try {
+      expect(() => modelFamily({ provider: "openrouter", model })).toThrowError(
+        expect.objectContaining({
+          code: "model_ref_invalid",
+          hint: expect.stringMatching(/\[endpoints\.openrouter\] family/),
+        }),
+      );
+      expect(modelFamily({ provider: "pinned", model })).toBe("mixed");
+    } finally {
+      undo();
+    }
+  });
+
+  test("segments are trimmed and a :suffix is ignored for meta ids and vendor segments", () => {
+    const undo = registerEndpoints({ openrouter: { baseUrl: "https://openrouter.ai/api/v1" } });
+    try {
+      for (const model of ["auto:floor", "openrouter/auto:floor", " auto ", "x/ default "]) {
+        expect(() => modelFamily({ provider: "openrouter", model })).toThrowError(
+          expect.objectContaining({ code: "model_ref_invalid" }),
+        );
+      }
+      expect(() => modelFamily({ provider: "openrouter", model: " openrouter /x" })).toThrowError(
+        expect.objectContaining({ code: "model_ref_invalid" }),
+      );
+      expect(modelFamily({ provider: "openrouter", model: " anthropic /opus-next" })).toBe(
+        "claude",
+      );
+      expect(modelFamily({ provider: "openrouter", model: "openai:beta/thing" })).toBe("gpt");
+      expect(modelFamily({ provider: "openrouter", model: "google/ gemma-3 " })).toBe("gemma");
+    } finally {
+      undo();
+    }
+  });
+
+  test("an unregistered endpoint ref throws model_ref_invalid", () => {
+    expect(() => modelFamily({ provider: "openrouter", model: "gpt-5" })).toThrowError(
+      expect.objectContaining({ code: "model_ref_invalid" }),
+    );
   });
 });

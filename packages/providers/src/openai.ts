@@ -260,12 +260,30 @@ export async function collectOpenAIStream(
   };
 }
 
+/** The part of the `openai` client the provider uses; `OpenAI` and `AzureOpenAI` both fit. */
+export type OpenAIChatClient = Pick<OpenAI, "chat">;
+
+export type OpenAIProviderOptions = {
+  /** The provider name used in errors (default `openai`). */
+  name?: string;
+  /** Extra values redacted literally from errors (credentials other than `apiKey`). */
+  secrets?: readonly string[];
+  /** How requests are shaped (default: OpenAI's own `max_completion_tokens`). */
+  params?: OpenAIParamOptions;
+};
+
 export class OpenAIProvider implements Provider {
-  private readonly client: OpenAI;
+  private readonly client: OpenAIChatClient;
   private readonly apiKey: string;
-  constructor(apiKey: string, client?: OpenAI) {
+  private readonly name: string;
+  private readonly secrets: readonly string[];
+  private readonly params: OpenAIParamOptions;
+  constructor(apiKey: string, client?: OpenAIChatClient, opts: OpenAIProviderOptions = {}) {
     this.apiKey = apiKey;
     this.client = client ?? new OpenAI({ apiKey });
+    this.name = opts.name ?? "openai";
+    this.secrets = opts.secrets ?? [];
+    this.params = opts.params ?? {};
   }
   async chat(req: ChatRequest): Promise<ChatResponse> {
     let resp: unknown;
@@ -274,6 +292,7 @@ export class OpenAIProvider implements Provider {
         const stream = await this.client.chat.completions.create(
           toOpenAIStreamParams(
             req,
+            this.params,
           ) as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
           req.signal ? { signal: req.signal } : undefined,
         );
@@ -282,12 +301,17 @@ export class OpenAIProvider implements Provider {
         resp = await this.client.chat.completions.create(
           toOpenAIParams(
             req,
+            this.params,
           ) as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
           req.signal ? { signal: req.signal } : undefined,
         );
     } catch (err) {
-      throw providerError("openai", err, { apiKey: this.apiKey, signal: req.signal });
+      throw providerError(this.name, err, {
+        apiKey: this.apiKey,
+        secrets: this.secrets,
+        signal: req.signal,
+      });
     }
-    return fromOpenAIResponse(resp as OResponse);
+    return fromOpenAIResponse(resp as OResponse, this.name);
   }
 }

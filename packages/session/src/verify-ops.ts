@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { assetRoot, fenceUntrusted, redact, sanitizeTerminal } from "@rewire/core";
-import type { ModelRef, Provider } from "@rewire/providers";
+import { cloudClaudeId, type ModelRef, type Provider } from "@rewire/providers";
 import { z } from "zod";
 import {
   type CitedMessage,
@@ -70,7 +70,7 @@ export type RiskyVerifierOptions = {
 
 /**
  * The hook, plus `independent`: false when the verifier is the author's very model (same model id
- * and, when given, provider). This is model-level only: a different model of the same family
+ * and, when given, provider; or the same Claude model on two Claude platforms). This is model-level only: a different model of the same family
  * counts as independent. Family independence comes from routing (`independence`), which the
  * caller should use for any notice.
  */
@@ -242,13 +242,34 @@ function toDecisions(n: number, reply: z.infer<typeof VerifyReply>): VerifyDecis
   });
 }
 
+/** Claude's own API and the clouds that serve the same Claude models under their own ids. */
+const CLAUDE_PLATFORMS: ReadonlySet<string> = new Set([
+  "anthropic",
+  "bedrock",
+  "vertex",
+  "foundry",
+]);
+
+/**
+ * Whether the verifier (`model` on `providerName`) is the author's very model: the same id (and
+ * provider, when given), or the same Claude model on two Claude platforms
+ * (`vertex:claude-opus-5-5` and `anthropic:claude-opus-5-5`).
+ */
+function sameModel(author: ModelRef, model: string, providerName: string | undefined): boolean {
+  if (author.model === model && (providerName === undefined || author.provider === providerName)) {
+    return true;
+  }
+  return (
+    providerName !== undefined &&
+    CLAUDE_PLATFORMS.has(author.provider) &&
+    CLAUDE_PLATFORMS.has(providerName) &&
+    cloudClaudeId(author.model) === cloudClaudeId(model)
+  );
+}
+
 export function createRiskyVerifier(o: RiskyVerifierOptions): RiskyVerifier {
   const timeoutMs = o.timeoutMs ?? VERIFY_TIMEOUT_MS;
-  const independent = !(
-    o.author !== undefined &&
-    o.author.model === o.model &&
-    (o.providerName === undefined || o.author.provider === o.providerName)
-  );
+  const independent = !(o.author !== undefined && sameModel(o.author, o.model, o.providerName));
   const verify: VerifyRisky = async (ops, evidence, signal) => {
     if (signal?.aborted) throw new VerifierUnavailable("aborted");
     const { sent, ids } = fitBudget(ops, evidence);

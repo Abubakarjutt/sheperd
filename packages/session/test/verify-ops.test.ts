@@ -319,6 +319,19 @@ describe("createRiskyVerifier", () => {
     expect(createRiskyVerifier({ provider, model: "gpt", author }).independent).toBe(true);
   });
 
+  test("the same Claude model on another Claude platform is not independent", () => {
+    const provider = faux();
+    const author = { provider: "anthropic", model: "claude-opus-5-5" } as const;
+    const on = (providerName: string, model: string) =>
+      createRiskyVerifier({ provider, model, providerName, author }).independent;
+    expect(on("vertex", "claude-opus-5-5")).toBe(false);
+    expect(on("vertex", "claude-opus-5-5@20261101")).toBe(false);
+    expect(on("bedrock", "us.anthropic.claude-opus-5-5")).toBe(false);
+    expect(on("foundry", "claude-opus-5-5")).toBe(false);
+    expect(on("bedrock", "anthropic.claude-sonnet-5-5")).toBe(true);
+    expect(on("openai", "claude-opus-5-5")).toBe(true);
+  });
+
   test("no ops: no call", async () => {
     const provider = faux();
     expect(await createRiskyVerifier({ provider, model: "v" })([], {})).toEqual([]);

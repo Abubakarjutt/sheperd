@@ -1,5 +1,5 @@
 import { RewireError } from "@rewire/core";
-import type { ModelRef } from "./types.js";
+import { azureFamilyOverride, builtinProvider, endpointConfig, type ModelRef } from "./types.js";
 
 /**
  * Ollama names whose leading word is not their lineage (row 96): code, vision and reasoning
@@ -13,30 +13,163 @@ const LINEAGE: Readonly<Record<string, string>> = {
   codegemma: "gemma",
 };
 
+/** The family a model id names under the Ollama rules: last path segment, leading word, lineage. */
+function ollamaFamily(model: string): string {
+  // Strip registry/namespace prefixes: "hf.co/Qwen/Qwen2.5-Coder-7B-GGUF:Q4_K_M" -> "qwen2.5-...".
+  const lower = (model.split("/").pop() ?? model).toLowerCase();
+  if (lower.startsWith("gpt-oss")) return "gpt";
+  const m = /^[a-z]+/.exec(lower);
+  const word = m ? m[0] : lower;
+  return LINEAGE[word] ?? word;
+}
+
+/** Vendor path segments in hosted ids ("anthropic/claude-opus-5-5") and the family they name. */
+const VENDOR: Readonly<Record<string, string>> = {
+  anthropic: "claude",
+  openai: "gpt",
+  google: "gemini",
+  "meta-llama": "llama",
+  "x-ai": "grok",
+  mistralai: "mistral",
+  deepseek: "deepseek",
+  qwen: "qwen",
+};
+
+/** Last segments that name a router or a server-side default, not a model. */
+const META_IDS: ReadonlySet<string> = new Set(["auto", "router", "default", ""]);
+
+/** Path segments that name a router serving models of several families. */
+const ROUTER_VENDORS: ReadonlySet<string> = new Set(["openrouter"]);
+
+/**
+ * The family of a model behind an OpenAI-compatible endpoint, from the model id alone (never the
+ * endpoint name, which the user picks): hosted ids name other vendors' models, often behind a
+ * vendor path ("anthropic/claude-opus-5-5" on OpenRouter is Claude). Independence is never
+ * inferred from an id that names no model: a router or meta id needs an explicit `family`.
+ */
+function endpointFamily(ref: ModelRef): string {
+  const segs = ref.model
+    .toLowerCase()
+    .split("/")
+    .map((s) => s.trim());
+  const last = segs[segs.length - 1] ?? "";
+  // Meta ids and vendor segments match without a ":suffix" ("auto:floor", "openai:beta").
+  const bare = (s: string) => s.replace(/:.*$/, "").trim();
+  const path = segs.slice(0, -1).map(bare);
+  if (META_IDS.has(bare(last)) || path.some((s) => ROUTER_VENDORS.has(s))) {
+    throw new RewireError(
+      "model_ref_invalid",
+      `cannot tell the model family of "${ref.provider}:${ref.model}": it names a router or default, not a model`,
+      `set [endpoints.${ref.provider}] family = "<family>" in models.toml`,
+    );
+  }
+  // The vendor segment right before the model, else the first segment of a longer path.
+  for (const seg of [path[path.length - 1], path[0]]) {
+    const family = seg !== undefined ? VENDOR[seg] : undefined;
+    if (family === "gemini" && last.includes("gemma")) return "gemma";
+    if (family !== undefined) return family;
+  }
+  if (last.includes("claude")) return "claude";
+  if (/^(gpt-|o1|o3|o4|chatgpt|codex)/.test(last)) return "gpt";
+  if (last.includes("gemini")) return "gemini";
+  if (last.includes("gemma")) return "gemma";
+  return ollamaFamily(ref.model);
+}
+
+/**
+ * Words that name another vendor's model in an Azure deployment name, and their family (the
+ * Ollama family of the same weights). Matched at the start of a word, so "dolphin" is not "phi".
+ */
+const AZURE_OTHER: readonly (readonly [string, string])[] = [
+  ["claude", "claude"],
+  ["gemini", "gemini"],
+  ["codegemma", "gemma"],
+  ["gemma", "gemma"],
+  ["codellama", "llama"],
+  ["llava", "llama"],
+  ["llama", "llama"],
+  ["mixtral", "mixtral"],
+  ["mistral", "mistral"],
+  ["deepseek", "deepseek"],
+  ["qwq", "qwen"],
+  ["codeqwen", "qwen"],
+  ["qwen", "qwen"],
+  ["grok", "grok"],
+  ["phi", "phi"],
+];
+
+/**
+ * An Azure deployment is named by the user and Azure serves other vendors' models too: a name
+ * that names one ("DeepSeek-R1", "Meta-Llama-3.1-70B") gets its family, anything else is `gpt`.
+ * `[providers.azure] family` overrides this.
+ */
+function azureFamily(ref: ModelRef): string {
+  const lower = ref.model.toLowerCase();
+  for (const [word, family] of AZURE_OTHER) {
+    if (new RegExp(`(^|[^a-z])${word}`).test(lower)) return family;
+  }
+  return "gpt";
+}
+
+/** Bedrock, Vertex and Foundry are supported for Claude only. */
+function cloudClaude(ref: ModelRef): string {
+  if (!ref.model.toLowerCase().includes("claude")) {
+    throw new RewireError(
+      "model_ref_invalid",
+      `${ref.provider} supports Claude models only, not "${ref.model}"`,
+      ref.provider === "bedrock"
+        ? "use a Claude model id such as bedrock:anthropic.claude-opus-5-5"
+        : `use a Claude model id such as ${ref.provider}:claude-opus-5-5`,
+    );
+  }
+  return "claude";
+}
+
 /** Model family used to enforce that reviewers differ from the author's family. */
 export function modelFamily(ref: ModelRef): string {
   if (ref.model.trim() === "") {
     throw new RewireError("model_ref_invalid", "model name is empty");
   }
-  switch (ref.provider) {
-    case "anthropic":
-      return "claude";
-    case "openai":
-      return "gpt";
-    case "faux":
-      return `faux-${ref.model}`;
-    case "ollama": {
-      // Strip registry/namespace prefixes: "hf.co/Qwen/Qwen2.5-Coder-7B-GGUF:Q4_K_M" -> "qwen2.5-...".
-      const lower = (ref.model.split("/").pop() ?? ref.model).toLowerCase();
-      if (lower.startsWith("gpt-oss")) return "gpt";
-      const m = /^[a-z]+/.exec(lower);
-      const word = m ? m[0] : lower;
-      return LINEAGE[word] ?? word;
-    }
-    default:
+  const provider = builtinProvider(ref.provider);
+  if (provider === undefined) {
+    const endpoint = endpointConfig(ref.provider);
+    if (endpoint === undefined) {
       throw new RewireError(
         "model_ref_invalid",
         `unknown provider "${String((ref as { provider: unknown }).provider)}"`,
       );
+    }
+    return endpoint.family ?? endpointFamily(ref);
   }
+  switch (provider) {
+    case "anthropic":
+      return "claude";
+    case "openai":
+      return "gpt";
+    case "azure":
+      return azureFamilyOverride() ?? azureFamily(ref);
+    case "gemini":
+      // The Gemini API serves Gemma too: the same weights as ollama:gemma*, never independent.
+      return ref.model.toLowerCase().includes("gemma") ? "gemma" : "gemini";
+    case "bedrock":
+    case "vertex":
+    case "foundry":
+      return cloudClaude(ref);
+    case "faux":
+      return `faux-${ref.model}`;
+    case "ollama":
+      return ollamaFamily(ref.model);
+  }
+}
+
+/**
+ * The family rewire derives from the ref alone, ignoring an endpoint's `family` override and
+ * `[providers.azure] family` (which `modelFamily` honours). `rewire doctor` shows it next to an
+ * override that differs.
+ */
+export function derivedFamily(ref: ModelRef): string {
+  if (ref.provider === "azure" && ref.model.trim() !== "") return azureFamily(ref);
+  return builtinProvider(ref.provider) === undefined && endpointConfig(ref.provider) !== undefined
+    ? endpointFamily(ref)
+    : modelFamily(ref);
 }

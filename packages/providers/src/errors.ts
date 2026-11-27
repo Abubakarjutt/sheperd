@@ -1,4 +1,4 @@
-import { RewireError } from "@rewire/core";
+import { RewireError, redact } from "@rewire/core";
 
 function isAbort(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
@@ -26,7 +26,7 @@ function collectMessages(err: unknown, depth = 0): string[] {
 export function providerError(
   provider: string,
   err: unknown,
-  opts: { apiKey?: string; signal?: AbortSignal | undefined } = {},
+  opts: { apiKey?: string; secrets?: readonly string[]; signal?: AbortSignal | undefined } = {},
 ): RewireError {
   if (err instanceof RewireError) return err;
   if (opts.signal?.aborted || isAbort(err)) {
@@ -35,17 +35,25 @@ export function providerError(
   const raw = collectMessages(err).join(" | ") || String(err);
   return new RewireError(
     "provider_error",
-    `${provider} request failed: ${scrub(raw, opts.apiKey)}`,
+    `${provider} request failed: ${scrub(raw, [opts.apiKey, ...(opts.secrets ?? [])])}`,
   );
 }
 
-function scrub(s: string, apiKey?: string): string {
+function scrub(s: string, secrets: readonly (string | undefined)[]): string {
   let out = s;
-  if (apiKey !== undefined && apiKey.length >= 8) out = out.replaceAll(apiKey, "[redacted]");
-  return out
-    .replace(/\b(sk|key)-[A-Za-z0-9_-]{8,}/g, "[redacted]")
-    .replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, "$1[redacted]")
-    .slice(0, 500);
+  for (const secret of secrets) {
+    if (secret !== undefined && secret.length >= 8) out = out.replaceAll(secret, "[redacted]");
+  }
+  return (
+    redact(out)
+      .replace(/\b(sk|key)-[A-Za-z0-9_-]{8,}/g, "[redacted]")
+      .replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, "$1[redacted]")
+      // Google OAuth access tokens, and the credential parts of a SigV4-signed URL or header.
+      .replace(/\bya29\.[A-Za-z0-9._-]+/g, "[redacted]")
+      .replace(/(X-Amz-(?:Signature|Credential|Security-Token)=)[^&\s"']+/gi, "$1[redacted]")
+      .replace(/((?:Signature|Credential)=)[A-Za-z0-9/+=_-]{8,}/g, "$1[redacted]")
+      .slice(0, 500)
+  );
 }
 
 /**

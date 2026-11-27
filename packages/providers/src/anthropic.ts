@@ -107,12 +107,35 @@ export function fromAnthropicResponse(resp: AResponse): ChatResponse {
   };
 }
 
+/**
+ * The Messages surface AnthropicProvider uses. The first-party client and the Bedrock, Vertex
+ * and Foundry clients (all built on `@anthropic-ai/sdk`) expose it unchanged.
+ */
+export type AnthropicMessagesClient = {
+  messages: Pick<Anthropic["messages"], "create" | "stream">;
+};
+
+export type AnthropicProviderOptions = {
+  /** The provider name in errors (default `anthropic`). */
+  name?: string;
+  /** Values redacted literally from error messages, beside `apiKey`. */
+  secrets?: readonly string[];
+};
+
 export class AnthropicProvider implements Provider {
-  private readonly client: Anthropic;
+  private readonly client: AnthropicMessagesClient;
   private readonly apiKey: string;
-  constructor(apiKey: string, client?: Anthropic) {
+  private readonly name: string;
+  private readonly secrets: readonly string[];
+  constructor(
+    apiKey: string,
+    client?: AnthropicMessagesClient,
+    opts: AnthropicProviderOptions = {},
+  ) {
     this.apiKey = apiKey;
     this.client = client ?? new Anthropic({ apiKey });
+    this.name = opts.name ?? "anthropic";
+    this.secrets = opts.secrets ?? [];
   }
   async chat(req: ChatRequest): Promise<ChatResponse> {
     let resp: unknown;
@@ -173,7 +196,11 @@ export class AnthropicProvider implements Provider {
           req.signal ? { signal: req.signal } : undefined,
         );
     } catch (err) {
-      throw providerError("anthropic", err, { apiKey: this.apiKey, signal: req.signal });
+      throw providerError(this.name, err, {
+        apiKey: this.apiKey,
+        secrets: this.secrets,
+        signal: req.signal,
+      });
     }
     return fromAnthropicResponse(resp as AResponse);
   }

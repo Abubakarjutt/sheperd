@@ -15,6 +15,7 @@ import {
   type ModelRef,
   OLLAMA_TRUNCATION_HINT,
   type Provider,
+  registerEndpoints,
 } from "@rewire/providers";
 import {
   buildProbe,
@@ -29,7 +30,13 @@ import {
 } from "@rewire/session";
 import type { SkillSet } from "@rewire/skills";
 import { afterAll, describe, expect, test } from "vitest";
-import { type CalibrateOptions, calibrateCommand, formatDuration } from "../src/calibrate.js";
+import {
+  CALIBRATE_USAGE,
+  type CalibrateOptions,
+  calibrateCommand,
+  formatDuration,
+  isPaidProvider,
+} from "../src/calibrate.js";
 import { chatSessions } from "../src/tui.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -519,6 +526,9 @@ describe("rewire calibrate (faux)", () => {
 });
 
 describe("rewire calibrate: the paid gate", () => {
+  test("--help names every free provider: ollama, faux and a loopback endpoint", () => {
+    expect(CALIBRATE_USAGE).toMatch(/all but ollama, faux and a loopback endpoint/);
+  });
   function paid() {
     const s = setup();
     const models = join(s.home, "models.toml");
@@ -560,6 +570,126 @@ describe("rewire calibrate: the paid gate", () => {
     // 8K + 16K + 32K + 64K + 128K
     expect(err.text()).toContain("about 253,952 input tokens");
     expect(out.text()).toBe("");
+  });
+
+  test("a cloud provider (bedrock) without --yes exits calibration_failed and creates no provider", async () => {
+    const s = setup();
+    const models = join(s.home, "models.toml");
+    writeFileSync(models, 'available = ["bedrock:anthropic.claude-opus-5-5"]\n');
+    let made = 0;
+    const err = sink();
+    const p = calibrateCommand(
+      { model: "bedrock:anthropic.claude-opus-5-5", models, yes: false, fresh: false },
+      {
+        stdout: sink().stream,
+        stderr: err.stream,
+        env: { ...s.env, REWIRE_FAUX_SCRIPT: "", AWS_REGION: "us-east-1" },
+        cwd: s.home,
+        providers: () => {
+          made++;
+          throw new Error("the paid gate let a provider be made");
+        },
+      },
+      new AbortController().signal,
+    );
+    await expect(p).rejects.toMatchObject({
+      code: "calibration_failed",
+      hint: "re-run with --yes to spend",
+    });
+    expect(made).toBe(0);
+    expect(err.text()).toContain("billed by bedrock");
+  });
+
+  test("an endpoint ref: models.toml is loaded before the ref is parsed, and a https endpoint is paid", async () => {
+    const s = setup();
+    const models = join(s.home, "models.toml");
+    writeFileSync(
+      models,
+      'available = ["groq:llama-3.3-70b"]\n[endpoints.groq]\nbase_url = "https://api.groq.com/openai/v1"\napi_key_env = "GROQ_API_KEY"\n',
+    );
+    let made = 0;
+    const err = sink();
+    const p = calibrateCommand(
+      { model: "groq:llama-3.3-70b", models, yes: false, fresh: false },
+      {
+        stdout: sink().stream,
+        stderr: err.stream,
+        env: { ...s.env, REWIRE_FAUX_SCRIPT: "" },
+        cwd: s.home,
+        providers: () => {
+          made++;
+          throw new Error("the paid gate let a provider be made");
+        },
+        window: async () => ({ window: 20_000, source: "model", provisional: false }),
+      },
+      new AbortController().signal,
+    );
+    await expect(p).rejects.toMatchObject({
+      code: "calibration_failed",
+      hint: "re-run with --yes to spend",
+    });
+    expect(made).toBe(0);
+    expect(err.text()).toContain("billed by groq");
+  });
+
+  test("a loopback endpoint ref measures without --yes", async () => {
+    const s = setup();
+    const models = join(s.home, "models.toml");
+    writeFileSync(
+      models,
+      'available = ["lm:qwen2.5-coder"]\n[endpoints.lm]\nbase_url = "http://127.0.0.1:1234/v1"\n',
+    );
+    s.setWindow({ window: 20_000, source: "model", provisional: false });
+    const model = oracle(1e9);
+    const r = await s.run({ model: "lm:qwen2.5-coder", models, yes: false }, model, undefined, {
+      REWIRE_FAUX_SCRIPT: "",
+    });
+    expect(r.code).toBe(0);
+    expect(model.lengths.length).toBeGreaterThan(0);
+  });
+
+  test("an undeclared endpoint ref keeps parseModelRef's hint", async () => {
+    const s = setup();
+    const models = join(s.home, "models.toml");
+    writeFileSync(models, 'available = ["ollama:m"]\n');
+    const p = calibrateCommand(
+      { model: "groq:llama-3.3-70b", models, yes: true, fresh: false },
+      {
+        stdout: sink().stream,
+        stderr: sink().stream,
+        env: { ...s.env, REWIRE_FAUX_SCRIPT: "" },
+        cwd: s.home,
+      },
+      new AbortController().signal,
+    );
+    await expect(p).rejects.toMatchObject({
+      code: "model_ref_invalid",
+      hint: expect.stringContaining("[endpoints.groq] in models.toml"),
+    });
+  });
+
+  test("paid is every provider but ollama, faux and a loopback endpoint", () => {
+    for (const name of ["anthropic", "openai", "bedrock", "vertex", "foundry", "azure", "gemini"]) {
+      expect(isPaidProvider(name)).toBe(true);
+    }
+    expect(isPaidProvider("ollama")).toBe(false);
+    expect(isPaidProvider("faux")).toBe(false);
+    const undo = registerEndpoints({
+      local: { baseUrl: "http://127.0.0.1:8080/v1" },
+      named: { baseUrl: "http://localhost:1234/v1" },
+      six: { baseUrl: "http://[::1]:9/v1" },
+      groq: { baseUrl: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY" },
+    });
+    try {
+      expect(isPaidProvider("local")).toBe(false);
+      expect(isPaidProvider("named")).toBe(false);
+      expect(isPaidProvider("six")).toBe(false);
+      expect(isPaidProvider("groq")).toBe(true);
+    } finally {
+      undo();
+    }
+    // An unknown name fails closed.
+    expect(isPaidProvider("nope")).toBe(true);
   });
 
   test("with --yes it measures", async () => {
