@@ -39,6 +39,12 @@ describe("blockedAddress", () => {
     ["::ffff:10.0.0.1", "private"],
     ["64:ff9b::a9fe:a9fe", "link-local"],
     ["2002:7f00:1::", "loopback"],
+    ["::ffff:0:7f00:1", "loopback"],
+    ["::ffff:0:10.0.0.1", "private"],
+    ["64:ff9b:1::a9fe:a9fe", "NAT64 local-use"],
+    ["64:ff9b:1:ffff::1", "NAT64 local-use"],
+    ["2001:0:4136:e378:8000:63bf:3fff:fdd2", "Teredo"],
+    ["2001::1", "Teredo"],
   ])("%s is refused (%s)", (addr, label) => {
     expect(blockedAddress(addr)).toContain(label);
   });
@@ -50,6 +56,8 @@ describe("blockedAddress", () => {
     "100.128.0.1",
     "2606:4700::1111",
     "::ffff:8.8.8.8",
+    "2001:4860:4860::8888",
+    "64:ff9b::808:808",
   ])("%s is allowed", (addr) => {
     expect(blockedAddress(addr)).toBeUndefined();
   });
@@ -153,5 +161,14 @@ describe("pinnedLookup through undici", () => {
       await agent.close();
       server.close();
     }
+  });
+});
+
+describe("vetHost under a signal (review M2)", () => {
+  test("a resolver that never answers gives way to the signal", async () => {
+    const ac = new AbortController();
+    const p = vetHost("hang.example", () => new Promise(() => {}), ac.signal);
+    ac.abort(new Error("stop now"));
+    await expect(p).rejects.toThrow(/stop now/);
   });
 });

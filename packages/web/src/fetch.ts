@@ -2,7 +2,7 @@ import { BUNDLE_VERSION } from "@rewire/core";
 import { Agent, type Dispatcher, fetch as undiciFetch } from "undici";
 import { WebError } from "./error.js";
 import { htmlToText } from "./html.js";
-import { checkOutgoing } from "./outgoing.js";
+import { checkOutgoingUrl } from "./outgoing.js";
 import { defaultResolver, pinnedLookup, type Resolver, vetHost } from "./ssrf.js";
 
 /** Sent on every request; carries no user or machine details. */
@@ -21,11 +21,14 @@ export type WebRequestInit = {
   body?: string;
   redirect: "manual" | "error";
   signal: AbortSignal;
-  /** The pinned-address dispatcher (`webFetch` only); an injected fetch may ignore it. */
+  /**
+   * The pinned-address dispatcher (`webFetch` only). A fetch that ignores it loses the DNS
+   * rebinding guard, so `webFetch` always uses `defaultFetch`; only tests inject another.
+   */
   dispatcher?: Dispatcher;
 };
 
-/** A `fetch` (injectable so tests never touch the network). */
+/** A `fetch`: `webSearch` takes one (tests); `webFetch` never does (see `webFetchUsing`). */
 export type WebFetchFn = (url: string, init: WebRequestInit) => Promise<Response>;
 
 /** undici's own `fetch`, so the undici `Agent` passed as `dispatcher` is honoured. */
@@ -33,10 +36,12 @@ export const defaultFetch: WebFetchFn = (url, init) =>
   undiciFetch(url, init) as unknown as Promise<Response>;
 
 export type WebFetchOptions = {
-  fetchFn?: WebFetchFn;
   resolve?: Resolver;
   signal?: AbortSignal;
-  /** A policy check on each hop's host: the refusal (naming the rule), or undefined to allow. */
+  /**
+   * A policy check on each hop's host, given lowercased and without a trailing dot: the refusal
+   * (naming the rule), or undefined to allow.
+   */
   isAllowed?: (host: string) => string | undefined;
   /** Overrides of the caps, for tests. */
   timeoutMs?: number;
@@ -60,6 +65,9 @@ function checkUrl(raw: string): URL {
   if (raw.length > MAX_URL_CHARS) {
     throw new WebError(`refused: the URL is longer than ${MAX_URL_CHARS} characters`);
   }
+  // The raw string first: `URL` lowercases the host, which hides an upper-case key pattern.
+  const rawSecret = checkOutgoingUrl(raw);
+  if (rawSecret !== undefined) throw new WebError(rawSecret);
   let u: URL;
   try {
     u = new URL(raw);
@@ -75,7 +83,7 @@ function checkUrl(raw: string): URL {
   if (u.href.length > MAX_URL_CHARS) {
     throw new WebError(`refused: the URL is longer than ${MAX_URL_CHARS} characters`);
   }
-  const secret = checkOutgoing(u.href);
+  const secret = checkOutgoingUrl(u.href);
   if (secret !== undefined) throw new WebError(secret);
   return u;
 }
@@ -88,10 +96,21 @@ const HTML_TYPES = new Set(["text/html", "application/xhtml+xml"]);
  * length, no credentials, no secret), passed through `isAllowed`, and its host resolved and
  * vetted; the connection goes to the vetted address (no DNS rebinding). Redirects are followed
  * by hand, at most 5. Only text types are read; HTML becomes text with links kept. Throws
- * `WebError` for every refusal and expected failure.
+ * `WebError` for every refusal and expected failure; a caller's abort is re-thrown as is.
  */
-export async function webFetch(url: string, o: WebFetchOptions = {}): Promise<WebFetchResult> {
-  const fetchFn = o.fetchFn ?? defaultFetch;
+export function webFetch(url: string, o: WebFetchOptions = {}): Promise<WebFetchResult> {
+  return webFetchUsing(defaultFetch, url, o);
+}
+
+/**
+ * `webFetch` over an injected transport. Test-only: it is not exported from the package entry,
+ * because a transport that drops `dispatcher` would silently lose the pinned address.
+ */
+export async function webFetchUsing(
+  fetchFn: WebFetchFn,
+  url: string,
+  o: WebFetchOptions = {},
+): Promise<WebFetchResult> {
   const resolve = o.resolve ?? defaultResolver;
   const timeoutMs = o.timeoutMs ?? FETCH_TIMEOUT_MS;
   const timeout = AbortSignal.timeout(timeoutMs);
@@ -102,9 +121,15 @@ export async function webFetch(url: string, o: WebFetchOptions = {}): Promise<We
   try {
     let current = checkUrl(url);
     for (let hop = 0; ; hop++) {
-      const refused = o.isAllowed?.(current.hostname.toLowerCase());
+      const refused = o.isAllowed?.(current.hostname.toLowerCase().replace(/\.$/, ""));
       if (refused !== undefined) throw new WebError(`refused by policy: ${refused}`);
-      const pin = await vetHost(current.hostname, resolve);
+      let pin: Awaited<ReturnType<typeof vetHost>>;
+      try {
+        pin = await vetHost(current.hostname, resolve, signal);
+      } catch (e) {
+        if (timeout.aborted) throw timedOut();
+        throw e;
+      }
       const agent = new Agent({ connect: { lookup: pinnedLookup(pin) } });
       agents.push(agent);
       let res: Response;
@@ -129,6 +154,9 @@ export async function webFetch(url: string, o: WebFetchOptions = {}): Promise<We
         await res.body?.cancel().catch(() => {});
         if (hop >= MAX_REDIRECTS)
           throw new WebError(`refused: more than ${MAX_REDIRECTS} redirects`);
+        // The raw Location too, before `URL` normalises it (and lowercases its host).
+        const rawSecret = checkOutgoingUrl(location);
+        if (rawSecret !== undefined) throw new WebError(rawSecret);
         let next: string;
         try {
           next = new URL(location, current).href;
@@ -155,7 +183,7 @@ export async function webFetch(url: string, o: WebFetchOptions = {}): Promise<We
         if (timeout.aborted) throw timedOut();
         throw e;
       }
-      const decoded = decode(body.bytes, header ?? "");
+      const decoded = decode(body.bytes, header ?? "", HTML_TYPES.has(contentType));
       const maxChars = o.maxChars ?? MAX_TEXT_CHARS;
       let text: string;
       let cut: boolean;
@@ -223,8 +251,16 @@ async function readCapped(
   return { bytes, truncated };
 }
 
-function decode(bytes: Uint8Array, contentType: string): string {
-  const charset = /;\s*charset\s*=\s*"?([^";\s]+)/i.exec(contentType)?.[1];
+/**
+ * The header's charset; for HTML without one, a `<meta charset>` (or http-equiv content type)
+ * in the first 1024 bytes; else UTF-8. An unknown label falls back to UTF-8.
+ */
+function decode(bytes: Uint8Array, contentType: string, html: boolean): string {
+  let charset = /;\s*charset\s*=\s*"?([^";\s]+)/i.exec(contentType)?.[1];
+  if (charset === undefined && html) {
+    const head = new TextDecoder("latin1").decode(bytes.subarray(0, 1024));
+    charset = /<meta\b[^>]{0,512}?charset\s*=\s*["']?\s*([A-Za-z0-9_.:-]{1,40})/i.exec(head)?.[1];
+  }
   try {
     return new TextDecoder(charset ?? "utf-8").decode(bytes);
   } catch {

@@ -97,6 +97,8 @@ function blockedV6(g: number[]): string | undefined {
   const zeroUpTo = (n: number): boolean => g.slice(0, n).every((x) => x === 0);
   if (zeroUpTo(8)) return "unspecified";
   if (zeroUpTo(7) && g[7] === 1) return "loopback";
+  // IPv4-translated (::ffff:0:a.b.c.d, ::ffff:0:0/96): judge the IPv4 inside.
+  if (zeroUpTo(4) && g[4] === 0xffff && g[5] === 0) return blockedV4(embeddedV4(g));
   // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d): judge the IPv4 inside.
   if (zeroUpTo(5) && (g[5] === 0xffff || g[5] === 0)) {
     return blockedV4(embeddedV4(g)) ?? (g[5] === 0 ? "reserved" : undefined);
@@ -105,6 +107,10 @@ function blockedV6(g: number[]): string | undefined {
   if (a === 0x64 && b === 0xff9b && g.slice(2, 6).every((x) => x === 0)) {
     return blockedV4(embeddedV4(g));
   }
+  // NAT64 local-use (64:ff9b:1::/48, RFC 8215) translates into a local network by definition.
+  if (a === 0x64 && b === 0xff9b && g[2] === 1) return "NAT64 local-use";
+  // Teredo (2001::/32) hides an obfuscated IPv4 server and client; refused outright.
+  if (a === 0x2001 && b === 0) return "Teredo tunnel";
   if (a === 0x2002) return blockedV4((((g[1] ?? 0) << 16) | (g[2] ?? 0)) >>> 0);
   if ((a & 0xfe00) === 0xfc00) return "private (unique local)";
   if ((a & 0xffc0) === 0xfe80) return "link-local";
@@ -136,9 +142,14 @@ export function blockedHostName(host: string): string | undefined {
 /**
  * Vet `hostname` (a WHATWG `URL.hostname`, so numeric IPv4 forms like `0x7f000001` are already
  * normalised to dotted quads): refuse local-only names, then resolve and refuse when ANY address
- * is in a blocked range. Returns the address to connect to (pin it: see `pinnedLookup`).
+ * is in a blocked range. Returns the address to connect to (pin it: see `pinnedLookup`). The
+ * lookup gives way to `signal` (its reason is thrown), so a hung resolver honours a timeout.
  */
-export async function vetHost(hostname: string, resolve: Resolver): Promise<ResolvedAddress> {
+export async function vetHost(
+  hostname: string,
+  resolve: Resolver,
+  signal?: AbortSignal,
+): Promise<ResolvedAddress> {
   const bare =
     hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
   const literal = isIP(bare.split("%")[0] ?? "");
@@ -151,8 +162,9 @@ export async function vetHost(hostname: string, resolve: Resolver): Promise<Reso
   if (name !== undefined) throw new WebError(`refused: ${hostname} is ${name}`);
   let addresses: ResolvedAddress[];
   try {
-    addresses = await resolve(bare);
+    addresses = await (signal === undefined ? resolve(bare) : raceAbort(resolve(bare), signal));
   } catch (e) {
+    if (signal?.aborted) throw signal.reason;
     throw new WebError(`cannot resolve ${hostname}: ${e instanceof Error ? e.message : String(e)}`);
   }
   const first = addresses[0];
@@ -181,4 +193,13 @@ export function pinnedLookup(pin: ResolvedAddress): LookupFunction {
       callback(null, pin.address, pin.family);
     }
   };
+}
+
+function raceAbort<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason);
+    if (signal.aborted) return onAbort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }

@@ -1,6 +1,17 @@
 import { describe, expect, test } from "vitest";
-import { USER_AGENT, type WebFetchFn, type WebRequestInit, webFetch } from "../src/fetch.js";
+import {
+  USER_AGENT,
+  type WebFetchFn,
+  type WebFetchOptions,
+  type WebRequestInit,
+  webFetchUsing,
+} from "../src/fetch.js";
+import * as web from "../src/index.js";
 import type { Resolver } from "../src/ssrf.js";
+
+/** The guarded fetch with an injected transport (test-only: the package entry never exposes it). */
+const webFetch = (url: string, o: WebFetchOptions & { fetchFn: WebFetchFn }) =>
+  webFetchUsing(o.fetchFn, url, o);
 
 const PUBLIC = "93.184.216.34";
 
@@ -332,5 +343,120 @@ describe("webFetch caps", () => {
     await expect(
       webFetch("https://slow.example/", { fetchFn, resolve: resolver(), signal: ac.signal }),
     ).rejects.toThrow(/abort/i);
+  });
+});
+
+describe("fix round 1", () => {
+  const never: WebFetchFn = async () => {
+    throw new Error("must not fetch");
+  };
+  const noDns: Resolver = async () => {
+    throw new Error("must not resolve");
+  };
+
+  test("a secret in the host is refused before DNS, whatever its case (review I2)", async () => {
+    for (const url of [
+      "https://AKIAIOSFODNN7EXAMPLE.evil.example/",
+      "https://akiaiosfodnn7example.evil.example/",
+      "https://x.evil.example/AKIAIOSFODNN7EXAMPLE",
+    ]) {
+      await expect(webFetch(url, { fetchFn: never, resolve: noDns })).rejects.toThrow(/secret/);
+    }
+  });
+
+  test("a raw Location carrying a secret is refused before it is normalised", async () => {
+    const { fetchFn, calls } = fake({
+      "https://a.example/": () =>
+        new Response(null, {
+          status: 302,
+          headers: { location: "https://AKIAIOSFODNN7EXAMPLE.evil.example/" },
+        }),
+    });
+    const seen: string[] = [];
+    await expect(
+      webFetch("https://a.example/", {
+        fetchFn,
+        resolve: async (h) => {
+          seen.push(h);
+          return [{ address: PUBLIC, family: 4 }];
+        },
+      }),
+    ).rejects.toThrow(/secret/);
+    expect(calls).toHaveLength(1);
+    expect(seen).toEqual(["a.example"]);
+  });
+
+  test("a secret hidden behind a stray % or double encoding is refused (review I1)", async () => {
+    for (const url of [
+      "https://evil.example/?d=%73k-ant-api03-abcdefghijk&x=%zz",
+      "https://evil.example/?d=%2573k-ant-api03-abcdefghijk",
+    ]) {
+      await expect(webFetch(url, { fetchFn: never, resolve: noDns })).rejects.toThrow(/secret/);
+    }
+  });
+
+  test("isAllowed gets the host without its trailing dot, lowercased (review M1)", async () => {
+    const seen: string[] = [];
+    await expect(
+      webFetch("https://Blocked.Example./", {
+        fetchFn: never,
+        resolve: noDns,
+        isAllowed: (h) => {
+          seen.push(h);
+          return h === "blocked.example" ? "deny_domains: blocked.example" : undefined;
+        },
+      }),
+    ).rejects.toThrow(/deny_domains/);
+    expect(seen).toEqual(["blocked.example"]);
+  });
+
+  test("DNS resolution is under the timeout and the caller's abort (review M2)", async () => {
+    const hang: Resolver = () => new Promise(() => {});
+    await expect(
+      webFetch("https://slow-dns.example/", { fetchFn: never, resolve: hang, timeoutMs: 50 }),
+    ).rejects.toThrow(/timed out after/);
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 20);
+    const err = await webFetch("https://slow-dns.example/", {
+      fetchFn: never,
+      resolve: hang,
+      signal: ac.signal,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).name).toBe("AbortError");
+  });
+
+  test("the package entry exposes no way to swap the pinned transport (review M4)", () => {
+    expect(web).not.toHaveProperty("webFetchUsing");
+    expect(web).not.toHaveProperty("defaultFetch");
+    expect(web).toHaveProperty("webFetch");
+  });
+
+  test("an HTML <meta charset> is honoured when the header has none (review M6)", async () => {
+    const bytes = new Uint8Array([
+      ...new TextEncoder().encode('<html><head><meta charset="iso-8859-1"></head><body><p>caf'),
+      0xe9,
+      ...new TextEncoder().encode("</p></body></html>"),
+    ]);
+    const { fetchFn } = fake({
+      "https://latin.example/": () =>
+        new Response(bytes, { headers: { "content-type": "text/html" } }),
+      "https://latin2.example/": () =>
+        new Response(
+          new Uint8Array([
+            ...new TextEncoder().encode(
+              '<meta http-equiv="Content-Type" content="text/html; charset=windows-1252"><p>caf',
+            ),
+            0xe9,
+          ]),
+          { headers: { "content-type": "text/html" } },
+        ),
+    });
+    expect((await webFetch("https://latin.example/", { fetchFn, resolve: resolver() })).text).toBe(
+      "café",
+    );
+    expect((await webFetch("https://latin2.example/", { fetchFn, resolve: resolver() })).text).toBe(
+      "café",
+    );
   });
 });

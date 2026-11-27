@@ -101,7 +101,7 @@ export function htmlToText(html: string, baseUrl: string, maxChars = 100_000): H
   let atStart = true;
   let pre = 0;
   let full = false;
-  const links: { href: string | undefined; raw: string; at: number }[] = [];
+  const links: { href: string | undefined; raw: string; at: number; len: number }[] = [];
 
   const push = (s: string): void => {
     if (full || s === "") return;
@@ -173,11 +173,9 @@ export function htmlToText(html: string, baseUrl: string, maxChars = 100_000): H
     pos = end + 1;
 
     if (!closing && (SKIP.has(name) || RCDATA.has(name))) {
-      const close = new RegExp(`</${name}\\b[^>]*>`, "gi");
-      close.lastIndex = pos;
-      const c = close.exec(html);
-      const inner = html.slice(pos, c === null ? html.length : c.index);
-      pos = c === null ? html.length : close.lastIndex;
+      const c = findClose(html, name, pos);
+      const inner = html.slice(pos, c?.start ?? html.length);
+      pos = c?.end ?? html.length;
       if (RCDATA.has(name)) {
         block(PARAGRAPH.has(name) ? 2 : 1);
         text(inner);
@@ -200,15 +198,19 @@ export function htmlToText(html: string, baseUrl: string, maxChars = 100_000): H
           href: raw === undefined ? undefined : linkTarget(raw, baseUrl),
           raw: raw ?? "",
           at: out.length,
+          len,
         });
       } else {
         const link = links.pop();
         if (link?.href !== undefined) {
-          const label = out.slice(link.at).join("").trim();
+          // Only a label no longer than the URL can equal it, so the join is bounded by the
+          // URL's length (O(1) per link in the input, never O(output)).
+          const short = len - link.len <= link.href.length + link.raw.length + 4;
+          const label = short ? out.slice(link.at).join("").trim() : undefined;
           if (label === "") {
             flush();
             push(link.href);
-          } else if (label !== link.href && label !== link.raw) {
+          } else if (label === undefined || (label !== link.href && label !== link.raw)) {
             push(` (${link.href})`);
           }
         }
@@ -218,6 +220,32 @@ export function htmlToText(html: string, baseUrl: string, maxChars = 100_000): H
   const joined = out.join("");
   const truncated = full;
   return { text: (truncated ? joined.slice(0, maxChars) : joined).trimEnd(), truncated };
+}
+
+const NAME_CHAR = /[a-zA-Z0-9-]/;
+
+/**
+ * The `</name ...>` that closes a raw-text element, searched from `from`: each `</` is looked at
+ * once, its name compared case-insensitively with a boundary check, then a single `indexOf(">")`.
+ * No backtracking regex, so an unclosed body full of near-miss candidates stays linear. A missing
+ * close tag (or a close tag without `>`) means the rest of the input is the body.
+ */
+function findClose(
+  html: string,
+  name: string,
+  from: number,
+): { start: number; end: number } | undefined {
+  let at = from;
+  for (;;) {
+    const i = html.indexOf("</", at);
+    if (i < 0) return undefined;
+    const after = i + 2 + name.length;
+    if (html.slice(i + 2, after).toLowerCase() === name && !NAME_CHAR.test(html[after] ?? "")) {
+      const gt = html.indexOf(">", after);
+      return gt < 0 ? undefined : { start: i, end: gt + 1 };
+    }
+    at = i + 2;
+  }
 }
 
 /** The index of the `>` that ends a tag whose attributes start at `from`, or -1. */

@@ -77,4 +77,40 @@ describe("htmlToText", () => {
     htmlToText(html, base);
     expect(Date.now() - t0).toBeLessThan(2000);
   });
+
+  describe("stays linear on hostile 5 MB inputs (review C1, M5)", () => {
+    const MB5 = 5 * 1024 * 1024;
+    const fill = (unit: string, prefix = "") =>
+      prefix + unit.repeat(Math.ceil((MB5 - prefix.length) / unit.length));
+    test.each([
+      ["an unclosed script with many </script candidates", fill("</script", "<script>")],
+      ["an unclosed style with many </style candidates", fill("</style", "<style>")],
+      ["an unclosed title with many </title candidates", fill("</title", "<title>")],
+      ["near-miss close tags", fill("</scripts></scrip", "<script>")],
+      ["many links closed at once", `${fill("<a href='/x'>y", "")}${"</a>".repeat(50_000)}`],
+      ["links each closing a long label", fill(`<a href="/x">${"w ".repeat(500)}</a>`)],
+      ["unclosed quoted attributes", fill('<p x="', "")],
+      ["attributes without values", fill(" href", "<a")],
+      ["entity-like noise", fill("&#x1234567&amp;&zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")],
+      ["lone angle brackets", fill("<<<< > ")],
+      ["many comment openers", fill("<!-- -- >")],
+    ])("%s", (_name, html) => {
+      const t0 = performance.now();
+      const r = htmlToText(html, base);
+      expect(performance.now() - t0).toBeLessThan(1000);
+      expect(r.text.length).toBeLessThanOrEqual(100_000);
+    });
+  });
+
+  test("a close tag is matched case-insensitively and needs a name boundary", () => {
+    expect(htmlToText("a<SCRIPT>x</scriptx>y</Script >b", base).text).toBe("ab");
+    expect(htmlToText("a<style>x</style", base).text).toBe("a");
+  });
+
+  test("an <a> with a long label still gets its target", () => {
+    const label = "word ".repeat(1000).trim();
+    expect(htmlToText(`<a href="/x">${label}</a>`, base).text).toBe(
+      `${label} (https://example.com/x)`,
+    );
+  });
 });
