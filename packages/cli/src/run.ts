@@ -14,7 +14,13 @@ import {
   runPipeline,
 } from "@rewire/pipeline";
 import { loadPolicy } from "@rewire/policy";
-import { createProvider, FauxProvider, type ModelRef, type Provider } from "@rewire/providers";
+import {
+  createProvider,
+  FauxProvider,
+  type ModelRef,
+  type Provider,
+  type ProviderSettings,
+} from "@rewire/providers";
 import { exitCodeFor } from "./exit.js";
 import { type FauxScript, loadFauxScript } from "./faux.js";
 import { discoverModels } from "./models.js";
@@ -137,7 +143,12 @@ export async function resolveModels(
   };
 }
 
-export function providerFactory(env: NodeJS.ProcessEnv, faux: FauxScript | undefined) {
+/** `settings`: models.toml's `[providers.*]` tables, for the cloud providers. */
+export function providerFactory(
+  env: NodeJS.ProcessEnv,
+  faux: FauxScript | undefined,
+  settings: ProviderSettings = {},
+) {
   const fauxByModel = new Map<string, FauxProvider>();
   return (ref: ModelRef): Provider => {
     if (ref.provider === "faux" && faux !== undefined) {
@@ -154,7 +165,7 @@ export function providerFactory(env: NodeJS.ProcessEnv, faux: FauxScript | undef
         `faux mode never uses a real provider (asked for ${ref.provider})`,
       );
     }
-    return createProvider(ref, env);
+    return createProvider(ref, env, settings);
   };
 }
 
@@ -224,7 +235,7 @@ export async function runCommand(
     task,
     repo,
     routing,
-    providers: providerFactory(io.env, faux),
+    providers: providerFactory(io.env, faux, models.providers),
     policy,
     ask: o.headless ? async () => null : (qs) => askInteractive(qs, io, signal, onInterrupt),
     emit,

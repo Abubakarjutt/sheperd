@@ -1,11 +1,17 @@
 import { RewireError } from "@rewire/core";
 import { AnthropicProvider } from "./anthropic.js";
+import { ClaudeCloudProvider } from "./claude-cloud.js";
 import { FauxProvider } from "./faux.js";
 import { normalizeOllamaHost, OllamaProvider, ollamaChatTimeoutMs } from "./ollama.js";
 import { OpenAIProvider } from "./openai.js";
-import type { ModelRef, Provider } from "./types.js";
+import type { ModelRef, Provider, ProviderSettings } from "./types.js";
 
-export type ProviderFactory = (ref: ModelRef, env: NodeJS.ProcessEnv) => Provider;
+/** `settings` are models.toml's `[providers.*]` tables (empty when there is no file). */
+export type ProviderFactory = (
+  ref: ModelRef,
+  env: NodeJS.ProcessEnv,
+  settings: ProviderSettings,
+) => Provider;
 
 const factories = new Map<string, ProviderFactory>();
 
@@ -27,12 +33,16 @@ export function requireKey(env: NodeJS.ProcessEnv, name: string): string {
   return v;
 }
 
-export function createProvider(ref: ModelRef, env: NodeJS.ProcessEnv = process.env): Provider {
+export function createProvider(
+  ref: ModelRef,
+  env: NodeJS.ProcessEnv = process.env,
+  settings: ProviderSettings = {},
+): Provider {
   const factory = factories.get(ref.provider);
   if (!factory) {
     throw new RewireError("provider_unknown", `no provider registered for "${ref.provider}"`);
   }
-  return factory(ref, env);
+  return factory(ref, env, settings);
 }
 
 registerProvider(
@@ -41,6 +51,10 @@ registerProvider(
 );
 registerProvider("openai", (_ref, env) => new OpenAIProvider(requireKey(env, "OPENAI_API_KEY")));
 registerProvider("faux", () => new FauxProvider([]));
+// Claude on the clouds: settings are checked now; each SDK is imported on the first chat.
+for (const name of ["bedrock", "vertex", "foundry"] as const) {
+  registerProvider(name, (_ref, env, settings) => new ClaudeCloudProvider(name, settings, env));
+}
 /** The Ollama base URL the provider and window discovery use: OLLAMA_HOST, normalized. */
 export function ollamaBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
   return normalizeOllamaHost(env.OLLAMA_HOST);

@@ -141,7 +141,7 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
   locateSandboxBinary({ env: io.env });
   if (faux) io.stderr.write(`${FAUX_WARNING}\n`);
 
-  const providers = providerFactory(io.env, faux);
+  const providers = providerFactory(io.env, faux, models.providers);
   const { home, xdgConfig, cacheDir } = xdgDirs(io.env);
   const trustFile = join(xdgConfig, "rewire", "trusted-skills.json");
   const store = new SessionStore();

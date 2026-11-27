@@ -151,10 +151,12 @@ export async function contextWindow(
     case "anthropic":
     case "openai":
       return fromTable(WINDOW_TABLE[provider], ref.model);
-    // Cloud providers: no table yet.
+    // Claude on the clouds: the anthropic table, by the bare Claude id.
     case "bedrock":
     case "vertex":
     case "foundry":
+      return fromTable(WINDOW_TABLE.anthropic, cloudClaudeId(ref.model));
+    // No table yet.
     case "azure":
     case "gemini":
       return DEFAULT;
@@ -194,6 +196,19 @@ export async function refreshContextWindow(
     }
   }
   return contextWindow(ref, opts);
+}
+
+/**
+ * The first-party id inside a cloud model id: Bedrock's `anthropic.` prefix (after an optional
+ * cross-region inference prefix such as `us.` or `global.`) and Vertex's `@<snapshot>` suffix
+ * are dropped.
+ */
+export function cloudClaudeId(model: string): string {
+  let id = model.trim().toLowerCase();
+  const at = id.indexOf("@");
+  if (at >= 0) id = id.slice(0, at);
+  const m = /^(?:[a-z]{2,6}\.)?anthropic\.(.+)$/.exec(id);
+  return m?.[1] ?? id;
 }
 
 function resolveBaseUrl(opts: ContextWindowOptions, env: NodeJS.ProcessEnv): string | undefined {

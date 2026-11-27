@@ -204,6 +204,13 @@ describe("faux mode is exclusive", () => {
     expect(() => f({ provider: "anthropic", model: "m" })).toThrow(/faux/);
     expect(f({ provider: "faux", model: "m" })).toBeDefined();
   });
+  test("models.toml [providers.*] settings reach the cloud provider factories", () => {
+    const vertex = { provider: "vertex", model: "claude-opus-5-5" } as const;
+    expect(() => providerFactory({}, undefined)(vertex)).toThrowError(
+      expect.objectContaining({ code: "provider_auth_missing" }),
+    );
+    expect(providerFactory({}, undefined, { vertex: { project: "p" } })(vertex)).toBeDefined();
+  });
   test("markFauxReport surfaces append failures", async () => {
     await expect(
       markFauxReport("/x/report.md", async () => {

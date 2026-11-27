@@ -471,17 +471,10 @@ describe("suspectTruncation", () => {
 });
 
 describe("contextWindow: providers without a table yet", () => {
-  test("cloud providers and registered endpoints get the default, never throw", async () => {
+  test("azure, gemini and registered endpoints get the default, never throw", async () => {
     const undo = registerEndpoints({ groq: { baseUrl: "https://api.groq.com/openai/v1" } });
     try {
-      for (const ref of [
-        "bedrock:anthropic.claude-opus-5-5",
-        "vertex:claude-opus-5-5",
-        "foundry:claude-opus-5-5",
-        "azure:gpt-5",
-        "gemini:gemini-2.5-pro",
-        "groq:llama-3.3-70b",
-      ]) {
+      for (const ref of ["azure:gpt-5", "gemini:gemini-2.5-pro", "groq:llama-3.3-70b"]) {
         await expect(contextWindow(parseModelRef(ref))).resolves.toEqual({
           window: DEFAULT_CONTEXT_WINDOW,
           source: "default",

@@ -241,7 +241,7 @@ export async function calibrateCommand(
     );
   }
 
-  const providers = io.providers ?? providerFactory(io.env, faux);
+  const providers = io.providers ?? providerFactory(io.env, faux, models.providers);
   const refreshWindow =
     io.refreshWindow ??
     (ref.provider === "ollama"

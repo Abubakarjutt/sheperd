@@ -45,10 +45,10 @@ describe("createProvider", () => {
 });
 
 describe("createProvider: names a later task wires up", () => {
-  test("cloud providers and endpoints fail cleanly with provider_unknown", () => {
+  test("azure, gemini and endpoints fail cleanly with provider_unknown", () => {
     const undo = registerEndpoints({ groq: { baseUrl: "https://api.groq.com/openai/v1" } });
     try {
-      for (const ref of ["bedrock:anthropic.claude-opus-5-5", "gemini:gemini-2.5-pro", "groq:m"]) {
+      for (const ref of ["azure:gpt-5", "gemini:gemini-2.5-pro", "groq:m"]) {
         expect(() => createProvider(parseModelRef(ref), {})).toThrowError(
           expect.objectContaining({ code: "provider_unknown" }),
         );
