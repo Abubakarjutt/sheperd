@@ -20,8 +20,10 @@ import {
   createProvider,
   FauxProvider,
   type ModelRef,
+  type OllamaTimeout,
   type Provider,
   type ProviderSettings,
+  resolveOllamaTimeout,
 } from "@rewire/providers";
 import { exitCodeFor } from "./exit.js";
 import { type FauxScript, loadFauxScript } from "./faux.js";
@@ -193,6 +195,24 @@ export function createRoutedProviders(
   }
 }
 
+/**
+ * `{ ollamaTimeout }` for the pipeline when any of `refs` is an Ollama model: the reply timeout
+ * from the env and models.toml, so the preflight smoke test uses the same one as the stages.
+ * Empty otherwise, or when the variable is invalid (the Ollama provider itself refuses that).
+ */
+export function ollamaTimeoutOption(
+  refs: readonly ModelRef[],
+  env: NodeJS.ProcessEnv,
+  settings: ProviderSettings = {},
+): { ollamaTimeout?: OllamaTimeout } {
+  if (!refs.some((r) => r.provider === "ollama")) return {};
+  try {
+    return { ollamaTimeout: resolveOllamaTimeout(env, settings) };
+  } catch {
+    return {};
+  }
+}
+
 async function askInteractive(
   questions: string[],
   io: RunIo,
@@ -263,6 +283,11 @@ export async function runCommand(
     repo,
     routing,
     providers,
+    ...ollamaTimeoutOption(
+      ROLES.map((r) => routing[r]),
+      io.env,
+      models.providers,
+    ),
     policy,
     ask: o.headless ? async () => null : (qs) => askInteractive(qs, io, signal, onInterrupt),
     emit,

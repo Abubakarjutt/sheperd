@@ -4,7 +4,7 @@ import type { Writable } from "node:stream";
 import { RewireError } from "@rewire/core";
 import { INSTALL_HINTS } from "@rewire/gates";
 import { loadModelsFile } from "@rewire/pipeline";
-import { ollamaChatTimeoutMs, probeOllama } from "@rewire/providers";
+import { probeOllama, resolveOllamaTimeout } from "@rewire/providers";
 import { type FindBinaryOptions, locateSandboxBinary, type SandboxBinary } from "@rewire/sandbox";
 import { providerLines } from "./doctor-providers.js";
 import { discoverModels, ollamaBase } from "./models.js";
@@ -108,9 +108,12 @@ export async function runDoctor(
     if (available.some((m) => m.provider === "ollama")) {
       const base = ollamaBase(io.env);
       try {
-        const timeoutS = ollamaChatTimeoutMs(io.env) / 1000;
+        const timeout = resolveOllamaTimeout(io.env, "providers" in models ? models.providers : {});
         const { version } = await probeOllama(base);
-        ok("ollama", `${version} at ${base}, reply timeout ${timeoutS}s`);
+        ok(
+          "ollama",
+          `${version} at ${base}, reply timeout ${timeout.ms / 1000}s (${timeout.source})`,
+        );
       } catch (e) {
         bad(
           "ollama",

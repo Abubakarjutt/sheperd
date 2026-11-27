@@ -1,11 +1,19 @@
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveRouting } from "@rewire/pipeline";
 import { afterAll, afterEach, describe, expect, test, vi } from "vitest";
 import { runDoctor } from "../src/doctor.js";
 import { DEFAULT_GEMINI_MODEL, discoverModels } from "../src/models.js";
-import { createRoutedProviders, providerFactory, resolveModels, runCommand } from "../src/run.js";
+import {
+  createRoutedProviders,
+  ollamaTimeoutOption,
+  providerFactory,
+  resolveModels,
+  runCommand,
+} from "../src/run.js";
 import { chatCommand } from "../src/tui.js";
 
 const dirs: string[] = [];
@@ -505,5 +513,58 @@ endpoint = "https://myres.openai.azure.com"
       return { chat: async () => Promise.reject(new Error("never called")) };
     });
     expect(made.sort()).toEqual(["anthropic:a", "ollama:llama3.1", "openai:b"]);
+  });
+});
+
+describe("doctor: the Ollama reply timeout and its source", () => {
+  const withOllama = async (run: (host: string) => Promise<void>): Promise<void> => {
+    const server = http.createServer((req, res) => {
+      res.writeHead(req.url === "/api/version" ? 200 : 404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ version: "0.9.0" }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    try {
+      await run(`http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+    } finally {
+      server.closeAllConnections();
+      await new Promise((r) => server.close(r));
+    }
+  };
+  test.each([
+    ["default", `available = ["ollama:m"]\n`, {}, "900s (default)"],
+    [
+      "models.toml",
+      `available = ["ollama:m"]\n[providers.ollama]\ntimeout_s = 1800\n`,
+      {},
+      "1800s (models.toml)",
+    ],
+    [
+      "env over models.toml",
+      `available = ["ollama:m"]\n[providers.ollama]\ntimeout_s = 1800\n`,
+      { REWIRE_OLLAMA_TIMEOUT_S: "600" },
+      "600s (env)",
+    ],
+  ])("%s", async (_name, body, env, shown) => {
+    await withOllama(async (host) => {
+      const [, out] = await doctor(toml(body), { OLLAMA_HOST: host, ...env });
+      expect(out).toContain(`✓ ollama 0.9.0 at ${host}, reply timeout ${shown}\n`);
+    });
+  });
+});
+
+describe("ollamaTimeoutOption", () => {
+  const ollama = { provider: "ollama", model: "m" } as const;
+  const other = { provider: "anthropic", model: "a" } as const;
+  test("resolves only when a ref is an Ollama model, with the toml settings", () => {
+    expect(ollamaTimeoutOption([other], {}, { ollama: { timeoutS: 60 } })).toEqual({});
+    expect(ollamaTimeoutOption([other, ollama], {}, { ollama: { timeoutS: 60 } })).toEqual({
+      ollamaTimeout: { ms: 60_000, source: "models.toml" },
+    });
+    expect(ollamaTimeoutOption([ollama], { REWIRE_OLLAMA_TIMEOUT_S: "5" })).toEqual({
+      ollamaTimeout: { ms: 5_000, source: "env" },
+    });
+  });
+  test("an invalid variable is left to the provider to refuse", () => {
+    expect(ollamaTimeoutOption([ollama], { REWIRE_OLLAMA_TIMEOUT_S: "15m" })).toEqual({});
   });
 });

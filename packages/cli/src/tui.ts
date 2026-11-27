@@ -32,7 +32,13 @@ import { loadFauxScript } from "./faux.js";
 import { isInteractive, tuiRequiresTty } from "./interactive.js";
 import { effectivePlatform } from "./platform.js";
 import { RoutingControl } from "./routing-control.js";
-import { createRoutedProviders, FAUX_WARNING, providerFactory, resolveModels } from "./run.js";
+import {
+  createRoutedProviders,
+  FAUX_WARNING,
+  ollamaTimeoutOption,
+  providerFactory,
+  resolveModels,
+} from "./run.js";
 import { type StartDeps, startInteractive } from "./start-tui.js";
 import { xdgDirs } from "./xdg.js";
 
@@ -210,6 +216,12 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
         repo,
         routing: () => control.current(),
         providers,
+        // `/model` picks from the available models, so any of them can reach a run.
+        ...ollamaTimeoutOption(
+          [...models.available, ...Object.values(models.overrides).filter((r) => r !== undefined)],
+          io.env,
+          models.providers,
+        ),
         policy,
         skills,
         ...(faux ? { faux: true } : {}),
