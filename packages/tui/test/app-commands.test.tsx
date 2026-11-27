@@ -22,6 +22,32 @@ const enter = async (stdin: { write: (s: string) => void }, text: string) => {
   await tick(80);
 };
 
+/** Polls `ok` for up to 10 s. */
+async function until(ok: () => boolean, ms = 10_000) {
+  const end = Date.now() + ms;
+  while (!ok()) {
+    if (Date.now() > end) throw new Error("timed out");
+    await tick(15);
+  }
+}
+type Frame = { lastFrame: () => string | undefined; stdin: { write: (s: string) => void } };
+/** Presses `key` (retrying while its handler may not be attached yet) until `needle` shows. */
+async function pressUntilShown(v: Frame, key: string, needle: string) {
+  for (let i = 0; i < 10 && !(v.lastFrame() ?? "").includes(needle); i++) {
+    v.stdin.write(key);
+    await until(() => (v.lastFrame() ?? "").includes(needle), 1500).catch(() => {});
+  }
+  expect(v.lastFrame()).toContain(needle);
+}
+/** Presses `key` until `needle` is gone. */
+async function pressUntilGone(v: Frame, key: string, needle: string) {
+  for (let i = 0; i < 10 && (v.lastFrame() ?? "").includes(needle); i++) {
+    v.stdin.write(key);
+    await until(() => !(v.lastFrame() ?? "").includes(needle), 1500).catch(() => {});
+  }
+  expect(v.lastFrame()).not.toContain(needle);
+}
+
 type Msg = { role: "user" | "assistant" | "tool"; content: string };
 
 function fakeSession(opts: { send?: (t: string) => Promise<ChatTurn>; history?: Msg[] } = {}) {
@@ -287,8 +313,11 @@ describe("during a run", () => {
     await enter(v.stdin, "/checkpoints");
     expect(v.lastFrame()).toContain("checkpoints: contract, tests");
     await enter(v.stdin, "/skills");
-    expect(v.lastFrame()).toContain("pending: deploy");
+    // Read-only during a run: the list, but no review row and no trust prompt.
+    await until(() => (v.lastFrame() ?? "").includes("repo · pending trust"));
+    expect(v.lastFrame()).not.toContain("Review pending repo skills");
     expect(v.lastFrame()).not.toContain("[y]es [n]o");
+    await pressUntilGone(v, "\x1b", "repo · pending trust");
     finish({ status: "verified", runId: "r", branch: "b", reportPath: "p" });
     await tick(100);
     await enter(v.stdin, "after");
@@ -390,7 +419,7 @@ describe("sessions", () => {
 });
 
 describe("/skills", () => {
-  it("lists skills and re-opens the trust prompt; y saves for a new session", async () => {
+  it("lists skills; the review row opens the trust prompt; y saves for a new session", async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "rewire-tui-skills-")));
     try {
       const repo = join(root, "repo");
@@ -408,8 +437,9 @@ describe("/skills", () => {
       const { session } = fakeSession();
       const v = mount({ session, skills: { found, active, pendingRepo, repo, trustFile } });
       await enter(v.stdin, "/skills");
-      expect(v.lastFrame()).toContain("pending");
-      expect(v.lastFrame()).toContain("[y]es [n]o [v]iew files");
+      await until(() => (v.lastFrame() ?? "").includes("Review pending repo skills"));
+      expect(v.lastFrame()).toContain("repo · pending trust");
+      await pressUntilShown(v, "\r", "[y]es [n]o [v]iew files");
       v.stdin.write("y");
       await tick(150);
       expect(v.lastFrame()).toContain("trusted; takes effect in a new session (/clear)");

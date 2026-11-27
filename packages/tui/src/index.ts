@@ -96,6 +96,12 @@ export {
 export { Safe } from "./safe.js";
 export { sanitize } from "./sanitize.js";
 export {
+  type SkillRow,
+  SkillsPicker,
+  type SkillsPickerProps,
+  skillRows,
+} from "./skills-picker.js";
+export {
   COMPACTING_VERB,
   ESC_CANCEL,
   ESC_INTERRUPT,

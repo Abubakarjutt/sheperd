@@ -59,6 +59,7 @@ import {
   routingLines,
 } from "./routing.js";
 import { sanitize } from "./sanitize.js";
+import { SkillsPicker } from "./skills-picker.js";
 import { COMPACTING_VERB, ESC_CANCEL, pickVerb } from "./spinner.js";
 import { type CtxStatus, StatusLine } from "./status-line.js";
 import { Transcript, type TranscriptEntry } from "./transcript.js";
@@ -171,23 +172,6 @@ function errorEntry(err: unknown): TranscriptEntry {
   const code = err instanceof RewireError ? err.code : "error";
   const message = redact(err instanceof Error ? err.message : String(err));
   return { kind: "error", code, message };
-}
-
-function skillsText(s: SkillsInfo | undefined, trustedLater: boolean): string {
-  if (!s || s.found.length === 0) return "no skills found";
-  const names = (list: Skill[]) => list.map((k) => `${k.name} (${k.source})`).join(", ");
-  const lines = [`active: ${s.active.length ? names(s.active) : "none"}`];
-  if (s.pendingRepo.length) {
-    const why = trustedLater ? TRUSTED_LATER : "not trusted";
-    lines.push(`pending: ${s.pendingRepo.map((k) => k.name).join(", ")} (${why})`);
-  }
-  const shadowed = s.found.filter((k) => k.shadowed);
-  if (shadowed.length) {
-    lines.push(
-      `shadowed: ${shadowed.map((k) => k.name).join(", ")} (a user skill has the same name)`,
-    );
-  }
-  return lines.join("\n");
 }
 
 /** `contextStatus()`, or undefined (compaction off, or a session without it). Never throws. */
@@ -311,6 +295,8 @@ export function App(props: AppProps) {
     () => props.checkpoints ?? DEFAULT_CHECKPOINTS,
   );
   const [trustOpen, setTrustOpen] = useState(false);
+  /** The `/skills` list is open. */
+  const [skillsOpen, setSkillsOpen] = useState(false);
   /** The `/model` picker is open; `applying` while its pick is being applied. */
   const [modelOpen, setModelOpen] = useState(false);
   const [applying, setApplying] = useState(false);
@@ -721,10 +707,8 @@ export function App(props: AppProps) {
           return startRun(c.task);
         case "skills": {
           const skills = skillsNow();
-          note(skillsText(skills, trustedLater));
-          if (!runRef.current && skills && skills.pendingRepo.length > 0 && !trustedLater)
-            setTrustOpen(true);
-          return;
+          if (!skills || skills.found.length === 0) return note("no skills found");
+          return setSkillsOpen(true);
         }
         case "checkpoints":
           if (c.set) setCheckpoints(c.set);
@@ -774,7 +758,6 @@ export function App(props: AppProps) {
     [
       startRun,
       skillsNow,
-      trustedLater,
       checkpoints,
       routing,
       routingControl,
@@ -851,6 +834,12 @@ export function App(props: AppProps) {
     [note],
   );
 
+  /** The `/skills` review row: the trust prompt replaces the list (never during a run). */
+  const openTrust = useCallback(() => {
+    setSkillsOpen(false);
+    if (!runRef.current) setTrustOpen(true);
+  }, []);
+
   /** Esc in the live area: aborts the turn's signal, like the Ctrl-C machine's abortTurn. */
   // Reads the synchronous run mirror, not `interruptible` alone: in the render between a run
   // starting and LiveTurn re-rendering, Esc must already be inert (Ctrl-C owns the run).
@@ -859,13 +848,22 @@ export function App(props: AppProps) {
     turnAbort.current?.abort();
   }, []);
   const trustSkills = trustOpen ? skillsNow() : undefined;
+  /** The `/skills` list, re-read on every render (a `/clear` may re-resolve the skills). */
+  const listSkills = skillsOpen ? skillsNow() : undefined;
   const checkpointOpen = run !== undefined && pending?.kind === "checkpoint";
   // A checkpoint owns the keys: the /context card gives way to it.
   const contextOpen = contextInfo !== undefined && !checkpointOpen;
   // The picker gives way to a checkpoint too (a run handed in while it is open).
   const pickerOpen = modelOpen && routingControl !== undefined && !checkpointOpen;
+  // The /skills list gives way to a checkpoint as well; it is read-only during a run.
+  const skillsListOpen = listSkills !== undefined && !checkpointOpen;
   const inputOff =
-    proposal !== undefined || trustOpen || checkpointOpen || contextOpen || pickerOpen;
+    proposal !== undefined ||
+    trustOpen ||
+    checkpointOpen ||
+    contextOpen ||
+    pickerOpen ||
+    skillsListOpen;
   const mode =
     run !== undefined && pending?.kind === "checkpoint"
       ? `checkpoint: ${pending.checkpoint.kind}`
@@ -914,6 +912,16 @@ export function App(props: AppProps) {
           applying={applying}
         />
       ) : null}
+      {skillsListOpen && listSkills ? (
+        <SkillsPicker
+          skills={listSkills}
+          trustedLater={trustedLater}
+          // No trust prompt during a run (as before): the list is read-only then.
+          canReview={run === undefined && listSkills.pendingRepo.length > 0 && !trustedLater}
+          onReview={openTrust}
+          onClose={() => setSkillsOpen(false)}
+        />
+      ) : null}
       {live ? (
         <LiveTurn
           state={live}
@@ -924,7 +932,8 @@ export function App(props: AppProps) {
             !trustOpen &&
             !popup &&
             !contextOpen &&
-            !pickerOpen
+            !pickerOpen &&
+            !skillsListOpen
           }
           maxRows={rows - LIVE_RESERVED_ROWS}
         />
