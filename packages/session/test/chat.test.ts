@@ -628,8 +628,9 @@ describe("toolPreview ordering: sanitize, then redact the whole text, then split
   });
 
   test("a key straddling the 300 code point cap is redacted before the cap", () => {
-    const out = toolPreview(`${"x".repeat(295)}sk-ant-api03-${KEY_BODY}`);
-    expect(out.preview).toEqual([`${"x".repeat(295)}[reda`]);
+    // The padding ends in a space: a key glued to a word is part of that word, never a secret.
+    const out = toolPreview(`${"x".repeat(294)} sk-ant-api03-${KEY_BODY}`);
+    expect(out.preview).toEqual([`${"x".repeat(294)} [reda`]);
     expect(Array.from(out.preview[0] ?? "")).toHaveLength(300);
   });
 

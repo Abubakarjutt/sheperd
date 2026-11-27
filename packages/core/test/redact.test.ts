@@ -45,6 +45,21 @@ describe("redact (I9: one implementation, broadened)", () => {
     expect(redact(s)).toBe(s);
   });
 
+  test("a key prefix inside a word is not a secret (ask-matt, --task-file, disk-usage)", () => {
+    const s =
+      "skills ask-matt and task-runner; rewire run --task-file t.md; disk-usage, risk-model; MAKIAX";
+    expect(redact(s)).toBe(s);
+  });
+
+  test("a key after a separator is still redacted", () => {
+    for (const sep of [" ", "=", ":", '"', "'", "(", "\n", "/"]) {
+      const out = redact(`KEY${sep}${tok("sk-")}`);
+      expect(out).toBe(`KEY${sep}[redacted]`);
+    }
+    expect(redact(tok("sk-ant-api03-"))).toBe("[redacted]");
+    expect(redact(`x ${tok("AKIA", "IOSFODNN7EXAMPLE")}`)).toBe("x [redacted]");
+  });
+
   test("SECRET is a global pattern that matches the same tokens", () => {
     expect(SECRET.global).toBe(true);
     expect(`a ${tok("ghs_")} b`.replace(SECRET, "[x]")).toBe("a [x] b");
