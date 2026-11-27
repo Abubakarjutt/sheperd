@@ -688,3 +688,29 @@ describe("ANTHROPIC_CUSTOM_HEADERS never reaches Bedrock, Vertex or Foundry", ()
     expect(f.seen[0]?.headers.get("x-foo")).toBe("1");
   });
 });
+
+describe("a malformed region or resource is never echoed", () => {
+  test("a secret pasted into AWS_REGION or ANTHROPIC_FOUNDRY_RESOURCE is not in the error", () => {
+    const pasted = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+    for (const [name, env] of [
+      ["bedrock", { AWS_REGION: pasted }],
+      ["foundry", { ANTHROPIC_FOUNDRY_API_KEY: FOUNDRY_KEY, ANTHROPIC_FOUNDRY_RESOURCE: pasted }],
+      ["vertex", { GOOGLE_CLOUD_PROJECT: "p", CLOUD_ML_REGION: pasted }],
+    ] as const) {
+      const err = (() => {
+        try {
+          createProvider(parseModelRef(`${name}:claude-opus-5-5`), env);
+        } catch (e) {
+          return e;
+        }
+        return undefined;
+      })();
+      expect(err).toMatchObject({
+        code: "provider_auth_missing",
+        message: expect.stringMatching(/is not a valid name/),
+      });
+      expect(JSON.stringify(err)).not.toContain(pasted.slice(0, 12));
+      expect(String((err as Error).message)).not.toContain(pasted.slice(0, 12));
+    }
+  });
+});

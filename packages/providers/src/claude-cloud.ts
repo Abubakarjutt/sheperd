@@ -53,7 +53,8 @@ function label(value: string, what: string, hint: string): string {
   if (!LABEL.test(value)) {
     throw new RewireError(
       "provider_auth_missing",
-      `${what} ${JSON.stringify(value.slice(0, 64))} is not a valid name`,
+      // Never the value: a secret pasted into the wrong variable must not be printed.
+      `${what} is not a valid name (one DNS label: letters, digits and hyphens)`,
       hint,
     );
   }
