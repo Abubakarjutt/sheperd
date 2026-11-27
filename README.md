@@ -282,7 +282,7 @@ It is a record and not a summary, so nothing is lost without a trace:
 - Some edits are also checked by a second model, from a different family when one is
   configured: an edit that changes one of your rules or adds a claim attributed to you, any
   change to an open question, and an inferred goal, constraint, must-keep-working item or
-  decision that rests only on tool output. Without that check they are not applied. If the
+  decision that rests on tool output with no message of yours behind it. Without that check they are not applied. If the
   check is unavailable, the whole compaction fails.
 - Skill text and `recall` results are never evidence for an edit.
 - Items are never deleted. Resolved and superseded items move to an archive.

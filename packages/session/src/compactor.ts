@@ -470,7 +470,7 @@ function newItem(
   };
 }
 
-/** Kinds that steer the chat: an inferred one resting only on tool output needs the verifier. */
+/** Kinds that steer the chat: an inferred one resting on tool output (no user message) needs the verifier. */
 const STEERING_KINDS: ReadonlySet<RecordItem["kind"]> = new Set([
   "goal",
   "constraint",
@@ -480,8 +480,14 @@ const STEERING_KINDS: ReadonlySet<RecordItem["kind"]> = new Set([
 
 type RoleOf = (messageId: string) => ChatMessage["role"] | undefined;
 
-const toolOnly = (ev: readonly Evidence[] | undefined, roleOf: RoleOf): boolean =>
-  (ev ?? []).length > 0 && (ev ?? []).every((e) => roleOf(e.messageId) === "tool");
+/**
+ * True when the evidence cites a tool result and no user message: tool text with only assistant
+ * replies beside it (which may repeat it) still needs the verifier.
+ */
+const toolOnly = (ev: readonly Evidence[] | undefined, roleOf: RoleOf): boolean => {
+  const roles = (ev ?? []).map((e) => roleOf(e.messageId));
+  return roles.includes("tool") && !roles.includes("user");
+};
 
 /** The evidence an op's new or changed text rests on: its own, else the target's or the op's. */
 const backing = (own: readonly Evidence[] | undefined, other: readonly Evidence[] | undefined) =>
@@ -491,7 +497,7 @@ const backing = (own: readonly Evidence[] | undefined, other: readonly Evidence[
  * Ops the verifier must confirm: any op on a `user` item, any add or supersede that creates a
  * `user` item, any op on an open question (update, resolve or supersede), and an add, update or
  * supersede that leaves an inferred goal, constraint, must-keep-working item or decision resting
- * only on tool results (`roleOf` gives the cited messages' roles): text from a file or a command
+ * on tool results with no user message beside them (`roleOf` gives the cited messages' roles): text from a file or a command
  * must not become a steering rule unchecked.
  */
 export const isRiskyOp = (op: CompactionOp, target?: RecordItem, roleOf?: RoleOf): boolean =>

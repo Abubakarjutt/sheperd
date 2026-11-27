@@ -1868,6 +1868,13 @@ describe("injected tool text cannot pass for the user (final review I1)", () => 
     expect(isRiskyOp(add("note", "m2"), undefined, roleOf)).toBe(false);
     expect(isRiskyOp(add("decision"), undefined, roleOf)).toBe(false);
     expect(isRiskyOp(add("decision", "m3"), undefined, roleOf)).toBe(false);
+    // Tool text with an assistant reply beside it (which may echo it) still needs the verifier.
+    const both = (kind: RecordItem["kind"], ids: string[]) => ({
+      ...add(kind),
+      evidence: ids.map((id) => ({ messageId: id, quote: "q" })),
+    });
+    expect(isRiskyOp(both("decision", ["m2", "m3"]), undefined, roleOf)).toBe(true);
+    expect(isRiskyOp(both("decision", ["m2", "m0"]), undefined, roleOf)).toBe(false);
     // Without roles (the old signature) nothing new is risky.
     expect(isRiskyOp(add("decision", "m2"))).toBe(false);
     const target = userItem({ source: "inferred", kind: "decision", evidence: ev("m2") });
