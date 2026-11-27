@@ -3,6 +3,7 @@ import { RewireError } from "@rewire/core";
 import {
   type EndpointConfig,
   endpointNameProblem,
+  isLoopbackHost,
   type ModelRef,
   modelFamily,
   type ProviderSettings,
@@ -133,9 +134,6 @@ const CompactionToml = z.strictObject({
     .record(z.string(), z.strictObject({ limit: z.number().int().min(MIN_COMPACTION_LIMIT) }))
     .optional(),
 });
-
-const isLoopbackHost = (host: string): boolean =>
-  host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
 
 /** An absolute http(s) URL; https is required unless `loopbackHttp` and the host is loopback. */
 const UrlString = (loopbackHttp: boolean) =>

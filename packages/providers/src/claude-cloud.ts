@@ -1,7 +1,8 @@
-import { RewireError } from "@rewire/core";
+import { RewireError, redact } from "@rewire/core";
 import { type AnthropicMessagesClient, AnthropicProvider } from "./anthropic.js";
 import { providerError } from "./errors.js";
 import type { ChatRequest, ChatResponse, Provider, ProviderSettings } from "./types.js";
+import { baseUrlProblem } from "./url.js";
 
 /** The clouds that serve Claude through a dedicated Anthropic SDK client. */
 export type ClaudeCloudName = "bedrock" | "vertex" | "foundry";
@@ -24,7 +25,7 @@ type BedrockAuth =
 
 /** Where a cloud client will send requests, resolved from models.toml and env. No secrets but auth. */
 export type ClaudeCloudTarget =
-  | { provider: "bedrock"; region: string; baseUrl?: string; auth: BedrockAuth }
+  | { provider: "bedrock"; region: string; baseUrl: string; auth: BedrockAuth }
   | { provider: "vertex"; project: string; region: string; baseUrl?: string }
   | { provider: "foundry"; apiKey: string; resource?: string; baseUrl?: string };
 
@@ -43,6 +44,24 @@ function label(value: string, what: string, hint: string): string {
     );
   }
   return value;
+}
+
+/**
+ * An SDK base-URL override, read from the env rewire was given (never from process.env behind
+ * its back) and held to the models.toml rule: https, or http only on a loopback host.
+ */
+function envBaseUrl(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const v = set(env[name]);
+  if (v === undefined) return undefined;
+  const problem = baseUrlProblem(v);
+  if (problem !== undefined) {
+    throw new RewireError(
+      "provider_auth_missing",
+      `${name} ${problem}`,
+      `fix or unset ${name} (https, or http only for localhost, 127.0.0.1 or [::1])`,
+    );
+  }
+  return v;
 }
 
 const BEDROCK_REGION_HINT =
@@ -94,13 +113,12 @@ export function resolveClaudeCloud(
             : profile !== undefined
               ? { kind: "profile", profile }
               : { kind: "chain" };
-      const baseUrl = set(env.ANTHROPIC_BEDROCK_MANTLE_BASE_URL);
-      return {
-        provider,
-        region: label(region, "AWS region", BEDROCK_REGION_HINT),
-        auth,
-        ...(baseUrl !== undefined ? { baseUrl } : {}),
-      };
+      const checked = label(region, "AWS region", BEDROCK_REGION_HINT);
+      // Passed explicitly: the SDK would otherwise read its override from process.env.
+      const baseUrl =
+        envBaseUrl(env, "ANTHROPIC_BEDROCK_MANTLE_BASE_URL") ??
+        `https://bedrock-mantle.${checked}.api.aws/anthropic`;
+      return { provider, region: checked, auth, baseUrl };
     }
     case "vertex": {
       const project =
@@ -115,7 +133,7 @@ export function resolveClaudeCloud(
         );
       }
       const region = set(settings.vertex?.region) ?? set(env.CLOUD_ML_REGION) ?? "global";
-      const baseUrl = set(env.ANTHROPIC_VERTEX_BASE_URL);
+      const baseUrl = envBaseUrl(env, "ANTHROPIC_VERTEX_BASE_URL");
       return {
         provider,
         project,
@@ -136,7 +154,9 @@ export function resolveClaudeCloud(
       const fromToml = settings.foundry;
       const baseUrl =
         set(fromToml?.baseUrl) ??
-        (set(fromToml?.resource) === undefined ? set(env.ANTHROPIC_FOUNDRY_BASE_URL) : undefined);
+        (set(fromToml?.resource) === undefined
+          ? envBaseUrl(env, "ANTHROPIC_FOUNDRY_BASE_URL")
+          : undefined);
       if (baseUrl !== undefined) return { provider, apiKey, baseUrl };
       const resource = set(fromToml?.resource) ?? set(env.ANTHROPIC_FOUNDRY_RESOURCE);
       if (resource === undefined) {
@@ -196,22 +216,25 @@ async function clientFor(
               : { apiKey: null };
       return new AnthropicBedrockMantle({
         awsRegion: t.region,
-        ...(t.baseUrl !== undefined ? { baseURL: t.baseUrl } : {}),
+        baseURL: t.baseUrl,
         ...auth,
         ...fetchOpt,
       });
     }
     case "vertex": {
       const { AnthropicVertex } = await import("@anthropic-ai/vertex-sdk");
-      return new AnthropicVertex({
+      const client = new AnthropicVertex({
         projectId: t.project,
         region: t.region,
-        ...(t.baseUrl !== undefined ? { baseURL: t.baseUrl } : {}),
+        // null, not undefined: the SDK then uses its regional default, never process.env.
+        baseURL: t.baseUrl ?? null,
         ...(opts.vertexAuthClient !== undefined
           ? { authClient: opts.vertexAuthClient as never }
           : {}),
         ...fetchOpt,
       });
+      await googleCredentials(client);
+      return client;
     }
     case "foundry": {
       const { default: AnthropicFoundry } = await import("@anthropic-ai/foundry-sdk");
@@ -223,6 +246,27 @@ async function clientFor(
         ...fetchOpt,
       });
     }
+  }
+}
+
+/**
+ * The Vertex constructor starts resolving Google credentials (ADC) and awaits them only inside a
+ * request, after the abort check: a first chat aborted before sending would leave a rejection
+ * unhandled and kill the process. Await it here, so a missing or broken ADC is always handled
+ * and reported as `provider_auth_missing` before any request.
+ */
+async function googleCredentials(client: object): Promise<void> {
+  const pending = (client as { _authClientPromise?: Promise<unknown> })._authClientPromise;
+  if (pending === undefined) return;
+  try {
+    await pending;
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err);
+    throw new RewireError(
+      "provider_auth_missing",
+      `no usable Google credentials for vertex: ${redact(why).slice(0, 300)}`,
+      "run `gcloud auth application-default login`, or set GOOGLE_APPLICATION_CREDENTIALS to a credential file",
+    );
   }
 }
 

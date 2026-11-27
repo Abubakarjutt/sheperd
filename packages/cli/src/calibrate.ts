@@ -6,6 +6,7 @@ import {
   type ContextWindow,
   contextWindow,
   endpointConfig,
+  isLoopbackUrl,
   type ModelRef,
   OLLAMA_TRUNCATION_HINT,
   ollamaChatTimeoutMs,
@@ -53,9 +54,6 @@ The chat session's compaction then triggers at the calibrated size. Never runs a
 /** Wall-clock cap of one probe call for providers without their own (Ollama has REWIRE_OLLAMA_TIMEOUT_S). */
 export const PROBE_TIMEOUT_MS = 600_000;
 
-const isLoopbackHost = (host: string): boolean =>
-  host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
-
 /**
  * Paid providers need `--yes`: every provider except Ollama, faux and an endpoint whose
  * `base_url` is loopback. An unknown name fails closed (paid).
@@ -64,12 +62,7 @@ export function isPaidProvider(provider: string): boolean {
   const builtin = builtinProvider(provider);
   if (builtin !== undefined) return builtin !== "ollama" && builtin !== "faux";
   const endpoint = endpointConfig(provider);
-  if (endpoint === undefined) return true;
-  try {
-    return !isLoopbackHost(new URL(endpoint.baseUrl).hostname);
-  } catch {
-    return true;
-  }
+  return endpoint === undefined || !isLoopbackUrl(endpoint.baseUrl);
 }
 
 export type CalibrateOptions = {
