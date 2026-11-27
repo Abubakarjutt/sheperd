@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_CHECKPOINTS, literalText, parseCommand } from "../src/commands.js";
+import { COMMAND_HELP, DEFAULT_CHECKPOINTS, literalText, parseCommand } from "../src/commands.js";
 
 describe("parseCommand", () => {
   it("is undefined for plain text and for a // escape", () => {
@@ -42,6 +42,7 @@ describe("parseCommand", () => {
   it("parses the remaining commands", () => {
     expect(parseCommand("/skills")).toEqual({ kind: "skills" });
     expect(parseCommand("/model")).toEqual({ kind: "model" });
+    expect(parseCommand("/models")).toEqual({ kind: "model" });
     expect(parseCommand("/resume")).toEqual({ kind: "resume" });
     expect(parseCommand("/resume abc")).toEqual({ kind: "resume", id: "abc" });
     expect(parseCommand("/clear")).toEqual({ kind: "clear" });
@@ -54,5 +55,13 @@ describe("parseCommand", () => {
   it("an unknown command is reported, not sent", () => {
     expect(parseCommand("/frob x")).toEqual({ kind: "unknown", name: "/frob" });
     expect(parseCommand("/")).toEqual({ kind: "unknown", name: "/" });
+  });
+});
+
+describe("command table", () => {
+  it("/model is described as choosing the model for each role", () => {
+    expect(COMMAND_HELP.find((c) => c.name === "model")?.description).toBe(
+      "choose the model for each role",
+    );
   });
 });

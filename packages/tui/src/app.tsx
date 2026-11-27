@@ -50,8 +50,16 @@ import {
   newLive,
   takeFinished,
 } from "./live-turn.js";
+import { ModelPicker } from "./model-picker.js";
 import { ClarifyPanel, ProposalCard } from "./proposal.js";
+import {
+  type RoutingControlDep,
+  type RoutingModel,
+  type RoutingRole,
+  routingLines,
+} from "./routing.js";
 import { sanitize } from "./sanitize.js";
+import { SkillsPicker } from "./skills-picker.js";
 import { COMPACTING_VERB, ESC_CANCEL, pickVerb } from "./spinner.js";
 import { type CtxStatus, StatusLine } from "./status-line.js";
 import { Transcript, type TranscriptEntry } from "./transcript.js";
@@ -114,8 +122,14 @@ export type AppProps = {
   skills?: SkillsInfo | (() => SkillsInfo | undefined);
   /** The `rewire doctor` output, for `/doctor` (injected: the CLI depends on this package). */
   doctor?: () => Promise<string>;
-  /** The model routing, for `/model`. */
+  /** The model routing, for `/model` (without `routingControl`). */
   routing?: string | (() => string);
+  /**
+   * The session routing that `/model` picks change (the CLI's `RoutingControl` plus the chat
+   * session swap). When present, `/model` shows its current routing and the status line its chat
+   * model (`spec`). Absent in a non-interactive context: `/model` prints `routing`.
+   */
+  routingControl?: RoutingControlDep;
   /** Initial checkpoints (default contract and tests). */
   checkpoints?: ReadonlySet<CheckpointKind>;
   /** Startup warnings (skipped skills, an unreadable trust store), shown as dim lines first. */
@@ -140,6 +154,7 @@ const HIDDEN_NOTES = new Set([PROPOSAL_NOTE, TURN_LIMIT_NOTE]);
 export const RUN_ACTIVE = "a run is active; answer its prompt or press Ctrl-C to abort";
 const SEPARATOR = "───";
 export const TRUSTED_LATER = "trusted; takes effect in a new session (/clear)";
+export const PICK_IN_RUN = "model picks are refused while a run is active; pick after it ends";
 
 /** Entries for a resumed session: user and assistant text only, minus the persisted placeholders. */
 export function historyEntries(session: ChatSession): TranscriptEntry[] {
@@ -157,23 +172,6 @@ function errorEntry(err: unknown): TranscriptEntry {
   const code = err instanceof RewireError ? err.code : "error";
   const message = redact(err instanceof Error ? err.message : String(err));
   return { kind: "error", code, message };
-}
-
-function skillsText(s: SkillsInfo | undefined, trustedLater: boolean): string {
-  if (!s || s.found.length === 0) return "no skills found";
-  const names = (list: Skill[]) => list.map((k) => `${k.name} (${k.source})`).join(", ");
-  const lines = [`active: ${s.active.length ? names(s.active) : "none"}`];
-  if (s.pendingRepo.length) {
-    const why = trustedLater ? TRUSTED_LATER : "not trusted";
-    lines.push(`pending: ${s.pendingRepo.map((k) => k.name).join(", ")} (${why})`);
-  }
-  const shadowed = s.found.filter((k) => k.shadowed);
-  if (shadowed.length) {
-    lines.push(
-      `shadowed: ${shadowed.map((k) => k.name).join(", ")} (a user skill has the same name)`,
-    );
-  }
-  return lines.join("\n");
 }
 
 /** `contextStatus()`, or undefined (compaction off, or a session without it). Never throws. */
@@ -207,6 +205,7 @@ function checkpointsShort(set: ReadonlySet<CheckpointKind>): string {
 
 export function App(props: AppProps) {
   const { subscribe, runController, sessions, doctor, routing, onExit, bindInterrupt } = props;
+  const routingControl = props.routingControl;
   const skillsProp = props.skills;
   const skillsNow = useCallback(
     (): SkillsInfo | undefined => (typeof skillsProp === "function" ? skillsProp() : skillsProp),
@@ -215,18 +214,30 @@ export function App(props: AppProps) {
   const configRepo = props.config.repo;
   const cwd = props.cwd ?? (typeof configRepo === "string" ? configRepo : process.cwd());
   const home = props.home ?? homedir();
-  const models = props.models;
+  const modelsProp = props.models;
+  /** The header's models as of now: the session routing when `/model` can change it. */
+  const modelsNow = useCallback((): ModelsInfo | undefined => {
+    if (!routingControl) return modelsProp;
+    const r = routingControl.current();
+    return {
+      chat: r.spec.model,
+      spec: r.spec.model,
+      implementer: r.implementer.model,
+      reviewers: [r.reviewer.model, r.verifier.model],
+    };
+  }, [routingControl, modelsProp]);
   /** The welcome box as of now (the skills getter is re-read, so `/clear` shows the new counts). */
   const headerEntry = useCallback((): TranscriptEntry => {
     const s = skillsNow();
+    const models = modelsNow();
     const info: HeaderInfo = {
       cwd,
       home,
-      models,
+      ...(models ? { models } : {}),
       ...(s ? { skills: { active: s.active.length, pending: s.pendingRepo.length } } : {}),
     };
     return { kind: "header", info };
-  }, [skillsNow, cwd, home, models]);
+  }, [skillsNow, cwd, home, modelsNow]);
   const listFilesProp = props.listFiles;
   const filesRepo = typeof configRepo === "string" ? configRepo : cwd;
   /** The `@` picker's file list: loaded on first want, per session (a swap resets it). */
@@ -284,6 +295,11 @@ export function App(props: AppProps) {
     () => props.checkpoints ?? DEFAULT_CHECKPOINTS,
   );
   const [trustOpen, setTrustOpen] = useState(false);
+  /** The `/skills` list is open. */
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  /** The `/model` picker is open; `applying` while its pick is being applied. */
+  const [modelOpen, setModelOpen] = useState(false);
+  const [applying, setApplying] = useState(false);
   /** Context size: the last chat model call's input plus output tokens; none before the first. */
   const [context, setContext] = useState<number | undefined>(undefined);
   /** With compaction: the estimate against the limit (`contextStatus()`), for the status line. */
@@ -414,6 +430,8 @@ export function App(props: AppProps) {
     (p: PendingPrompt | undefined) => {
       setPending(p);
       setClarify(p?.kind === "clarify" ? { prompt: p, answers: [] } : undefined);
+      // A run's prompt takes the keys: the /skills list closes, and stays closed afterwards.
+      if (p !== undefined) setSkillsOpen(false);
     },
     [setClarify],
   );
@@ -559,6 +577,43 @@ export function App(props: AppProps) {
     [runController, checkpoints, add, setRun, setClarify],
   );
 
+  /**
+   * Makes `next` the session, at once (call it inside `exclusive`, so the old one cannot send
+   * again), and returns the old one for the caller to dispose. With `region`, a new transcript
+   * region starts (`/clear`, `/resume`); without, the transcript stays (a `/model` pick resumed
+   * the same conversation on another model).
+   */
+  const installSession = useCallback(
+    (
+      next: ChatSession,
+      region?: { label: string; entries: (s: ChatSession) => TranscriptEntry[] },
+    ): ChatSession => {
+      const old = sessionRef.current;
+      sessionRef.current = next;
+      if (region) {
+        // The old transcript stays in the terminal's scrollback above this separator.
+        setEntries([
+          { kind: "note", text: `${SEPARATOR} ${region.label} ${SEPARATOR}` },
+          headerEntry(),
+          ...sessionNotices(next),
+          ...region.entries(next),
+        ]);
+        setRegion((r) => r + 1);
+        lastCompaction.current = undefined;
+        resetFiles(); // `/clear` and `/resume` list the repo afresh
+      }
+      setContext(undefined);
+      sessionGen.current++;
+      setContextInfo(undefined);
+      setCtx(undefined);
+      refreshStatus();
+      // The new session re-resolved the skills: a trust given earlier is now in effect.
+      setTrustedLater(false);
+      return old;
+    },
+    [headerEntry, resetFiles, refreshStatus],
+  );
+
   const swapSession = useCallback(
     (
       make: () => Promise<ChatSession>,
@@ -567,32 +622,52 @@ export function App(props: AppProps) {
     ) =>
       exclusive(async () => {
         try {
-          const next = await make();
-          const old = sessionRef.current;
-          sessionRef.current = next;
-          // The old transcript stays in the terminal's scrollback above this separator.
-          setEntries([
-            { kind: "note", text: `${SEPARATOR} ${label} ${SEPARATOR}` },
-            headerEntry(),
-            ...sessionNotices(next),
-            ...entriesOf(next),
-          ]);
-          setRegion((r) => r + 1);
-          setContext(undefined);
-          sessionGen.current++;
-          lastCompaction.current = undefined;
-          setContextInfo(undefined);
-          setCtx(undefined);
-          refreshStatus();
-          resetFiles(); // `/clear` and `/resume` list the repo afresh
-          // The new session re-resolved the skills: a trust given earlier is now in effect.
-          setTrustedLater(false);
+          const old = installSession(await make(), { label, entries: entriesOf });
           await old.dispose();
         } catch (err) {
           add(errorEntry(err));
         }
       }),
-    [exclusive, add, headerEntry, resetFiles, refreshStatus],
+    [exclusive, add, installSession],
+  );
+
+  /**
+   * A `/model` pick: applied inside `exclusive`, so no turn, compaction or session swap starts
+   * meanwhile. A pick that rebuilt the session (chat model or verifier) hands it back: it is
+   * installed before anything can send again, then the old one is disposed, as `/resume` does.
+   */
+  const applyPick = useCallback(
+    (role: RoutingRole, ref: RoutingModel | undefined) => {
+      if (!routingControl) return;
+      if (runRef.current || inFlight.current) {
+        setModelOpen(false);
+        return note(
+          runRef.current ? PICK_IN_RUN : "refused: the chat is busy; pick after it is done",
+          true,
+        );
+      }
+      setApplying(true);
+      exclusive(async () => {
+        try {
+          const pick = await routingControl.set(role, ref);
+          if (!pick.ok) {
+            note(pick.reason, true);
+            return;
+          }
+          const old = pick.session ? installSession(pick.session) : undefined;
+          note(pick.note);
+          // As at start, /clear and /resume: the rebuilt session may check compaction same-family.
+          if (pick.session) add(...sessionNotices(pick.session));
+          await old?.dispose();
+        } catch (err) {
+          add(errorEntry(err));
+        } finally {
+          setApplying(false);
+          setModelOpen(false);
+        }
+      });
+    },
+    [routingControl, exclusive, installSession, note, add],
   );
 
   const resume = useCallback(
@@ -636,15 +711,19 @@ export function App(props: AppProps) {
           return startRun(c.task);
         case "skills": {
           const skills = skillsNow();
-          note(skillsText(skills, trustedLater));
-          if (!runRef.current && skills && skills.pendingRepo.length > 0 && !trustedLater)
-            setTrustOpen(true);
-          return;
+          if (!skills || skills.found.length === 0) return note("no skills found");
+          return setSkillsOpen(true);
         }
         case "checkpoints":
           if (c.set) setCheckpoints(c.set);
           return note(describeCheckpoints(c.set ?? checkpoints));
         case "model": {
+          if (routingControl) {
+            if (!runRef.current) return setModelOpen(true);
+            // The routing a run uses never changes mid-run: show it, and why there is no picker.
+            note(routingLines(routingControl.current()));
+            return note(PICK_IN_RUN, true);
+          }
           const text = typeof routing === "function" ? routing() : routing;
           return note(text ?? "model routing is not available here");
         }
@@ -683,9 +762,9 @@ export function App(props: AppProps) {
     [
       startRun,
       skillsNow,
-      trustedLater,
       checkpoints,
       routing,
+      routingControl,
       resume,
       sessions,
       swapSession,
@@ -759,6 +838,12 @@ export function App(props: AppProps) {
     [note],
   );
 
+  /** The `/skills` review row: the trust prompt replaces the list (never during a run). */
+  const openTrust = useCallback(() => {
+    setSkillsOpen(false);
+    if (!runRef.current) setTrustOpen(true);
+  }, []);
+
   /** Esc in the live area: aborts the turn's signal, like the Ctrl-C machine's abortTurn. */
   // Reads the synchronous run mirror, not `interruptible` alone: in the render between a run
   // starting and LiveTurn re-rendering, Esc must already be inert (Ctrl-C owns the run).
@@ -767,10 +852,23 @@ export function App(props: AppProps) {
     turnAbort.current?.abort();
   }, []);
   const trustSkills = trustOpen ? skillsNow() : undefined;
+  /** The `/skills` list, re-read on every render (a `/clear` may re-resolve the skills). */
+  const listSkills = skillsOpen ? skillsNow() : undefined;
   const checkpointOpen = run !== undefined && pending?.kind === "checkpoint";
   // A checkpoint owns the keys: the /context card gives way to it.
   const contextOpen = contextInfo !== undefined && !checkpointOpen;
-  const inputOff = proposal !== undefined || trustOpen || checkpointOpen || contextOpen;
+  // The picker gives way to a checkpoint too (a run handed in while it is open).
+  const pickerOpen = modelOpen && routingControl !== undefined && !checkpointOpen;
+  // The /skills list gives way to a run's prompt (checkpoint or clarification), which also closes
+  // it (`onPending`); it is read-only during a run.
+  const skillsListOpen = listSkills !== undefined && !checkpointOpen && clarify === undefined;
+  const inputOff =
+    proposal !== undefined ||
+    trustOpen ||
+    checkpointOpen ||
+    contextOpen ||
+    pickerOpen ||
+    skillsListOpen;
   const mode =
     run !== undefined && pending?.kind === "checkpoint"
       ? `checkpoint: ${pending.checkpoint.kind}`
@@ -811,12 +909,36 @@ export function App(props: AppProps) {
           reserved={around}
         />
       ) : null}
+      {pickerOpen && routingControl ? (
+        <ModelPicker
+          control={routingControl}
+          onPick={applyPick}
+          onClose={() => setModelOpen(false)}
+          applying={applying}
+        />
+      ) : null}
+      {skillsListOpen && listSkills ? (
+        <SkillsPicker
+          skills={listSkills}
+          trustedLater={trustedLater}
+          // No trust prompt during a run (as before): the list is read-only then.
+          canReview={run === undefined && listSkills.pendingRepo.length > 0 && !trustedLater}
+          onReview={openTrust}
+          onClose={() => setSkillsOpen(false)}
+        />
+      ) : null}
       {live ? (
         <LiveTurn
           state={live}
           onInterrupt={abortTurn}
           interruptible={
-            run === undefined && proposal === undefined && !trustOpen && !popup && !contextOpen
+            run === undefined &&
+            proposal === undefined &&
+            !trustOpen &&
+            !popup &&
+            !contextOpen &&
+            !pickerOpen &&
+            !skillsListOpen
           }
           maxRows={rows - LIVE_RESERVED_ROWS}
         />
@@ -836,7 +958,7 @@ export function App(props: AppProps) {
           onPopup={setPopup}
         />
         <StatusLine
-          model={models?.chat}
+          model={routingControl?.current().spec.model ?? modelsProp?.chat}
           context={context}
           ctx={ctx}
           checkpoints={checkpointsShort(checkpoints)}

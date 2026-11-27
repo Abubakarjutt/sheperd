@@ -65,6 +65,12 @@ export {
 export { InputBox, PLACEHOLDER, SHORTCUTS } from "./input.js";
 export { type InputAction, type InputState, initialInput, reduceInput } from "./input-state.js";
 export {
+  ListPicker,
+  type ListPickerItem,
+  type ListPickerProps,
+  moveSelection,
+} from "./list-picker.js";
+export {
   applyEvent,
   INTERRUPTED,
   LIVE_THROTTLE_MS,
@@ -76,8 +82,25 @@ export {
   takeFinished,
 } from "./live-turn.js";
 export { cleanForMarkdown, Markdown } from "./markdown.js";
+export { ModelPicker, type ModelPickerProps } from "./model-picker.js";
+export {
+  ROUTING_ROLES,
+  type RoutingControlDep,
+  type RoutingModel,
+  type RoutingPick,
+  type RoutingRole,
+  type RoutingSource,
+  type RoutingView,
+  routingLines,
+} from "./routing.js";
 export { Safe } from "./safe.js";
 export { sanitize } from "./sanitize.js";
+export {
+  type SkillRow,
+  SkillsPicker,
+  type SkillsPickerProps,
+  skillRows,
+} from "./skills-picker.js";
 export {
   COMPACTING_VERB,
   ESC_CANCEL,

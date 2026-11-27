@@ -54,7 +54,7 @@ export const COMMAND_HELP: readonly CommandHelp[] = [
     description: "show or set where runs pause for approval",
     inRun: true,
   },
-  { name: "model", description: "show the model routing", inRun: true },
+  { name: "model", description: "choose the model for each role", inRun: true },
   {
     name: "resume",
     args: "[id]",
@@ -155,6 +155,8 @@ export function parseCommand(line: string): Command | undefined {
       return args[0] === undefined ? { kind: "resume" } : { kind: "resume", id: args[0] };
     case "/compact":
       return rest === "" ? { kind: "compact" } : { kind: "compact", focus: rest };
+    case "/models":
+      return { kind: "model" };
     case "/context":
     case "/skills":
     case "/model":

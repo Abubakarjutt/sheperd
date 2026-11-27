@@ -218,9 +218,9 @@ works).
 | Command                                    | What it does                                                     | During a run |
 | ------------------------------------------ | ---------------------------------------------------------------- | ------------ |
 | `/run <task>`                              | Start a gated run directly, without proposing first.             | no           |
-| `/skills`                                  | List skills and review pending repo skills.                      | yes          |
+| `/skills`                                  | Browse skills and their files; review pending repo skills.       | browse only  |
 | `/checkpoints [contract] [tests] [commit]` | Show or set where runs pause. `/checkpoints off` pauses nowhere. | show only    |
-| `/model`                                   | Show the model routing.                                          | yes          |
+| `/model` (or `/models`)                    | Choose the model for each role (see "Choosing models").          | show only    |
 | `/resume [id]`                             | List stored sessions, or resume one.                             | no           |
 | `/compact [focus]`                         | Compact the chat context now (see "Context and compaction").     | no           |
 | `/context`                                 | Show the compaction limit, window and session record.            | yes          |
@@ -422,7 +422,16 @@ Interactive mode can use Claude-style skills (`<name>/SKILL.md`).
   stored once per repo, pinned to a sha256 over all the skills' files, in
   `$XDG_CONFIG_HOME/rewire/trusted-skills.json`. If any file changes, rewire asks again. The
   prompt also lists repo skills shadowed by a user skill, because they are part of the hash.
-- Skills are read once per session. A skill you trust mid-session takes effect after `/clear`.
+- Skills are read once per session. A skill you trust mid-session takes effect when the session
+  is rebuilt: after `/clear` or `/resume`, or a `/model` pick that changes the chat model or the
+  verifier.
+- `/skills` lists every skill found, with its source (`user` or `repo`) and state (`active`,
+  `pending trust`, `trusted; takes effect in a new session (/clear)` or `shadowed`), active ones
+  first. Enter shows a skill's description, path and the files in its directory now. A
+  symlinked skill directory is followed once and shown as `linked → <real path>`; links inside
+  it are listed, never followed. Esc goes back, then closes. When repo skills
+  are pending, a first row, "Review pending repo skills", opens the trust prompt. During a run
+  the list is read-only, that row is absent, and a checkpoint or clarification closes the list.
 - A skill that is rejected (malformed, over a limit, or a repo skill with a symlink) is skipped
   and shown as a warning line when the session starts.
 - Skills are given to the chat, the spec stage, the test writer and the implementer. The
@@ -618,6 +627,33 @@ rewire checks this.
 Each Ollama reply may take up to 300 seconds. A larger local model on modest hardware can need
 more: set `REWIRE_OLLAMA_TIMEOUT_S` (whole seconds, 1 to 86400), e.g.
 `REWIRE_OLLAMA_TIMEOUT_S=900 rewire run ...`. `rewire doctor` shows the value in use.
+
+### Picking models in the TUI
+
+In interactive mode, `/model` (or `/models`) picks the model for each role. The roles are
+`chat & spec` (the chat model is the spec author), `test-writer`, `implementer`, `reviewer` and
+`verifier`. Each role shows its `provider:model`, family and source: `session`, `models.toml` or
+`auto`. Enter on a role lists the `available` models, plus `default`, which drops the session
+pick and goes back to `[roles]` or automatic routing.
+
+- **Session only.** Nothing writes `models.toml`; the next `rewire` starts from the file again.
+- **Family rule.** A pick that puts the reviewer or the verifier in the implementer's family is
+  refused while `available` holds a model of another family, and the message names both
+  families. A pairing already in effect, or set by the models file itself, is exempt, so a file
+  that pins a same-family reviewer keeps working and `default` always gets back to it. With only
+  one family available, the pick applies and its note says `independence: same-family`.
+- A pick whose provider cannot be created (for example `provider_auth_missing`) is refused. A
+  refused pick changes nothing.
+- **The conversation carries over.** Changing `chat & spec` or the verifier (the chat's
+  compaction check uses the verifier) rebuilds the chat session by resuming the same session id
+  on the new routing, so the messages, the session record and the compaction state are kept. A
+  session with no completed turn yet starts fresh, as there is nothing to keep. The status line
+  then shows the new chat model and, with compaction on, its context limit. The rebuild also
+  re-reads the skills, so a skill trusted earlier in the session loads then. Such a pick can
+  make the chat's compaction check same-family (the verifier shares the chat model's family);
+  it is not refused, and the same notice as at session start says so.
+- Picks are refused while a gated run, a chat turn, a compaction or a session change is in
+  progress. A run keeps the routing it started with; the next run uses the new one.
 
 ## Providers
 
@@ -877,6 +913,10 @@ defines what a first run must show.
 
 ## Behaviour changes in this release
 
+- `/model` in the TUI opens a picker instead of printing the routing. During a run it still
+  prints the routing and says why picks are refused.
+- `/skills` opens a list instead of printing the skill names and opening the trust prompt at
+  once. The list's "Review pending repo skills" row opens the prompt.
 - Leftover processes fail the command on Linux too: a command that leaves a child running more than
   300 ms after it exits (a server a test suite never closes, slow workers) now fails as a sandbox
   escape (`sandbox_escape`), matching macOS. Test suites that relied on this passing on Linux need

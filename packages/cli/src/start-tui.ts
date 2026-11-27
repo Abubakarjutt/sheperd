@@ -1,5 +1,7 @@
 import { basename } from "node:path";
 import { RewireError } from "@rewire/core";
+import type { Role, RoleRouting } from "@rewire/pipeline";
+import { type ModelRef, modelFamily } from "@rewire/providers";
 import type {
   ChatEvent,
   ChatSession,
@@ -9,8 +11,16 @@ import type {
 } from "@rewire/session";
 import { resolveSkills, type Skill, type SkillProblem, type SkillSet } from "@rewire/skills";
 // Type-only: the TUI (Ink, React) is loaded by the caller, only on the interactive path.
-import type { InterruptTarget, ModelsInfo, SkillsInfo, TuiDeps } from "@rewire/tui";
+import type {
+  InterruptTarget,
+  ModelsInfo,
+  RoutingControlDep,
+  RoutingPick,
+  SkillsInfo,
+  TuiDeps,
+} from "@rewire/tui";
 import { type Activity, Interrupter } from "./interactive.js";
+import type { RoutingControl } from "./routing-control.js";
 
 /** Cleanup on exit (run done, session and skill-set disposal) never waits longer than this. */
 export const DISPOSE_TIMEOUT_MS = 2000;
@@ -36,11 +46,15 @@ export type StartDeps = {
   }) => Promise<boolean | undefined>;
   createSkillSet: (active: Skill[]) => SkillSet;
   disposeSkillSet: (set: SkillSet) => Promise<void>;
-  /** A new (or, with `sessionId`, resumed) ChatSession, on the one SessionStore. */
+  /**
+   * A new (or, with `sessionId`, resumed) ChatSession, on the one SessionStore. `routing`, when
+   * given, is a pick's candidate routing (not yet committed): build on it instead of the current.
+   */
   newSession: (o: {
     skills: SkillSet;
     emit: (e: ChatEvent) => void;
     sessionId?: string;
+    routing?: RoleRouting;
   }) => Promise<ChatSession>;
   /** The same SessionStore's `list(repo)`. */
   listSessions: () => Promise<SessionSummary[]>;
@@ -53,7 +67,16 @@ export type StartDeps = {
   /** Ink unmounted; also make sure raw mode is off and the cursor is shown. */
   restoreTerminal: () => void;
   doctor?: () => Promise<string>;
-  routing?: string;
+  /** The routing text for `/model` (re-read on each use when a getter). */
+  routing?: string | (() => string);
+  /**
+   * The session routing `/model` picks change. `newSession` and `newRunController` must read
+   * it (`current()`) when they build; the TUI gets a wrapper that refuses picks during a run or
+   * a turn and, when the pick changes `spec` or `verifier` (the chat model, the compaction
+   * verifier), first resumes the current session on the candidate routing, committing the pick
+   * only once that succeeded.
+   */
+  routingControl?: Pick<RoutingControl, "current" | "available" | "source" | "plan">;
   /** The chat and run models, for the TUI's header and status line. */
   models?: ModelsInfo;
   /** The home directory, shown as `~` in the header. */
@@ -71,6 +94,9 @@ type Resolved = {
   /** The trust store could not be read: do not prompt (saving would fail the same way). */
   trustUnreadable: boolean;
 };
+
+const sameRef = (a: ModelRef, b: ModelRef): boolean =>
+  a.provider === b.provider && a.model === b.model;
 
 const problemLine = (p: SkillProblem): string =>
   `skill ${basename(p.dir)} skipped: ${p.code} ${p.message}`;
@@ -189,9 +215,20 @@ export async function startInteractive(d: StartDeps): Promise<number> {
       return s;
     };
     const session = track(await d.newSession({ skills: set, emit }));
+    /** The session the TUI shows: the first, then each one `/clear`, `/resume` or a pick built. */
+    let current = session;
     let runs = d.newRunController(set);
+    /** A pick's session build is in flight: its routing is not committed yet. */
+    let picking = false;
     const runController: Pick<RunController, "start"> = {
       start: (task, opts) => {
+        if (picking) {
+          throw new RewireError(
+            "run_in_progress",
+            "a model change is in progress",
+            "start the run once the /model pick is done",
+          );
+        }
         const h = runs.start(task, opts);
         activeRun = h;
         void h.done.finally(() => {
@@ -202,7 +239,7 @@ export async function startInteractive(d: StartDeps): Promise<number> {
     };
 
     /** A session on freshly discovered and resolved skills (a trust given mid-session applies). */
-    const build = async (sessionId?: string): Promise<ChatSession> => {
+    const build = async (sessionId?: string, routing?: RoleRouting): Promise<ChatSession> => {
       if (activeRun) throw new RewireError("run_in_progress", "a run is active");
       const next = await resolveNow();
       if (exiting !== undefined) throw closing();
@@ -213,6 +250,7 @@ export async function startInteractive(d: StartDeps): Promise<number> {
           skills: nextSet,
           emit,
           ...(sessionId !== undefined ? { sessionId } : {}),
+          ...(routing !== undefined ? { routing } : {}),
         });
       } catch (e) {
         await d.disposeSkillSet(nextSet).catch(() => {});
@@ -225,6 +263,7 @@ export async function startInteractive(d: StartDeps): Promise<number> {
         throw closing();
       }
       track(s);
+      current = s;
       const old = set;
       set = nextSet;
       sets.push(nextSet);
@@ -236,14 +275,58 @@ export async function startInteractive(d: StartDeps): Promise<number> {
     };
 
     /** `/clear` and `/resume` in flight; cleanup waits for them (bounded) so nothing leaks. */
-    const fresh = (sessionId?: string): Promise<ChatSession> => {
-      const p = build(sessionId);
+    const fresh = (sessionId?: string, routing?: RoleRouting): Promise<ChatSession> => {
+      const p = build(sessionId, routing);
       building.add(p);
       void p.then(
         () => building.delete(p),
         () => building.delete(p),
       );
       return p;
+    };
+
+    const rc = d.routingControl;
+    const routingControl: RoutingControlDep | undefined = rc && {
+      current: () => rc.current(),
+      available: () => rc.available(),
+      source: (role) => rc.source(role),
+      family: (ref) => modelFamily(ref),
+      set: async (role, ref): Promise<RoutingPick> => {
+        if (activeRun || target?.activity() === "run") {
+          return { ok: false, reason: "refused: a gated run is active; pick after it ends" };
+        }
+        if (target?.activity() === "turn") {
+          return { ok: false, reason: "refused: a chat turn is in flight; pick after it ends" };
+        }
+        if (building.size > 0) {
+          return { ok: false, reason: "refused: a session change is in progress" };
+        }
+        const plan = rc.plan(role as Role, ref as ModelRef | undefined);
+        if (!plan.ok) return plan;
+        const now = rc.current();
+        // The chat model and the compaction verifier live in the session: rebuild it for those.
+        const rebuild =
+          !sameRef(now.spec, plan.routing.spec) || !sameRef(now.verifier, plan.routing.verifier);
+        if (!rebuild) return plan.commit();
+        // The same conversation continues on the candidate routing (a session with no completed
+        // turn has no id and nothing to carry: a fresh one). Committed only once it is built.
+        picking = true;
+        let next: ChatSession;
+        try {
+          next = await fresh(current.id(), plan.routing);
+        } catch (e) {
+          return {
+            ok: false,
+            reason: `the routing was not changed: ${e instanceof Error ? e.message : String(e)}`,
+          };
+        } finally {
+          picking = false;
+        }
+        const pick = plan.commit();
+        // Not reachable while picks are serialized (`building` refuses); never leave it unused.
+        if (!pick.ok) return pick;
+        return { ...pick, session: next };
+      },
     };
 
     if (exiting !== undefined) return exiting;
@@ -263,6 +346,7 @@ export async function startInteractive(d: StartDeps): Promise<number> {
       warnings: r.warnings,
       ...(d.doctor ? { doctor: d.doctor } : {}),
       ...(d.routing !== undefined ? { routing: d.routing } : {}),
+      ...(routingControl ? { routingControl } : {}),
       bindEmit: (l) => {
         forward = l;
       },

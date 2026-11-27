@@ -1,6 +1,6 @@
 import { join, resolve } from "node:path";
 import { Writable } from "node:stream";
-import { type CompactionConfig, type RoleRouting, resolveRouting } from "@rewire/pipeline";
+import type { CompactionConfig, RoleRouting } from "@rewire/pipeline";
 import { loadPolicy, type Policy } from "@rewire/policy";
 import {
   type ContextWindowOptions,
@@ -14,6 +14,7 @@ import {
   compactionDeps,
   PrefillMeter,
   RunController,
+  type RunControllerOptions,
   SessionStore,
 } from "@rewire/session";
 import {
@@ -25,11 +26,12 @@ import {
   repoSkillsHash,
   trustKey,
 } from "@rewire/skills";
-import { renderTrustPrompt, renderTui } from "@rewire/tui";
+import { renderTrustPrompt, renderTui, routingLines } from "@rewire/tui";
 import { runDoctor } from "./doctor.js";
 import { loadFauxScript } from "./faux.js";
 import { isInteractive, tuiRequiresTty } from "./interactive.js";
 import { effectivePlatform } from "./platform.js";
+import { RoutingControl } from "./routing-control.js";
 import { createRoutedProviders, FAUX_WARNING, providerFactory, resolveModels } from "./run.js";
 import { type StartDeps, startInteractive } from "./start-tui.js";
 import { xdgDirs } from "./xdg.js";
@@ -57,19 +59,13 @@ export function restoreTerminal(io: Pick<ChatIo, "stdin" | "stdout">): void {
   if (io.stdout.isTTY) io.stdout.write("\x1b[?25h");
 }
 
-function routingText(r: ReturnType<typeof resolveRouting>): string {
-  const roles = ["spec", "test-writer", "implementer", "reviewer", "verifier"] as const;
-  const lines = roles.map((role) => `${role}: ${r[role].provider}:${r[role].model}`);
-  lines.push(`independence: ${r.independence}`);
-  return lines.join("\n");
-}
-
 /** How long a new chat session waits for its model's context window before using the default. */
 export const WINDOW_LOOKUP_TIMEOUT_MS = 2500;
 
 export type ChatSessionsOptions = {
   repo: string;
-  routing: RoleRouting;
+  /** A getter is read at each session build (a `/model` pick of `spec` changes the chat model). */
+  routing: RoleRouting | (() => RoleRouting);
   providers: (ref: ModelRef) => Provider;
   policy: Policy;
   store: SessionStore;
@@ -84,8 +80,8 @@ export type ChatSessionsOptions = {
 };
 
 /**
- * Builds every ChatSession of the TUI (the first, `/clear` and `/resume`) on the chat model
- * (`routing.spec`), each with compaction on: `compactionDeps` from the routing (the verifier on
+ * Builds every ChatSession of the TUI (the first, `/clear`, `/resume` and a chat-model pick) on
+ * the chat model (`routing.spec`, read at each build), each with compaction on: `compactionDeps` from the routing (the verifier on
  * `routing.verifier`, routing's independence), the `[compaction]` config and the window. One
  * token estimator and one prompt-reading meter are shared by the sessions: they describe the
  * model, not the conversation.
@@ -94,10 +90,13 @@ export function chatSessions(o: ChatSessionsOptions): StartDeps["newSession"] {
   const estimator = new TokenEstimator();
   const prefillMeter = new PrefillMeter();
   const build = o.buildCompaction ?? compactionDeps;
-  const chatModel = o.routing.spec;
-  return async ({ skills, emit, sessionId }) => {
+  const routingNow = (): RoleRouting => (typeof o.routing === "function" ? o.routing() : o.routing);
+  return async ({ skills, emit, sessionId, routing: candidate }) => {
+    // A pick's candidate routing (committed only once this session is built), else the current.
+    const routing = candidate ?? routingNow();
+    const chatModel = routing.spec;
     const compaction = await build({
-      routing: o.routing,
+      routing,
       providers: o.providers,
       config: o.compaction,
       estimator,
@@ -125,6 +124,25 @@ export function chatSessions(o: ChatSessionsOptions): StartDeps["newSession"] {
 }
 
 /**
+ * A run controller whose runs each take the routing as of their start (`routing()`): a `/model`
+ * pick applies to the next run, never to one in progress. One run at a time, as RunController.
+ */
+export function routedRunController(
+  o: Omit<RunControllerOptions, "routing"> & { routing: () => RoleRouting },
+): Pick<RunController, "start"> {
+  const { routing, ...rest } = o;
+  let last: RunController | undefined;
+  return {
+    start: (task, opts) => {
+      // A run still going: its controller refuses with `run_in_progress`.
+      if (last?.running()) return last.start(task, opts);
+      last = new RunController({ ...rest, routing: routing() });
+      return last.start(task, opts);
+    },
+  };
+}
+
+/**
  * `rewire` on a TTY and `rewire chat`: the same preflight as `rewire run` (policy, models, routing,
  * sandbox binary; any failure throws, so the caller prints it and exits 1 before any UI), then the
  * interactive session. Returns the exit code.
@@ -136,7 +154,14 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
   const fauxPath = io.env.REWIRE_FAUX_SCRIPT;
   const faux = fauxPath ? loadFauxScript(fauxPath) : undefined;
   const models = await resolveModels(o.models, io.cwd, io.env, faux);
-  const routing = resolveRouting(models.available, models.overrides);
+  // `/model` picks change it for this session only (never written to the models file). The
+  // providers are created below, after the sandbox check, as before; no pick happens until then.
+  const control = new RoutingControl({
+    available: models.available,
+    fileOverrides: models.overrides,
+    providers: (ref) => providers(ref),
+  });
+  const routing = control.current();
   // Every chat tool call and every run stage needs the sandbox: fail now, not mid-session.
   locateSandboxBinary({ env: io.env });
   if (faux) io.stderr.write(`${FAUX_WARNING}\n`);
@@ -171,7 +196,7 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
     disposeSkillSet,
     newSession: chatSessions({
       repo,
-      routing,
+      routing: () => control.current(),
       providers,
       policy,
       store,
@@ -181,9 +206,9 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
     }),
     listSessions: () => store.list(repo),
     newRunController: (skills) =>
-      new RunController({
+      routedRunController({
         repo,
-        routing,
+        routing: () => control.current(),
         providers,
         policy,
         skills,
@@ -211,7 +236,8 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
       });
       return out.join("").trimEnd();
     },
-    routing: routingText(routing),
+    routing: () => routingLines(control.current()),
+    routingControl: control,
     models: {
       chat: chatModel.model,
       spec: routing.spec.model,

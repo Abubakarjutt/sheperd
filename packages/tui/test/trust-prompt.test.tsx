@@ -127,6 +127,29 @@ describe("listSkillFiles", () => {
   });
 });
 
+describe("listSkillFiles on a symlinked skill dir (M4)", () => {
+  it("follows the root link once and walks it; links inside are listed, never followed", async () => {
+    const target = join(root, "elsewhere");
+    await mkdir(join(target, "sub"), { recursive: true });
+    await writeFile(join(target, "SKILL.md"), "abc");
+    await writeFile(join(target, "sub", "x.md"), "de");
+    const outside = join(root, "outside");
+    await mkdir(outside);
+    await writeFile(join(outside, "private.txt"), "x".repeat(50));
+    await symlink(outside, join(target, "inner"));
+    const link = join(root, "linked-skill");
+    await symlink(target, link);
+    const r = await listSkillFiles(link);
+    expect(r.linkedTo).toBe(target);
+    expect(r.truncated).toBe(false);
+    expect(r.entries.map((e) => e.path)).toEqual(["SKILL.md", "inner", join("sub", "x.md")]);
+    expect(r.entries.find((e) => e.path === "inner")?.symlink).toBe(true);
+    expect(r.entries.some((e) => e.path.includes("private"))).toBe(false);
+    const plainDir = await listSkillFiles(target);
+    expect(plainDir.linkedTo).toBeUndefined();
+  });
+});
+
 describe("TrustPrompt covers every repo skill the hash pins", () => {
   it("shows a shadowed repo skill, labelled, and pins repoSkillsHash(found)", async () => {
     const home = join(root, "home");

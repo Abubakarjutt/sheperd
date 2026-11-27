@@ -7,6 +7,13 @@ import { App, type InterruptTarget } from "../src/app.js";
 import { renderTrustPrompt, renderTui } from "../src/index.js";
 
 const tick = (ms = 40) => new Promise((r) => setTimeout(r, ms));
+async function until(ok: () => boolean, ms = 10_000) {
+  const end = Date.now() + ms;
+  while (!ok()) {
+    if (Date.now() > end) throw new Error("timed out");
+    await tick(15);
+  }
+}
 
 /** Streams for Ink whose stdin can be typed into (Ink reads on 'readable'). */
 function streams() {
@@ -142,10 +149,14 @@ describe("App interrupt target", () => {
       v.stdin.write("/skills");
       await tick();
       v.stdin.write("\r");
-      await tick(80);
+      await until(() => (v.lastFrame() ?? "").includes(`${next}  user · active`));
+      // Esc closes the list (retried: the list's key handler attaches after its first frame).
+      for (let i = 0; i < 10 && (v.lastFrame() ?? "").includes("user · active"); i++) {
+        v.stdin.write("\x1b");
+        await until(() => !(v.lastFrame() ?? "").includes("user · active"), 1500).catch(() => {});
+      }
+      expect(v.lastFrame()).not.toContain("user · active");
     }
-    expect(v.lastFrame()).toContain("first (user)");
-    expect(v.lastFrame()).toContain("second (user)");
     v.unmount();
   });
 });
