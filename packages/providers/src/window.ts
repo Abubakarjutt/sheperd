@@ -169,7 +169,13 @@ export async function contextWindow(
     case "azure":
       return fromTable(WINDOW_TABLE.openai, ref.model);
     case "gemini":
-      return fromTable(WINDOW_TABLE.gemini, ref.model.replace(/^models\//, ""));
+      return fromTable(
+        WINDOW_TABLE.gemini,
+        ref.model
+          .trim()
+          .toLowerCase()
+          .replace(/^models\//, ""),
+      );
     // Claude on the clouds: the anthropic table, by the bare Claude id.
     case "bedrock":
     case "vertex":

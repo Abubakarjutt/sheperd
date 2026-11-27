@@ -85,11 +85,37 @@ function stubSdkEnv() {
   vi.stubEnv("OPENAI_API_VERSION", "1999-01-01");
   vi.stubEnv("OPENAI_ORG_ID", "org-fake");
   vi.stubEnv("OPENAI_PROJECT_ID", "proj-fake");
+  vi.stubEnv("OPENAI_API_KEY", OPENAI_KEY);
+  vi.stubEnv("OPENAI_CUSTOM_HEADERS", CUSTOM_HEADERS);
 }
+
+/** A credential meant for an OpenAI gateway: it must never reach another vendor. */
+const OPENAI_KEY = "sk-processenvopenaikey0000000";
+const GATEWAY_KEY = "gatewaykey0123456789abcdef";
+const CUSTOM_HEADERS = `Authorization: Bearer ${OPENAI_KEY}\napi-key: ${GATEWAY_KEY}\nx-foo: 1`;
 
 function expectNoOpenAIHeaders(h: Headers) {
   expect(h.has("openai-organization")).toBe(false);
   expect(h.has("openai-project")).toBe(false);
+  expect(h.has("x-foo")).toBe(false);
+  const all = [...h.values()].join(" ");
+  expect(all).not.toContain(OPENAI_KEY);
+  expect(all).not.toContain(GATEWAY_KEY);
+}
+
+/** Exactly this client's own credential, in its own header, and no other auth header. */
+function expectOwnAuth(h: Headers, auth: { apiKey: string } | { bearer: string } | "none") {
+  if (auth === "none") {
+    expect(h.has("authorization")).toBe(false);
+    expect(h.has("api-key")).toBe(false);
+  } else if ("apiKey" in auth) {
+    expect(h.get("api-key")).toBe(auth.apiKey);
+    expect(h.has("authorization")).toBe(false);
+  } else {
+    expect(h.get("authorization")).toBe(`Bearer ${auth.bearer}`);
+    expect(h.has("api-key")).toBe(false);
+  }
+  expectNoOpenAIHeaders(h);
 }
 
 describe("azure", () => {
@@ -112,9 +138,7 @@ describe("azure", () => {
         "https://res.openai.azure.com/openai/deployments/my-gpt/chat/completions?api-version=2024-10-21",
       );
       expect(s.method).toBe("POST");
-      expect(s.headers.has("api-key")).toBe(true);
-      expect(s.headers.has("authorization")).toBe(false);
-      expectNoOpenAIHeaders(s.headers);
+      expectOwnAuth(s.headers, { apiKey: AZURE_KEY });
     }
     expect(plain.body).toEqual(wire(toOpenAIParams(r)));
     expect(stream.body).toEqual(wire(toOpenAIStreamParams(r)));
@@ -169,6 +193,7 @@ describe("azure", () => {
       "http://res.openai.azure.com",
       "https://u:p@res.openai.azure.com",
       "https://res.openai.azure.com/?x=1",
+      "https://res.openai.azure.com/openai/deployments/foo",
       "not a url",
     ]) {
       expect(() =>
@@ -198,8 +223,7 @@ describe("gemini", () => {
         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
       );
       expect(s.method).toBe("POST");
-      expect(s.headers.get("authorization")).toMatch(/^Bearer \S+$/);
-      expectNoOpenAIHeaders(s.headers);
+      expectOwnAuth(s.headers, { bearer: GEMINI_KEY });
     }
     expect(plain.body).toEqual(wire(toOpenAIParams(r, { maxTokensField: "max_tokens" })));
     expect(stream.body).toEqual(wire(toOpenAIStreamParams(r, { maxTokensField: "max_tokens" })));
@@ -234,8 +258,7 @@ describe("OpenAI-compatible endpoints", () => {
       for (const s of [plain, stream]) {
         expect(s.url).toBe("https://api.groq.com/openai/v1/chat/completions");
         expect(s.method).toBe("POST");
-        expect(s.headers.get("authorization")).toMatch(/^Bearer \S+$/);
-        expectNoOpenAIHeaders(s.headers);
+        expectOwnAuth(s.headers, { bearer: GROQ_KEY });
       }
       expect(plain.body).toEqual(wire(toOpenAIParams(r, { maxTokensField: "max_tokens" })));
       expect(stream.body).toEqual(wire(toOpenAIStreamParams(r, { maxTokensField: "max_tokens" })));
@@ -268,7 +291,7 @@ describe("OpenAI-compatible endpoints", () => {
   });
 
   test("a loopback endpoint without api_key_env sends no auth header at all", async () => {
-    vi.stubEnv("OPENAI_API_KEY", "sk-processenvkey000000000");
+    stubSdkEnv();
     const undo = registerEndpoints({ local: { baseUrl: "http://127.0.0.1:8080/v1" } });
     try {
       const f = recordingFetch();
@@ -276,8 +299,7 @@ describe("OpenAI-compatible endpoints", () => {
       await both(p, f.seen, req("qwen2.5-coder"));
       for (const s of f.seen) {
         expect(s.url).toBe("http://127.0.0.1:8080/v1/chat/completions");
-        expect(s.headers.has("authorization")).toBe(false);
-        expect(s.headers.has("api-key")).toBe(false);
+        expectOwnAuth(s.headers, "none");
         // Nothing key-like anywhere in the headers.
         expect([...s.headers.values()].join(" ")).not.toMatch(/Bearer|sk-/);
       }
@@ -389,6 +411,67 @@ describe("OpenAI-compatible endpoints", () => {
   });
 });
 
+describe("OPENAI_CUSTOM_HEADERS never reaches Azure, Gemini or endpoints", () => {
+  test("from process.env or the env passed in: each client sends exactly its own credential", async () => {
+    stubSdkEnv();
+    const passed = { OPENAI_CUSTOM_HEADERS: "X-Bar: 2\nAuthorization: Bearer passedenvtoken00000" };
+    const undo = registerEndpoints({
+      groq: { baseUrl: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY" },
+      local: { baseUrl: "http://localhost:11434/v1" },
+    });
+    try {
+      const cases: [
+        (f: typeof globalThis.fetch) => OpenAIProvider,
+        Parameters<typeof expectOwnAuth>[1],
+      ][] = [
+        [
+          (fetch) =>
+            createAzureProvider(
+              { azure: { endpoint: "https://res.openai.azure.com", apiVersion: "v" } },
+              { ...passed, AZURE_OPENAI_API_KEY: AZURE_KEY },
+              { fetch },
+            ),
+          { apiKey: AZURE_KEY },
+        ],
+        [
+          (fetch) => createGeminiProvider({ ...passed, GEMINI_API_KEY: GEMINI_KEY }, { fetch }),
+          { bearer: GEMINI_KEY },
+        ],
+        [
+          (fetch) =>
+            createEndpointProvider("groq", { ...passed, GROQ_API_KEY: GROQ_KEY }, { fetch }),
+          { bearer: GROQ_KEY },
+        ],
+        [(fetch) => createEndpointProvider("local", passed, { fetch }), "none"],
+      ];
+      for (const [make, auth] of cases) {
+        const f = recordingFetch();
+        await both(make(f.fetch), f.seen, req("m"));
+        for (const s of f.seen) {
+          expectOwnAuth(s.headers, auth);
+          expect(s.headers.has("x-bar")).toBe(false);
+          expect([...s.headers.values()].join(" ")).not.toContain("passedenvtoken");
+        }
+      }
+    } finally {
+      undo();
+    }
+  });
+
+  test("the plain openai provider still applies OPENAI_CUSTOM_HEADERS (unchanged)", async () => {
+    vi.stubEnv("OPENAI_CUSTOM_HEADERS", "x-foo: 1");
+    const p = createProvider(parseModelRef("openai:gpt-5"), {
+      OPENAI_API_KEY: "sk-test-openai-000",
+    });
+    expect(p).toBeInstanceOf(OpenAIProvider);
+    const { default: OpenAI } = await import("openai");
+    const f = recordingFetch();
+    const client = new OpenAI({ apiKey: "sk-test-openai-000", fetch: f.fetch, maxRetries: 0 });
+    await new OpenAIProvider("sk-test-openai-000", client).chat(req("gpt-5"));
+    expect(f.seen[0]?.headers.get("x-foo")).toBe("1");
+  });
+});
+
 describe("errors never carry the key", () => {
   const echo = (key: string) => () =>
     new Response(JSON.stringify({ error: { message: `invalid key ${key} given` } }), {
@@ -485,6 +568,7 @@ describe("context windows", () => {
       "gemini-3-flash",
       "gemini-1.5-pro",
       "models/gemini-2.5-pro",
+      "Gemini-2.5-Pro",
     ]) {
       await expect(contextWindow({ provider: "gemini", model: m })).resolves.toEqual(w(1_048_576));
     }

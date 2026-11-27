@@ -15,17 +15,57 @@ export type OpenAICompatibleOptions = {
 const set = (v: string | undefined): string | undefined =>
   v !== undefined && v.trim() !== "" ? v.trim() : undefined;
 
+/** An HTTP token, the SDK's own rule for a header name (`internal/headers.js`). */
+const HEADER_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/**
+ * The header names in `OPENAI_CUSTOM_HEADERS`, parsed as the installed SDK parses it
+ * (`client.js`: the value trimmed, split on newlines, each line cut at its first colon, the name
+ * trimmed), from both the env rewire was given and process.env (which the SDK reads itself).
+ * Lowercased, as the SDK's header merge treats names. Names the SDK would refuse are skipped: it
+ * throws on them before any request.
+ */
+export function customHeaderNames(env: NodeJS.ProcessEnv): string[] {
+  const names = new Set<string>();
+  for (const raw of [env.OPENAI_CUSTOM_HEADERS, process.env.OPENAI_CUSTOM_HEADERS]) {
+    const value = raw?.trim();
+    if (!value) continue;
+    for (const line of value.split("\n")) {
+      const colon = line.indexOf(":");
+      if (colon < 0) continue;
+      const name = line.substring(0, colon).trim();
+      if (HEADER_TOKEN.test(name)) names.add(name.toLowerCase());
+    }
+  }
+  return [...names];
+}
+
 /**
  * Options every non-OpenAI client gets: the base URL and key are always passed, so the SDK never
  * falls back to `OPENAI_BASE_URL`/`OPENAI_API_KEY` from process.env, and OpenAI's organization and
  * project ids (`OPENAI_ORG_ID`, `OPENAI_PROJECT_ID`) are never sent to another vendor.
+ *
+ * `OPENAI_CUSTOM_HEADERS` is meant for OpenAI (often a gateway credential) and the SDK merges it
+ * after its auth headers, so it could replace this client's key. Every name it holds is passed as
+ * `null` in `defaultHeaders`, which the SDK applies last, and then `auth` (this client's own
+ * credential header, or nulls for a keyless endpoint) is set over it.
  */
-function clientOptions(baseURL: string, apiKey: string, opts: OpenAICompatibleOptions) {
+function clientOptions(
+  baseURL: string,
+  apiKey: string,
+  env: NodeJS.ProcessEnv,
+  auth: Record<string, string | null>,
+  opts: OpenAICompatibleOptions,
+) {
+  const defaultHeaders: Record<string, string | null> = {};
+  for (const name of customHeaderNames(env)) defaultHeaders[name] = null;
+  for (const [name, value] of Object.entries(auth)) defaultHeaders[name.toLowerCase()] = value;
   return {
     baseURL,
     apiKey,
     organization: null,
     project: null,
+    defaultHeaders,
     ...(opts.fetch !== undefined ? { fetch: opts.fetch } : {}),
   };
 }
@@ -74,6 +114,15 @@ export function createAzureProvider(
     fromToml !== undefined ? "[providers.azure] endpoint" : "AZURE_OPENAI_ENDPOINT",
     AZURE_ENDPOINT_HINT,
   );
+  // The resource root only: a path (".../openai/deployments/x") would make the SDK build a URL
+  // that never names the deployment.
+  if (new URL(endpoint).pathname.replace(/\/+$/, "") !== "") {
+    throw new RewireError(
+      "provider_auth_missing",
+      `${fromToml !== undefined ? "[providers.azure] endpoint" : "AZURE_OPENAI_ENDPOINT"} must be the resource root, with no path`,
+      AZURE_ENDPOINT_HINT,
+    );
+  }
   const apiVersion = set(settings.azure?.apiVersion) ?? set(env.OPENAI_API_VERSION);
   if (apiVersion === undefined) {
     throw new RewireError(
@@ -85,7 +134,13 @@ export function createAzureProvider(
   // The SDK's own endpoint handling: trailing slashes dropped, then `/openai`. Passing the base
   // URL (not `endpoint`) keeps it from reading OPENAI_BASE_URL or AZURE_OPENAI_ENDPOINT itself.
   const client = new AzureOpenAI({
-    ...clientOptions(`${endpoint.replace(/\/+$/, "")}/openai`, apiKey, opts),
+    ...clientOptions(
+      `${endpoint.replace(/\/+$/, "")}/openai`,
+      apiKey,
+      env,
+      { "api-key": apiKey },
+      opts,
+    ),
     apiVersion,
   });
   return new OpenAIProvider(apiKey, client, { name: "azure" });
@@ -95,6 +150,8 @@ export function createAzureProvider(
  * Gemini through its OpenAI-compatible API, with Bearer auth from `GEMINI_API_KEY` (else
  * `GOOGLE_API_KEY`). The output cap goes in `max_tokens`: it is the field Google's compatibility
  * layer has always accepted (Vertex AI's OpenAI docs list `max_completion_tokens` only as an alias).
+ * Not yet confirmed against the Gemini API's own reference, which lists neither field: a live
+ * request that rejects it shows up as a 400 naming the field.
  */
 export function createGeminiProvider(
   env: NodeJS.ProcessEnv,
@@ -108,7 +165,9 @@ export function createGeminiProvider(
       "set GEMINI_API_KEY (or GOOGLE_API_KEY)",
     );
   }
-  const client = new OpenAI(clientOptions(GEMINI_BASE_URL, apiKey, opts));
+  const client = new OpenAI(
+    clientOptions(GEMINI_BASE_URL, apiKey, env, { authorization: `Bearer ${apiKey}` }, opts),
+  );
   return new OpenAIProvider(apiKey, client, {
     name: "gemini",
     params: { maxTokensField: "max_tokens" },
@@ -153,10 +212,9 @@ export function createEndpointProvider(
         `set [endpoints.${name}] api_key_env to the name of the env var holding its key`,
       );
     }
-    const client = new OpenAI({
-      ...clientOptions(baseUrl, UNSENT_KEY, opts),
-      defaultHeaders: { Authorization: null },
-    });
+    const client = new OpenAI(
+      clientOptions(baseUrl, UNSENT_KEY, env, { authorization: null, "api-key": null }, opts),
+    );
     return new OpenAIProvider("", client, { name, params });
   }
   const apiKey = set(env[config.apiKeyEnv]);
@@ -167,6 +225,8 @@ export function createEndpointProvider(
       `set ${config.apiKeyEnv} (named by [endpoints.${name}] api_key_env)`,
     );
   }
-  const client = new OpenAI(clientOptions(baseUrl, apiKey, opts));
+  const client = new OpenAI(
+    clientOptions(baseUrl, apiKey, env, { authorization: `Bearer ${apiKey}` }, opts),
+  );
   return new OpenAIProvider(apiKey, client, { name, params });
 }
