@@ -380,8 +380,9 @@ describe("OllamaProvider", () => {
       .catch((e) => e);
     expect(err).toMatchObject({ code: "ollama_timeout" });
     expect(err.message).toMatch(/default/);
+    expect(err.hint).toMatch(/retry, or open a new terminal/);
     expect(err.hint).toMatch(/REWIRE_OLLAMA_TIMEOUT_S is not set in this process's environment/);
-    expect(err.hint).toMatch(/open a new one/);
+    expect(err.hint).toMatch(/or set REWIRE_OLLAMA_TIMEOUT_S or \[providers\.ollama\] timeout_s/);
     expect(err.hint).toMatch(/\[providers\.ollama\] timeout_s/);
   });
   test("a slow reply within the rewire timeout is not cut by Node fetch's headers timeout", async () => {
@@ -514,6 +515,43 @@ describe("OllamaProvider streaming (onDelta)", () => {
     expect(err.message).toMatch(/no output for 200ms/);
     expect(Date.now() - t0).toBeLessThan(2_000);
     expect(deltas).toEqual(["par", "tial"]);
+  });
+  test("silence before the first chunk, past the idle limit but within the reply timeout, is fine", async () => {
+    // The whole reply arrives in one write after 400 ms: longer than the 100 ms idle limit, within
+    // the 2 s reply timeout. Idle applies only once the reply has started.
+    mock.chat = () => ({ __drip: [`${events(["ok"]).join("")}data: [DONE]\n\n`], everyMs: 400 });
+    const p = new OllamaProvider(base, tmo(2_000), { idleTimeoutMs: 100 });
+    const r = await p.chat({ ...req, onDelta: () => {} });
+    expect(r.message.text).toBe("ok");
+  });
+  test("thinking-only and tool-call-only chunks reset the idle timer", async () => {
+    const chunk = (delta: unknown, finish_reason: string | null = null) =>
+      `data: ${JSON.stringify({
+        id: "c",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "m",
+        choices: [{ index: 0, delta, finish_reason }],
+      })}\n\n`;
+    const thinking = Array.from({ length: 6 }, () => chunk({ reasoning: "hmm" }));
+    const tool = [
+      chunk({
+        tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "echo" } }],
+      }),
+      ...Array.from({ length: 5 }, () =>
+        chunk({ tool_calls: [{ index: 0, function: { arguments: " " } }] }),
+      ),
+      chunk({ tool_calls: [{ index: 0, function: { arguments: "{}" } }] }),
+    ];
+    // 13 chunks 50 ms apart (650 ms, over three idle limits), none with text until the last.
+    mock.chat = () => ({
+      __drip: [...thinking, ...tool, chunk({ content: "done" }, "tool_calls"), "data: [DONE]\n\n"],
+      everyMs: 50,
+    });
+    const p = new OllamaProvider(base, tmo(5_000), { idleTimeoutMs: 200 });
+    const r = await p.chat({ ...req, onDelta: () => {} });
+    expect(r.message.text).toBe("done");
+    expect(r.message.toolCalls.map((c) => c.name)).toEqual(["echo"]);
   });
   test("no first chunk within the reply timeout is ollama_timeout with the first-chunk message", async () => {
     mock.chat = () => ({ __sse: "", after: "hang" });

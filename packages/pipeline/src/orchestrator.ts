@@ -119,7 +119,8 @@ export type RunPipelineInput = {
   providers: (ref: ModelRef) => Provider;
   /**
    * The Ollama reply timeout for the preflight smoke test (`resolveOllamaTimeout` with the
-   * models.toml settings). Unset: REWIRE_OLLAMA_TIMEOUT_S from process.env, else the default.
+   * models.toml settings). Unset: REWIRE_OLLAMA_TIMEOUT_S from process.env, else the default;
+   * `[providers.ollama] timeout_s` reaches the smoke test only when the caller passes this.
    */
   ollamaTimeout?: OllamaTimeout;
   policy: Policy;

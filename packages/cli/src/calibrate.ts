@@ -297,7 +297,12 @@ export async function calibrateCommand(
         system: probe.system,
         messages: [{ role: "user", content: probe.user }],
         maxTokens: PROBE_MAX_TOKENS,
-        signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
+        // Ollama enforces `timeoutMs` itself, and its timer alone must fire: a second one here
+        // would turn its ollama_timeout (which names the value and its source) into an abort.
+        signal:
+          ref.provider === "ollama"
+            ? signal
+            : AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
         timeoutMs,
       });
       if (!refreshed && refreshWindow !== undefined) {

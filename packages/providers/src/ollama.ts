@@ -92,7 +92,7 @@ function describeTimeout(t: OllamaTimeout): string {
 /** How to raise the reply timeout, given where the current one came from. */
 function raiseHint(t: OllamaTimeout): string {
   if (t.source === "default") {
-    return `${OLLAMA_TIMEOUT_ENV} is not set in this process's environment, so the default applies (a terminal opened before you edited ~/.zshrc does not have it: open a new one), or set [providers.ollama] timeout_s in models.toml (seconds, e.g. 1800)`;
+    return `open a new terminal (${OLLAMA_TIMEOUT_ENV} is not set in this process's environment: a terminal opened before you edited ~/.zshrc does not have it), or set ${OLLAMA_TIMEOUT_ENV} or [providers.ollama] timeout_s in models.toml (seconds, e.g. 1800)`;
   }
   if (t.source === "env") {
     return `raise ${OLLAMA_TIMEOUT_ENV} (seconds, e.g. 1800); it overrides [providers.ollama] timeout_s`;
