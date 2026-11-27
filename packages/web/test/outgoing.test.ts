@@ -97,3 +97,30 @@ describe("checkOutgoingUrl hosts (fix round 2)", () => {
     expect(checkOutgoingUrl("https://ask-matt.disk-usage.example/task-file")).toBeUndefined();
   });
 });
+
+describe("the outgoing sk- check needs a key-shaped run (fix round 2b)", () => {
+  test.each([
+    "https://blog.example/how-to-ask-questions-on-stack-overflow",
+    "disk-usage-analyzer-for-linux",
+    "risk-assessment-framework-2024",
+    "ask-matt",
+    "task-file",
+  ])("%s passes", (s) => {
+    expect(checkOutgoing(s)).toBeUndefined();
+  });
+
+  test.each([
+    "xsk-ant-api03-abcdefghijklmnopqrstuvwxyz01",
+    "xsk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789",
+    "xsk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV",
+    "xsk-svcacct-AbCdEfGhIjKlMnOpQrStUvWx",
+    // OpenAI project-key shape: internal - and _, with a 20+ hyphen-free run.
+    "d=xsk-proj-Ab3_dEf9-GhIjKlMnOpQrStUvWxYz0123_4567-89AbCdEfGhIj",
+  ])("%s is refused", (s) => {
+    expect(checkOutgoing(s)).toMatch(/secret/);
+  });
+});
+
+test("a 20-letter word after a hyphenated sk- word is the known false positive (documented)", () => {
+  expect(checkOutgoing("ask-about-internationalization")).toMatch(/secret/);
+});

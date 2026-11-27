@@ -11,11 +11,18 @@ const UNICODE_ESCAPES = /%u([0-9a-fA-F]{4})/g;
 /**
  * The outgoing secret pattern: `SECRET` plus the main key shapes WITHOUT its token-start guard.
  * That guard keeps display redaction from mangling words like "task-file"; on the way out it
- * would let `x<key>` through (the receiver just drops the letter). Length floors keep ordinary
- * words ("ask-matt", "disk-usage") from matching.
+ * would let `x<key>` through (the receiver just drops the letter). The `sk-` shape allows up to
+ * eight hyphen-separated segments (prefixes like `ant-api03-`, `proj-`, `svcacct-`, and the
+ * hyphens a base64url key body itself contains) and then needs a run of 20+ characters with no
+ * hyphen, which keys have and hyphenated words ("ask-questions-on-stack-overflow") do not.
  */
 const OUTGOING = new RegExp(
-  [SECRET.source, "sk-[A-Za-z0-9_-]{20,}", "ghp_[A-Za-z0-9]{30,}", "AKIA[0-9A-Z]{16}"].join("|"),
+  [
+    SECRET.source,
+    "sk-(?:[A-Za-z0-9_]+-){0,8}[A-Za-z0-9_]{20,}",
+    "ghp_[A-Za-z0-9]{30,}",
+    "AKIA[0-9A-Z]{16}",
+  ].join("|"),
 );
 /** Mixed-case key shapes, checked case-insensitively on host names (DNS folds case). */
 const HOST_ONLY = /aiza[0-9a-z_-]{30,}/i;
