@@ -4,7 +4,12 @@ import { ClaudeCloudProvider } from "./claude-cloud.js";
 import { FauxProvider } from "./faux.js";
 import { normalizeOllamaHost, OllamaProvider, ollamaChatTimeoutMs } from "./ollama.js";
 import { OpenAIProvider } from "./openai.js";
-import type { ModelRef, Provider, ProviderSettings } from "./types.js";
+import {
+  createAzureProvider,
+  createEndpointProvider,
+  createGeminiProvider,
+} from "./openai-compatible.js";
+import { isEndpointName, type ModelRef, type Provider, type ProviderSettings } from "./types.js";
 
 /** `settings` are models.toml's `[providers.*]` tables (empty when there is no file). */
 export type ProviderFactory = (
@@ -39,6 +44,8 @@ export function createProvider(
   settings: ProviderSettings = {},
 ): Provider {
   const factory = factories.get(ref.provider);
+  // A registered `[endpoints.<name>]` without an overriding factory.
+  if (!factory && isEndpointName(ref.provider)) return createEndpointProvider(ref.provider, env);
   if (!factory) {
     throw new RewireError("provider_unknown", `no provider registered for "${ref.provider}"`);
   }
@@ -51,6 +58,8 @@ registerProvider(
 );
 registerProvider("openai", (_ref, env) => new OpenAIProvider(requireKey(env, "OPENAI_API_KEY")));
 registerProvider("faux", () => new FauxProvider([]));
+registerProvider("azure", (_ref, env, settings) => createAzureProvider(settings, env));
+registerProvider("gemini", (_ref, env) => createGeminiProvider(env));
 // Claude on the clouds: settings are checked now; each SDK is imported on the first chat.
 for (const name of ["bedrock", "vertex", "foundry"] as const) {
   registerProvider(name, (_ref, env, settings) => new ClaudeCloudProvider(name, settings, env));

@@ -9,10 +9,8 @@ import {
   type ModelRef,
   OLLAMA_PROVISIONAL_WINDOW_CAP,
   OLLAMA_TRUNCATION_HINT,
-  parseModelRef,
   parseNumCtx,
   refreshContextWindow,
-  registerEndpoints,
   suspectTruncation,
   TokenEstimator,
   WINDOW_TABLE,
@@ -470,21 +468,7 @@ describe("suspectTruncation", () => {
   });
 });
 
-describe("contextWindow: providers without a table yet", () => {
-  test("azure, gemini and registered endpoints get the default, never throw", async () => {
-    const undo = registerEndpoints({ groq: { baseUrl: "https://api.groq.com/openai/v1" } });
-    try {
-      for (const ref of ["azure:gpt-5", "gemini:gemini-2.5-pro", "groq:llama-3.3-70b"]) {
-        await expect(contextWindow(parseModelRef(ref))).resolves.toEqual({
-          window: DEFAULT_CONTEXT_WINDOW,
-          source: "default",
-          provisional: true,
-        });
-      }
-    } finally {
-      undo();
-    }
-  });
+describe("contextWindow: endpoints", () => {
   test("an unregistered endpoint throws context_window_unknown", async () => {
     await expect(contextWindow({ provider: "groq", model: "m" })).rejects.toMatchObject({
       code: "context_window_unknown",

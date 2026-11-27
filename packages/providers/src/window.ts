@@ -1,9 +1,11 @@
 import { RewireError } from "@rewire/core";
+import { modelFamily } from "./family.js";
 import { findOllamaTag, getLoadedOllamaModel, showOllamaModel } from "./ollama.js";
 import { ollamaBaseUrl } from "./registry.js";
 import {
   builtinProvider,
   type ChatMessage,
+  endpointConfig,
   isKnownProvider,
   type ModelRef,
   PROVIDER_NAMES,
@@ -53,7 +55,7 @@ export const FAUX_WINDOW_ENV = "REWIRE_FAUX_WINDOW";
  * Owner: whoever adds a model family; a missing id only makes compaction start early (32K).
  */
 export const WINDOW_TABLE: Readonly<
-  Record<"anthropic" | "openai", ReadonlyArray<[string, number]>>
+  Record<"anthropic" | "openai" | "gemini", ReadonlyArray<[string, number]>>
 > = {
   anthropic: [
     ["claude-3", 200_000],
@@ -77,6 +79,19 @@ export const WINDOW_TABLE: Readonly<
     ["o3", 200_000],
     ["o4-mini", 200_000],
   ],
+  // Gemini API ids (gemini-2.5-pro, gemini-2.5-flash, ...): 1M input tokens from 2.5 on, and
+  // assumed for any other gemini- id.
+  gemini: [
+    ["gemini-", 1_048_576],
+    ["gemini-2.5", 1_048_576],
+  ],
+};
+
+/** The table for a model family, when there is one. */
+const FAMILY_TABLE: Readonly<Record<string, ReadonlyArray<[string, number]>>> = {
+  claude: WINDOW_TABLE.anthropic,
+  gpt: WINDOW_TABLE.openai,
+  gemini: WINDOW_TABLE.gemini,
 };
 
 const DEFAULT: ContextWindow = {
@@ -145,21 +160,21 @@ export async function contextWindow(
   assertRef(ref);
   const env = opts.env ?? process.env;
   const provider = builtinProvider(ref.provider);
-  // Registered OpenAI-compatible endpoints: no table yet.
-  if (provider === undefined) return DEFAULT;
+  if (provider === undefined) return endpointWindow(ref);
   switch (provider) {
     case "anthropic":
     case "openai":
       return fromTable(WINDOW_TABLE[provider], ref.model);
+    // Azure model refs are deployment names: a deployment named like its model gets the table.
+    case "azure":
+      return fromTable(WINDOW_TABLE.openai, ref.model);
+    case "gemini":
+      return fromTable(WINDOW_TABLE.gemini, ref.model.replace(/^models\//, ""));
     // Claude on the clouds: the anthropic table, by the bare Claude id.
     case "bedrock":
     case "vertex":
     case "foundry":
       return fromTable(WINDOW_TABLE.anthropic, cloudClaudeId(ref.model));
-    // No table yet.
-    case "azure":
-    case "gemini":
-      return DEFAULT;
     case "faux": {
       const w = positiveInt(opts.fauxWindow) ?? positiveInt(Number(env[FAUX_WINDOW_ENV] ?? ""));
       return w !== null ? { window: w, source: "model", provisional: true } : DEFAULT;
@@ -169,6 +184,26 @@ export async function contextWindow(
       return baseUrl === undefined ? DEFAULT : ollamaWindow(baseUrl, ref.model);
     }
   }
+}
+
+/**
+ * A registered endpoint: its `context_window`, else the table for the model's family looked up by
+ * the id's last path segment ("anthropic/claude-opus-5-5" -> "claude-opus-5-5"), else the default.
+ * A model whose family cannot be derived (a router id) gets the default, never a throw.
+ */
+function endpointWindow(ref: ModelRef): ContextWindow {
+  const declared = endpointConfig(ref.provider)?.contextWindow;
+  if (declared !== undefined) return { window: declared, source: "model", provisional: true };
+  let family: string;
+  try {
+    family = modelFamily(ref);
+  } catch {
+    return DEFAULT;
+  }
+  const rows = FAMILY_TABLE[family];
+  if (rows === undefined) return DEFAULT;
+  const last = (ref.model.split("/").pop() ?? ref.model).trim().toLowerCase();
+  return fromTable(rows, last);
 }
 
 /**
