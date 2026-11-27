@@ -50,8 +50,14 @@ import {
   newLive,
   takeFinished,
 } from "./live-turn.js";
+import { ModelPicker } from "./model-picker.js";
 import { ClarifyPanel, ProposalCard } from "./proposal.js";
-import { type RoutingControlDep, routingLines } from "./routing.js";
+import {
+  type RoutingControlDep,
+  type RoutingModel,
+  type RoutingRole,
+  routingLines,
+} from "./routing.js";
 import { sanitize } from "./sanitize.js";
 import { COMPACTING_VERB, ESC_CANCEL, pickVerb } from "./spinner.js";
 import { type CtxStatus, StatusLine } from "./status-line.js";
@@ -147,6 +153,7 @@ const HIDDEN_NOTES = new Set([PROPOSAL_NOTE, TURN_LIMIT_NOTE]);
 export const RUN_ACTIVE = "a run is active; answer its prompt or press Ctrl-C to abort";
 const SEPARATOR = "───";
 export const TRUSTED_LATER = "trusted; takes effect in a new session (/clear)";
+export const PICK_IN_RUN = "model picks are refused while a run is active; pick after it ends";
 
 /** Entries for a resumed session: user and assistant text only, minus the persisted placeholders. */
 export function historyEntries(session: ChatSession): TranscriptEntry[] {
@@ -223,18 +230,30 @@ export function App(props: AppProps) {
   const configRepo = props.config.repo;
   const cwd = props.cwd ?? (typeof configRepo === "string" ? configRepo : process.cwd());
   const home = props.home ?? homedir();
-  const models = props.models;
+  const modelsProp = props.models;
+  /** The header's models as of now: the session routing when `/model` can change it. */
+  const modelsNow = useCallback((): ModelsInfo | undefined => {
+    if (!routingControl) return modelsProp;
+    const r = routingControl.current();
+    return {
+      chat: r.spec.model,
+      spec: r.spec.model,
+      implementer: r.implementer.model,
+      reviewers: [r.reviewer.model, r.verifier.model],
+    };
+  }, [routingControl, modelsProp]);
   /** The welcome box as of now (the skills getter is re-read, so `/clear` shows the new counts). */
   const headerEntry = useCallback((): TranscriptEntry => {
     const s = skillsNow();
+    const models = modelsNow();
     const info: HeaderInfo = {
       cwd,
       home,
-      models,
+      ...(models ? { models } : {}),
       ...(s ? { skills: { active: s.active.length, pending: s.pendingRepo.length } } : {}),
     };
     return { kind: "header", info };
-  }, [skillsNow, cwd, home, models]);
+  }, [skillsNow, cwd, home, modelsNow]);
   const listFilesProp = props.listFiles;
   const filesRepo = typeof configRepo === "string" ? configRepo : cwd;
   /** The `@` picker's file list: loaded on first want, per session (a swap resets it). */
@@ -292,6 +311,9 @@ export function App(props: AppProps) {
     () => props.checkpoints ?? DEFAULT_CHECKPOINTS,
   );
   const [trustOpen, setTrustOpen] = useState(false);
+  /** The `/model` picker is open; `applying` while its pick is being applied. */
+  const [modelOpen, setModelOpen] = useState(false);
+  const [applying, setApplying] = useState(false);
   /** Context size: the last chat model call's input plus output tokens; none before the first. */
   const [context, setContext] = useState<number | undefined>(undefined);
   /** With compaction: the estimate against the limit (`contextStatus()`), for the status line. */
@@ -567,6 +589,43 @@ export function App(props: AppProps) {
     [runController, checkpoints, add, setRun, setClarify],
   );
 
+  /**
+   * Makes `next` the session, at once (call it inside `exclusive`, so the old one cannot send
+   * again), and returns the old one for the caller to dispose. With `region`, a new transcript
+   * region starts (`/clear`, `/resume`); without, the transcript stays (a `/model` pick resumed
+   * the same conversation on another model).
+   */
+  const installSession = useCallback(
+    (
+      next: ChatSession,
+      region?: { label: string; entries: (s: ChatSession) => TranscriptEntry[] },
+    ): ChatSession => {
+      const old = sessionRef.current;
+      sessionRef.current = next;
+      if (region) {
+        // The old transcript stays in the terminal's scrollback above this separator.
+        setEntries([
+          { kind: "note", text: `${SEPARATOR} ${region.label} ${SEPARATOR}` },
+          headerEntry(),
+          ...sessionNotices(next),
+          ...region.entries(next),
+        ]);
+        setRegion((r) => r + 1);
+        lastCompaction.current = undefined;
+        resetFiles(); // `/clear` and `/resume` list the repo afresh
+      }
+      setContext(undefined);
+      sessionGen.current++;
+      setContextInfo(undefined);
+      setCtx(undefined);
+      refreshStatus();
+      // The new session re-resolved the skills: a trust given earlier is now in effect.
+      setTrustedLater(false);
+      return old;
+    },
+    [headerEntry, resetFiles, refreshStatus],
+  );
+
   const swapSession = useCallback(
     (
       make: () => Promise<ChatSession>,
@@ -575,32 +634,50 @@ export function App(props: AppProps) {
     ) =>
       exclusive(async () => {
         try {
-          const next = await make();
-          const old = sessionRef.current;
-          sessionRef.current = next;
-          // The old transcript stays in the terminal's scrollback above this separator.
-          setEntries([
-            { kind: "note", text: `${SEPARATOR} ${label} ${SEPARATOR}` },
-            headerEntry(),
-            ...sessionNotices(next),
-            ...entriesOf(next),
-          ]);
-          setRegion((r) => r + 1);
-          setContext(undefined);
-          sessionGen.current++;
-          lastCompaction.current = undefined;
-          setContextInfo(undefined);
-          setCtx(undefined);
-          refreshStatus();
-          resetFiles(); // `/clear` and `/resume` list the repo afresh
-          // The new session re-resolved the skills: a trust given earlier is now in effect.
-          setTrustedLater(false);
+          const old = installSession(await make(), { label, entries: entriesOf });
           await old.dispose();
         } catch (err) {
           add(errorEntry(err));
         }
       }),
-    [exclusive, add, headerEntry, resetFiles, refreshStatus],
+    [exclusive, add, installSession],
+  );
+
+  /**
+   * A `/model` pick: applied inside `exclusive`, so no turn, compaction or session swap starts
+   * meanwhile. A pick that rebuilt the session (chat model or verifier) hands it back: it is
+   * installed before anything can send again, then the old one is disposed, as `/resume` does.
+   */
+  const applyPick = useCallback(
+    (role: RoutingRole, ref: RoutingModel | undefined) => {
+      if (!routingControl) return;
+      if (runRef.current || inFlight.current) {
+        setModelOpen(false);
+        return note(
+          runRef.current ? PICK_IN_RUN : "refused: the chat is busy; pick after it is done",
+          true,
+        );
+      }
+      setApplying(true);
+      exclusive(async () => {
+        try {
+          const pick = await routingControl.set(role, ref);
+          if (!pick.ok) {
+            note(pick.reason, true);
+            return;
+          }
+          const old = pick.session ? installSession(pick.session) : undefined;
+          note(pick.note);
+          await old?.dispose();
+        } catch (err) {
+          add(errorEntry(err));
+        } finally {
+          setApplying(false);
+          setModelOpen(false);
+        }
+      });
+    },
+    [routingControl, exclusive, installSession, note, add],
   );
 
   const resume = useCallback(
@@ -653,11 +730,13 @@ export function App(props: AppProps) {
           if (c.set) setCheckpoints(c.set);
           return note(describeCheckpoints(c.set ?? checkpoints));
         case "model": {
-          const text = routingControl
-            ? routingLines(routingControl.current())
-            : typeof routing === "function"
-              ? routing()
-              : routing;
+          if (routingControl) {
+            if (!runRef.current) return setModelOpen(true);
+            // The routing a run uses never changes mid-run: show it, and why there is no picker.
+            note(routingLines(routingControl.current()));
+            return note(PICK_IN_RUN, true);
+          }
+          const text = typeof routing === "function" ? routing() : routing;
           return note(text ?? "model routing is not available here");
         }
         case "resume":
@@ -783,7 +862,10 @@ export function App(props: AppProps) {
   const checkpointOpen = run !== undefined && pending?.kind === "checkpoint";
   // A checkpoint owns the keys: the /context card gives way to it.
   const contextOpen = contextInfo !== undefined && !checkpointOpen;
-  const inputOff = proposal !== undefined || trustOpen || checkpointOpen || contextOpen;
+  // The picker gives way to a checkpoint too (a run handed in while it is open).
+  const pickerOpen = modelOpen && routingControl !== undefined && !checkpointOpen;
+  const inputOff =
+    proposal !== undefined || trustOpen || checkpointOpen || contextOpen || pickerOpen;
   const mode =
     run !== undefined && pending?.kind === "checkpoint"
       ? `checkpoint: ${pending.checkpoint.kind}`
@@ -824,12 +906,25 @@ export function App(props: AppProps) {
           reserved={around}
         />
       ) : null}
+      {pickerOpen && routingControl ? (
+        <ModelPicker
+          control={routingControl}
+          onPick={applyPick}
+          onClose={() => setModelOpen(false)}
+          applying={applying}
+        />
+      ) : null}
       {live ? (
         <LiveTurn
           state={live}
           onInterrupt={abortTurn}
           interruptible={
-            run === undefined && proposal === undefined && !trustOpen && !popup && !contextOpen
+            run === undefined &&
+            proposal === undefined &&
+            !trustOpen &&
+            !popup &&
+            !contextOpen &&
+            !pickerOpen
           }
           maxRows={rows - LIVE_RESERVED_ROWS}
         />
@@ -849,7 +944,7 @@ export function App(props: AppProps) {
           onPopup={setPopup}
         />
         <StatusLine
-          model={routingControl?.current().spec.model ?? models?.chat}
+          model={routingControl?.current().spec.model ?? modelsProp?.chat}
           context={context}
           ctx={ctx}
           checkpoints={checkpointsShort(checkpoints)}

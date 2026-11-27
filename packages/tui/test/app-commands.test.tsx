@@ -150,7 +150,7 @@ describe("slash commands", () => {
     expect(v.lastFrame()).toContain("/checkpoints");
   });
 
-  it("/model with a routingControl prints its current routing (re-read each time)", async () => {
+  it("/model with a routingControl opens the picker on its current routing (re-read each time)", async () => {
     const { session } = fakeSession();
     const ref = (model: string) => ({ provider: "ollama", model });
     let spec = ref("qwen3:8b");
@@ -170,11 +170,17 @@ describe("slash commands", () => {
     };
     const v = mount({ session, routing: () => "stale text", routingControl });
     await enter(v.stdin, "/model");
-    expect(v.lastFrame()).toContain("spec: ollama:qwen3:8b");
+    expect(v.lastFrame()).toMatch(/chat & spec\s+ollama:qwen3:8b/);
     expect(v.lastFrame()).not.toContain("stale text");
+    // Esc closes the picker (retried: its key handler attaches after the first frame).
+    for (let i = 0; i < 20 && (v.lastFrame() ?? "").includes("Choose a role"); i++) {
+      v.stdin.write("\x1b");
+      await tick(80);
+    }
+    expect(v.lastFrame()).not.toContain("Choose a role");
     spec = ref("llama3.1:8b\x1b[2J");
     await enter(v.stdin, "/model");
-    expect(v.lastFrame()).toContain("spec: ollama:llama3.1:8b");
+    expect(v.lastFrame()).toMatch(/chat & spec\s+ollama:llama3\.1:8b/);
     expect(v.lastFrame()).not.toContain("\x1b[2J");
   });
 
