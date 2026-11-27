@@ -1,12 +1,13 @@
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Contract } from "@rewire/core";
 import type { ChatSession, PendingPrompt, RunController, RunHandle } from "@rewire/session";
 import type { Skill } from "@rewire/skills";
 import { render } from "ink-testing-library";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { App, type AppProps, type SkillsInfo } from "../src/app.js";
-import { DETAIL_FILE_ROWS, skillRows } from "../src/skills-picker.js";
+import { DETAIL_FILE_ROWS, SkillsPicker, skillRows } from "../src/skills-picker.js";
 
 const SGR = new RegExp(`${"\x1b"}\\[[0-9;]*m`, "g");
 const plain = (s: string | undefined): string => (s ?? "").replace(SGR, "");
@@ -73,8 +74,14 @@ function mount(props: Partial<AppProps> & { session: ChatSession }) {
 
 /** A run that never ends and asks nothing. */
 function idleRun(): RunHandle {
+  return promptRun(() => undefined).run;
+}
+
+/** A run that never ends; its pending prompt is whatever `prompt()` says now. */
+function promptRun(prompt: () => PendingPrompt | undefined) {
   const done = new Promise(() => {});
-  return {
+  const answer = vi.fn(() => true);
+  const run = {
     events: {
       [Symbol.asyncIterator]: () => ({
         next: async () => {
@@ -83,12 +90,22 @@ function idleRun(): RunHandle {
         },
       }),
     },
-    pending: (): PendingPrompt | undefined => undefined,
-    answer: () => true,
+    pending: prompt,
+    answer,
     abort: () => {},
     done,
   } as unknown as RunHandle;
+  return { run, answer };
 }
+
+const contract: Contract = {
+  id: "C-1",
+  title: "Add parser",
+  criteria: [{ id: "AC-1", kind: "change", statement: "parse() returns tokens" }],
+  nonGoals: [],
+  affectedAreas: [],
+  openQuestions: [],
+};
 
 let root = "";
 beforeAll(async () => {
@@ -315,6 +332,30 @@ describe("/skills details", () => {
     v.unmount();
   });
 
+  it("terminal escapes in file names are sanitized in the details", async () => {
+    const a = await skill("files", "user");
+    const listFiles = async () => ({
+      entries: [{ path: "a\x1b[2Jb\x1b]52;c;aGk=\x07.md", bytes: 3 }],
+      truncated: false,
+    });
+    const v = render(
+      <SkillsPicker
+        skills={{ found: [a], active: [a], pendingRepo: [] }}
+        trustedLater={false}
+        canReview={false}
+        onReview={() => {}}
+        onClose={() => {}}
+        listFiles={listFiles}
+      />,
+    );
+    await waitText(v, "user · active");
+    await pressFor(v, KEY.enter, ".md  3 B");
+    const raw = v.lastFrame() ?? "";
+    for (const bad of ["\x1b[2J", "\x1b]52", "\x07"]) expect(raw).not.toContain(bad);
+    expect(plain(raw)).toContain("ab");
+    v.unmount();
+  });
+
   it("Esc in the list does not interrupt anything and never reaches the input", async () => {
     const { session, sent } = fakeSession();
     const onExit = vi.fn();
@@ -328,6 +369,43 @@ describe("/skills details", () => {
     await pressUntil(v, KEY.enter, () => sent.length > 0, "sent");
     expect(sent).toEqual(["hello"]);
     expect(onExit).not.toHaveBeenCalled();
+    v.unmount();
+  });
+});
+
+describe("/skills during a run's prompts", () => {
+  it("a clarification closes the list and its answer can be typed (M1)", async () => {
+    const { session } = fakeSession();
+    let pending: PendingPrompt | undefined;
+    const { run, answer } = promptRun(() => pending);
+    const v = mount({ session, skills: await fixture(), run });
+    await enter(v, "/skills");
+    await waitText(v, "repo · pending trust");
+    pending = { kind: "clarify", questions: ["Which file?"] };
+    await waitText(v, "Which file?");
+    await waitFor(v, (f) => !f.includes("repo · pending trust"), "the list closed");
+    await enter(v, "src/a.ts");
+    await waitFor(v, () => answer.mock.calls.length === 1, "the answer");
+    expect(answer).toHaveBeenCalledWith(pending, ["src/a.ts"]);
+    v.unmount();
+  });
+
+  it("after a checkpoint the list stays closed and the input is back (M3)", async () => {
+    const { session } = fakeSession();
+    let pending: PendingPrompt | undefined;
+    const { run } = promptRun(() => pending);
+    const v = mount({ session, skills: await fixture(), run });
+    await enter(v, "/skills");
+    await waitText(v, "repo · pending trust");
+    pending = { kind: "checkpoint", checkpoint: { kind: "contract", contract } };
+    await waitText(v, "Add parser");
+    await waitFor(v, (f) => !f.includes("repo · pending trust"), "the list gave way");
+    pending = undefined; // answered elsewhere: the checkpoint goes
+    await waitFor(v, (f) => !f.includes("Add parser"), "the checkpoint gone");
+    await tick(200);
+    const f = plain(v.lastFrame());
+    expect(f).not.toContain("repo · pending trust");
+    expect(f).toContain("> ");
     v.unmount();
   });
 });

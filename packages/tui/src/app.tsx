@@ -430,6 +430,8 @@ export function App(props: AppProps) {
     (p: PendingPrompt | undefined) => {
       setPending(p);
       setClarify(p?.kind === "clarify" ? { prompt: p, answers: [] } : undefined);
+      // A run's prompt takes the keys: the /skills list closes, and stays closed afterwards.
+      if (p !== undefined) setSkillsOpen(false);
     },
     [setClarify],
   );
@@ -654,6 +656,8 @@ export function App(props: AppProps) {
           }
           const old = pick.session ? installSession(pick.session) : undefined;
           note(pick.note);
+          // As at start, /clear and /resume: the rebuilt session may check compaction same-family.
+          if (pick.session) add(...sessionNotices(pick.session));
           await old?.dispose();
         } catch (err) {
           add(errorEntry(err));
@@ -855,8 +859,9 @@ export function App(props: AppProps) {
   const contextOpen = contextInfo !== undefined && !checkpointOpen;
   // The picker gives way to a checkpoint too (a run handed in while it is open).
   const pickerOpen = modelOpen && routingControl !== undefined && !checkpointOpen;
-  // The /skills list gives way to a checkpoint as well; it is read-only during a run.
-  const skillsListOpen = listSkills !== undefined && !checkpointOpen;
+  // The /skills list gives way to a run's prompt (checkpoint or clarification), which also closes
+  // it (`onPending`); it is read-only during a run.
+  const skillsListOpen = listSkills !== undefined && !checkpointOpen && clarify === undefined;
   const inputOff =
     proposal !== undefined ||
     trustOpen ||

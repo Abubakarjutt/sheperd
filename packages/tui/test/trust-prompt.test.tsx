@@ -127,6 +127,21 @@ describe("listSkillFiles", () => {
   });
 });
 
+describe("listSkillFiles on a symlinked skill dir (M4)", () => {
+  it("lists the root link as a symlink and never walks its target", async () => {
+    const target = join(root, "elsewhere");
+    await mkdir(target);
+    await writeFile(join(target, "private.txt"), "x".repeat(50));
+    const link = join(root, "linked-skill");
+    await symlink(target, link);
+    const r = await listSkillFiles(link);
+    expect(r.truncated).toBe(false);
+    expect(r.entries).toHaveLength(1);
+    expect(r.entries[0]?.symlink).toBe(true);
+    expect(r.entries.some((e) => e.path.includes("private"))).toBe(false);
+  });
+});
+
 describe("TrustPrompt covers every repo skill the hash pins", () => {
   it("shows a shadowed repo skill, labelled, and pins repoSkillsHash(found)", async () => {
     const home = join(root, "home");

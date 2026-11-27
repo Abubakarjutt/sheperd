@@ -315,6 +315,7 @@ describe("during a run", () => {
     await enter(v.stdin, "/skills");
     // Read-only during a run: the list, but no review row and no trust prompt.
     await until(() => (v.lastFrame() ?? "").includes("repo · pending trust"));
+    expect(v.lastFrame()).toMatch(/deploy +repo · pending trust/);
     expect(v.lastFrame()).not.toContain("Review pending repo skills");
     expect(v.lastFrame()).not.toContain("[y]es [n]o");
     await pressUntilGone(v, "\x1b", "repo · pending trust");

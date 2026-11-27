@@ -19,7 +19,8 @@ export type SkillFile = { path: string; bytes: number; symlink?: boolean };
 /**
  * The files under a skill dir as they are on disk now, read on the host with `lstat`: a symlink is
  * listed as one (its own size) and never followed, and directories are walked without following
- * links. Bounded: files and directories both count toward `cap`, and the walk stops at `maxDepth`;
+ * links. That includes `dir` itself: a symlinked skill dir is one entry (`.`, a symlink), not
+ * walked, so a link swapped after discovery never lists another dir. Bounded: files and directories both count toward `cap`, and the walk stops at `maxDepth`;
  * `truncated` is true only when something was actually left out. Paths are relative to `dir` and
  * sorted. Names are NOT sanitized here.
  */
@@ -57,6 +58,10 @@ export async function listSkillFiles(
       }
     }
   };
+  const rootStat = await lstat(dir);
+  if (rootStat.isSymbolicLink()) {
+    return { entries: [{ path: ".", bytes: rootStat.size, symlink: true }], truncated: false };
+  }
   await walk(dir, 1);
   return { entries, truncated };
 }

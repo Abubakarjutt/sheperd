@@ -17,6 +17,7 @@ import { render } from "ink-testing-library";
 import { useState } from "react";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { App, type AppProps } from "../src/app.js";
+import { INDEPENDENCE_NOTICE } from "../src/compaction-view.js";
 import { ListPicker, type ListPickerItem, moveSelection } from "../src/list-picker.js";
 import type {
   RoutingControlDep,
@@ -345,6 +346,28 @@ describe("/model picker", () => {
     await enter(v, "hello");
     await waitFor(v, () => next.sent.length === 1, "the turn on the new session");
     expect(old.sent).toEqual([]);
+    v.unmount();
+  });
+
+  it("a pick whose rebuilt session checks compaction same-family shows the notice (I1)", async () => {
+    const old = fakeSession();
+    const next = fakeSession();
+    // The rebuilt session's compaction verifier now shares the chat model's family.
+    (next.session as { compactionView?: () => unknown }).compactionView = () => ({
+      independence: "same-family",
+    });
+    const c = control();
+    c.dep.set = async (role, r) => {
+      if (r) c.routing[role] = r;
+      return { ok: true, routing: { ...c.routing }, note: "spec: openai:O", session: next.session };
+    };
+    const v = mount({ session: old.session, routingControl: c.dep });
+    await open(v);
+    expect(plain(v.lastFrame())).not.toContain(INDEPENDENCE_NOTICE);
+    await pressFor(v, KEY.enter, "Model for chat & spec");
+    await pressUntil(v, KEY.down, (f) => selectedRow(f).includes("llama"), "↓");
+    await pressFor(v, KEY.enter, "spec: openai:O");
+    await waitText(v, INDEPENDENCE_NOTICE);
     v.unmount();
   });
 
