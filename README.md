@@ -422,12 +422,15 @@ Interactive mode can use Claude-style skills (`<name>/SKILL.md`).
   stored once per repo, pinned to a sha256 over all the skills' files, in
   `$XDG_CONFIG_HOME/rewire/trusted-skills.json`. If any file changes, rewire asks again. The
   prompt also lists repo skills shadowed by a user skill, because they are part of the hash.
-- Skills are read once per session. A skill you trust mid-session takes effect after `/clear`.
+- Skills are read once per session. A skill you trust mid-session takes effect when the session
+  is rebuilt: after `/clear` or `/resume`, or a `/model` pick that changes the chat model or the
+  verifier.
 - `/skills` lists every skill found, with its source (`user` or `repo`) and state (`active`,
-  `pending trust`, `shadowed`), active ones first. Enter shows a skill's description, path and
-  the files in its directory now; Esc goes back, then closes. When repo skills are pending, a
-  first row, "Review pending repo skills", opens the trust prompt. During a run the list is
-  read-only and that row is absent.
+  `pending trust`, `trusted; takes effect in a new session (/clear)` or `shadowed`), active ones
+  first. Enter shows a skill's description, path and the files in its directory now (a symlinked
+  skill directory is shown as the link, not walked); Esc goes back, then closes. When repo skills
+  are pending, a first row, "Review pending repo skills", opens the trust prompt. During a run
+  the list is read-only, that row is absent, and a checkpoint or clarification closes the list.
 - A skill that is rejected (malformed, over a limit, or a repo skill with a symlink) is skipped
   and shown as a warning line when the session starts.
 - Skills are given to the chat, the spec stage, the test writer and the implementer. The
@@ -644,7 +647,10 @@ pick and goes back to `[roles]` or automatic routing.
   compaction check uses the verifier) rebuilds the chat session by resuming the same session id
   on the new routing, so the messages, the session record and the compaction state are kept. A
   session with no completed turn yet starts fresh, as there is nothing to keep. The status line
-  then shows the new chat model and, with compaction on, its context limit.
+  then shows the new chat model and, with compaction on, its context limit. The rebuild also
+  re-reads the skills, so a skill trusted earlier in the session loads then. Such a pick can
+  make the chat's compaction check same-family (the verifier shares the chat model's family);
+  it is not refused, and the same notice as at session start says so.
 - Picks are refused while a gated run, a chat turn, a compaction or a session change is in
   progress. A run keeps the routing it started with; the next run uses the new one.
 
@@ -906,10 +912,10 @@ defines what a first run must show.
 
 ## Behaviour changes in this release
 
-- `/model` in the TUI opens a picker instead of printing the routing (during a run it still prints
-  the routing, and says why picks are refused), and `/skills` opens a list instead of printing the skill names and
-  opening the trust prompt at once: the list's "Review pending repo skills" row opens it.
-
+- `/model` in the TUI opens a picker instead of printing the routing. During a run it still
+  prints the routing and says why picks are refused.
+- `/skills` opens a list instead of printing the skill names and opening the trust prompt at
+  once. The list's "Review pending repo skills" row opens the prompt.
 - Leftover processes fail the command on Linux too: a command that leaves a child running more than
   300 ms after it exits (a server a test suite never closes, slow workers) now fails as a sandbox
   escape (`sandbox_escape`), matching macOS. Test suites that relied on this passing on Linux need
