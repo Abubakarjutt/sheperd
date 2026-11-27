@@ -985,6 +985,9 @@ describe.skipIf(!sandboxAvailable())("ChatSession web access", () => {
     });
     const preview = events.find((e) => e.type === "tool_result" && e.tool === "web_search");
     expect(JSON.stringify(preview)).not.toContain(KEY);
+    // The preview is the tool's display lines (title · host), not the start of the fenced text.
+    expect(preview).toMatchObject({ preview: ["Vitest docs · vitest.dev"], more: 0 });
+    expect(JSON.stringify(preview)).not.toContain("untrusted_web");
   });
 
   test("with no search key the chat still works and web_search says what to set", async () => {

@@ -2,7 +2,16 @@
 import type { RewireError, RunEvent } from "@rewire/core";
 import type { ChatMessage, Provider, ToolCall, ToolSpec, Usage } from "@rewire/providers";
 
-export type ToolResult = { content: string; isError: boolean };
+export type ToolResult = {
+  content: string;
+  isError: boolean;
+  /**
+   * Display-only lines for a UI's preview of this result, instead of the start of `content`
+   * (e.g. the web tools' result titles). Never sent to the model; untrusted text, so a renderer
+   * still sanitizes and redacts it.
+   */
+  preview?: string[];
+};
 
 export type AgentTool = {
   spec: ToolSpec;

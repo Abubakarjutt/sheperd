@@ -382,3 +382,64 @@ describe("fix round 1", () => {
     expect(fence(r.content).inner.endsWith("\uFFFD")).toBe(true);
   });
 });
+
+describe("display previews (UI only, never sent to the model)", () => {
+  test("web_search previews each shown result as title · host, cleaned", async () => {
+    const { t } = make(
+      mergeTightenOnly(DEFAULT_POLICY, { web: { denyDomains: ["blocked.example"] } }),
+      {
+        search: async () => ({
+          backend: "ollama",
+          results: [
+            { title: "Guide\x1b[31m red\n two", url: "https://docs.example/a?q=1", snippet: "s" },
+            { title: `leak ${KEY}`, url: "https://www.other.example/b", snippet: "s" },
+            { title: "gone", url: "https://blocked.example/", snippet: "s" },
+            { title: "", url: "https://untitled.example/", snippet: "s" },
+          ],
+        }),
+      },
+    );
+    const r = await t("web_search").execute({ query: "q" });
+    expect(r.preview).toEqual([
+      "Guide red two · docs.example",
+      "leak [redacted] · www.other.example",
+      "(untitled) · untitled.example",
+      "1 hidden by policy",
+    ]);
+    expect(r.content).not.toContain("·");
+  });
+
+  test("web_search with no results previews that", async () => {
+    const { t } = make(DEFAULT_POLICY, {
+      search: async () => ({ backend: "brave", results: [] }),
+    });
+    expect((await t("web_search").execute({ query: "q" })).preview).toEqual(["(no results)"]);
+  });
+
+  test("web_fetch previews the page's first line, then status, type, size and truncation", async () => {
+    const { t } = make(DEFAULT_POLICY, {
+      fetch: async () =>
+        page(`\n\n  My \x1b]0;evil\x07Page ${KEY}  \nbody text\n`, { truncated: true }),
+    });
+    const r = await t("web_fetch").execute({ url: "https://docs.example/guide" });
+    expect(r.preview?.[0]).toBe("My Page [redacted]");
+    expect(r.preview?.[1]).toMatch(/^HTTP 200 · text\/html · \d+ B · truncated$/);
+    expect(r.preview).toHaveLength(2);
+  });
+
+  test("web_fetch of an empty page previews only the status line; failures have no preview", async () => {
+    const { t } = make(DEFAULT_POLICY, {
+      fetch: async () => page("", { status: 404, contentType: "text/plain" }),
+    });
+    const r = await t("web_fetch").execute({ url: "https://docs.example/x" });
+    expect(r.preview).toEqual(["HTTP 404 · text/plain · 0 B"]);
+    const bad = make(DEFAULT_POLICY, {
+      fetch: async () => {
+        throw new WebError("nope");
+      },
+    });
+    const e = await bad.t("web_fetch").execute({ url: "https://docs.example/x" });
+    expect(e.isError).toBe(true);
+    expect(e.preview).toBeUndefined();
+  });
+});

@@ -13,7 +13,7 @@ const USAGE = `usage:
   rewire chat [--repo <path>] [--models <file>]
   rewire run <task> [--repo <path>] [--models <file>] [--headless]
   rewire run --task-file <path> [--repo <path>] [--models <file>] [--headless]
-  rewire doctor [--models <file>]
+  rewire doctor [--models <file>] [--repo <path>]
   rewire calibrate <provider:model> [--max <tokens>] [--yes] [--models <file>] [--fresh]
 `;
 
@@ -56,6 +56,7 @@ async function main(argv: string[]): Promise<number> {
         stdout: process.stdout,
         env,
         cwd: process.cwd(),
+        repo: values.repo,
       });
     }
     const ac = new AbortController();

@@ -84,7 +84,8 @@ export type ChatEvent =
   /** `callId` pairs it with the `tool_result` that follows it (when the tool ran). */
   | { type: "tool_call"; callId: string; tool: string; summary: string; isError: boolean }
   /**
-   * The start of a tool's result, emitted right after its `tool_call` (same `callId` and `tool`).
+   * The start of a tool's result (or the tool's display-only `preview` lines, as the web tools
+   * give), emitted right after its `tool_call` (same `callId` and `tool`).
    * The whole result is sanitized, then redacted, then split: the first 4 non-empty lines, each
    * capped at 300 code points (not terminal cells: the renderer still wraps or clips each line to
    * the columns it has); `more` counts the non-empty lines left out. A tool that threw, or a call the loop did not run, has
@@ -1422,7 +1423,9 @@ export class ChatSession {
                 type: "tool_result",
                 callId,
                 tool: e.tool,
-                ...toolPreview(result.content),
+                // A tool's display lines (web: titles and hosts) when it gives them, cleaned the
+                // same way; otherwise the start of what the model saw.
+                ...toolPreview(result.preview ? result.preview.join("\n") : result.content),
                 isError: result.isError,
               });
             }

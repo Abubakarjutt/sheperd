@@ -29,10 +29,21 @@ export type TranscriptEntry =
   /** The welcome box, first in every transcript region (startup, `/clear`, `/resume`). */
   | { kind: "header"; info: HeaderInfo };
 
-/** `read src/x.ts` renders as `Read src/x.ts`. */
+/** Display names of tools whose name does not just capitalize (the web tools). */
+const TOOL_NAMES: Readonly<Record<string, string>> = {
+  web_search: "WebSearch",
+  web_fetch: "Fetch",
+};
+
+/** `read src/x.ts` renders as `Read src/x.ts`; `web_fetch` as `Fetch`, `web_search` as `WebSearch`. */
 export function toolLabel(summary: string): string {
+  const named = TOOL_NAMES[summary];
+  if (named !== undefined) return named;
   return summary === "" ? summary : summary.charAt(0).toUpperCase() + summary.slice(1);
 }
+
+/** Arguments a tool's summary hook put in place of a refused value (`[refused: secret-shaped]`). */
+const isRefused = (args: string): boolean => args.startsWith("[refused:");
 
 /** Splits a tool summary (`read src/x.ts`) into its display name (`Read`) and its arguments. */
 export function toolParts(summary: string): { name: string; args: string } {
@@ -52,7 +63,10 @@ export const PREVIEW_MAX = 4;
 
 /**
  * `● Read(src/x.ts)` with the name bold, then the result preview under `  ⎿  ` (dim) and
- * `… +N lines`. An error is red with `✗`. Every line is cut to the terminal width.
+ * `… +N lines`. An error is red with `✗`; `[refused: …]` arguments are red too. Web calls come
+ * from the same `tool_call`/`tool_result` pair (`● WebSearch("…")`, `● Fetch(host/path)`, with the
+ * tool's title previews); their `web_request` events are audit records and draw nothing. Every
+ * line is cut to the terminal width.
  */
 export function ToolLine({
   summary,
@@ -87,7 +101,9 @@ export function ToolLine({
         <Safe bold color={isError ? theme.error : undefined}>
           {line.slice(head.length, nameEnd)}
         </Safe>
-        <Safe color={isError ? theme.error : undefined}>{line.slice(nameEnd)}</Safe>
+        <Safe color={isError || isRefused(args) ? theme.error : undefined}>
+          {line.slice(nameEnd)}
+        </Safe>
       </Text>
       {lines.map((l, i) => (
         // biome-ignore lint/suspicious/noArrayIndexKey: lines of one fixed preview

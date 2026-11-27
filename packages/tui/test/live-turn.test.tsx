@@ -633,6 +633,126 @@ describe("live turn", () => {
     expect(f).toContain("… +4 lines");
   });
 
+  it('web calls render as WebSearch("…") and Fetch(host/path) with their display preview', () => {
+    const v = render(
+      <>
+        <ToolLine
+          summary={'web_search "vitest toBe"'}
+          isError={false}
+          preview={["Vitest docs · vitest.dev", "Expect API · vitest.dev"]}
+        />
+        <ToolLine
+          summary="web_fetch docs.example/guide"
+          isError={false}
+          preview={["The Guide", "HTTP 200 · text/html · 12.3 KB · truncated"]}
+        />
+      </>,
+    );
+    const f = plain(v.lastFrame());
+    v.unmount();
+    expect(f).toContain('● WebSearch("vitest toBe")');
+    expect(f).toContain("⎿  Vitest docs · vitest.dev");
+    expect(f).toContain("Expect API · vitest.dev");
+    expect(f).toContain("● Fetch(docs.example/guide)");
+    expect(f).toContain("⎿  The Guide");
+    expect(f).toContain("HTTP 200 · text/html · 12.3 KB · truncated");
+    expect(f).not.toMatch(/Web_search|Web_fetch/);
+  });
+
+  it("a web call's preview and summary are sanitized and redacted", () => {
+    const key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+    const v = render(
+      <ToolLine
+        summary={`web_search "a\x1b[2Jb ${key}"`}
+        isError={false}
+        preview={[`T\x1b]52;c;ZXZpbA==\x07itle ${key} · evil.example\x1b[31m`]}
+      />,
+    );
+    const raw = v.lastFrame() ?? "";
+    v.unmount();
+    expectOnlySgr(raw);
+    const f = plain(raw);
+    expect(f).toContain('WebSearch("ab [redacted]")');
+    expect(f).toContain("Title [redacted] · evil.example");
+    expect(f).not.toContain("abcdefghij");
+    expect(f).not.toContain("52;c;");
+  });
+
+  it("[refused: …] web arguments are shown in the error style", () => {
+    const ok = render(<ToolLine summary="web_fetch docs.example/x" isError={false} />);
+    const okRaw = ok.lastFrame() ?? "";
+    ok.unmount();
+    expect(okRaw).not.toMatch(new RegExp(`${ESC}\\[31m`));
+    for (const isError of [true, false]) {
+      const v = render(
+        <ToolLine
+          summary="web_fetch [refused: secret-shaped]"
+          isError={isError}
+          preview={["web_fetch: the URL contains a secret-shaped value"]}
+        />,
+      );
+      const raw = v.lastFrame() ?? "";
+      v.unmount();
+      expect(plain(raw)).toContain("Fetch([refused: secret-shaped])");
+      // Inside a red run: the last colour switch before the arguments turned red on.
+      const before = raw.slice(0, raw.indexOf("([refused:"));
+      expect(before.lastIndexOf(`${ESC}[31m`)).toBeGreaterThan(before.lastIndexOf(`${ESC}[39m`));
+    }
+  });
+
+  it("a web_request event is an audit record: it adds no line, so a web call renders once", async () => {
+    const before = applyEvent(newLive("Thinking", 0), {
+      type: "tool_call",
+      callId: "w",
+      tool: "web_search",
+      summary: 'web_search "q"',
+      isError: false,
+    });
+    const after = applyEvent(before, {
+      type: "web_request",
+      tool: "web_search",
+      backend: "ollama",
+      query: "q",
+      results: 1,
+      bytes: 10,
+      ok: true,
+    });
+    expect(after).toBe(before);
+    const m = track(
+      mount(async (_t, _s, emit) => {
+        emit({
+          type: "web_request",
+          tool: "web_search",
+          backend: "ollama",
+          query: "q",
+          results: 1,
+          bytes: 10,
+          ok: true,
+        });
+        emit({
+          type: "tool_call",
+          callId: "w",
+          tool: "web_search",
+          summary: 'web_search "q"',
+          isError: false,
+        });
+        emit({
+          type: "tool_result",
+          callId: "w",
+          tool: "web_search",
+          preview: ["Q docs · q.example"],
+          more: 0,
+          isError: false,
+        });
+        return { text: "done" };
+      }),
+    );
+    await send(m.v, "x");
+    const f = await waitText(m.v, "done");
+    expect(f.split('WebSearch("q")')).toHaveLength(2);
+    expect(f.split("Q docs · q.example")).toHaveLength(2);
+  });
+
   it("an error mid-turn keeps the streamed text and tool lines, then the error line", async () => {
     const m = track(
       mount(async (_t, _s, emit) => {
