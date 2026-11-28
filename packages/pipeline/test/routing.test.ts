@@ -179,6 +179,52 @@ describe("loadModelsFile [compaction]", () => {
   });
 });
 
+describe("loadModelsFile [web]", () => {
+  const base = `available = ["anthropic:a"]\n`;
+
+  test("a file without [web] gets the defaults (auto-selected search, 5 results)", async () => {
+    const m = await loadModelsFile(file(base));
+    expect(m.web).toEqual({ maxResults: 5 });
+  });
+
+  test("reads search, searxng_url and max_results", async () => {
+    const m = await loadModelsFile(
+      file(
+        `${base}[web]\nsearch = "searxng"\nsearxng_url = "http://127.0.0.1:8888"\nmax_results = 10\n`,
+      ),
+    );
+    expect(m.web).toEqual({
+      search: "searxng",
+      searxngUrl: "http://127.0.0.1:8888",
+      maxResults: 10,
+    });
+    const t = await loadModelsFile(file(`${base}[web]\nsearch = "tavily"\n`));
+    expect(t.web).toEqual({ search: "tavily", maxResults: 5 });
+    const h = await loadModelsFile(
+      file(`${base}[web]\nsearxng_url = "https://searx.example/sub"\nmax_results = 1\n`),
+    );
+    expect(h.web).toEqual({ searxngUrl: "https://searx.example/sub", maxResults: 1 });
+  });
+
+  test.each([
+    ["an unknown backend", `[web]\nsearch = "google"\n`, /web\.search/],
+    ["an unknown key", `[web]\nsearch_url = "x"\n`, /search_url/],
+    ["max_results 0", `[web]\nmax_results = 0\n`, /web\.max_results/],
+    ["max_results 11", `[web]\nmax_results = 11\n`, /web\.max_results/],
+    ["max_results not an integer", `[web]\nmax_results = 2.5\n`, /web\.max_results/],
+    ["searxng without a url", `[web]\nsearch = "searxng"\n`, /web\.searxng_url/],
+    ["an http searxng_url off loopback", `[web]\nsearxng_url = "http://searx.example"\n`, /https/],
+    ["a searxng_url with a query", `[web]\nsearxng_url = "https://s.example/?k=1"\n`, /query/],
+    ["a searxng_url that is not a url", `[web]\nsearxng_url = "searx"\n`, /searxng_url/],
+    ["web not a table", `web = 3\n`, /web/],
+  ])("rejects %s with models_file_invalid", async (_name, body, why) => {
+    const err = await loadModelsFile(file(`${base}${body}`)).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RewireError);
+    expect(err).toMatchObject({ code: "models_file_invalid" });
+    expect((err as Error).message).toMatch(why);
+  });
+});
+
 describe("loadModelsFile [providers] and [endpoints]", () => {
   test("reads provider settings and endpoints, and registers the endpoints", async () => {
     const m = await loadModelsFile(

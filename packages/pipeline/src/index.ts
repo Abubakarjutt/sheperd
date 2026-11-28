@@ -1,3 +1,4 @@
+export type { WebAccess } from "@rewire/tools";
 export * from "./fix-loop.js";
 export * from "./frozen.js";
 export * from "./orchestrator.js";

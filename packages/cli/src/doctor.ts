@@ -3,10 +3,12 @@ import { delimiter, join, resolve } from "node:path";
 import type { Writable } from "node:stream";
 import { RewireError } from "@rewire/core";
 import { INSTALL_HINTS } from "@rewire/gates";
-import { loadModelsFile } from "@rewire/pipeline";
+import { defaultWebConfig, loadModelsFile, type WebConfig } from "@rewire/pipeline";
+import { loadPolicy } from "@rewire/policy";
 import { probeOllama, resolveOllamaTimeout } from "@rewire/providers";
 import { type FindBinaryOptions, locateSandboxBinary, type SandboxBinary } from "@rewire/sandbox";
 import { providerLines } from "./doctor-providers.js";
+import { webLine } from "./doctor-web.js";
 import { discoverModels, ollamaBase } from "./models.js";
 import { defaultModelsFile } from "./run.js";
 import { oneLine } from "./sanitize.js";
@@ -35,10 +37,20 @@ export function findOnPath(bin: string, env: NodeJS.ProcessEnv): string | undefi
   return undefined;
 }
 
+const isDirectory = (p: string): boolean => {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+};
+
 export type DoctorIo = {
   stdout: Writable;
   env: NodeJS.ProcessEnv;
   cwd: string;
+  /** The repo whose `.rewire/policy.toml` the web line reads (`--repo`; default `cwd`). */
+  repo?: string | undefined;
   /** Test seam: lookup options other than `env` (default: the run's own defaults). */
   sandboxLookup?: Omit<FindBinaryOptions, "env">;
 };
@@ -96,6 +108,8 @@ export async function runDoctor(
     else bad(b, "not found", HINTS[b]);
   }
 
+  // models.toml [web], when the models file loads (the defaults otherwise).
+  let web: WebConfig = defaultWebConfig();
   // Models, then Ollama reachability and version when any of them is an Ollama model.
   try {
     const file =
@@ -104,6 +118,7 @@ export async function runDoctor(
       ? await loadModelsFile(file)
       : { available: await discoverModels(io.env), overrides: {} };
     const available = models.available;
+    if ("web" in models) web = models.web;
     ok("models", oneLine(available.map((m) => `${m.provider}:${m.model}`).join(", "), 300));
     if (available.some((m) => m.provider === "ollama")) {
       const base = ollamaBase(io.env);
@@ -133,6 +148,21 @@ export async function runDoctor(
   } catch (e) {
     bad(
       "models",
+      oneLine(e instanceof Error ? e.message : String(e)),
+      e instanceof RewireError ? e.hint : undefined,
+    );
+  }
+  // Web access: optional, so a missing key or web off is a note; a broken policy fails a run.
+  try {
+    const repo = resolve(io.cwd, io.repo ?? ".");
+    if (!isDirectory(repo)) throw new Error(`--repo ${repo} is not a directory`);
+    const policy = await loadPolicy(repo);
+    const l = webLine(web, io.env, policy);
+    if (l.ok) ok("web", oneLine(l.detail, 300));
+    else note("web", oneLine(l.detail, 300), undefined);
+  } catch (e) {
+    bad(
+      "policy",
       oneLine(e instanceof Error ? e.message : String(e)),
       e instanceof RewireError ? e.hint : undefined,
     );

@@ -33,7 +33,14 @@ import {
 } from "@rewire/providers";
 import { profileFor, SandboxClient } from "@rewire/sandbox";
 import { type SkillSet, skillIndex, skillTool } from "@rewire/skills";
-import { createTools } from "@rewire/tools";
+import {
+  createTools,
+  createWebTools,
+  WEB_NOTICE,
+  type WebAccess,
+  type WebRequest,
+  webToolsOn,
+} from "@rewire/tools";
 import { type CalibrationState, calibrationState, loadCalibration } from "./calibration-cache.js";
 import {
   COMPACT_MAX_TOKENS,
@@ -77,7 +84,8 @@ export type ChatEvent =
   /** `callId` pairs it with the `tool_result` that follows it (when the tool ran). */
   | { type: "tool_call"; callId: string; tool: string; summary: string; isError: boolean }
   /**
-   * The start of a tool's result, emitted right after its `tool_call` (same `callId` and `tool`).
+   * The start of a tool's result (or the tool's display-only `preview` lines, as the web tools
+   * give), emitted right after its `tool_call` (same `callId` and `tool`).
    * The whole result is sanitized, then redacted, then split: the first 4 non-empty lines, each
    * capped at 300 code points (not terminal cells: the renderer still wraps or clips each line to
    * the columns it has); `more` counts the non-empty lines left out. A tool that threw, or a call the loop did not run, has
@@ -92,6 +100,12 @@ export type ChatEvent =
       isError: boolean;
     }
   | { type: "skill_loaded"; name: string }
+  /**
+   * One `web_search` or `web_fetch` call, success or failure, also from a turn that was aborted
+   * meanwhile (the audit record:
+   * query or host+path sanitized and redacted, never a key).
+   */
+  | ({ type: "web_request" } & WebRequest)
   /**
    * A streamed piece of the assistant's text, NOT redacted or sanitized: a secret or an escape
    * sequence may be split across deltas, so it is only safe on the joined buffer.
@@ -386,6 +400,11 @@ export type ChatSessionOptions = {
   prefillMeter?: PrefillMeter;
   /** Enables compaction (automatic before a send, and `compact()`). Off when absent. */
   compaction?: CompactionDeps;
+  /**
+   * Web access: `web_search` and `web_fetch` for the chat agent when policy has web on (never
+   * for the compaction or its verifier). Absent, or web off in policy: no web tools.
+   */
+  web?: WebAccess;
 };
 
 let promptCache: string | undefined;
@@ -726,7 +745,14 @@ export class ChatSession {
   }
 
   private system(): string {
-    return `${chatPrompt()}\n\n${skillIndex(this.opts.skills)}`;
+    const web = webToolsOn(this.opts.policy, this.opts.web) ? `\n\n${WEB_NOTICE}` : "";
+    return `${chatPrompt()}${web}\n\n${skillIndex(this.opts.skills)}`;
+  }
+
+  /** The web tools (none without access or with web off), reporting through `onRequest`. */
+  private webTools(onRequest: (r: WebRequest) => void): AgentTool[] {
+    const { policy, web } = this.opts;
+    return webToolsOn(policy, web) ? createWebTools({ ...web, policy, onRequest }) : [];
   }
 
   private contextMessages(): ChatMessage[] {
@@ -870,11 +896,16 @@ export class ChatSession {
   }
 
   /** The chat tools every turn has, in order, before its `propose_run`. */
-  private baseTools(client: SandboxClient, skill: AgentTool = this.skill): AgentTool[] {
+  private baseTools(
+    client: SandboxClient,
+    skill: AgentTool = this.skill,
+    web: AgentTool[] = this.webTools(() => {}),
+  ): AgentTool[] {
     const { policy } = this.opts;
     return [
       ...createTools(client, { policy, stage: STAGE, allow: ["read", "grep", "find", "bash"] }),
       skill,
+      ...web,
       recallTool(
         () => ({ messages: this.historyWithIds(), archive: [...this.archived.values()] }),
         this.recallCache,
@@ -1256,7 +1287,10 @@ export class ChatSession {
         return r;
       },
     };
-    const tools = [...this.baseTools(client, skill), propose];
+    // Audit records, not UI state: a call of an aborted or abandoned turn is still reported,
+    // because its request went out.
+    const web = this.webTools((r) => this.emit({ type: "web_request", ...r }));
+    const tools = [...this.baseTools(client, skill, web), propose];
     this.specCache ??= tools.map((t) => t.spec);
     const system = this.system();
 
@@ -1389,7 +1423,9 @@ export class ChatSession {
                 type: "tool_result",
                 callId,
                 tool: e.tool,
-                ...toolPreview(result.content),
+                // A tool's display lines (web: titles and hosts) when it gives them, cleaned the
+                // same way; otherwise the start of what the model saw.
+                ...toolPreview(result.preview ? result.preview.join("\n") : result.content),
                 isError: result.isError,
               });
             }

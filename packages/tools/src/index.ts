@@ -34,3 +34,14 @@ export function createTools(client: SandboxClient, opts: ToolsOptions): AgentToo
 }
 
 export { evaluateBashCommand } from "./commands.js";
+export {
+  createWebTools,
+  WEB_NOTICE,
+  WEB_RESULT_MAX_BYTES,
+  WEB_TOOL_NAMES,
+  type WebAccess,
+  type WebRequest,
+  type WebToolName,
+  type WebToolsOptions,
+  webToolsOn,
+} from "./web.js";

@@ -4,8 +4,31 @@ import { RewireError } from "@rewire/core";
 import { parse } from "smol-toml";
 import { z } from "zod";
 import { DEFAULT_POLICY, type Policy } from "./defaults.js";
-import { mergeTightenOnly } from "./merge.js";
+import { mergeTightenOnly, type PolicyOverlay } from "./merge.js";
 import { selfTestRules } from "./rules.js";
+import { domainProblem, normalizeHost } from "./web.js";
+
+const domain = z
+  .string()
+  .superRefine((s, ctx) => {
+    const problem = domainProblem(s);
+    if (problem !== undefined) ctx.addIssue({ code: "custom", message: problem });
+  })
+  .transform((s) => normalizeHost(s.trim()));
+
+// `[web]` uses the snake_case keys of models.toml's `[web]`.
+const webSchema = z
+  .strictObject({
+    enabled: z.boolean(),
+    deny_domains: z.array(domain),
+    allow_domains: z.array(domain),
+  })
+  .partial()
+  .transform((w) => ({
+    ...(w.enabled !== undefined ? { enabled: w.enabled } : {}),
+    ...(w.deny_domains !== undefined ? { denyDomains: w.deny_domains } : {}),
+    ...(w.allow_domains !== undefined ? { allowDomains: w.allow_domains } : {}),
+  }));
 
 const commandRule = z.strictObject({
   pattern: z.array(z.union([z.string(), z.array(z.string())])).min(1),
@@ -26,6 +49,7 @@ const overlaySchema = z
     noProgressRounds: z.number().int().positive(),
     gateTimeoutMs: z.number().int().positive(),
     commandRules: z.array(commandRule),
+    web: webSchema,
   })
   .partial();
 
@@ -53,7 +77,7 @@ export async function loadPolicy(repoRoot: string): Promise<Policy> {
       "policy_invalid",
       `.rewire/policy.toml: ${z.prettifyError(parsed.error)}`,
     );
-  const policy = mergeTightenOnly(DEFAULT_POLICY, parsed.data as Partial<Policy>);
+  const policy = mergeTightenOnly(DEFAULT_POLICY, parsed.data as PolicyOverlay);
   selfTestRules(policy.commandRules);
   return policy;
 }

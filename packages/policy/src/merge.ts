@@ -1,5 +1,9 @@
 import { RewireError } from "@rewire/core";
-import type { Policy } from "./defaults.js";
+import type { Policy, WebPolicy } from "./defaults.js";
+import { domainWithin } from "./web.js";
+
+/** One policy layer: any field may be left out, and `web` field by field. */
+export type PolicyOverlay = Partial<Omit<Policy, "web">> & { web?: Partial<WebPolicy> };
 
 const ARRAY_FIELDS = ["testGlobs", "protectedGlobs", "credentialDenyGlobs", "gates"] as const;
 const LOWER_ONLY = ["maxFixRounds", "noProgressRounds", "gateTimeoutMs"] as const;
@@ -12,7 +16,7 @@ function loosening(field: string, why: string): RewireError {
  * Overlay may only tighten the base: supersets, lower limits, a lower reviewer confidence
  * threshold (findings below it are dropped, so lower keeps more), appended rules.
  */
-export function mergeTightenOnly(base: Policy, overlay: Partial<Policy>): Policy {
+export function mergeTightenOnly(base: Policy, overlay: PolicyOverlay): Policy {
   const out: Policy = structuredClone(base);
 
   for (const f of ARRAY_FIELDS) {
@@ -45,5 +49,35 @@ export function mergeTightenOnly(base: Policy, overlay: Partial<Policy>): Policy
 
   if (overlay.commandRules)
     out.commandRules = [...base.commandRules, ...structuredClone(overlay.commandRules)];
+  if (overlay.web) out.web = mergeWeb(base.web, overlay.web);
   return out;
+}
+
+/**
+ * `enabled` can only go false; `denyDomains` is the union; `allowDomains` is set by the first
+ * layer that names it and intersected by every later one (a domain survives when it lies within
+ * an entry of both lists; the narrower of the two is kept), so no layer can widen it.
+ */
+function mergeWeb(base: WebPolicy, overlay: Partial<WebPolicy>): WebPolicy {
+  if (overlay.enabled === true && !base.enabled)
+    throw loosening("web.enabled", "may not be turned back on (a lower layer turned web off)");
+  const out: WebPolicy = {
+    enabled: base.enabled && overlay.enabled !== false,
+    denyDomains: [...new Set([...base.denyDomains, ...(overlay.denyDomains ?? [])])],
+  };
+  const a = base.allowDomains;
+  const b = overlay.allowDomains;
+  if (a !== undefined && b !== undefined) out.allowDomains = intersect(a, b);
+  else if (a !== undefined || b !== undefined) out.allowDomains = [...new Set(a ?? b ?? [])];
+  return out;
+}
+
+function intersect(a: readonly string[], b: readonly string[]): string[] {
+  const out = new Set<string>();
+  for (const x of a)
+    for (const y of b) {
+      if (domainWithin(y, x)) out.add(y);
+      else if (domainWithin(x, y)) out.add(x);
+    }
+  return [...out];
 }

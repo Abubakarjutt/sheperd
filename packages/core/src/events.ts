@@ -31,6 +31,25 @@ export const RunEvent = z.discriminatedUnion("type", [
     source: z.enum(["user", "repo"]),
     sha256: z.string().regex(/^[0-9a-f]{64}$/),
   }),
+  /**
+   * One web tool call (success or failure), for the audit trail. `query` (web_search) and `url`
+   * (web_fetch: host and path, never the query string) are redacted; no API key is ever in it.
+   * `bytes` is the UTF-8 size of the text returned to the model; `status` the HTTP status when
+   * a page answered.
+   */
+  z.object({
+    ...staged,
+    type: z.literal("web_request"),
+    tool: z.enum(["web_search", "web_fetch"]),
+    backend: z.string().optional(),
+    query: z.string().optional(),
+    url: z.string().optional(),
+    status: z.number().int().optional(),
+    results: z.number().int().nonnegative().optional(),
+    bytes: z.number().int().nonnegative(),
+    ok: z.boolean(),
+    error: z.string().optional(),
+  }),
   z.object({ ...base, type: z.literal("fix_round"), round: z.number(), score: z.number() }),
   z.object({
     ...base,

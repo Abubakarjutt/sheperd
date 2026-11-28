@@ -246,6 +246,25 @@ describe("RunController (fake pipeline)", () => {
     expect(seen[1]).not.toHaveProperty("ollamaTimeout");
   });
 
+  test("the web access reaches the pipeline input; without it the input has none", async () => {
+    const seen: RunPipelineInput[] = [];
+    const web = { config: { maxResults: 5 }, env: { OLLAMA_API_KEY: "k" } };
+    const c = new RunController({
+      repo: "/repo",
+      routing: ROUTING,
+      providers: () => {
+        throw new Error("unused");
+      },
+      policy: DEFAULT_POLICY,
+      web,
+      pipeline: fakePipeline({ seen }),
+    });
+    await c.start("t", { checkpoints: NONE }).done;
+    expect(seen[0]?.web).toBe(web);
+    await controller(fakePipeline({ seen })).start("t", { checkpoints: NONE }).done;
+    expect(seen[1]).not.toHaveProperty("web");
+  });
+
   test("checkpoints not in the set auto-approve without a pending prompt", async () => {
     const seen: RunPipelineInput[] = [];
     const c = controller(fakePipeline({ seen }));

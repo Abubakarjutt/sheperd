@@ -26,6 +26,7 @@
     "@rewire/session": "workspace:*",
     "@rewire/skills": "workspace:*",
     "@rewire/tui": "workspace:*",
+    "@rewire/web": "workspace:*",
     "zod": "^4.6.7"
   }
 }

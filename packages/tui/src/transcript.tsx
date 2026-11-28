@@ -29,19 +29,34 @@ export type TranscriptEntry =
   /** The welcome box, first in every transcript region (startup, `/clear`, `/resume`). */
   | { kind: "header"; info: HeaderInfo };
 
-/** `read src/x.ts` renders as `Read src/x.ts`. */
+/** Display names of tools whose name does not just capitalize (the web tools). */
+const TOOL_NAMES: Readonly<Record<string, string>> = {
+  web_search: "WebSearch",
+  web_fetch: "Fetch",
+};
+
+/** `read src/x.ts` renders as `Read src/x.ts`; `web_fetch` as `Fetch`, `web_search` as `WebSearch`. */
 export function toolLabel(summary: string): string {
+  // Own keys only: a model-chosen name like `constructor` must not reach the prototype.
+  if (Object.hasOwn(TOOL_NAMES, summary)) return TOOL_NAMES[summary] as string;
   return summary === "" ? summary : summary.charAt(0).toUpperCase() + summary.slice(1);
 }
 
-/** Splits a tool summary (`read src/x.ts`) into its display name (`Read`) and its arguments. */
-export function toolParts(summary: string): { name: string; args: string } {
+/** Arguments a tool's summary hook put in place of a refused value (`[refused: secret-shaped]`). */
+const isRefused = (args: string): boolean => args.startsWith("[refused:");
+
+/**
+ * Splits a tool summary (`read src/x.ts`) into its display name (`Read`) and its arguments.
+ * `web`: one of the web tools, whose summary hook writes `[refused: …]` for a refused value.
+ */
+export function toolParts(summary: string): { name: string; args: string; web: boolean } {
   const clean = redact(sanitize(summary))
     .replace(/[\n\t]+/g, " ")
     .trim();
   const sp = clean.indexOf(" ");
-  if (sp < 0) return { name: toolLabel(clean), args: "" };
-  return { name: toolLabel(clean.slice(0, sp)), args: clean.slice(sp + 1).trim() };
+  const raw = sp < 0 ? clean : clean.slice(0, sp);
+  const web = Object.hasOwn(TOOL_NAMES, raw);
+  return { name: toolLabel(raw), args: sp < 0 ? "" : clean.slice(sp + 1).trim(), web };
 }
 
 /** Prefix of a tool's first preview line, and the indent of the lines under it. */
@@ -52,7 +67,10 @@ export const PREVIEW_MAX = 4;
 
 /**
  * `● Read(src/x.ts)` with the name bold, then the result preview under `  ⎿  ` (dim) and
- * `… +N lines`. An error is red with `✗`. Every line is cut to the terminal width.
+ * `… +N lines`. An error is red with `✗`; a web tool's `[refused: …]` arguments are red too. Web calls come
+ * from the same `tool_call`/`tool_result` pair (`● WebSearch("…")`, `● Fetch(host/path)`, with the
+ * tool's title previews); their `web_request` events are audit records and draw nothing. Every
+ * line is cut to the terminal width.
  */
 export function ToolLine({
   summary,
@@ -66,7 +84,7 @@ export function ToolLine({
   more?: number;
 }) {
   const cols = useColumns();
-  const { name, args } = toolParts(summary);
+  const { name, args, web } = toolParts(summary);
   const glyph = isError ? theme.glyph.toolError : theme.glyph.tool;
   const head = `${glyph} `;
   // Redacted before it is cut, so a cut can never split a secret out of its pattern.
@@ -87,7 +105,9 @@ export function ToolLine({
         <Safe bold color={isError ? theme.error : undefined}>
           {line.slice(head.length, nameEnd)}
         </Safe>
-        <Safe color={isError ? theme.error : undefined}>{line.slice(nameEnd)}</Safe>
+        <Safe color={isError || (web && isRefused(args)) ? theme.error : undefined}>
+          {line.slice(nameEnd)}
+        </Safe>
       </Text>
       {lines.map((l, i) => (
         // biome-ignore lint/suspicious/noArrayIndexKey: lines of one fixed preview

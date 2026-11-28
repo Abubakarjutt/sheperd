@@ -7,6 +7,7 @@ import type { Readable, Writable } from "node:stream";
 import { RewireError, type RunEvent } from "@rewire/core";
 import {
   defaultCompactionConfig,
+  defaultWebConfig,
   loadModelsFile,
   type ModelsFile,
   ROLES,
@@ -14,8 +15,9 @@ import {
   type RunOutcome,
   resolveRouting,
   runPipeline,
+  type WebAccess,
 } from "@rewire/pipeline";
-import { loadPolicy } from "@rewire/policy";
+import { loadPolicy, mergeTightenOnly, type Policy } from "@rewire/policy";
 import {
   createProvider,
   FauxProvider,
@@ -38,6 +40,8 @@ export type RunOptions = {
   repo?: string | undefined;
   models?: string | undefined;
   headless: boolean;
+  /** `--no-web`: web access off for this run (a run-layer policy; nothing can turn it back on). */
+  noWeb?: boolean | undefined;
 };
 
 export type RunIo = {
@@ -135,6 +139,7 @@ export async function resolveModels(
       available: names.map((model) => ({ provider: "faux", model }) as ModelRef),
       overrides: {},
       compaction: defaultCompactionConfig(),
+      web: defaultWebConfig(),
     };
   }
   if (modelsPath !== undefined) return loadModelsFile(resolve(cwd, modelsPath));
@@ -144,7 +149,30 @@ export async function resolveModels(
     available: await discoverModels(env),
     overrides: {},
     compaction: defaultCompactionConfig(),
+    web: defaultWebConfig(),
   };
+}
+
+/**
+ * The web access the chat and a run's spec and implementer get: models.toml's `[web]` and the
+ * env (search keys). Policy still decides (`[web] enabled`). None in faux mode: a faux run is a
+ * harness self-test that never touches the network.
+ */
+export function webAccess(
+  models: Pick<ModelsFile, "web">,
+  env: NodeJS.ProcessEnv,
+  faux: boolean,
+): WebAccess | undefined {
+  return faux ? undefined : { config: models.web, env };
+}
+
+/**
+ * The run's policy: the repository's, then `--no-web` as the run layer (tighten-only, so a repo
+ * or fixture policy setting `enabled = true` cannot undo it).
+ */
+export async function runPolicy(repo: string, noWeb: boolean): Promise<Policy> {
+  const policy = await loadPolicy(repo);
+  return noWeb ? mergeTightenOnly(policy, { web: { enabled: false } }) : policy;
 }
 
 /** `settings`: models.toml's `[providers.*]` tables, for the cloud providers. */
@@ -255,7 +283,7 @@ export async function runCommand(
 ): Promise<number> {
   const task = await readTask(o, io.cwd);
   const repo = resolve(io.cwd, o.repo ?? ".");
-  const policy = await loadPolicy(repo);
+  const policy = await runPolicy(repo, o.noWeb === true);
 
   const fauxPath = io.env.REWIRE_FAUX_SCRIPT;
   const faux = fauxPath ? loadFauxScript(fauxPath) : undefined;
@@ -293,6 +321,7 @@ export async function runCommand(
     emit,
     signal,
     ...(faux ? { faux: true } : {}),
+    ...webOption(webAccess(models, io.env, faux !== undefined)),
   });
 
   // runPipeline has no provenance flag: the CLI appends the faux note to the report it wrote.
@@ -316,6 +345,8 @@ export async function runCommand(
   }
   return exitCodeFor(outcome);
 }
+
+export const webOption = (web: WebAccess | undefined): { web?: WebAccess } => (web ? { web } : {});
 
 export const FAUX_NOTE =
   "\n## Provider note\n\nThis run used the faux provider (REWIRE_FAUX_SCRIPT), not real models. It is a harness self-test, not evidence of model-checked code.\n";

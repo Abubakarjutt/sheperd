@@ -68,3 +68,39 @@ describe("skill_loaded event", () => {
     expect(RunEvent.safeParse(ev(sha)).success).toBe(false);
   });
 });
+
+describe("web_request event", () => {
+  const web = { ...base, type: "web_request" };
+  test("accepts a search and a fetch record, success or failure", () => {
+    for (const e of [
+      {
+        ...web,
+        tool: "web_search",
+        backend: "ollama",
+        query: "vitest config",
+        ok: true,
+        bytes: 120,
+        results: 3,
+      },
+      { ...web, tool: "web_fetch", url: "example.com/docs", status: 200, ok: true, bytes: 4096 },
+      {
+        ...web,
+        tool: "web_fetch",
+        url: "example.com/x",
+        ok: false,
+        bytes: 0,
+        error: "refused by policy",
+      },
+    ]) {
+      const r = RunEvent.safeParse(e);
+      expect(r.success, JSON.stringify(r.error)).toBe(true);
+      expect(r.data).toEqual(e);
+    }
+  });
+  test("rejects an unknown tool and a negative byte count", () => {
+    expect(RunEvent.safeParse({ ...web, tool: "bash", ok: true, bytes: 0 }).success).toBe(false);
+    expect(
+      RunEvent.safeParse({ ...web, tool: "web_fetch", url: "a/b", ok: true, bytes: -1 }).success,
+    ).toBe(false);
+  });
+});

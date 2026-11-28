@@ -68,6 +68,7 @@ import {
   trustedGitOk,
 } from "@rewire/sandbox";
 import type { SkillSet } from "@rewire/skills";
+import type { WebAccess } from "@rewire/tools";
 import { z } from "zod";
 import { commitDiff } from "./commit-diff.js";
 import { type EscalationReport, FixLoopController, type RoundState, score } from "./fix-loop.js";
@@ -132,6 +133,13 @@ export type RunPipelineInput = {
   faux?: boolean;
   /** Claude skills for the author stages (spec, test-writer, implementer) only. The caller owns the set. */
   skills?: SkillSet;
+  /**
+   * Web access (`web_search`, `web_fetch`) for the spec and implementer agents only, when policy
+   * has web on. Never the test-writer, reviewers or verifier. Unset: no stage has web tools.
+   * `faux` does not turn it off: a caller running a faux self-test must leave this unset (the
+   * CLI does), or pass injected `search`/`fetch` so no real network is used.
+   */
+  web?: WebAccess;
   /**
    * Approval checkpoints. Unset (`rewire run`, headless): nothing pauses and nothing extra is
    * computed. The pending promise races the run's abort signal.
@@ -811,6 +819,7 @@ async function execute(ctx: Ctx): Promise<void> {
       policy,
       ...(notes.length > 0 ? { reviewerNotes: [...notes] } : {}),
       ...(input.skills ? { skills: input.skills } : {}),
+      ...(input.web ? { web: input.web } : {}),
       ...sig,
       ...clientFactory,
     });
@@ -896,6 +905,7 @@ async function execute(ctx: Ctx): Promise<void> {
       ...(input.seams?.implementerMaxTurns ? { maxTurns: input.seams.implementerMaxTurns } : {}),
       gateGuard: preGate(worktree, st, sig),
       ...(input.skills ? { skills: input.skills } : {}),
+      ...(input.web ? { web: input.web } : {}),
       ...sig,
       ...clientFactory,
     });

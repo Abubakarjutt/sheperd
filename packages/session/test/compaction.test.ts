@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runAgent } from "@rewire/loop";
-import { type CompactionConfig, defaultCompactionConfig, resolveRouting } from "@rewire/pipeline";
+import {
+  type CompactionConfig,
+  defaultCompactionConfig,
+  defaultWebConfig,
+  resolveRouting,
+} from "@rewire/pipeline";
 import { DEFAULT_POLICY } from "@rewire/policy";
 import {
   type ChatRequest,
@@ -25,6 +30,7 @@ import {
   makeWritable,
   type SkillSet,
 } from "@rewire/skills";
+import { WEB_NOTICE, type WebAccess } from "@rewire/tools";
 import { afterAll, describe, expect, test } from "vitest";
 import {
   ARCHIVE_MAX,
@@ -32,6 +38,7 @@ import {
   ChatSession,
   type CompactionDeps,
   compactionDeps,
+  createRiskyVerifier,
   emptyRecord,
   RECENT_TITLE,
   RECORD_PREFACE,
@@ -178,6 +185,7 @@ async function setup(
     store?: SessionStore;
     sessionId?: string;
     provider?: "faux" | "ollama";
+    web?: WebAccess;
   } = {},
 ) {
   const repo = o.repo ?? makeRepo();
@@ -192,6 +200,7 @@ async function setup(
     store,
     emit: (e: ChatEvent) => events.push(e),
     ...(compaction ? { compaction } : {}),
+    ...(o.web ? { web: o.web } : {}),
   };
   const session =
     o.sessionId !== undefined
@@ -558,6 +567,35 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
     });
     expect(res.endedBy).not.toBe("error");
     expect(res.messages.slice(0, ctx.length)).toEqual(ctx);
+  });
+
+  test("with web on in the chat, the compaction and its verifier get no web tools and no web notice", async () => {
+    const p = model({
+      chat: [text("ok")],
+      compact: [ops(userAdd("constraint", "ship on fridays only", "m0", "ship on fridays only"))],
+    });
+    const verifierModel = new FauxProvider([
+      {
+        text: JSON.stringify({ decisions: [{ index: 0, verdict: "reject", reason: "no" }] }),
+      },
+    ]);
+    const { deps: d } = deps({
+      verifier: createRiskyVerifier({ provider: verifierModel, model: "v" }),
+    });
+    const web: WebAccess = { config: defaultWebConfig(), env: {} };
+    const { session } = await setup(p, d, { web });
+    await session.send("ship on fridays only");
+    // non-vacuous: the chat itself has the web tools
+    expect((p.chats[0]?.tools ?? []).map((t) => t.name)).toContain("web_search");
+    const out = await session.compact();
+    expect(out).toMatchObject({ ok: true, rejected: 1 });
+    expect(p.compactions.length).toBeGreaterThan(0);
+    expect(verifierModel.requests.length).toBe(1);
+    for (const r of [...p.compactions, ...verifierModel.requests]) {
+      expect(r.tools ?? []).toEqual([]);
+      expect(r.system).not.toContain(WEB_NOTICE);
+      expect(r.system).not.toContain("untrusted_web");
+    }
   });
 
   test("record.pending is persisted and restored on resume", async () => {

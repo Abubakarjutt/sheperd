@@ -538,6 +538,17 @@ describe("process", () => {
     expect(r.stderr).toMatch(/task_file_unreadable/);
   }, 15_000);
 
+  test("run accepts --no-web (the bench passes it)", async () => {
+    // Parsed, not an unknown flag: the run gets as far as its own faux/--models check.
+    const r = await exec(
+      ["run", "--headless", "--no-web", "--models", "/nonexistent.toml", "x"],
+      cleanEnv({ REWIRE_FAUX_SCRIPT: writeScript({ m: [] }) }),
+    );
+    expect(r.code).toBe(1);
+    expect(r.stderr).not.toMatch(/no-web/);
+    expect(r.stderr).toMatch(/--models cannot be combined with REWIRE_FAUX_SCRIPT/);
+  });
+
   test("faux with --models is refused", async () => {
     const r = await exec(
       ["run", "--headless", "--models", "/nonexistent.toml", "x"],

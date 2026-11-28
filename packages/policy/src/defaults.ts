@@ -6,6 +6,17 @@ export type CommandRule = {
   notMatch?: string[];
 };
 
+/**
+ * Web access for the chat, spec and implementer web tools (tighten-only, see `mergeTightenOnly`).
+ * Domains are lowercase host names without a trailing dot; each matches itself and its
+ * subdomains. `allowDomains` absent means no allow list; present (even empty) means only those.
+ */
+export type WebPolicy = {
+  enabled: boolean;
+  denyDomains: string[];
+  allowDomains?: string[];
+};
+
 export type Policy = {
   testGlobs: string[];
   protectedGlobs: string[];
@@ -16,6 +27,7 @@ export type Policy = {
   noProgressRounds: number;
   gateTimeoutMs: number;
   commandRules: CommandRule[];
+  web: WebPolicy;
 };
 
 /**
@@ -170,4 +182,5 @@ export const DEFAULT_POLICY: Policy = deepFreeze({
   noProgressRounds: 2,
   gateTimeoutMs: 300000,
   commandRules: [],
+  web: { enabled: true, denyDomains: [] },
 });

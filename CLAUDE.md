@@ -48,7 +48,7 @@ The system tools the gates need at runtime are git, ripgrep, semgrep and gitleak
 
 ## Architecture
 
-Package dependency direction, from bottom to top: `core`, then `policy` and `providers`, then `sandbox`, `pack-typescript`, `loop` and `skills`, then `gates` and `tools`, then `reviewers`, then `pipeline`, then `session`, then `tui`, then `cli`.
+Package dependency direction, from bottom to top: `core`, then `web`, `policy` and `providers`, then `sandbox`, `pack-typescript`, `loop` and `skills`, then `gates` and `tools`, then `reviewers`, then `pipeline`, then `session`, then `tui`, then `cli`.
 
 - **`core`**: zod schemas (contract, criteria with `kind: change | preserve`, events), `RewireError(code, message, hint)`, run ids, secret redaction, and `fenceUntrusted()`.
   - Errors are identified by a stable snake_case `code` (e.g. `preserve_fails_now`, `ollama_request_dropped`). Tests and docs refer to codes, so treat them as API.
@@ -61,6 +61,10 @@ Package dependency direction, from bottom to top: `core`, then `policy` and `pro
   5. **gates**, then **reviewers**, then **fix loop** (`fix-loop.ts`, using `loop` for progress and oscillation detection and re-planning).
   6. **report** (`report.ts`), then commit.
   - Each run writes `.rewire/runs/<runId>/{events.jsonl, contract.json, manifest.json, report.md}` into the target repo.
+- **`web`** (depends on `core` only): every web call made from the rewire process, never from inside the sandbox.
+  - `webFetch` is an SSRF-guarded direct GET. Every hop is resolved and refused if any address is loopback, private, link-local, CGNAT, multicast or unspecified, and the socket is pinned to the vetted IP. It follows at most 5 redirects by hand and reads only text types, with HTML turned into text that keeps its links.
+  - `webSearch` uses a pluggable backend chosen by `resolveSearch`: Ollama (the default), Tavily, Brave or SearXNG, set by `[web]` in models.toml or picked by whichever key is present.
+  - `checkOutgoing` refuses a query or URL that carries a `SECRET`. Refusals throw `WebError`, which has no code.
 - **`providers`**: Anthropic, OpenAI, Ollama and faux behind one interface, plus Claude on Bedrock, Vertex and Foundry, Azure OpenAI, Gemini and `[endpoints.<name>]` OpenAI-compatible endpoints (design decision #35). Cloud SDKs are imported lazily. An endpoint's family comes from its `family` key or the model id, never the endpoint name (`family.ts`).
   - `registry.ts` resolves `models.toml` or env auto-detection.
   - `family.ts` decides model families. Reviewer and verifier are chosen cross-family from the implementer when possible.
@@ -71,7 +75,9 @@ Package dependency direction, from bottom to top: `core`, then `policy` and `pro
   - The CLI's binary lookup order (`REWIRE_SANDBOX_BIN`, then the checkout's `target/`, then the sha256-pinned `sheperd-<os>-<arch>` package, then `PATH`) is security-relevant and documented in the README. Keep the two in sync.
 - **`gates`**: hard blocks, never advisory. They are tests (including `requireAssertions`), types, lint, semgrep, gitleaks, dependency audit and frozen-test integrity. Language specifics come from **`pack-typescript`**, the only language pack in v0.1.
 - **`policy`**: tighten-only layering: built-in, then org, then the repo's `.rewire/policy.toml`, then the run. Protected paths (policy, CI, lint configs) are never writable by any agent stage.
+  - `[web]` (`enabled`, `deny_domains`, `allow_domains`, snake_case) only tightens: `enabled` can only go false (`policy_loosening`), deny lists form a union, allow lists intersect.
 - **`tools`**: the implementer agent's tools (read, write, edit, find, grep, bash), routed through the sandbox and policy.
+  - `web.ts` `createWebTools` gives `web_search` and `web_fetch` to the chat, spec and implementer only (never the test-writer, reviewers or verifiers; design decision #38). It is the one sink for web text: `stripControls`, `redact`, an `untrusted_web` fence, policy filtering of result URLs, and a `web_request` audit event per call. Policy also covers the search service's host, and the literal values of configured search keys are refused outgoing and redacted incoming. Its `summary` hook keeps raw arguments out of `tool_call` events, its `storedArguments` hook keeps a refused call's arguments out of the history, and its display-only `ToolResult.preview` lines feed the TUI (`● WebSearch("…")`, `● Fetch(host/path)`). With policy web off (`webOffReason`) there are no tools and the prompts are byte-identical. Faux mode gets no web access.
 - **`reviewers`**: security, spec-compliance and silent-failure reviewers, plus a verifier that tries to refute findings. Findings must cite evidence.
 - **`skills`**: discovers, validates, trusts, hashes and snapshots `SKILL.md` skills.
   - User skills load automatically (`~/.claude/skills`, `$XDG_CONFIG_HOME/rewire/skills`). Repo skills need trust pinned to a sha256 in `$XDG_CONFIG_HOME/rewire/trusted-skills.json`.
@@ -85,6 +91,8 @@ Package dependency direction, from bottom to top: `core`, then `policy` and `pro
   - `REWIRE_TUI_SELFCHECK=1` is an internal smoke-test switch.
   - Faux-provider caveat: chat and spec share one faux turn queue when they use the same model name, so a script must list the chat turns and spec turns in the order they are consumed.
 - **`cli`**: the `run`, `doctor` and `chat` commands (bare `rewire` on a TTY opens the TUI), plus wiring.
+  - `doctor` prints a `web` line (`doctor-web.ts`): the search backend and the env var name it found, never a value, plus the policy state.
+  - `run --no-web` adds `[web] enabled = false` as the run-layer policy; the bench passes it on every run.
   - Exit codes: 0 only when verified, 1 for usage or prerequisite errors, 2 when the run escalates, 130 on a forced quit.
   - `--headless` writes events to stdout and the summary to stderr.
   - `rewire calibrate <model> [--max] [--yes] [--fresh]` measures a model's effective context with planted-fact probes (`calibrate.ts`). It is resumable, never automatic, and needs `--yes` on paid providers. Its exit codes differ from `run`: 0 when complete, 130 on the first Ctrl-C (it stops after the recorded lengths) as well as on a forced quit, and 1 on `calibration_failed` (including the paid gate without `--yes`).

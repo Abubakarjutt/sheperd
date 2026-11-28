@@ -12,11 +12,13 @@ import {
 } from "@rewire/core";
 import type { Gate } from "@rewire/gates";
 import { detectTsPack } from "@rewire/pack-typescript";
-import { DEFAULT_POLICY } from "@rewire/policy";
+import { DEFAULT_POLICY, mergeTightenOnly } from "@rewire/policy";
 import { call, FauxProvider, type ScriptEntry, text } from "@rewire/providers";
 import { SandboxClient } from "@rewire/sandbox";
+import { WEB_NOTICE } from "@rewire/tools";
+import { defaultWebConfig } from "@rewire/web";
 import { afterAll, expect, test, vi } from "vitest";
-import { hashFiles, runImplementerStage } from "../src/index.js";
+import { hashFiles, type ImplementerInput, runImplementerStage } from "../src/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = resolve(here, "../../gates/test/fixtures/ts-basic");
@@ -98,6 +100,7 @@ async function run(
     manifest?: FrozenTestManifest;
     contract?: Contract;
     policy?: typeof DEFAULT_POLICY;
+    web?: ImplementerInput["web"];
     clientFactory?: (p: never) => SandboxClient;
   } = {},
 ) {
@@ -116,6 +119,7 @@ async function run(
     runId: "r1",
     policy: over.policy ?? DEFAULT_POLICY,
     ...(over.clientFactory ? { clientFactory: over.clientFactory } : {}),
+    ...(over.web ? { web: over.web } : {}),
     ...(over.gates ? { gates: over.gates } : {}),
     ...(over.feedback ? { feedback: over.feedback } : {}),
     ...(over.maxTurns ? { maxTurns: over.maxTurns } : {}),
@@ -447,4 +451,46 @@ test("stage events are emitted and owned clients are disposed", async () => {
   ]);
   expect(spies.length).toBe(2);
   for (const s of spies) expect(s).toHaveBeenCalledTimes(1);
+});
+
+test("with web access the implementer gets web_search and web_fetch, and its fence notice names untrusted_web", async () => {
+  const events: RunEvent[] = [];
+  const searched: string[] = [];
+  const web = {
+    config: defaultWebConfig(),
+    env: {},
+    search: async (q: string) => {
+      searched.push(q);
+      return { backend: "ollama" as const, results: [] };
+    },
+  };
+  const { promise, provider } = await run(
+    [call("web_search", { query: "vitest toBe" }), text("all done")],
+    { gates: [stub("tsc", [["pass"]])], web, events },
+  );
+  expect((await promise).endedBy).toBe("done");
+  expect(searched).toEqual(["vitest toBe"]);
+  const req = provider.requests[0];
+  expect(req?.tools?.map((t) => t.name)).toEqual(
+    expect.arrayContaining(["web_search", "web_fetch", "read", "write", "bash"]),
+  );
+  expect(req?.system).toContain(WEB_NOTICE);
+  expect(req?.system).toMatch(/<untrusted_\*> fences \([^)]*web content/);
+  expect(events.filter((e) => e.type === "web_request")).toEqual([
+    expect.objectContaining({ stage: "implementer", tool: "web_search", ok: true }),
+  ]);
+});
+
+test("with web off in policy the implementer's prompt and tools are those of a run without web", async () => {
+  const off = mergeTightenOnly(DEFAULT_POLICY, { web: { enabled: false } });
+  const web = { config: defaultWebConfig(), env: {} };
+  const a = await run([text("all done")], { gates: [stub("tsc", [["pass"]])], policy: off });
+  await a.promise;
+  const b = await run([text("all done")], { gates: [stub("tsc", [["pass"]])], policy: off, web });
+  await b.promise;
+  const ra = a.provider.requests[0];
+  const rb = b.provider.requests[0];
+  expect(rb?.system).toBe(ra?.system);
+  expect(rb?.tools).toEqual(ra?.tools);
+  expect(rb?.system).not.toContain("untrusted_web");
 });

@@ -11,7 +11,11 @@ import {
   registerAzureFamily,
   registerEndpoints,
 } from "@rewire/providers";
+import { defaultWebConfig, MAX_MAX_RESULTS, SEARCH_BACKENDS, type WebConfig } from "@rewire/web";
 import { parse } from "smol-toml";
+
+export { defaultWebConfig, type WebConfig } from "@rewire/web";
+
 import { z } from "zod";
 
 export const ROLES = ["spec", "test-writer", "implementer", "reviewer", "verifier"] as const;
@@ -27,6 +31,8 @@ export type ModelsFile = {
   providers?: ProviderSettings;
   /** OpenAI-compatible endpoints (`[endpoints.<name>]`); registered by `loadModelsFile`. */
   endpoints?: Record<string, EndpointConfig>;
+  /** Web search settings (`[web]`); defaults when the table is absent. */
+  web: WebConfig;
 };
 
 /**
@@ -237,11 +243,28 @@ const EndpointsToml = z.record(z.string(), EndpointToml).superRefine((endpoints,
   }
 });
 
+const WebToml = z
+  .strictObject({
+    search: z.enum(SEARCH_BACKENDS).optional(),
+    searxng_url: UrlString(true).optional(),
+    max_results: z.number().int().min(1).max(MAX_MAX_RESULTS).optional(),
+  })
+  .superRefine((w, ctx) => {
+    if (w.search === "searxng" && w.searxng_url === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["searxng_url"],
+        message: 'is required when search = "searxng"',
+      });
+    }
+  });
+
 const ModelsToml = z.strictObject({
   available: z.array(RefString).min(1, "available must list at least one model"),
   compaction: CompactionToml.optional(),
   endpoints: EndpointsToml.optional(),
   providers: ProvidersToml.optional(),
+  web: WebToml.optional(),
   roles: z
     .object(Object.fromEntries(ROLES.map((r) => [r, RefString.optional()])))
     .strict()
@@ -249,10 +272,10 @@ const ModelsToml = z.strictObject({
 });
 
 /**
- * Read `available = [...]` and the optional `[roles]`, `[compaction]`, `[providers.*]` and
- * `[endpoints.<name>]` tables from a TOML file. The endpoints are registered (`registerEndpoints`)
- * before the refs are parsed, replacing those of the previous load; an invalid file leaves the
- * previous load's endpoints registered and its own not.
+ * Read `available = [...]` and the optional `[roles]`, `[compaction]`, `[providers.*]`,
+ * `[endpoints.<name>]` and `[web]` tables from a TOML file. The endpoints are registered
+ * (`registerEndpoints`) before the refs are parsed, replacing those of the previous load; an
+ * invalid file leaves the previous load's endpoints registered and its own not.
  */
 export async function loadModelsFile(path: string): Promise<ModelsFile> {
   let raw: unknown;
@@ -309,6 +332,7 @@ export async function loadModelsFile(path: string): Promise<ModelsFile> {
       available: r.data.available,
       overrides,
       compaction: compactionConfig(r.data.compaction, path),
+      web: webConfig(r.data.web),
     };
     if (r.data.providers !== undefined) out.providers = providerSettings(r.data.providers);
     if (endpoints !== undefined) out.endpoints = endpoints;
@@ -384,6 +408,14 @@ function providerSettings(raw: z.infer<typeof ProvidersToml>): ProviderSettings 
   }
   if (raw.ollama) out.ollama = defined({ timeoutS: raw.ollama.timeout_s });
   return out;
+}
+
+function webConfig(raw: z.infer<typeof WebToml> | undefined): WebConfig {
+  const config = defaultWebConfig();
+  if (raw?.search !== undefined) config.search = raw.search;
+  if (raw?.searxng_url !== undefined) config.searxngUrl = raw.searxng_url;
+  if (raw?.max_results !== undefined) config.maxResults = raw.max_results;
+  return config;
 }
 
 function compactionConfig(
