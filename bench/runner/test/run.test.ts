@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { fileStem, uniqueStem } from "../run.js";
+import { fileStem, rewireArgs, uniqueStem } from "../run.js";
 
 describe("result file names", () => {
   test("the stem carries seconds", () => {
@@ -15,5 +15,16 @@ describe("result file names", () => {
     expect(uniqueStem(dir, "a")).toBe("a-2");
     writeFileSync(join(dir, "a-2.json"), "{}");
     expect(uniqueStem(dir, "a")).toBe("a-3");
+  });
+});
+
+describe("rewireArgs: how the bench starts a run", () => {
+  test("every run passes --no-web, so no task can go online (a fixture policy cannot loosen it)", () => {
+    const task = { id: "t", dir: "/x", meta: {} as never, taskFile: "/x/task.md" };
+    for (const o of [{}, { models: "models.toml" }]) {
+      const args = rewireArgs("/repo", task, o as never);
+      expect(args.slice(1, 4)).toEqual(["run", "--headless", "--no-web"]);
+      expect(args).toContain("/x/task.md");
+    }
   });
 });

@@ -1,11 +1,12 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_POLICY, mergeTightenOnly } from "@rewire/policy";
+import { DEFAULT_POLICY, mergeTightenOnly, webOffReason } from "@rewire/policy";
 import { defaultWebConfig } from "@rewire/web";
 import { afterEach, describe, expect, test } from "vitest";
 import { runDoctor } from "../src/doctor.js";
 import { webLine } from "../src/doctor-web.js";
+import { runPolicy } from "../src/run.js";
 
 const FAKE_KEY = "fake-key-Zq9XwV7uT5sR3pN1mL0k";
 const dirs: string[] = [];
@@ -65,9 +66,18 @@ describe("webLine", () => {
     });
   });
 
+  test("a search service the policy refuses is a note naming the rule", () => {
+    const narrowed = mergeTightenOnly(DEFAULT_POLICY, { web: { allowDomains: ["python.org"] } });
+    expect(webLine(defaultWebConfig(), { OLLAMA_API_KEY: FAKE_KEY }, narrowed)).toEqual({
+      ok: false,
+      detail:
+        "search: ollama (OLLAMA_API_KEY), refused: the search service ollama.com is not in [web] allow_domains · fetch: on · policy: on, allow_domains 1 sites",
+    });
+  });
+
   test("policy: allow-list and deny counts, and off with the reason", () => {
     const narrowed = mergeTightenOnly(DEFAULT_POLICY, {
-      web: { allowDomains: ["python.org", "nodejs.org"], denyDomains: ["evil.example"] },
+      web: { allowDomains: ["python.org", "ollama.com"], denyDomains: ["evil.example"] },
     });
     expect(webLine(defaultWebConfig(), { OLLAMA_API_KEY: FAKE_KEY }, narrowed).detail).toBe(
       "search: ollama (OLLAMA_API_KEY) · fetch: on · policy: on, allow_domains 2 sites, deny_domains 1",
@@ -137,5 +147,55 @@ describe("doctor: the web line", () => {
     writeFileSync(join(repo, ".rewire", "policy.toml"), `[web]\nenabled = "yes"\n`);
     const out = await doctor(repo, models, { ANTHROPIC_API_KEY: FAKE_KEY });
     expect(out).toMatch(/^✗ policy — \.rewire\/policy\.toml: /m);
+  });
+});
+
+describe("doctor --repo (final review M5)", () => {
+  test("the policy comes from --repo, not the working directory", async () => {
+    const cwd = tmp();
+    const repo = tmp();
+    const models = join(cwd, "models.toml");
+    writeFileSync(models, `available = ["anthropic:claude-opus-5-5"]\n`);
+    mkdirSync(join(repo, ".rewire"));
+    writeFileSync(join(repo, ".rewire", "policy.toml"), `[web]\nenabled = false\n`);
+    const out: string[] = [];
+    const code = await runDoctor(models, "darwin", {
+      stdout: { write: (s: string) => out.push(s) } as unknown as NodeJS.WritableStream,
+      env: { PATH: "", ANTHROPIC_API_KEY: FAKE_KEY },
+      cwd,
+      repo,
+      sandboxLookup: { sourceRoot: null, packageRoot: tmp() },
+    } as Parameters<typeof runDoctor>[2]);
+    expect(out.join("")).toContain("! web — off — web access is off ([web] enabled = false)\n");
+    expect(code).toBe(1); // no sandbox binary or tools in this env; the web line is a note
+  });
+
+  test("a --repo that is not a directory is a failure, never the default policy", async () => {
+    const cwd = tmp();
+    const models = join(cwd, "models.toml");
+    writeFileSync(models, `available = ["anthropic:claude-opus-5-5"]\n`);
+    const out: string[] = [];
+    await runDoctor(models, "darwin", {
+      stdout: { write: (s: string) => out.push(s) } as unknown as NodeJS.WritableStream,
+      env: { PATH: "", ANTHROPIC_API_KEY: FAKE_KEY },
+      cwd,
+      repo: "./no-such-repo",
+      sandboxLookup: { sourceRoot: null, packageRoot: tmp() },
+    } as Parameters<typeof runDoctor>[2]);
+    const text = out.join("");
+    expect(text).toContain(`✗ policy — --repo ${join(cwd, "no-such-repo")} is not a directory`);
+    expect(text).not.toMatch(/web .*policy: on/);
+  });
+});
+
+describe("runPolicy: rewire run --no-web (bench)", () => {
+  test("--no-web turns web off as a run layer, over a repo policy that sets enabled = true", async () => {
+    const repo = tmp();
+    mkdirSync(join(repo, ".rewire"));
+    writeFileSync(join(repo, ".rewire", "policy.toml"), `[web]\nenabled = true\n`);
+    expect((await runPolicy(repo, false)).web.enabled).toBe(true);
+    const off = await runPolicy(repo, true);
+    expect(off.web.enabled).toBe(false);
+    expect(webOffReason(off)).toMatch(/enabled = false/);
   });
 });

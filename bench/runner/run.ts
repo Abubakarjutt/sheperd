@@ -59,9 +59,28 @@ type Child = {
   timedOut: boolean;
 };
 
-function runRewire(repo: string, task: Task, o: BenchOptions): Promise<Child> {
-  const args = [CLI_MAIN, "run", "--headless", "--repo", repo, "--task-file", task.taskFile];
+/**
+ * The `rewire run` command line for one task. `--no-web` turns web access off as a run-layer
+ * policy, which a fixture's `.rewire/policy.toml` cannot loosen: a task must not be solved (or
+ * its hidden tests found) online, and runs stay comparable.
+ */
+export function rewireArgs(repo: string, task: Task, o: Pick<BenchOptions, "models">): string[] {
+  const args = [
+    CLI_MAIN,
+    "run",
+    "--headless",
+    "--no-web",
+    "--repo",
+    repo,
+    "--task-file",
+    task.taskFile,
+  ];
   if (o.models) args.push("--models", resolve(o.models));
+  return args;
+}
+
+function runRewire(repo: string, task: Task, o: BenchOptions): Promise<Child> {
+  const args = rewireArgs(repo, task, o);
   const t0 = Date.now();
   // REWIRE_FAUX_SCRIPT (and everything else) passes through untouched in the child's env.
   const child: ChildProcess = spawn(process.execPath, args, {

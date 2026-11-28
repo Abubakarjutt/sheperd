@@ -17,7 +17,7 @@ import {
   runPipeline,
   type WebAccess,
 } from "@rewire/pipeline";
-import { loadPolicy } from "@rewire/policy";
+import { loadPolicy, mergeTightenOnly, type Policy } from "@rewire/policy";
 import {
   createProvider,
   FauxProvider,
@@ -40,6 +40,8 @@ export type RunOptions = {
   repo?: string | undefined;
   models?: string | undefined;
   headless: boolean;
+  /** `--no-web`: web access off for this run (a run-layer policy; nothing can turn it back on). */
+  noWeb?: boolean | undefined;
 };
 
 export type RunIo = {
@@ -164,6 +166,15 @@ export function webAccess(
   return faux ? undefined : { config: models.web, env };
 }
 
+/**
+ * The run's policy: the repository's, then `--no-web` as the run layer (tighten-only, so a repo
+ * or fixture policy setting `enabled = true` cannot undo it).
+ */
+export async function runPolicy(repo: string, noWeb: boolean): Promise<Policy> {
+  const policy = await loadPolicy(repo);
+  return noWeb ? mergeTightenOnly(policy, { web: { enabled: false } }) : policy;
+}
+
 /** `settings`: models.toml's `[providers.*]` tables, for the cloud providers. */
 export function providerFactory(
   env: NodeJS.ProcessEnv,
@@ -272,7 +283,7 @@ export async function runCommand(
 ): Promise<number> {
   const task = await readTask(o, io.cwd);
   const repo = resolve(io.cwd, o.repo ?? ".");
-  const policy = await loadPolicy(repo);
+  const policy = await runPolicy(repo, o.noWeb === true);
 
   const fauxPath = io.env.REWIRE_FAUX_SCRIPT;
   const faux = fauxPath ? loadFauxScript(fauxPath) : undefined;

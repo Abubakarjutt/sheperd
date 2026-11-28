@@ -11,8 +11,8 @@ import { installSigint, onProcessSigint } from "./sigint.js";
 const USAGE = `usage:
   rewire                      (on a terminal: the interactive session)
   rewire chat [--repo <path>] [--models <file>]
-  rewire run <task> [--repo <path>] [--models <file>] [--headless]
-  rewire run --task-file <path> [--repo <path>] [--models <file>] [--headless]
+  rewire run <task> [--repo <path>] [--models <file>] [--headless] [--no-web]
+  rewire run --task-file <path> [--repo <path>] [--models <file>] [--headless] [--no-web]
   rewire doctor [--models <file>] [--repo <path>]
   rewire calibrate <provider:model> [--max <tokens>] [--yes] [--models <file>] [--fresh]
 `;
@@ -49,6 +49,7 @@ async function main(argv: string[]): Promise<number> {
         models: { type: "string" },
         "task-file": { type: "string" },
         headless: { type: "boolean", default: false },
+        "no-web": { type: "boolean", default: false },
       },
     });
     if (command === "doctor") {
@@ -78,6 +79,7 @@ async function main(argv: string[]): Promise<number> {
         repo: values.repo,
         models: values.models,
         headless: values.headless === true,
+        noWeb: values["no-web"] === true,
       },
       {
         stdout: process.stdout,

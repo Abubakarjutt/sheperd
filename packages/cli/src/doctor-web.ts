@@ -1,5 +1,5 @@
-import { type Policy, webOffReason } from "@rewire/policy";
-import { type Env, resolveSearch, type WebConfig } from "@rewire/web";
+import { type Policy, webHostRefusal, webOffReason } from "@rewire/policy";
+import { type Env, resolveSearch, searchServiceHost, type WebConfig } from "@rewire/web";
 
 /** What doctor says when no search backend is set up and none was chosen. */
 const NONE_AUTO =
@@ -41,5 +41,14 @@ export function webLine(
     r.backend === "searxng"
       ? ` at ${searxngHost(config.searxngUrl)}`
       : ` (${r.keyEnv ?? "no key"})`;
+  // web_search refuses a service the policy refuses (the query goes to its host).
+  const host = searchServiceHost(r.backend, config);
+  const rule = host === undefined ? undefined : webHostRefusal(w, host);
+  if (rule !== undefined) {
+    return {
+      ok: false,
+      detail: `search: ${r.backend}${from}, refused: the search service ${rule}${tail}`,
+    };
+  }
   return { ok: true, detail: `search: ${r.backend}${from}${tail}` };
 }

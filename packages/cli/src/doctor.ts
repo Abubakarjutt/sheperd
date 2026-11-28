@@ -37,6 +37,14 @@ export function findOnPath(bin: string, env: NodeJS.ProcessEnv): string | undefi
   return undefined;
 }
 
+const isDirectory = (p: string): boolean => {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+};
+
 export type DoctorIo = {
   stdout: Writable;
   env: NodeJS.ProcessEnv;
@@ -146,7 +154,9 @@ export async function runDoctor(
   }
   // Web access: optional, so a missing key or web off is a note; a broken policy fails a run.
   try {
-    const policy = await loadPolicy(resolve(io.cwd, io.repo ?? "."));
+    const repo = resolve(io.cwd, io.repo ?? ".");
+    if (!isDirectory(repo)) throw new Error(`--repo ${repo} is not a directory`);
+    const policy = await loadPolicy(repo);
     const l = webLine(web, io.env, policy);
     if (l.ok) ok("web", oneLine(l.detail, 300));
     else note("web", oneLine(l.detail, 300), undefined);
