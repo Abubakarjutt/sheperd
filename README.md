@@ -453,9 +453,10 @@ allowlist stays empty, so `bash` in the chat or the implementer still cannot rea
 
 Web access is on by default in `rewire` (chat) and `rewire run`. `web_fetch` needs no key. Without
 a search backend, `web_search` returns a tool error that says what to set, and chat and runs work
-as before. `.rewire/policy.toml` can turn web off (see below). Faux-provider runs
-(`REWIRE_FAUX_SCRIPT`) never get web access. The benchmark runs tasks through `rewire run`, so a
-real-model benchmark run has web access too, unless a task fixture's policy turns it off.
+as before. `.rewire/policy.toml` can turn web off (see below), and `rewire run --no-web` turns it
+off for one run as a run-layer policy that no repository policy can turn back on. Faux-provider
+runs (`REWIRE_FAUX_SCRIPT`) never get web access. The benchmark passes `--no-web` on every run
+(see `bench/README.md`).
 
 ### Search backends
 
@@ -497,9 +498,12 @@ deny_domains = ["pastebin.com"]         # these hosts and their subdomains are r
 allow_domains = ["nodejs.org", "developer.mozilla.org"]  # when set, only these and their subdomains
 ```
 
-The rules apply to every fetch target, every redirect hop, and the result URLs `web_search`
-shows (hidden results are counted, as `N hidden by policy`). A refused fetch is a tool error that
-names the rule. Domains are bare host names (no scheme, port, path or `*.`), matched case-
+The rules apply to every fetch target, every redirect hop, the search service itself, and the
+result URLs `web_search` shows (hidden results are counted, as `N hidden by policy`). A query is
+sent to the backend's host (`ollama.com`, `api.tavily.com`, `api.search.brave.com`, or your
+SearXNG host), so once any layer sets `allow_domains`, `web_search` is refused unless that host
+is in it, and a `deny_domains` entry matching it refuses it too. A refused fetch or search is a
+tool error that names the rule, and `rewire doctor` shows it. Domains are bare host names (no scheme, port, path or `*.`), matched case-
 insensitively, and `deny_domains` wins over `allow_domains`. A bad entry fails with
 `policy_invalid`.
 
@@ -528,20 +532,28 @@ The SearXNG URL is yours, so it is not checked against these rules; it can be on
 ### What goes out, and what comes back
 
 - **Outgoing.** A query or URL that holds a secret-shaped value is refused before anything is
-  sent. The patterns are the ones rewire redacts, also when percent-encoded (to any depth),
-  `%uXXXX`-escaped, full-width or split by control characters. `sk-`, `ghp_` and `AKIA` keys are
-  also caught with other characters in front (`x<key>`). A host name is checked case-
-  insensitively. Queries are capped at 400 characters.
+  sent. The patterns are the ones rewire redacts (Tavily's `tvly-` keys among them), also when
+  percent-encoded (to any depth), `%uXXXX`-escaped, full-width or split by control characters.
+  `sk-`, `ghp_` and `AKIA` keys are also caught with other characters in front (`x<key>`). A
+  host name is checked case-insensitively. Brave and Ollama keys have no fixed shape, so a query
+  or URL holding the value of any search key set in this process (`OLLAMA_API_KEY`,
+  `TAVILY_API_KEY`, `BRAVE_API_KEY`, 8 characters or more), raw or percent-encoded, in any case,
+  is refused too, and those values are redacted from web text. Queries are capped at 400
+  characters.
+- **History.** The model's own arguments for a refused call are kept as
+  `{"refused":"secret-shaped"}`, so the value never reaches `.rewire/sessions/`, the spec
+  digest or a later prompt.
 - **Incoming.** Every title, URL, snippet and page has control and escape sequences removed and
   secrets redacted. It reaches the model inside an `<untrusted_web>` fence, which the page
   cannot close, and the agents' prompts say web content is data, never instructions.
 - **Audit.** Every call emits a `web_request` event, whether it succeeded or failed: the tool, the
   backend, the query or the URL's host and path (never its query string), the status, the
-  number of results and the bytes returned. It goes to the run's `events.jsonl`, or the chat's
-  event stream. A refused secret-shaped value is recorded as `[refused: secret-shaped]`, and a
-  key is never recorded. The TUI shows each call as `● WebSearch("<query>")` or
-  `● Fetch(<host><path>)`, with result titles and hosts, or the page's first line, status and
-  size.
+  number of results and the bytes returned. A run writes them to its `events.jsonl`. In chat
+  they are shown live and not written to disk (the session file keeps the messages only). A
+  refused secret-shaped value is recorded as `[refused: secret-shaped]`, and a key is never
+  recorded. The TUI shows each call as `● WebSearch("<query>")` or `● Fetch(<host><path>)`, with
+  result titles and hosts, or a status line (`HTTP 200 · text/html · 12.3 KB`, the size the
+  model got, and `truncated`) followed by the page's first line.
 
 ### Residuals
 
@@ -550,8 +562,11 @@ The SearXNG URL is yours, so it is not checked against these rules; it can be on
   the review check the result, not the sources.
 - With web on, repository text that does not look like a secret can leave in a query or a URL,
   through a prompt-injected page or a model's own choice. The outgoing check catches only
-  secret-shaped values. `allow_domains` (or `enabled = false`) is the control for repositories
-  where this matters.
+  secret-shaped values and the configured search keys. For repositories where this matters,
+  `enabled = false` stops it, and `allow_domains` limits it to the hosts listed: text can still
+  reach those hosts, in URLs, and in queries when the search service's host is listed.
+- A Brave or Ollama key, or any other unprefixed secret, that is not the value configured in
+  this process is not recognised.
 - A key that has been re-encoded (base64, reversed, split across host labels, overlong UTF-8) is
   not recognised.
 - The outgoing check has false positives that fail closed: an `sk-` word followed by a word of
@@ -561,7 +576,7 @@ The SearXNG URL is yours, so it is not checked against these rules; it can be on
   model as their plain forms.
 - `tool_call` summaries of other tools (a `bash` command, for one) are still logged with display
   redaction only, so a key written with a prefix (`x<key>`) can appear there.
-- A cancelled chat turn's web calls are still recorded, because their requests went out.
+- A cancelled chat turn's web calls are still reported, because their requests went out.
 
 ## How a run works
 
@@ -611,15 +626,15 @@ The SearXNG URL is yours, so it is not checked against these rules; it can be on
 ```sh
 rewire                                     # interactive session (on a TTY)
 rewire chat [--repo <path>] [--models <file>]
-rewire run "add a --json flag to the export command" [--repo <path>] [--models <file>] [--headless]
-rewire run --task-file task.md [--repo <path>] [--models <file>] [--headless]
+rewire run "add a --json flag to the export command" [--repo <path>] [--models <file>] [--headless] [--no-web]
+rewire run --task-file task.md [--repo <path>] [--models <file>] [--headless] [--no-web]
 ```
 
 `--repo` defaults to the current directory, which must be the root of a clean git repository
 (a package subdirectory of a monorepo is refused with `not_repo_root` in v0.1).
 `--headless` never asks questions (an ambiguous task escalates with reason
 `clarification_required`) and writes machine-readable events to stdout and the human summary to
-stderr.
+stderr. `--no-web` turns web access off for the run (see "Web access").
 
 ### Exit codes
 
@@ -699,8 +714,9 @@ A `web` line shows the search backend and the env var **name** its key came from
 what to set, the SearXNG host when that is used, and the web policy from the repository's
 `.rewire/policy.toml` (`--repo`, default the current directory): `on` with the `allow_domains`
 and `deny_domains` counts, or `off` and why. It is a `✓`, or a `!` note when there is no search
-backend or web is off; web never makes doctor exit 1. An invalid policy file is a `✗ policy`
-line, because a run would fail on it too.
+backend, when the policy refuses the search service's host, or when web is off; none of these
+makes doctor exit 1. An invalid policy file, or a `--repo` that is not a directory, is a
+`✗ policy` line and exit 1, because a run would fail on it too.
 
 ## Choosing models
 

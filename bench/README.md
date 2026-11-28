@@ -16,8 +16,11 @@ pnpm -F bench selftest    # two end-to-end runs of the harness with the faux pro
 ## How a task is run
 
 1. `tasks/<id>/fixture/` is copied into a temporary git repo (a small TS project using vitest).
-2. `rewire run --headless --task-file task.md` runs on it. Headless cannot ask questions, so an
-   ambiguous contract escalates with reason `clarification_required`.
+2. `rewire run --headless --no-web --task-file task.md` runs on it. Headless cannot ask questions,
+   so an ambiguous contract escalates with reason `clarification_required`. `--no-web` turns web
+   access off as a run-layer policy, which a fixture's `.rewire/policy.toml` cannot turn back on:
+   a task must not be solved, or its hidden tests found, online, and runs stay comparable
+   (`rewireArgs` in `runner/run.ts`, tested in `runner/test/run.test.ts`).
 3. `tasks/<id>/hidden-tests/` is copied in only after the run, onto the produced branch, into
    `__bench_hidden__/`. The pipeline never sees these tests.
 4. The hidden tests run **inside `rewire-sandbox`** with the no-network verify profile, because
