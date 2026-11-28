@@ -659,6 +659,13 @@ describe("live turn", () => {
     expect(f).not.toMatch(/Web_search|Web_fetch/);
   });
 
+  it("a tool named like an Object prototype key keeps its own label", () => {
+    const v = render(<ToolLine summary="constructor x" isError={false} />);
+    const f = plain(v.lastFrame());
+    v.unmount();
+    expect(f).toContain("● Constructor(x)");
+  });
+
   it("a web call's preview and summary are sanitized and redacted", () => {
     const key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCD";
     const v = render(
@@ -679,10 +686,13 @@ describe("live turn", () => {
   });
 
   it("[refused: …] web arguments are shown in the error style", () => {
-    const ok = render(<ToolLine summary="web_fetch docs.example/x" isError={false} />);
-    const okRaw = ok.lastFrame() ?? "";
-    ok.unmount();
-    expect(okRaw).not.toMatch(new RegExp(`${ESC}\\[31m`));
+    for (const summary of ["web_fetch docs.example/x", "bash [refused: chosen by the model]"]) {
+      // Only the web tools' summary hooks write `[refused: …]`: other tools' text is not styled.
+      const ok = render(<ToolLine summary={summary} isError={false} />);
+      const okRaw = ok.lastFrame() ?? "";
+      ok.unmount();
+      expect(okRaw).not.toMatch(new RegExp(`${ESC}\\[31m`));
+    }
     for (const isError of [true, false]) {
       const v = render(
         <ToolLine
