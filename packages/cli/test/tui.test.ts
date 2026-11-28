@@ -333,6 +333,48 @@ describe("chatSessions reads the control at each build", () => {
   });
 });
 
+describe("chatSessions per-model state", () => {
+  test("one prompt-reading meter per chat model; an Ollama chat model gets the reply timeout", async () => {
+    const repo = await realpath(await mkdtemp(join(tmpdir(), "rewire-cli-meter-")));
+    try {
+      const rc = control();
+      const newSession = chatSessions({
+        repo,
+        routing: () => rc.current(),
+        providers: () => new FauxProvider([]),
+        policy: DEFAULT_POLICY,
+        store: new SessionStore(),
+        compaction: defaultCompactionConfig(),
+        windowOptions: { env: { REWIRE_FAUX_WINDOW: "9000" } },
+        ollamaTimeoutMs: 123_000,
+        buildCompaction: async (a) => ({
+          window: { window: 9000, source: "model", provisional: true },
+          config: a.config,
+          estimator: a.estimator,
+          verifier: async (ops) => ops.map(() => ({ accept: true })),
+          independence: a.routing.independence,
+        }),
+      });
+      const skills = { skills: [], root: "/x" } as unknown as SkillSet;
+      type Inner = { meter: unknown; opts: { replyTimeoutMs?: number } };
+      const inner = (s: unknown) => s as Inner;
+      const a = await newSession({ skills, emit: () => {} });
+      expect(rc.set("spec", qwen3).ok).toBe(true);
+      const b = await newSession({ skills, emit: () => {} });
+      expect(rc.set("spec", undefined).ok).toBe(true);
+      const c = await newSession({ skills, emit: () => {} });
+      expect(inner(a).meter).toBe(inner(c).meter);
+      expect(inner(a).meter).not.toBe(inner(b).meter);
+      expect(inner(a).opts.replyTimeoutMs).toBe(123_000);
+      await a.dispose();
+      await b.dispose();
+      await c.dispose();
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("routedRunController", () => {
   test("a run started after a pick gets the new routing; a running run keeps its own", async () => {
     const rc = control();

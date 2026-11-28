@@ -51,6 +51,14 @@ import {
   retain,
   type VerifyRisky,
 } from "./compactor.js";
+import {
+  clearedLabel,
+  clearToFit,
+  IN_TURN_KEEP,
+  LOW_WATER_SHARE,
+  PREFILL_GUARD_SHARE,
+  PREFILL_KEEP,
+} from "./in-turn.js";
 import { RecallCache, recallTool } from "./recall.js";
 import { emptyRecord, type RecordItem, renderRecord, type SessionRecord } from "./record.js";
 import {
@@ -145,7 +153,14 @@ export type ChatEvent =
    * (`suspectTruncation`): the server probably cut the prompt to a smaller runtime context.
    * Emitted at most once per session; `hint` is `OLLAMA_TRUNCATION_HINT`.
    */
-  | { type: "truncation_suspected"; estimated: number; actual: number; hint: string };
+  | { type: "truncation_suspected"; estimated: number; actual: number; hint: string }
+  /**
+   * Before a model call inside a turn, `cleared` more of this turn's older tool results were
+   * replaced by stubs in the model-visible context (the stored messages keep them whole):
+   * `reason` `limit` to fit the compaction limit, `reading_time` to fit the prefill guard's
+   * budget. `limit` is the token target that was applied.
+   */
+  | { type: "context_cleared"; cleared: number; limit: number; reason: "limit" | "reading_time" };
 
 export type CompactionCounts = {
   decisions: number;
@@ -401,6 +416,13 @@ export type ChatSessionOptions = {
   /** Enables compaction (automatic before a send, and `compact()`). Off when absent. */
   compaction?: CompactionDeps;
   /**
+   * The chat model's reply timeout in ms, which bounds its prompt reading (Ollama's: the CLI
+   * passes `resolveOllamaTimeout` only for an Ollama chat model). With compaction and a measured
+   * prompt-reading speed it turns on the prefill guard: a call whose estimated prompt would take
+   * over 80% of it to read is trimmed, then refused with `ollama_timeout`.
+   */
+  replyTimeoutMs?: number;
+  /**
    * Web access: `web_search` and `web_fetch` for the chat agent when policy has web on (never
    * for the compaction or its verifier). Absent, or web off in policy: no web tools.
    */
@@ -536,6 +558,22 @@ export class ChatSession {
   private epoch = 0;
   /** `truncation_suspected` was already emitted (once per session). */
   private truncationShown = false;
+  /** The system prompt, built on first use (see `system()`). */
+  private systemText: string | undefined;
+  /**
+   * The last model call this session sent, for the prompt-reading meter: its system prompt, tool
+   * specs and messages (JSON each) and its reported input tokens. A server with a prefix cache
+   * reads only what follows the part a new request shares with it.
+   */
+  private lastSent:
+    | {
+        system: string;
+        tools: string;
+        messages: string[];
+        sent: readonly ChatMessage[];
+        inputTokens: number;
+      }
+    | undefined;
 
   constructor(opts: ChatSessionOptions) {
     this.opts = opts;
@@ -744,9 +782,17 @@ export class ChatSession {
     }
   }
 
+  /**
+   * The chat's system prompt, built once per session: the skills index is fenced with a fresh
+   * random id each time it is rendered, so rebuilding it per turn changed the prompt's first
+   * bytes at every user message and no server prefix cache could reuse anything across turns.
+   */
   private system(): string {
-    const web = webToolsOn(this.opts.policy, this.opts.web) ? `\n\n${WEB_NOTICE}` : "";
-    return `${chatPrompt()}${web}\n\n${skillIndex(this.opts.skills)}`;
+    if (this.systemText === undefined) {
+      const web = webToolsOn(this.opts.policy, this.opts.web) ? `\n\n${WEB_NOTICE}` : "";
+      this.systemText = `${chatPrompt()}${web}\n\n${skillIndex(this.opts.skills)}`;
+    }
+    return this.systemText;
   }
 
   /** The web tools (none without access or with web off), reporting through `onRequest`. */
@@ -875,6 +921,111 @@ export class ChatSession {
       ...(override !== undefined ? { override } : {}),
       ...(this.calib.calibrated !== undefined ? { calibrated: this.calib.calibrated } : {}),
     });
+  }
+
+  /**
+   * Input tokens of `req` a server with a prefix cache already holds from the last call: all of
+   * the last request's when `req` extends it, else the last call's reported count scaled by the
+   * estimated share of it both requests have in common; none with another system prompt or
+   * other tools. A server
+   * that dropped its cache reads more than this, so the meter then sees a slow read, which the
+   * reload check discards when it is far off.
+   */
+  private cachedPrefix(req: ChatRequest): number {
+    const last = this.lastSent;
+    if (last === undefined || last.system !== req.system) return 0;
+    if (last.tools !== JSON.stringify(req.tools ?? [])) return 0;
+    let k = 0;
+    while (
+      k < last.messages.length &&
+      k < req.messages.length &&
+      last.messages[k] === JSON.stringify(req.messages[k])
+    ) {
+      k++;
+    }
+    if (k === last.messages.length) return last.inputTokens;
+    // The shared part's share of the last request, by one estimator, applied to its reported
+    // count: estimated and reported tokens are never mixed.
+    const est = this.opts.compaction?.estimator;
+    if (est === undefined) return 0;
+    const whole = est.estimate(req.system, [...last.sent], req.tools);
+    if (!(whole > 0)) return 0;
+    const shared = est.estimate(req.system, req.messages.slice(0, k), req.tools);
+    return Math.min(last.inputTokens, Math.round((last.inputTokens * shared) / whole));
+  }
+
+  /**
+   * The in-turn budget (compaction on), applied before each model call of a turn: while the
+   * estimate is over the compaction limit, the oldest tool results of this turn (all but the
+   * newest {@link IN_TURN_KEEP}) become stubs in what is sent. Then the prefill guard (with
+   * `replyTimeoutMs` and a measured reading speed): over 80% of the reply timeout to read, it
+   * clears down to the newest result alone, and if that is still over, the call is not sent
+   * (`ollama_timeout`). `from` is the index of the turn's user message in `req.messages`.
+   */
+  private fitTurn(
+    req: ChatRequest,
+    from: number,
+    cleared: Map<number, string>,
+    tools: readonly AgentTool[],
+    emit: (e: ChatEvent) => void,
+  ): ChatRequest {
+    const d = this.opts.compaction as CompactionDeps;
+    const limit = this.limit();
+    if (limit === undefined) return req;
+    const base = {
+      from,
+      cleared,
+      estimate: (m: ChatMessage[]) => d.estimator.estimate(req.system, m, req.tools),
+      label: (c: { name: string; arguments: Record<string, unknown> }) =>
+        clearedLabel(
+          c.name,
+          c.arguments,
+          tools.find((t) => t.spec.name === c.name),
+        ),
+    };
+    const low = (n: number): number => Math.floor(n * LOW_WATER_SHARE);
+    let fitted = clearToFit(req.messages, {
+      ...base,
+      max: limit.limit,
+      target: low(limit.limit),
+      keep: IN_TURN_KEEP,
+      clearReruns: false,
+    });
+    let newly = fitted.newly;
+    let event: { limit: number; reason: "limit" | "reading_time" } = {
+      limit: limit.limit,
+      reason: "limit",
+    };
+    const rate = this.meter.rate();
+    const timeoutMs = this.opts.replyTimeoutMs;
+    if (rate !== undefined && timeoutMs !== undefined && timeoutMs > 0) {
+      const budgetS = (PREFILL_GUARD_SHARE * timeoutMs) / 1000;
+      const readable = Math.floor(rate.tokensPerSec * budgetS);
+      if (fitted.estimate > readable) {
+        fitted = clearToFit(req.messages, {
+          ...base,
+          max: readable,
+          target: low(readable),
+          keep: PREFILL_KEEP,
+          clearReruns: true,
+        });
+        newly += fitted.newly;
+        event = { limit: readable, reason: "reading_time" };
+      }
+      if (fitted.estimate > readable) {
+        if (newly > 0) emit({ type: "context_cleared", cleared: newly, ...event });
+        const tps = Math.round(rate.tokensPerSec);
+        const secs = Math.round(fitted.estimate / rate.tokensPerSec);
+        throw new RewireError(
+          "ollama_timeout",
+          `not sent: estimated ${fitted.estimate} tokens at the measured ${tps} tokens/s ≈ ${secs}s of prompt reading, over ${PREFILL_GUARD_SHARE} × the ${Math.round(timeoutMs / 1000)}s reply timeout (${Math.round(budgetS)}s); the context is too large for this model's reading speed`,
+          "run /compact to shrink the context (or /clear to start over), then ask for less at a time (read files with offset/limit); or raise the reply timeout (REWIRE_OLLAMA_TIMEOUT_S, or [providers.ollama] timeout_s in models.toml)",
+        );
+      }
+    }
+    // One line per clearing batch, whichever budget made it.
+    if (newly > 0) emit({ type: "context_cleared", cleared: newly, ...event });
+    return cleared.size === 0 ? req : { ...req, messages: fitted.messages };
   }
 
   private estimate(specs: ToolSpec[], next?: string): number {
@@ -1328,8 +1479,17 @@ export class ChatSession {
     let unnamed = 0;
     const inner = this.opts.provider;
     let reload = false;
+    // The model-visible context; the stored history keeps everything.
+    const prior = this.contextMessages();
+    // This turn's tool results cleared from the model-visible context (message index → stub): once
+    // cleared, a result stays cleared, so the prompt prefix is stable after each step.
+    const cleared = new Map<number, string>();
     const provider: Provider = {
-      chat: async (req: ChatRequest) => {
+      chat: async (original: ChatRequest) => {
+        const req =
+          deps === undefined
+            ? original
+            : this.fitTurn(original, prior.length, cleared, tools, emitLive);
         const firstCall = this.calls++ === 0;
         const estimated = deps?.estimator.estimate(req.system, req.messages, req.tools);
         // Prompt reading ends at the first streamed chunk of any kind: a thinking model's
@@ -1361,17 +1521,30 @@ export class ChatSession {
             });
           }
         }
+        // Only the part after what the previous request shared was read: a prefix-cache hit
+        // read a few hundred tokens of a long prompt, and timing the whole prompt would
+        // measure the cache, not the model.
+        const read = Math.max(0, res.usage.inputTokens - this.cachedPrefix(req));
+        this.lastSent = {
+          system: req.system,
+          tools: JSON.stringify(req.tools ?? []),
+          messages: req.messages.map((m) => JSON.stringify(m)),
+          sent: req.messages,
+          inputTokens: res.usage.inputTokens,
+        };
         if (ttftMs !== undefined) {
           // The first call of a session, or one far slower than this model reads, includes a
-          // model load: its time is not a reading speed.
+          // model load (or a cache the server dropped): its time is not a reading speed.
           const rate = this.meter.rate();
           const expectedMs =
-            rate !== undefined && res.usage.inputTokens >= PREFILL_MIN_TOKENS
-              ? (res.usage.inputTokens / rate.tokensPerSec) * 1000
+            // A small read (a new user message after a long history) still has an expected time:
+            // a reload dwarfs even the floor's, while only reads at the floor or over are samples.
+            rate !== undefined
+              ? (Math.max(read, PREFILL_MIN_TOKENS) / rate.tokensPerSec) * 1000
               : undefined;
           const loaded = expectedMs !== undefined && ttftMs > RELOAD_FACTOR * expectedMs;
           if (loaded) reload = true;
-          if (!firstCall && !loaded) this.meter.sample(res.usage.inputTokens, ttftMs);
+          if (!firstCall && !loaded) this.meter.sample(read, ttftMs);
         }
         pendingCalls.push(...res.message.toolCalls);
         if (res.message.text !== "") {
@@ -1380,8 +1553,6 @@ export class ChatSession {
         return res;
       },
     };
-    // The model-visible context; the stored history keeps everything.
-    const prior = this.contextMessages();
     let result: RunAgentResult;
     try {
       result = await untilAborted(

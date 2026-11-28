@@ -2,6 +2,7 @@ import type { ChatEvent } from "@rewire/session";
 import { Box, useInput } from "ink";
 import { cleanForMarkdown, lex, Markdown } from "./markdown.js";
 import { COMPACTING_VERB, Spinner } from "./spinner.js";
+import { kTokens } from "./status-line.js";
 import { EntryLine, ToolLine, type TranscriptEntry } from "./transcript.js";
 import { useColumns } from "./use-columns.js";
 
@@ -24,7 +25,9 @@ export type LiveItem =
       preview?: string[];
       more?: number;
     }
-  | { kind: "skill"; name: string };
+  | { kind: "skill"; name: string }
+  /** A dim line of the session's own (`context_cleared`). */
+  | { kind: "line"; text: string };
 
 /**
  * The part of an in-flight turn that is not finished yet. Finished items (a tool with its
@@ -104,6 +107,8 @@ export function applyEvent(s: LiveState, e: ChatEvent): LiveState {
     }
     case "skill_loaded":
       return { ...s, items: [...s.items, { kind: "skill", name: e.name }] };
+    case "context_cleared":
+      return { ...s, items: [...s.items, { kind: "line", text: clearedLine(e) }] };
     case "compaction":
       if (e.phase === "start") return { ...s, compacting: Date.now() };
       if (s.compacting === undefined) return s;
@@ -123,6 +128,16 @@ export function applyEvent(s: LiveState, e: ChatEvent): LiveState {
       // assistant_text: the streamed deltas (or the turn's final text) already carry it.
       return s;
   }
+}
+
+/** `⎿ cleared 3 earlier tool outputs to fit the context (75k limit)`. */
+export function clearedLine(e: Extract<ChatEvent, { type: "context_cleared" }>): string {
+  const n = `${e.cleared} earlier tool output${e.cleared === 1 ? "" : "s"}`;
+  const why =
+    e.reason === "limit"
+      ? `to fit the context (${kTokens(e.limit)} limit)`
+      : `to fit this model's prompt-reading time (${kTokens(e.limit)} tokens)`;
+  return `⎿ cleared ${n} ${why}`;
 }
 
 function withoutCompacting(s: LiveState): LiveState {
@@ -197,11 +212,13 @@ function entryOf(
       },
     ];
   }
+  if (it.kind === "line") return [{ kind: "line", tone: "dim", text: it.text }];
   return [{ kind: "skill", name: it.name }];
 }
 
 const finished = (it: LiveItem): boolean =>
   it.kind === "skill" ||
+  it.kind === "line" ||
   (it.kind === "tool" && it.preview !== undefined) ||
   (it.kind === "text" && it.closed === true);
 
@@ -257,6 +274,8 @@ function LiveItemView({ item, cols }: { item: LiveItem; cols: number }) {
       />
     );
   }
+  if (item.kind === "line")
+    return <EntryLine entry={{ kind: "line", tone: "dim", text: item.text }} />;
   return <EntryLine entry={{ kind: "skill", name: item.name }} />;
 }
 

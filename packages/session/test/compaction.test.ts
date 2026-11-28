@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { RewireError } from "@rewire/core";
 import { runAgent } from "@rewire/loop";
 import {
   type CompactionConfig,
@@ -40,6 +41,7 @@ import {
   compactionDeps,
   createRiskyVerifier,
   emptyRecord,
+  PrefillMeter,
   RECENT_TITLE,
   RECORD_PREFACE,
   type RecordItem,
@@ -186,6 +188,8 @@ async function setup(
     sessionId?: string;
     provider?: "faux" | "ollama";
     web?: WebAccess;
+    prefillMeter?: PrefillMeter;
+    replyTimeoutMs?: number;
   } = {},
 ) {
   const repo = o.repo ?? makeRepo();
@@ -201,6 +205,8 @@ async function setup(
     emit: (e: ChatEvent) => events.push(e),
     ...(compaction ? { compaction } : {}),
     ...(o.web ? { web: o.web } : {}),
+    ...(o.prefillMeter ? { prefillMeter: o.prefillMeter } : {}),
+    ...(o.replyTimeoutMs !== undefined ? { replyTimeoutMs: o.replyTimeoutMs } : {}),
   };
   const session =
     o.sessionId !== undefined
@@ -701,7 +707,9 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
 
   test("the first call of a session, and a call far slower than the measured speed, are not prefill samples; the window is refreshed after the first turn and after a reload", async () => {
     const delays = [400, 400, 400];
-    const inputs = [40_000, 40_000, 4_000];
+    // Each request extends the last: the second reads 40,000 new tokens; the third only 200 (a
+    // new user message after a long history), too few to be a sample but still a reload check.
+    const inputs = [40_000, 80_000, 80_200];
     let k = 0;
     const p: Provider = {
       async chat(req: ChatRequest): Promise<ChatResponse> {
@@ -727,7 +735,7 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
     await session.send("two"); // 40,000 tokens in ~400 ms: ~100,000 tok/s
     expect(session.prefill()?.samples).toBe(1);
     expect(refreshed).toHaveLength(1);
-    // 4,000 tokens should take ~40 ms; 400 ms is over 5x: a reload, not a sample.
+    // At ~100,000 tok/s even the 1,000-token floor takes ~10 ms; 400 ms is over 5x: a reload.
     await session.send("three");
     expect(session.prefill()?.samples).toBe(1);
     expect(refreshed).toHaveLength(2);
@@ -1278,5 +1286,254 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
     };
     await Promise.all([session.contextStatus(), session.contextStatus(), session.contextStatus()]);
     expect(made).toEqual(["client"]);
+  });
+});
+
+/** A file of `chars` characters (lines of 80), distinct per `tag`. */
+function bigFile(repo: string, name: string, tag: string, chars: number): void {
+  const line = `${tag} ${"x".repeat(78 - tag.length)}\n`;
+  writeFileSync(join(repo, name), line.repeat(Math.ceil(chars / line.length)).slice(0, chars));
+}
+
+const readCall = (path: string): ScriptedTurn => ({
+  toolCalls: [{ id: "", name: "read", arguments: { path } }],
+});
+
+const toolContents = (msgs: readonly { role: string; content: string }[]): string[] =>
+  msgs.filter((m) => m.role === "tool").map((m) => m.content);
+
+const STUB_HEAD = "[tool output cleared to fit the context: ";
+
+describe.skipIf(!sandboxAvailable())("ChatSession in-turn budget", { timeout: 60_000 }, () => {
+  test("a turn of many large tool results stays under the limit, keeps the 2 newest whole, and stores everything", async () => {
+    const plain = new TokenEstimator();
+    const KEY = `sk-ant-api03-${"C".repeat(40)}`;
+    const repo = makeRepo();
+    for (let i = 1; i <= 5; i++) bigFile(repo, `big${i}.txt`, `file${i}`, 16_000);
+    const p = model({
+      chat: [
+        // A bash call first: its stub label is the command, redacted.
+        { toolCalls: [{ id: "", name: "bash", arguments: { command: `cat big1.txt # ${KEY}` } }] },
+        ...[1, 2, 3, 4, 5].map((i) => readCall(`big${i}.txt`)),
+        text("done"),
+      ],
+      usage: (req) => plain.estimate(req.system, req.messages, req.tools),
+    });
+    const { deps: d } = deps({ limit: 12_000 });
+    const { session, events } = await setup(p, d, { repo });
+    await session.send("read them all");
+
+    expect(p.chats).toHaveLength(7);
+    const stored = toolContents(session.history());
+    expect(stored).toHaveLength(6);
+    for (const c of stored) expect(c.length).toBeGreaterThan(15_000);
+
+    const seen = new Map<string, string>();
+    for (const [k, req] of p.chats.entries()) {
+      expect(validContext(req.messages)).toBe(true);
+      expect(plain.estimate(req.system, req.messages, req.tools)).toBeLessThanOrEqual(12_000);
+      const tools = req.messages.filter((m) => m.role === "tool");
+      // The 2 newest results are always whole.
+      for (const m of tools.slice(-2)) expect(stored).toContain(m.content);
+      for (const m of tools) {
+        const id = m.toolCallId as string;
+        if (m.content.startsWith(STUB_HEAD)) {
+          // Once cleared, the same bytes on every later step.
+          if (seen.has(id)) expect(m.content).toBe(seen.get(id));
+          seen.set(id, m.content);
+        } else {
+          expect(seen.has(id), `result ${id} came back after it was cleared (step ${k})`).toBe(
+            false,
+          );
+        }
+      }
+    }
+    expect(seen.size).toBeGreaterThanOrEqual(3);
+    const stubs = [...seen.values()];
+    expect(stubs[0]).toBe(
+      `[tool output cleared to fit the context: bash cat big1.txt # [redacted] — ${stored[0]?.length} chars. Run it again (with offset/limit for read) if you still need it, or use recall after this turn.]`,
+    );
+    expect(stubs[1]).toContain("read big1.txt — ");
+    for (const s of stubs) expect(s).not.toContain("CCCC");
+    const cleared = events.filter((e) => e.type === "context_cleared");
+    expect(cleared.length).toBeGreaterThan(0);
+    expect(cleared.reduce((n, e) => n + (e.type === "context_cleared" ? e.cleared : 0), 0)).toBe(
+      seen.size,
+    );
+    expect(cleared[0]).toMatchObject({ type: "context_cleared", limit: 12_000, reason: "limit" });
+
+    // The next turn sends the stored history: every result whole (compaction handles it there).
+    expect(toolContents(session.context())).toEqual(stored);
+  });
+
+  test("the system prompt is the same bytes on every turn, so a server prefix cache spans turns", async () => {
+    const p = model({ chat: [text("a"), text("b"), text("c")] });
+    const { deps: d } = deps();
+    const { session } = await setup(p, d);
+    for (const t of ["one", "two", "three"]) await session.send(t);
+    const [first, ...rest] = p.chats;
+    for (const req of rest) {
+      expect(req.system).toBe(first?.system);
+      // Each request starts with the whole previous one.
+      expect(req.messages.slice(0, first?.messages.length)).toEqual(first?.messages);
+    }
+  });
+
+  test("clearing goes down to a low-water mark, so the prefix changes in rare batches, one line each", async () => {
+    const plain = new TokenEstimator();
+    const repo = makeRepo();
+    for (let i = 1; i <= 10; i++) bigFile(repo, `f${i}.txt`, `file${i}`, 8_000);
+    const p = model({
+      chat: [...[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((i) => readCall(`f${i}.txt`)), text("done")],
+      usage: (req) => plain.estimate(req.system, req.messages, req.tools),
+    });
+    const { deps: d } = deps({ limit: 12_000 });
+    const { session, events } = await setup(p, d, { repo });
+    await session.send("read all ten");
+    expect(p.chats).toHaveLength(11);
+    // A request "busts" the cache when it differs from the previous one before that one's end.
+    let busts = 0;
+    for (let k = 1; k < p.chats.length; k++) {
+      const prev = p.chats[k - 1]?.messages ?? [];
+      const cur = p.chats[k]?.messages ?? [];
+      if (prev.some((m, i) => JSON.stringify(m) !== JSON.stringify(cur[i]))) busts++;
+    }
+    const lines = events.filter((e) => e.type === "context_cleared");
+    expect(busts).toBeGreaterThan(0);
+    // Clearing just under the limit would change the prefix on every call once over it (5 of
+    // these 10); down to 60% it happens twice.
+    expect(busts).toBeLessThanOrEqual(2);
+    expect(lines).toHaveLength(busts);
+    for (const req of p.chats) {
+      expect(plain.estimate(req.system, req.messages, req.tools)).toBeLessThanOrEqual(12_000);
+    }
+  });
+
+  test("a cleared result the model reads again is kept, not cleared again before older ones", async () => {
+    const plain = new TokenEstimator();
+    const repo = makeRepo();
+    for (let i = 1; i <= 5; i++) bigFile(repo, `g${i}.txt`, `file${i}`, 16_000);
+    const p = model({
+      chat: [
+        ...[1, 2, 3, 4].map((i) => readCall(`g${i}.txt`)),
+        // g1 was cleared: the model reads it again, then two more files.
+        readCall("g1.txt"),
+        readCall("g5.txt"),
+        readCall("g4.txt"),
+        text("done"),
+      ],
+      usage: (req) => plain.estimate(req.system, req.messages, req.tools),
+    });
+    const { deps: d } = deps({ limit: 12_000 });
+    const { session } = await setup(p, d, { repo });
+    await session.send("read");
+    const last = p.chats.at(-1)?.messages ?? [];
+    const tools = last.filter((m) => m.role === "tool");
+    // The re-read of g1 (the 5th result) is whole even though it is older than the 2 kept.
+    expect(tools[4]?.content.startsWith(STUB_HEAD)).toBe(false);
+    expect(tools[4]?.content).toContain("file1 ");
+    expect(tools[0]?.content.startsWith(STUB_HEAD)).toBe(true);
+  });
+
+  test("under the limit nothing is cleared and the request is the loop's own", async () => {
+    const repo = makeRepo();
+    bigFile(repo, "small.txt", "small", 2_000);
+    const p = model({
+      chat: [readCall("small.txt"), readCall("small.txt"), readCall("small.txt"), text("ok")],
+    });
+    const { deps: d } = deps({ limit: 100_000 });
+    const { session, events } = await setup(p, d, { repo });
+    await session.send("read");
+    for (const req of p.chats) {
+      for (const c of toolContents(req.messages)) expect(c.startsWith(STUB_HEAD)).toBe(false);
+    }
+    expect(events.some((e) => e.type === "context_cleared")).toBe(false);
+  });
+
+  test("the prefill guard clears down to the newest result, then refuses to send with ollama_timeout", async () => {
+    const plain = new TokenEstimator();
+    const repo = makeRepo();
+    bigFile(repo, "big1.txt", "file1", 14_000);
+    bigFile(repo, "big2.txt", "file2", 14_000);
+    bigFile(repo, "huge.txt", "huge", 40_000);
+    const p = model({
+      chat: [readCall("big1.txt"), readCall("big2.txt"), readCall("huge.txt"), text("never")],
+      usage: (req) => plain.estimate(req.system, req.messages, req.tools),
+    });
+    // 100 tokens/s measured, a 100 s reply timeout: at most 8,000 tokens may be sent.
+    const meter = new PrefillMeter();
+    meter.sample(1_000, 10_000);
+    const { deps: d } = deps({ limit: 100_000 });
+    const { session, events } = await setup(p, d, {
+      repo,
+      prefillMeter: meter,
+      replyTimeoutMs: 100_000,
+    });
+    const before = session.history();
+    const err = await session.send("read").catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "ollama_timeout" });
+    expect((err as RewireError).message).toMatch(
+      /^not sent: estimated \d+ tokens at the measured 100 tokens\/s ≈ \d+s of prompt reading, over 0\.8 × the 100s reply timeout \(80s\); the context is too large for this model's reading speed$/,
+    );
+    expect((err as RewireError).hint).toContain("/compact");
+    // The call with huge.txt was never sent; the one before it kept only the newest result.
+    expect(p.chats).toHaveLength(3);
+    const third = toolContents(p.chats[2]?.messages ?? []);
+    expect(third[0]?.startsWith(STUB_HEAD)).toBe(true);
+    expect(third[1]?.startsWith(STUB_HEAD)).toBe(false);
+    for (const req of p.chats) {
+      expect(plain.estimate(req.system, req.messages, req.tools)).toBeLessThanOrEqual(8_000);
+    }
+    // big1 before the third call; big2 before the fourth, which huge.txt alone still overfills.
+    const guard = { type: "context_cleared", cleared: 1, limit: 8_000, reason: "reading_time" };
+    expect(events.filter((e) => e.type === "context_cleared")).toEqual([guard, guard]);
+    // The message the TUI shows says the request was refused before sending.
+    expect((err as RewireError).message.startsWith("not sent:")).toBe(true);
+    // A failed turn stores nothing.
+    expect(session.history()).toEqual(before);
+  });
+
+  test("the latency limit applies after 2 samples, measuring only what a prefix-cache hit left to read, with reasoning streamed first", async () => {
+    // Each call: [input tokens, ms before the first (reasoning) chunk]. The first call is a
+    // model load; the second is a cache hit (200 new tokens); the next two read 1,200 new
+    // tokens each in ~400 ms (~3,000 tokens/s), then reason for 600 ms before any text.
+    const calls: [number, number][] = [
+      [20_000, 400],
+      [20_200, 350],
+      [21_400, 400],
+      [22_600, 400],
+    ];
+    let k = 0;
+    const p: Provider = {
+      async chat(req: ChatRequest): Promise<ChatResponse> {
+        const [input, delay] = calls[k++] ?? [0, 0];
+        await new Promise((r) => setTimeout(r, delay));
+        req.onFirstChunk?.();
+        await new Promise((r) => setTimeout(r, 600));
+        req.onDelta?.("x");
+        return {
+          message: { text: "x", toolCalls: [] },
+          stopReason: "end",
+          usage: { inputTokens: input, outputTokens: 1 },
+        };
+      },
+    };
+    const { deps: d } = deps();
+    d.config = { ...d.config, latencyBudgetS: 5 };
+    const { session } = await setup(p, d);
+    for (const t of ["one", "two", "three"]) await session.send(t);
+    expect(session.prefill()?.samples).toBe(1);
+    expect((await session.contextStatus())?.limit.reason).toBe("formula");
+    await session.send("four");
+    const r = session.prefill();
+    expect(r?.samples).toBe(2);
+    // ~3,000 tokens/s: timed over the whole prompt it would be ~55,000; timed to the first
+    // text (after the reasoning) ~1,200.
+    expect(r?.tokensPerSec).toBeLessThanOrEqual(1_200 / 0.39);
+    expect(r?.tokensPerSec).toBeGreaterThan(1_200 / 0.6);
+    const st = await session.contextStatus();
+    expect(st?.limit.reason).toBe("latency");
+    expect(st?.limit.limit).toBeGreaterThanOrEqual(10_000);
+    expect(st?.limit.limit).toBeLessThanOrEqual(15_000);
   });
 });
