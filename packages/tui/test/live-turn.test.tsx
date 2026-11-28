@@ -27,7 +27,14 @@ import { render } from "ink-testing-library";
 import stringWidth from "string-width";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { App, type InterruptTarget } from "../src/app.js";
-import { applyEvent, liveEntries, newLive, splitBlocks, takeFinished } from "../src/live-turn.js";
+import {
+  applyEvent,
+  clearedLine,
+  liveEntries,
+  newLive,
+  splitBlocks,
+  takeFinished,
+} from "../src/live-turn.js";
 import { cleanForMarkdown } from "../src/markdown.js";
 import { formatTokens, SPINNER_GLYPHS, SPINNER_VERBS, Spinner } from "../src/spinner.js";
 import { ToolLine } from "../src/transcript.js";
@@ -207,6 +214,41 @@ describe("Spinner", () => {
       "Reasoning",
       "Composing",
     ]);
+  });
+});
+
+describe("context_cleared", () => {
+  it("is one dim line, in arrival order, finished at once", () => {
+    let s = newLive("Thinking", 0);
+    s = applyEvent(s, {
+      type: "tool_call",
+      callId: "c1",
+      tool: "read",
+      summary: "read a",
+      isError: false,
+    });
+    s = applyEvent(s, {
+      type: "tool_result",
+      callId: "c1",
+      tool: "read",
+      preview: ["x"],
+      more: 0,
+      isError: false,
+    });
+    s = applyEvent(s, { type: "context_cleared", cleared: 3, limit: 75_000, reason: "limit" });
+    const { entries, state } = takeFinished(s);
+    expect(state.items).toEqual([]);
+    expect(entries.at(-1)).toEqual({
+      kind: "line",
+      tone: "dim",
+      text: "⎿ cleared 3 earlier tool outputs to fit the context (75k limit)",
+    });
+  });
+
+  it("names the prompt-reading budget for the prefill guard", () => {
+    expect(
+      clearedLine({ type: "context_cleared", cleared: 1, limit: 8_000, reason: "reading_time" }),
+    ).toBe("⎿ cleared 1 earlier tool output to fit this model's prompt-reading time (8k tokens)");
   });
 });
 

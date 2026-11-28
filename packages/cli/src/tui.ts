@@ -67,6 +67,16 @@ export function restoreTerminal(io: Pick<ChatIo, "stdin" | "stdout">): void {
   if (io.stdout.isTTY) io.stdout.write("\x1b[?25h");
 }
 
+/** The Ollama reply timeout for `chatSessions`, when any available model is on Ollama. */
+function ollamaTimeoutMs(
+  refs: readonly ModelRef[],
+  env: NodeJS.ProcessEnv,
+  settings: Parameters<typeof ollamaTimeoutOption>[2],
+): { ollamaTimeoutMs?: number } {
+  const t = ollamaTimeoutOption(refs, env, settings).ollamaTimeout;
+  return t === undefined ? {} : { ollamaTimeoutMs: t.ms };
+}
+
 /** How long a new chat session waits for its model's context window before using the default. */
 export const WINDOW_LOOKUP_TIMEOUT_MS = 2500;
 
@@ -87,24 +97,32 @@ export type ChatSessionsOptions = {
   buildCompaction?: typeof compactionDeps;
   /** Web access for the chat agent (`webAccess`); policy still decides. */
   web?: WebAccess;
+  /**
+   * The Ollama reply timeout in ms (`resolveOllamaTimeout`): an Ollama chat model's sessions get
+   * it as `replyTimeoutMs`, which turns on the prefill guard.
+   */
+  ollamaTimeoutMs?: number;
 };
 
 /**
  * Builds every ChatSession of the TUI (the first, `/clear`, `/resume` and a chat-model pick) on
  * the chat model (`routing.spec`, read at each build), each with compaction on: `compactionDeps` from the routing (the verifier on
  * `routing.verifier`, routing's independence), the `[compaction]` config and the window. One
- * token estimator and one prompt-reading meter are shared by the sessions: they describe the
- * model, not the conversation.
+ * token estimator is shared by the sessions, and one prompt-reading meter per chat model (a
+ * `/model` pick gets its own): they describe the model, not the conversation.
  */
 export function chatSessions(o: ChatSessionsOptions): StartDeps["newSession"] {
   const estimator = new TokenEstimator();
-  const prefillMeter = new PrefillMeter();
+  const meters = new Map<string, PrefillMeter>();
   const build = o.buildCompaction ?? compactionDeps;
   const routingNow = (): RoleRouting => (typeof o.routing === "function" ? o.routing() : o.routing);
   return async ({ skills, emit, sessionId, routing: candidate }) => {
     // A pick's candidate routing (committed only once this session is built), else the current.
     const routing = candidate ?? routingNow();
     const chatModel = routing.spec;
+    const key = `${chatModel.provider}:${chatModel.model}`;
+    const prefillMeter = meters.get(key) ?? new PrefillMeter();
+    meters.set(key, prefillMeter);
     const compaction = await build({
       routing,
       providers: o.providers,
@@ -127,6 +145,9 @@ export function chatSessions(o: ChatSessionsOptions): StartDeps["newSession"] {
       prefillMeter,
       compaction,
       ...(o.web ? { web: o.web } : {}),
+      ...(chatModel.provider === "ollama" && o.ollamaTimeoutMs !== undefined
+        ? { replyTimeoutMs: o.ollamaTimeoutMs }
+        : {}),
     };
     return sessionId === undefined
       ? new ChatSession(opts)
@@ -216,6 +237,11 @@ export async function chatCommand(o: ChatOptions, io: ChatIo): Promise<number> {
       windowOptions: { env: io.env },
       cacheDir,
       ...web,
+      ...ollamaTimeoutMs(
+        [...models.available, ...Object.values(models.overrides).filter((r) => r !== undefined)],
+        io.env,
+        models.providers,
+      ),
     }),
     listSessions: () => store.list(repo),
     newRunController: (skills) =>

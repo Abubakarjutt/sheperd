@@ -848,10 +848,12 @@ describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
     const p = streaming([
       // The session's first call includes a model load: never a sample.
       WARM_UP,
-      { chunks: ["slow"], delayMs: 400, usage: { inputTokens: 4000, outputTokens: 1 } },
-      // A prefix-cache hit (first delta at once) and a tiny prompt are not reading speeds.
-      { chunks: ["cached"], usage: { inputTokens: 4000, outputTokens: 1 } },
-      { chunks: ["tiny"], delayMs: 400, usage: { inputTokens: 500, outputTokens: 1 } },
+      // Each request extends the last, so only the tokens after its 4,000 are read: 4,000.
+      { chunks: ["slow"], delayMs: 400, usage: { inputTokens: 8000, outputTokens: 1 } },
+      // A prefix-cache hit (first delta at once) and a tiny read (500 new tokens) are not
+      // reading speeds.
+      { chunks: ["cached"], usage: { inputTokens: 12_000, outputTokens: 1 } },
+      { chunks: ["tiny"], delayMs: 400, usage: { inputTokens: 12_500, outputTokens: 1 } },
     ]);
     const { session } = await setup(p);
     expect(session.prefill()).toBeUndefined();
@@ -875,7 +877,7 @@ describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
         chunks: ["answer"],
         delayMs: 400,
         reasoningMs: 1200,
-        usage: { inputTokens: 4000, outputTokens: 1 },
+        usage: { inputTokens: 8000, outputTokens: 1 },
       },
     ]);
     const { session } = await setup(p);
@@ -894,9 +896,9 @@ describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
       {
         toolCalls: [{ id: "c1", name: "find", arguments: { pattern: "*.ts" } }],
         delayMs: 400,
-        usage: { inputTokens: 4000, outputTokens: 1 },
+        usage: { inputTokens: 8000, outputTokens: 1 },
       },
-      { chunks: ["done"], delayMs: 400, usage: { inputTokens: 6000, outputTokens: 1 } },
+      { chunks: ["done"], delayMs: 400, usage: { inputTokens: 12_000, outputTokens: 1 } },
     ]);
     const { session } = await setup(p);
     await session.send("load");
