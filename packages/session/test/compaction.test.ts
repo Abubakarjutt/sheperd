@@ -707,8 +707,9 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
 
   test("the first call of a session, and a call far slower than the measured speed, are not prefill samples; the window is refreshed after the first turn and after a reload", async () => {
     const delays = [400, 400, 400];
-    // Each request extends the last: the second reads 40,000 new tokens, the third 4,000.
-    const inputs = [40_000, 80_000, 84_000];
+    // Each request extends the last: the second reads 40,000 new tokens; the third only 200 (a
+    // new user message after a long history), too few to be a sample but still a reload check.
+    const inputs = [40_000, 80_000, 80_200];
     let k = 0;
     const p: Provider = {
       async chat(req: ChatRequest): Promise<ChatResponse> {
@@ -734,7 +735,7 @@ describe.skipIf(!sandboxAvailable())("ChatSession compaction", { timeout: 60_000
     await session.send("two"); // 40,000 tokens in ~400 ms: ~100,000 tok/s
     expect(session.prefill()?.samples).toBe(1);
     expect(refreshed).toHaveLength(1);
-    // 4,000 tokens should take ~40 ms; 400 ms is over 5x: a reload, not a sample.
+    // At ~100,000 tok/s even the 1,000-token floor takes ~10 ms; 400 ms is over 5x: a reload.
     await session.send("three");
     expect(session.prefill()?.samples).toBe(1);
     expect(refreshed).toHaveLength(2);
@@ -1378,6 +1379,62 @@ describe.skipIf(!sandboxAvailable())("ChatSession in-turn budget", { timeout: 60
     }
   });
 
+  test("clearing goes down to a low-water mark, so the prefix changes in rare batches, one line each", async () => {
+    const plain = new TokenEstimator();
+    const repo = makeRepo();
+    for (let i = 1; i <= 10; i++) bigFile(repo, `f${i}.txt`, `file${i}`, 8_000);
+    const p = model({
+      chat: [...[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((i) => readCall(`f${i}.txt`)), text("done")],
+      usage: (req) => plain.estimate(req.system, req.messages, req.tools),
+    });
+    const { deps: d } = deps({ limit: 12_000 });
+    const { session, events } = await setup(p, d, { repo });
+    await session.send("read all ten");
+    expect(p.chats).toHaveLength(11);
+    // A request "busts" the cache when it differs from the previous one before that one's end.
+    let busts = 0;
+    for (let k = 1; k < p.chats.length; k++) {
+      const prev = p.chats[k - 1]?.messages ?? [];
+      const cur = p.chats[k]?.messages ?? [];
+      if (prev.some((m, i) => JSON.stringify(m) !== JSON.stringify(cur[i]))) busts++;
+    }
+    const lines = events.filter((e) => e.type === "context_cleared");
+    expect(busts).toBeGreaterThan(0);
+    // Clearing just under the limit would change the prefix on every call once over it (5 of
+    // these 10); down to 60% it happens twice.
+    expect(busts).toBeLessThanOrEqual(2);
+    expect(lines).toHaveLength(busts);
+    for (const req of p.chats) {
+      expect(plain.estimate(req.system, req.messages, req.tools)).toBeLessThanOrEqual(12_000);
+    }
+  });
+
+  test("a cleared result the model reads again is kept, not cleared again before older ones", async () => {
+    const plain = new TokenEstimator();
+    const repo = makeRepo();
+    for (let i = 1; i <= 5; i++) bigFile(repo, `g${i}.txt`, `file${i}`, 16_000);
+    const p = model({
+      chat: [
+        ...[1, 2, 3, 4].map((i) => readCall(`g${i}.txt`)),
+        // g1 was cleared: the model reads it again, then two more files.
+        readCall("g1.txt"),
+        readCall("g5.txt"),
+        readCall("g4.txt"),
+        text("done"),
+      ],
+      usage: (req) => plain.estimate(req.system, req.messages, req.tools),
+    });
+    const { deps: d } = deps({ limit: 12_000 });
+    const { session } = await setup(p, d, { repo });
+    await session.send("read");
+    const last = p.chats.at(-1)?.messages ?? [];
+    const tools = last.filter((m) => m.role === "tool");
+    // The re-read of g1 (the 5th result) is whole even though it is older than the 2 kept.
+    expect(tools[4]?.content.startsWith(STUB_HEAD)).toBe(false);
+    expect(tools[4]?.content).toContain("file1 ");
+    expect(tools[0]?.content.startsWith(STUB_HEAD)).toBe(true);
+  });
+
   test("under the limit nothing is cleared and the request is the loop's own", async () => {
     const repo = makeRepo();
     bigFile(repo, "small.txt", "small", 2_000);
@@ -1415,7 +1472,9 @@ describe.skipIf(!sandboxAvailable())("ChatSession in-turn budget", { timeout: 60
     const before = session.history();
     const err = await session.send("read").catch((e: unknown) => e);
     expect(err).toMatchObject({ code: "ollama_timeout" });
-    expect((err as RewireError).message).toContain("too large for this model's reading speed");
+    expect((err as RewireError).message).toMatch(
+      /^not sent: estimated \d+ tokens at the measured 100 tokens\/s ≈ \d+s of prompt reading, over 0\.8 × the 100s reply timeout \(80s\); the context is too large for this model's reading speed$/,
+    );
     expect((err as RewireError).hint).toContain("/compact");
     // The call with huge.txt was never sent; the one before it kept only the newest result.
     expect(p.chats).toHaveLength(3);
@@ -1428,6 +1487,8 @@ describe.skipIf(!sandboxAvailable())("ChatSession in-turn budget", { timeout: 60
     // big1 before the third call; big2 before the fourth, which huge.txt alone still overfills.
     const guard = { type: "context_cleared", cleared: 1, limit: 8_000, reason: "reading_time" };
     expect(events.filter((e) => e.type === "context_cleared")).toEqual([guard, guard]);
+    // The message the TUI shows says the request was refused before sending.
+    expect((err as RewireError).message.startsWith("not sent:")).toBe(true);
     // A failed turn stores nothing.
     expect(session.history()).toEqual(before);
   });

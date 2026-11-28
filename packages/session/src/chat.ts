@@ -55,6 +55,7 @@ import {
   clearedLabel,
   clearToFit,
   IN_TURN_KEEP,
+  LOW_WATER_SHARE,
   PREFILL_GUARD_SHARE,
   PREFILL_KEEP,
 } from "./in-turn.js";
@@ -565,7 +566,13 @@ export class ChatSession {
    * reads only what follows the part a new request shares with it.
    */
   private lastSent:
-    | { system: string; tools: string; messages: string[]; inputTokens: number }
+    | {
+        system: string;
+        tools: string;
+        messages: string[];
+        sent: readonly ChatMessage[];
+        inputTokens: number;
+      }
     | undefined;
 
   constructor(opts: ChatSessionOptions) {
@@ -918,8 +925,9 @@ export class ChatSession {
 
   /**
    * Input tokens of `req` a server with a prefix cache already holds from the last call: all of
-   * the last request's when `req` extends it, else an estimate of the messages both share (never
-   * more than the last call's count); none with another system prompt or other tools. A server
+   * the last request's when `req` extends it, else the last call's reported count scaled by the
+   * estimated share of it both requests have in common; none with another system prompt or
+   * other tools. A server
    * that dropped its cache reads more than this, so the meter then sees a slow read, which the
    * reload check discards when it is far off.
    */
@@ -936,12 +944,14 @@ export class ChatSession {
       k++;
     }
     if (k === last.messages.length) return last.inputTokens;
+    // The shared part's share of the last request, by one estimator, applied to its reported
+    // count: estimated and reported tokens are never mixed.
     const est = this.opts.compaction?.estimator;
     if (est === undefined) return 0;
-    return Math.min(
-      last.inputTokens,
-      est.estimate(req.system, req.messages.slice(0, k), req.tools),
-    );
+    const whole = est.estimate(req.system, [...last.sent], req.tools);
+    if (!(whole > 0)) return 0;
+    const shared = est.estimate(req.system, req.messages.slice(0, k), req.tools);
+    return Math.min(last.inputTokens, Math.round((last.inputTokens * shared) / whole));
   }
 
   /**
@@ -955,7 +965,7 @@ export class ChatSession {
   private fitTurn(
     req: ChatRequest,
     from: number,
-    cleared: Map<string, string>,
+    cleared: Map<number, string>,
     tools: readonly AgentTool[],
     emit: (e: ChatEvent) => void,
   ): ChatRequest {
@@ -973,35 +983,49 @@ export class ChatSession {
           tools.find((t) => t.spec.name === c.name),
         ),
     };
-    let fitted = clearToFit(req.messages, { ...base, max: limit.limit, keep: IN_TURN_KEEP });
-    if (fitted.newly > 0) {
-      emit({ type: "context_cleared", cleared: fitted.newly, limit: limit.limit, reason: "limit" });
-    }
+    const low = (n: number): number => Math.floor(n * LOW_WATER_SHARE);
+    let fitted = clearToFit(req.messages, {
+      ...base,
+      max: limit.limit,
+      target: low(limit.limit),
+      keep: IN_TURN_KEEP,
+      clearReruns: false,
+    });
+    let newly = fitted.newly;
+    let event: { limit: number; reason: "limit" | "reading_time" } = {
+      limit: limit.limit,
+      reason: "limit",
+    };
     const rate = this.meter.rate();
     const timeoutMs = this.opts.replyTimeoutMs;
     if (rate !== undefined && timeoutMs !== undefined && timeoutMs > 0) {
-      const readable = Math.floor((rate.tokensPerSec * PREFILL_GUARD_SHARE * timeoutMs) / 1000);
+      const budgetS = (PREFILL_GUARD_SHARE * timeoutMs) / 1000;
+      const readable = Math.floor(rate.tokensPerSec * budgetS);
       if (fitted.estimate > readable) {
-        fitted = clearToFit(req.messages, { ...base, max: readable, keep: PREFILL_KEEP });
-        if (fitted.newly > 0) {
-          emit({
-            type: "context_cleared",
-            cleared: fitted.newly,
-            limit: readable,
-            reason: "reading_time",
-          });
-        }
+        fitted = clearToFit(req.messages, {
+          ...base,
+          max: readable,
+          target: low(readable),
+          keep: PREFILL_KEEP,
+          clearReruns: true,
+        });
+        newly += fitted.newly;
+        event = { limit: readable, reason: "reading_time" };
       }
       if (fitted.estimate > readable) {
+        if (newly > 0) emit({ type: "context_cleared", cleared: newly, ...event });
+        const tps = Math.round(rate.tokensPerSec);
         const secs = Math.round(fitted.estimate / rate.tokensPerSec);
         throw new RewireError(
           "ollama_timeout",
-          `the context (about ${fitted.estimate} tokens) is too large for this model's reading speed: at the measured ${Math.round(rate.tokensPerSec)} tokens/s it would take about ${secs}s to read, over ${Math.round(PREFILL_GUARD_SHARE * 100)}% of the ${Math.round(timeoutMs / 1000)}s reply timeout, so the request was not sent`,
+          `not sent: estimated ${fitted.estimate} tokens at the measured ${tps} tokens/s ≈ ${secs}s of prompt reading, over ${PREFILL_GUARD_SHARE} × the ${Math.round(timeoutMs / 1000)}s reply timeout (${Math.round(budgetS)}s); the context is too large for this model's reading speed`,
           "run /compact to shrink the context (or /clear to start over), then ask for less at a time (read files with offset/limit); or raise the reply timeout (REWIRE_OLLAMA_TIMEOUT_S, or [providers.ollama] timeout_s in models.toml)",
         );
       }
     }
-    return fitted.newly === 0 && cleared.size === 0 ? req : { ...req, messages: fitted.messages };
+    // One line per clearing batch, whichever budget made it.
+    if (newly > 0) emit({ type: "context_cleared", cleared: newly, ...event });
+    return cleared.size === 0 ? req : { ...req, messages: fitted.messages };
   }
 
   private estimate(specs: ToolSpec[], next?: string): number {
@@ -1457,9 +1481,9 @@ export class ChatSession {
     let reload = false;
     // The model-visible context; the stored history keeps everything.
     const prior = this.contextMessages();
-    // This turn's tool results cleared from the model-visible context (call id → stub): once
+    // This turn's tool results cleared from the model-visible context (message index → stub): once
     // cleared, a result stays cleared, so the prompt prefix is stable after each step.
-    const cleared = new Map<string, string>();
+    const cleared = new Map<number, string>();
     const provider: Provider = {
       chat: async (original: ChatRequest) => {
         const req =
@@ -1505,6 +1529,7 @@ export class ChatSession {
           system: req.system,
           tools: JSON.stringify(req.tools ?? []),
           messages: req.messages.map((m) => JSON.stringify(m)),
+          sent: req.messages,
           inputTokens: res.usage.inputTokens,
         };
         if (ttftMs !== undefined) {
@@ -1512,8 +1537,10 @@ export class ChatSession {
           // model load (or a cache the server dropped): its time is not a reading speed.
           const rate = this.meter.rate();
           const expectedMs =
-            rate !== undefined && read >= PREFILL_MIN_TOKENS
-              ? (read / rate.tokensPerSec) * 1000
+            // A small read (a new user message after a long history) still has an expected time:
+            // a reload dwarfs even the floor's, while only reads at the floor or over are samples.
+            rate !== undefined
+              ? (Math.max(read, PREFILL_MIN_TOKENS) / rate.tokensPerSec) * 1000
               : undefined;
           const loaded = expectedMs !== undefined && ttftMs > RELOAD_FACTOR * expectedMs;
           if (loaded) reload = true;

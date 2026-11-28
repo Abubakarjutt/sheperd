@@ -850,8 +850,9 @@ describe.skipIf(!sandboxAvailable())("ChatSession streaming events", () => {
       WARM_UP,
       // Each request extends the last, so only the tokens after its 4,000 are read: 4,000.
       { chunks: ["slow"], delayMs: 400, usage: { inputTokens: 8000, outputTokens: 1 } },
-      // A prefix-cache hit (first delta at once) and a tiny read (500 new tokens) are not
-      // reading speeds.
+      // Not reading speeds: a first delta at once (dropped by the 300 ms time-to-first-token
+      // rule, before the prefix rule applies) and a tiny read of 500 new tokens (the prefix
+      // rule; the latency test in compaction.test.ts covers a slow call with a small read).
       { chunks: ["cached"], usage: { inputTokens: 12_000, outputTokens: 1 } },
       { chunks: ["tiny"], delayMs: 400, usage: { inputTokens: 12_500, outputTokens: 1 } },
     ]);

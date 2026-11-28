@@ -342,8 +342,10 @@ automatic compaction is held back (` · held`, or ` · stuck`).
 Compaction runs only between your messages, but one message can lead to many tool calls, and
 a few large file reads can fill the context before the turn ends. So before each model call
 inside a turn, when the context is over the limit, rewire clears this turn's older tool
-results from what the model sees, oldest first, until it fits. The 2 most recent results are
-always kept whole. A cleared result becomes a fixed line:
+results from what the model sees, oldest first, down to 60% of the limit, so the turn can add
+several results before it has to clear again. The 2 most recent results are always kept whole,
+and so is a result the model asked for again after it was cleared. A cleared result becomes a
+fixed line:
 
 ```
 [tool output cleared to fit the context: read src/big.ts — 65536 chars. Run it again (with offset/limit for read) if you still need it, or use recall after this turn.]
@@ -353,15 +355,18 @@ It names the call by the same safe summary the TUI shows (redacted, never the ra
 A cleared result stays cleared for the rest of the turn, so the start of the prompt does not
 change again and a prefix cache keeps working. The stored conversation keeps every result
 whole, so `recall` finds it once the turn has ended, and the next turn starts from the full
-history (which compaction then handles). The TUI shows one dim line, for example
+history (which compaction then handles). So the status line's context size can drop during a
+long turn and jump back after it, until compaction runs before your next message. The TUI shows
+one dim line per clearing, for example
 `⎿ cleared 3 earlier tool outputs to fit the context (75k limit)`.
 
 **Prefill guard (Ollama).** A local model can read slowly: at 90 tokens a second a 107K-token
 prompt takes about 20 minutes, which is past the reply timeout. Once rewire has measured the
 chat model's reading speed, it checks each call: if the estimated prompt would take more than
 80% of the reply timeout to read, it clears more, down to only the most recent result. If even
-that is too large, the request is not sent and the turn ends with `ollama_timeout`, saying the
-context is too large for this model's reading speed. Run `/compact`, ask for less at a time
+that is too large, the request is not sent and the turn ends at once with `ollama_timeout`,
+whose message starts `not sent:` and gives the estimated tokens, the measured speed and the
+reading time against the reply timeout. Run `/compact`, ask for less at a time
 (read with offset and limit), or raise the reply timeout. The guard counts the whole prompt,
 even when part of it may be cached, because Ollama does not keep the cache of a very large
 prompt reliably.
