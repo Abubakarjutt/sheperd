@@ -318,8 +318,11 @@ every turn re-reads the whole context.
 Other candidates:
 
 - **Window share.** `0.85·W`, rounded down to the thousand.
-- **Latency.** Once rewire has timed the model reading prompts, that rate times
-  `latency_budget_s`. A slow local model compacts sooner.
+- **Latency.** Once rewire has timed the model reading prompts (2 samples), that rate times
+  `latency_budget_s`. A slow local model compacts sooner. A sample counts only the tokens the
+  server had to read: when a request starts with the whole previous one, a server with a prefix
+  cache (Ollama) reads only what was added, so rewire divides only that by the time to the first
+  streamed chunk (reasoning included). A read of under 1,000 new tokens is not a sample.
 - **Calibrated.** `rewire calibrate` (below) measures how much context a model really uses.
   The measured value replaces the formula, so it can be higher than the formula's value (a 200K
   window that passes at 128K gives 131,072, not 97,000).
@@ -333,6 +336,35 @@ Compaction aims to leave the context at no more than half the limit, with room f
 being sent, keeping fewer recent messages and then a shorter record until it fits. Your own rules are
 never dropped from the record, so when they alone are too big the compaction still applies, and
 automatic compaction is held back (` · held`, or ` · stuck`).
+
+### Inside one turn
+
+Compaction runs only between your messages, but one message can lead to many tool calls, and
+a few large file reads can fill the context before the turn ends. So before each model call
+inside a turn, when the context is over the limit, rewire clears this turn's older tool
+results from what the model sees, oldest first, until it fits. The 2 most recent results are
+always kept whole. A cleared result becomes a fixed line:
+
+```
+[tool output cleared to fit the context: read src/big.ts — 65536 chars. Run it again (with offset/limit for read) if you still need it, or use recall after this turn.]
+```
+
+It names the call by the same safe summary the TUI shows (redacted, never the raw arguments).
+A cleared result stays cleared for the rest of the turn, so the start of the prompt does not
+change again and a prefix cache keeps working. The stored conversation keeps every result
+whole, so `recall` finds it once the turn has ended, and the next turn starts from the full
+history (which compaction then handles). The TUI shows one dim line, for example
+`⎿ cleared 3 earlier tool outputs to fit the context (75k limit)`.
+
+**Prefill guard (Ollama).** A local model can read slowly: at 90 tokens a second a 107K-token
+prompt takes about 20 minutes, which is past the reply timeout. Once rewire has measured the
+chat model's reading speed, it checks each call: if the estimated prompt would take more than
+80% of the reply timeout to read, it clears more, down to only the most recent result. If even
+that is too large, the request is not sent and the turn ends with `ollama_timeout`, saying the
+context is too large for this model's reading speed. Run `/compact`, ask for less at a time
+(read with offset and limit), or raise the reply timeout. The guard counts the whole prompt,
+even when part of it may be cached, because Ollama does not keep the cache of a very large
+prompt reliably.
 
 ### `models.toml`
 
@@ -788,7 +820,15 @@ A streamed reply (the TUI chat) works differently. The reply timeout covers only
 its first chunk, which is mostly the time the model spends reading the prompt. Once chunks
 flow there is no total limit. The request fails only when no chunk (text, thinking or a tool
 call) arrives for 120 seconds. Esc still interrupts it. The pipeline's stages never stream, so
-each of their replies has the reply timeout as its whole limit.
+each of their replies has the reply timeout as its whole limit. In the chat, a prompt too large
+to read within the reply timeout is trimmed or refused before it is sent (see "Inside one turn"
+under "Context and compaction").
+
+Ollama keeps a prompt cache per loaded model. When the chat model and another role's model (the
+reviewer or verifier, say) take turns and only one fits in memory, each switch unloads the
+other, and the next chat call reads its whole prompt again. If you have the memory, letting
+Ollama keep both loaded (`OLLAMA_MAX_LOADED_MODELS=2` in the Ollama server's environment) avoids
+those reloads. rewire does not set it.
 
 ### Picking models in the TUI
 
@@ -1080,6 +1120,11 @@ defines what a first run must show.
   and `web_fetch` (see "Web access"). It is on by default; `web_fetch` works without a key.
   Turn it off with `[web] enabled = false` in `.rewire/policy.toml`, or limit it with
   `allow_domains`.
+- The chat clears its own older tool results inside a long turn to stay under the compaction
+  limit, and on Ollama refuses (`ollama_timeout`) a request whose prompt it could not read
+  within the reply timeout, instead of waiting for the timeout (see "Inside one turn"). The
+  latency-based compaction limit now ignores prefix-cache hits, so on a slow local model it
+  is lower than before, and compaction runs sooner.
 - `/model` in the TUI opens a picker instead of printing the routing. During a run it still
   prints the routing and says why picks are refused.
 - `/skills` opens a list instead of printing the skill names and opening the trust prompt at
