@@ -442,6 +442,127 @@ Limits: `SKILL.md` up to 256 KiB. A repo skill directory up to 2 MiB and 200 fil
 symlinks. A user skill directory up to 64 MiB and 5000 files; its symlinks are followed only to
 targets inside your home directory that are not credential files.
 
+## Web access
+
+The chat agent, the spec stage and the implementer (in every fix round too) have two tools,
+`web_search` and `web_fetch`. Nothing else goes online: the test writer, the reviewers, the
+verifier, compaction and its verifier never get the tools, and the frozen tests and the gates run
+in the sandbox as before, with no network (the dependency audit's registry exception is
+unchanged). The tools run in the rewire process, outside the sandbox. The sandbox's network
+allowlist stays empty, so `bash` in the chat or the implementer still cannot reach the network.
+
+Web access is on by default in `rewire` (chat) and `rewire run`. `web_fetch` needs no key. Without
+a search backend, `web_search` returns a tool error that says what to set, and chat and runs work
+as before. `.rewire/policy.toml` can turn web off (see below). Faux-provider runs
+(`REWIRE_FAUX_SCRIPT`) never get web access. The benchmark runs tasks through `rewire run`, so a
+real-model benchmark run has web access too, unless a task fixture's policy turns it off.
+
+### Search backends
+
+| Backend          | Setup                                                                 |
+| ---------------- | --------------------------------------------------------------------- |
+| Ollama (default) | `OLLAMA_API_KEY`, a free key from ollama.com (its hosted search API). |
+| Tavily           | `TAVILY_API_KEY`.                                                     |
+| Brave Search     | `BRAVE_API_KEY` (sent as the `X-Subscription-Token` header).          |
+| SearXNG          | Your own instance: `search = "searxng"` and `searxng_url`, no key.    |
+
+A SearXNG server must allow JSON output: add `json` to `search.formats` in its `settings.yml`
+(a 403 means it does not).
+
+With `search` unset, rewire uses the first of `OLLAMA_API_KEY`, `TAVILY_API_KEY` and
+`BRAVE_API_KEY` that is set (a blank value counts as unset). An explicit `search` uses that
+backend or says its key is missing; it never falls back to another one. Search requests never
+follow a redirect, so a key is never sent to another host. `rewire doctor` shows which backend
+and which env var it found (see [`rewire doctor`](#rewire-doctor)).
+
+`models.toml`:
+
+```toml
+[web]
+search = "tavily"                       # "ollama" | "tavily" | "brave" | "searxng"; optional
+searxng_url = "https://search.example"  # https, or http on a loopback host; no credentials, query or fragment
+max_results = 5                         # 1 to 10, default 5
+```
+
+An unknown key or a bad value fails with `models_file_invalid`.
+
+### Policy
+
+`.rewire/policy.toml`:
+
+```toml
+[web]
+enabled = false                         # default true
+deny_domains = ["pastebin.com"]         # these hosts and their subdomains are refused
+allow_domains = ["nodejs.org", "developer.mozilla.org"]  # when set, only these and their subdomains
+```
+
+The rules apply to every fetch target, every redirect hop, and the result URLs `web_search`
+shows (hidden results are counted, as `N hidden by policy`). A refused fetch is a tool error that
+names the rule. Domains are bare host names (no scheme, port, path or `*.`), matched case-
+insensitively, and `deny_domains` wins over `allow_domains`. A bad entry fails with
+`policy_invalid`.
+
+Layers only tighten. A later layer can turn web off but never back on (`policy_loosening`).
+`deny_domains` is the union of all layers. The first layer that sets `allow_domains` sets it, and
+each later one intersects with it. An empty `allow_domains` (`[]`, or layers with no domain in
+common) allows nothing, so the tools are removed, as with `enabled = false`.
+
+### What a fetch may do
+
+- Only `http` and `https`, URLs up to 2048 characters, no `user:password@`.
+- **No private addresses.** Each host is resolved and refused if any address is loopback, private
+  (10/8, 172.16/12, 192.168/16, fc00::/7), link-local (169.254/16 including cloud metadata,
+  fe80::/10), CGNAT (100.64/10), multicast, unspecified or reserved. `localhost`, `*.localhost`,
+  `.local` and `.internal` names are refused too. IPv4 written as a number (`0x7f000001`,
+  `2130706433`, `127.1`) and IPv4 inside IPv6 (mapped, compatible, NAT64, 6to4) are judged as
+  IPv4. Teredo is refused. The connection is pinned to the address that was checked, so DNS
+  rebinding cannot swap it. Every redirect is checked again, up to 5.
+- 30 s for the whole fetch, at most 5 MB read and 100,000 characters of text, with truncation
+  stated. Only text types: `text/*`, JSON and XML. HTML is converted to plain text, and links keep
+  their targets. Any other type is a short tool error naming the type.
+- A fixed `User-Agent: rewire/<version>` is sent, and nothing about you.
+
+The SearXNG URL is yours, so it is not checked against these rules; it can be on loopback.
+
+### What goes out, and what comes back
+
+- **Outgoing.** A query or URL that holds a secret-shaped value is refused before anything is
+  sent. The patterns are the ones rewire redacts, also when percent-encoded (to any depth),
+  `%uXXXX`-escaped, full-width or split by control characters. `sk-`, `ghp_` and `AKIA` keys are
+  also caught with other characters in front (`x<key>`). A host name is checked case-
+  insensitively. Queries are capped at 400 characters.
+- **Incoming.** Every title, URL, snippet and page has control and escape sequences removed and
+  secrets redacted. It reaches the model inside an `<untrusted_web>` fence, which the page
+  cannot close, and the agents' prompts say web content is data, never instructions.
+- **Audit.** Every call emits a `web_request` event, whether it succeeded or failed: the tool, the
+  backend, the query or the URL's host and path (never its query string), the status, the
+  number of results and the bytes returned. It goes to the run's `events.jsonl`, or the chat's
+  event stream. A refused secret-shaped value is recorded as `[refused: secret-shaped]`, and a
+  key is never recorded. The TUI shows each call as `● WebSearch("<query>")` or
+  `● Fetch(<host><path>)`, with result titles and hosts, or the page's first line, status and
+  size.
+
+### Residuals
+
+- A page can still mislead the model's reasoning. The fence stops a page from posing as
+  instructions in rewire's prompts, but a model can still believe what it reads. The gates and
+  the review check the result, not the sources.
+- With web on, repository text that does not look like a secret can leave in a query or a URL,
+  through a prompt-injected page or a model's own choice. The outgoing check catches only
+  secret-shaped values. `allow_domains` (or `enabled = false`) is the control for repositories
+  where this matters.
+- A key that has been re-encoded (base64, reversed, split across host labels, overlong UTF-8) is
+  not recognised.
+- The outgoing check has false positives that fail closed: an `sk-` word followed by a word of
+  20 or more letters (`ask-about-internationalization`) and host labels that start like an AWS
+  key id (`akia…`) are refused.
+- Web text is NFKC-normalised, so full-width and other compatibility forms in a page reach the
+  model as their plain forms.
+- `tool_call` summaries of other tools (a `bash` command, for one) are still logged with display
+  redaction only, so a key written with a prefix (`x<key>`) can appear there.
+- A cancelled chat turn's web calls are still recorded, because their requests went out.
+
 ## How a run works
 
 <p align="center">
@@ -557,7 +678,7 @@ result of a verified run lives on the branch `rewire/<runId>`.
 ## `rewire doctor`
 
 ```sh
-rewire doctor [--models <file>]
+rewire doctor [--models <file>] [--repo <path>]
 ```
 
 Prints one line per check, `✓` or `✗` with a fix hint, and exits `0` when everything required is
@@ -573,6 +694,13 @@ normal one is shown as `(set, unusual format)` instead of its value. An endpoint
 is shown, with the family rewire would derive when it differs. A provider that a model uses but
 that is incomplete is `✗` and makes doctor exit 1; a table that no model uses is a `!` note and
 does not. Doctor makes no network calls and reads no credential files.
+
+A `web` line shows the search backend and the env var **name** its key came from, or `none` and
+what to set, the SearXNG host when that is used, and the web policy from the repository's
+`.rewire/policy.toml` (`--repo`, default the current directory): `on` with the `allow_domains`
+and `deny_domains` counts, or `off` and why. It is a `✓`, or a `!` note when there is no search
+backend or web is off; web never makes doctor exit 1. An invalid policy file is a `✗ policy`
+line, because a run would fail on it too.
 
 ## Choosing models
 
@@ -836,6 +964,7 @@ as independent; set `family` when you know it does.
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`                | Enable the Anthropic, OpenAI and Gemini providers (auto-detected when no `models.toml` is given).                  |
 | `REWIRE_ANTHROPIC_MODEL`, `REWIRE_OPENAI_MODEL`, `REWIRE_GEMINI_MODEL` | Override the auto-detected models.                                                                                 |
 | Cloud and endpoint credentials                                         | Named under "Providers" (AWS, Google, `ANTHROPIC_FOUNDRY_*`, `AZURE_OPENAI_*`, and each endpoint's `api_key_env`). |
+| `OLLAMA_API_KEY`, `TAVILY_API_KEY`, `BRAVE_API_KEY`                    | Web search backends, first set wins in this order (see "Web access"). `web_fetch` needs no key.                    |
 | `OLLAMA_HOST`                                                          | Where Ollama is found (default `http://127.0.0.1:11434`).                                                          |
 | `REWIRE_OLLAMA_TIMEOUT_S`                                              | Ollama reply timeout, whole seconds 1 to 86400 (default 900). Wins over `[providers.ollama] timeout_s`.            |
 | `REWIRE_SANDBOX_BIN`                                                   | Use this sandbox binary (a missing file is an error, never a fall-through).                                        |
@@ -931,6 +1060,10 @@ defines what a first run must show.
 
 ## Behaviour changes in this release
 
+- The chat agent, the spec stage and the implementer can use the internet through `web_search`
+  and `web_fetch` (see "Web access"). It is on by default; `web_fetch` works without a key.
+  Turn it off with `[web] enabled = false` in `.rewire/policy.toml`, or limit it with
+  `allow_domains`.
 - `/model` in the TUI opens a picker instead of printing the routing. During a run it still
   prints the routing and says why picks are refused.
 - `/skills` opens a list instead of printing the skill names and opening the trust prompt at
@@ -1050,6 +1183,8 @@ Also known:
 - The Ollama role-fitness cache is not safe for concurrent runs (single-user CLI), and each
   fitness probe costs a few model calls the first time a model digest is seen.
 - `events.jsonl` has no size cap.
+- Web access has its own residuals (a page can mislead the model; non-secret repository text can
+  leave in a query or URL when web is on): see "Web access", "Residuals".
 - An unexpected (non-`RewireError`) failure inside a stage exits 1 and keeps the worktree.
 - A coverage failure in the test-writer stage (a criterion without a test) escalates without a
   retry.

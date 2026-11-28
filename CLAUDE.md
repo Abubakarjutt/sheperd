@@ -75,7 +75,9 @@ Package dependency direction, from bottom to top: `core`, then `web`, `policy` a
   - The CLI's binary lookup order (`REWIRE_SANDBOX_BIN`, then the checkout's `target/`, then the sha256-pinned `sheperd-<os>-<arch>` package, then `PATH`) is security-relevant and documented in the README. Keep the two in sync.
 - **`gates`**: hard blocks, never advisory. They are tests (including `requireAssertions`), types, lint, semgrep, gitleaks, dependency audit and frozen-test integrity. Language specifics come from **`pack-typescript`**, the only language pack in v0.1.
 - **`policy`**: tighten-only layering: built-in, then org, then the repo's `.rewire/policy.toml`, then the run. Protected paths (policy, CI, lint configs) are never writable by any agent stage.
+  - `[web]` (`enabled`, `deny_domains`, `allow_domains`, snake_case) only tightens: `enabled` can only go false (`policy_loosening`), deny lists form a union, allow lists intersect.
 - **`tools`**: the implementer agent's tools (read, write, edit, find, grep, bash), routed through the sandbox and policy.
+  - `web.ts` `createWebTools` gives `web_search` and `web_fetch` to the chat, spec and implementer only (never the test-writer, reviewers or verifiers; design decision #38). It is the one sink for web text: `stripControls`, `redact`, an `untrusted_web` fence, policy filtering of result URLs, and a `web_request` audit event per call. Its `summary` hook keeps raw arguments out of `tool_call` events, and its display-only `ToolResult.preview` lines feed the TUI (`● WebSearch("…")`, `● Fetch(host/path)`). With policy web off (`webOffReason`) there are no tools and the prompts are byte-identical. Faux mode gets no web access.
 - **`reviewers`**: security, spec-compliance and silent-failure reviewers, plus a verifier that tries to refute findings. Findings must cite evidence.
 - **`skills`**: discovers, validates, trusts, hashes and snapshots `SKILL.md` skills.
   - User skills load automatically (`~/.claude/skills`, `$XDG_CONFIG_HOME/rewire/skills`). Repo skills need trust pinned to a sha256 in `$XDG_CONFIG_HOME/rewire/trusted-skills.json`.
@@ -89,6 +91,7 @@ Package dependency direction, from bottom to top: `core`, then `web`, `policy` a
   - `REWIRE_TUI_SELFCHECK=1` is an internal smoke-test switch.
   - Faux-provider caveat: chat and spec share one faux turn queue when they use the same model name, so a script must list the chat turns and spec turns in the order they are consumed.
 - **`cli`**: the `run`, `doctor` and `chat` commands (bare `rewire` on a TTY opens the TUI), plus wiring.
+  - `doctor` prints a `web` line (`doctor-web.ts`): the search backend and the env var name it found, never a value, plus the policy state.
   - Exit codes: 0 only when verified, 1 for usage or prerequisite errors, 2 when the run escalates, 130 on a forced quit.
   - `--headless` writes events to stdout and the summary to stderr.
   - `rewire calibrate <model> [--max] [--yes] [--fresh]` measures a model's effective context with planted-fact probes (`calibrate.ts`). It is resumable, never automatic, and needs `--yes` on paid providers. Its exit codes differ from `run`: 0 when complete, 130 on the first Ctrl-C (it stops after the recorded lengths) as well as on a forced quit, and 1 on `calibration_failed` (including the paid gate without `--yes`).
