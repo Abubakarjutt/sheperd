@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { resolveSearch, type WebConfig } from "../src/config.js";
+import { resolveSearch, searchServiceHost, type WebConfig } from "../src/config.js";
 import { USER_AGENT, type WebFetchFn, type WebRequestInit } from "../src/fetch.js";
 import { webSearch } from "../src/search.js";
 
@@ -300,5 +300,24 @@ describe("search queries (fix round 2)", () => {
     const { fetchFn, calls } = json({ results: [] });
     await webSearch("ask-matt task-file disk-usage", { config: cfg(), env, fetchFn });
     expect(calls).toHaveLength(1);
+  });
+});
+
+describe("searchServiceHost (what policy checks before a search)", () => {
+  test.each([
+    ["ollama", { OLLAMA_API_KEY: OLLAMA }, cfg({ search: "ollama" })],
+    ["tavily", { TAVILY_API_KEY: TAVILY }, cfg({ search: "tavily" })],
+    ["brave", { BRAVE_API_KEY: BRAVE }, cfg({ search: "brave" })],
+    ["searxng", {}, cfg({ search: "searxng", searxngUrl: "https://Search.Example.org:8443/sub" })],
+  ] as const)("%s: the host the request goes to", async (backend, env, config) => {
+    const { fetchFn, calls } = json(
+      backend === "brave" ? { web: { results: [] } } : { results: [] },
+    );
+    await webSearch("q", { config, env, fetchFn });
+    expect(searchServiceHost(backend, config)).toBe(new URL(calls[0]?.url ?? "").hostname);
+  });
+
+  test("searxng without a URL has no host", () => {
+    expect(searchServiceHost("searxng", cfg({ search: "searxng" }))).toBeUndefined();
   });
 });

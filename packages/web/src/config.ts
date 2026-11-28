@@ -60,3 +60,24 @@ export function resolveSearch(config: WebConfig, env: Env): ResolvedSearch {
       "models.toml",
   };
 }
+
+/** The fixed host each keyed backend's request goes to (`searchServiceHost`). */
+export const SEARCH_HOSTS = {
+  ollama: "ollama.com",
+  tavily: "api.tavily.com",
+  brave: "api.search.brave.com",
+} as const satisfies Partial<Record<SearchBackend, string>>;
+
+/**
+ * The host a search with `backend` is sent to, lowercased (policy checks it before a search):
+ * the fixed service host, or the SearXNG URL's host; undefined for SearXNG without a URL.
+ */
+export function searchServiceHost(backend: SearchBackend, config: WebConfig): string | undefined {
+  if (backend !== "searxng") return SEARCH_HOSTS[backend];
+  if (config.searxngUrl === undefined) return undefined;
+  try {
+    return new URL(config.searxngUrl).hostname.toLowerCase();
+  } catch {
+    return undefined;
+  }
+}

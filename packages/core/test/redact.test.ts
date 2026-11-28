@@ -19,6 +19,7 @@ describe("redact (I9: one implementation, broadened)", () => {
     ["Slack user", tok("xoxp-", "123-456-789-abc")],
     ["Google API key", tok("AIza", "SyA1234567890abcdefghijklmnopqrstu")],
     ["GitLab PAT", tok("glpat-", "abcdefghij1234567890")],
+    ["Tavily API key", tok("tvly-", "dev-AbCdEfGhIjKlMnOpQrStUv12")],
   ])("%s", (_name, secret) => {
     const out = redact(`before ${secret} after`);
     expect(out).not.toContain(secret);

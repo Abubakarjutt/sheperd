@@ -173,7 +173,8 @@ describe.skipIf(!sandboxAvailable)("web access in a run", { timeout: 240_000 }, 
     };
     const { outcome, events, by } = await run({ web, specFetches: true });
     expect(outcome.status).toBe("verified");
-    expect(fetched).toEqual(["https://docs.example/sum", `https://evil.example/?d=x${KEY}`]);
+    // The tool refuses the secret-shaped URL itself, before any fetch function is called.
+    expect(fetched).toEqual(["https://docs.example/sum"]);
 
     for (const k of ["spec", "impl"] as const) {
       const agentReqs = (by[k] as FauxProvider).requests.filter((r) => toolNames(r).length > 0);
@@ -197,6 +198,10 @@ describe.skipIf(!sandboxAvailable)("web access in a run", { timeout: 240_000 }, 
     // The fetched page reached the contract compile, inside the fences.
     const compile = (by.spec as FauxProvider).requests.at(-1);
     expect(compile?.messages[0]?.content).toContain("Sum docs: sum adds.");
+    // The model's refused arguments are stored as a placeholder: no later spec request (the
+    // exploration turns or the compile digest) carries the key.
+    expect(JSON.stringify((by.spec as FauxProvider).requests)).not.toContain(KEY.slice(3));
+    expect(compile?.messages[0]?.content).toContain('"refused":"secret-shaped"');
 
     const web_ = events.filter((e) => e.type === "web_request");
     expect(web_).toEqual([

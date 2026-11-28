@@ -22,6 +22,13 @@ export type AgentTool = {
    * `[summary unavailable]`, never the arguments.
    */
   summary?(args: Record<string, unknown>): string;
+  /**
+   * Arguments to keep in the message history instead of the model's own, or undefined to keep
+   * them (for a call whose arguments must never be stored or sent again, e.g. a refused secret).
+   * The tool still runs with the real arguments. A throwing hook stores
+   * `{ refused: "arguments unavailable" }`, never the arguments.
+   */
+  storedArguments?(args: Record<string, unknown>): Record<string, unknown> | undefined;
 };
 
 export type LoopState = { messages: ChatMessage[]; turns: number; lastText: string };

@@ -380,6 +380,40 @@ describe("runAgent", () => {
     expect(JSON.stringify(events)).not.toContain("xsk-hidden");
   });
 
+  test("a tool's storedArguments hook replaces a call's arguments in history, not in the call", async () => {
+    const KEY = "xsk-ant-api03-hiddenhiddenhiddenhidden";
+    const guarded = mkTool("guarded");
+    const tool: AgentTool = {
+      ...guarded.tool,
+      storedArguments: (args) =>
+        String(args.q).includes("xsk-") ? { refused: "secret-shaped" } : undefined,
+    };
+    const broken: AgentTool = {
+      ...mkTool("broken").tool,
+      storedArguments: () => {
+        throw new Error("x");
+      },
+    };
+    const faux = new FauxProvider([
+      call("guarded", { q: `a ${KEY}` }),
+      call("guarded", { q: "plain" }),
+      call("broken", { q: KEY }),
+      text("ok"),
+    ]);
+    const res = await runAgent(base(faux, [tool, broken]));
+    // The tool itself got the model's real arguments.
+    expect(guarded.execute.mock.calls[0]?.[0]).toEqual({ q: `a ${KEY}` });
+    const stored = res.messages.flatMap((m) => m.toolCalls ?? []).map((c) => c.arguments);
+    expect(stored).toEqual([
+      { refused: "secret-shaped" },
+      { q: "plain" },
+      { refused: "arguments unavailable" },
+    ]);
+    expect(JSON.stringify(res.messages)).not.toContain(KEY);
+    // Later requests carry the stored form, never the key.
+    expect(JSON.stringify(faux.requests.slice(1))).not.toContain(KEY);
+  });
+
   test("never appends an empty assistant message", async () => {
     const faux = new FauxProvider([{ text: "", stopReason: "end" }]);
     const res = await runAgent(base(faux, []));
